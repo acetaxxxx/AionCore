@@ -1,0 +1,219 @@
+use aionui_api_types::{ConversationResponse, MessageResponse, MessageSearchItem};
+use aionui_common::{
+    AgentType, AppError, ConversationSource, ConversationStatus, MessagePosition, MessageStatus,
+    MessageType, ProviderWithModel,
+};
+use aionui_db::MessageSearchRow;
+use aionui_db::models::ConversationRow;
+use aionui_db::models::MessageRow;
+
+/// Convert a database row into an API response DTO.
+///
+/// Parses string enum fields and JSON text fields back into typed values.
+pub fn row_to_response(row: ConversationRow) -> Result<ConversationResponse, AppError> {
+    let agent_type: AgentType = string_to_enum(&row.r#type)?;
+    let status: ConversationStatus = string_to_enum(&row.status)?;
+
+    let source: Option<ConversationSource> =
+        row.source.as_deref().map(string_to_enum).transpose()?;
+
+    let model: Option<ProviderWithModel> = row
+        .model
+        .as_deref()
+        .map(|s| {
+            serde_json::from_str(s)
+                .map_err(|e| AppError::Internal(format!("Invalid model JSON: {e}")))
+        })
+        .transpose()?;
+
+    let extra: serde_json::Value = serde_json::from_str(&row.extra)
+        .map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
+
+    Ok(ConversationResponse {
+        id: row.id,
+        name: row.name,
+        r#type: agent_type,
+        model,
+        status,
+        source,
+        pinned: row.pinned,
+        pinned_at: row.pinned_at,
+        channel_chat_id: row.channel_chat_id,
+        created_at: row.created_at,
+        modified_at: row.updated_at,
+        extra,
+    })
+}
+
+/// Parse a DB string value into a typed enum via serde.
+///
+/// e.g. `"gemini"` → `AgentType::Gemini`
+pub fn string_to_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, AppError> {
+    serde_json::from_value(serde_json::Value::String(s.to_owned()))
+        .map_err(|e| AppError::Internal(format!("Invalid enum value '{s}': {e}")))
+}
+
+/// Convert a message database row into an API response DTO.
+pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppError> {
+    let msg_type: MessageType = string_to_enum(&row.r#type)?;
+
+    let position: Option<MessagePosition> =
+        row.position.as_deref().map(string_to_enum).transpose()?;
+
+    let status: Option<MessageStatus> = row.status.as_deref().map(string_to_enum).transpose()?;
+
+    let content: serde_json::Value = serde_json::from_str(&row.content)
+        .map_err(|e| AppError::Internal(format!("Invalid message content JSON: {e}")))?;
+
+    Ok(MessageResponse {
+        id: row.id,
+        conversation_id: row.conversation_id,
+        msg_id: row.msg_id,
+        r#type: msg_type,
+        content,
+        position,
+        status,
+        hidden: row.hidden,
+        created_at: row.created_at,
+    })
+}
+
+/// Convert a search result row into an API search item DTO.
+pub fn search_row_to_item(row: MessageSearchRow) -> MessageSearchItem {
+    MessageSearchItem {
+        message_id: row.message_id,
+        conversation_id: row.conversation_id,
+        conversation_name: row.conversation_name,
+        r#type: row.r#type,
+        content: row.content,
+        created_at: row.created_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aionui_common::{AgentType, ConversationSource, ConversationStatus};
+    use serde_json::json;
+
+    fn make_row(
+        agent_type: &str,
+        status: &str,
+        source: Option<&str>,
+        model_json: Option<&str>,
+        extra_json: &str,
+    ) -> ConversationRow {
+        ConversationRow {
+            id: "conv_1".into(),
+            user_id: "user_1".into(),
+            name: "Test".into(),
+            r#type: agent_type.into(),
+            extra: extra_json.into(),
+            model: model_json.map(|s| s.into()),
+            status: status.into(),
+            source: source.map(|s| s.into()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: 1000,
+            updated_at: 2000,
+        }
+    }
+
+    #[test]
+    fn row_to_response_basic() {
+        let model = json!({"providerId": "p1", "model": "m1"});
+        let row = make_row(
+            "gemini",
+            "pending",
+            Some("aionui"),
+            Some(&model.to_string()),
+            r#"{"workspace": "/project"}"#,
+        );
+        let resp = row_to_response(row).unwrap();
+        assert_eq!(resp.id, "conv_1");
+        assert_eq!(resp.r#type, AgentType::Gemini);
+        assert_eq!(resp.status, ConversationStatus::Pending);
+        assert_eq!(resp.source, Some(ConversationSource::Aionui));
+        assert_eq!(resp.model.unwrap().model, "m1");
+        assert_eq!(resp.extra["workspace"], "/project");
+        assert_eq!(resp.modified_at, 2000);
+    }
+
+    #[test]
+    fn row_to_response_no_source() {
+        let row = make_row("acp", "running", None, None, "{}");
+        let resp = row_to_response(row).unwrap();
+        assert!(resp.source.is_none());
+        assert!(resp.model.is_none());
+    }
+
+    #[test]
+    fn row_to_response_invalid_type() {
+        let row = make_row("invalid", "pending", None, None, "{}");
+        let err = row_to_response(row).unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn row_to_response_invalid_extra_json() {
+        let row = ConversationRow {
+            id: "conv_1".into(),
+            user_id: "user_1".into(),
+            name: "Test".into(),
+            r#type: "gemini".into(),
+            extra: "not-json".into(),
+            model: None,
+            status: "pending".into(),
+            source: None,
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: 1000,
+            updated_at: 2000,
+        };
+        let err = row_to_response(row).unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn string_to_enum_valid() {
+        let agent: AgentType = string_to_enum("gemini").unwrap();
+        assert_eq!(agent, AgentType::Gemini);
+
+        let status: ConversationStatus = string_to_enum("finished").unwrap();
+        assert_eq!(status, ConversationStatus::Finished);
+
+        let src: ConversationSource = string_to_enum("telegram").unwrap();
+        assert_eq!(src, ConversationSource::Telegram);
+    }
+
+    #[test]
+    fn string_to_enum_invalid() {
+        let err = string_to_enum::<AgentType>("not_valid").unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn row_with_pinned_at() {
+        let row = ConversationRow {
+            id: "conv_2".into(),
+            user_id: "user_1".into(),
+            name: "Pinned".into(),
+            r#type: "gemini".into(),
+            extra: "{}".into(),
+            model: None,
+            status: "pending".into(),
+            source: Some("aionui".into()),
+            channel_chat_id: Some("chat:1".into()),
+            pinned: true,
+            pinned_at: Some(5000),
+            created_at: 1000,
+            updated_at: 3000,
+        };
+        let resp = row_to_response(row).unwrap();
+        assert!(resp.pinned);
+        assert_eq!(resp.pinned_at, Some(5000));
+        assert_eq!(resp.channel_chat_id.as_deref(), Some("chat:1"));
+    }
+}

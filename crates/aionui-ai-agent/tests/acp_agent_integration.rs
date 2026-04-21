@@ -1,0 +1,410 @@
+//! Integration tests for AcpAgentManager.
+//!
+//! These tests use mock shell scripts to simulate ACP CLI behavior,
+//! verifying the full lifecycle: spawn → session → events → kill.
+//!
+//! Tests are serialized via `SERIAL_LOCK` to avoid OS-level resource
+//! contention from parallel subprocess spawning (pipes, I/O scheduling).
+
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use aionui_ai_agent::acp_agent::AcpAgentManager;
+use aionui_ai_agent::{AgentStreamEvent, IAgentManager};
+use aionui_common::{AcpBackend, ConversationStatus};
+use tokio::sync::broadcast;
+
+/// Timeout for receiving events from the relay.
+const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Serialize integration tests to avoid OS-level resource contention
+/// from parallel subprocess spawning (pipes, I/O scheduling).
+static SERIAL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the serial lock (panics on poison).
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Create an AcpAgentManager wrapping a mock shell script.
+///
+/// Returns the Arc-wrapped manager and a pre-subscribed event receiver
+/// (subscribed BEFORE the relay starts, so no events are missed).
+async fn make_mock_agent(
+    script: &str,
+    backend: AcpBackend,
+) -> (Arc<AcpAgentManager>, broadcast::Receiver<AgentStreamEvent>) {
+    let temp_dir = std::env::temp_dir();
+    let script_path = temp_dir.join(format!(
+        "mock_acp_{}_{}.sh",
+        std::process::id(),
+        aionui_common::now_ms()
+    ));
+    std::fs::write(&script_path, format!("#!/bin/sh\n{script}")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let config = aionui_ai_agent::AcpBuildExtra {
+        backend,
+        cli_path: script_path.to_string_lossy().into_owned(),
+        custom_workspace: false,
+        agent_name: None,
+        custom_agent_id: None,
+        preset_context: None,
+        enabled_skills: vec![],
+        preset_assistant_id: None,
+        session_mode: None,
+        cron_job_id: None,
+    };
+
+    let manager = AcpAgentManager::new("test-conv-1".into(), "/tmp".into(), config)
+        .await
+        .expect("Failed to spawn mock ACP agent");
+
+    let arc = Arc::new(manager);
+
+    // Subscribe to typed events BEFORE starting relay to capture all events
+    let rx = arc.subscribe();
+    arc.start_relay();
+
+    (arc, rx)
+}
+
+/// Wait until a specific event type is received, returning all collected events.
+async fn wait_for_event(
+    rx: &mut broadcast::Receiver<AgentStreamEvent>,
+    predicate: impl Fn(&AgentStreamEvent) -> bool,
+) -> Vec<AgentStreamEvent> {
+    let mut events = Vec::new();
+    loop {
+        match tokio::time::timeout(EVENT_TIMEOUT, rx.recv()).await {
+            Ok(Ok(event)) => {
+                let matched = predicate(&event);
+                events.push(event);
+                if matched {
+                    return events;
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                panic!(
+                    "Event channel closed before target event. Received: {:?}",
+                    events.iter().map(event_type_name).collect::<Vec<_>>()
+                )
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                eprintln!("Warning: receiver lagged by {n} events");
+                continue;
+            }
+            Err(_) => panic!(
+                "Timed out waiting for target event. Received: {:?}",
+                events.iter().map(event_type_name).collect::<Vec<_>>()
+            ),
+        }
+    }
+}
+
+/// Get a short name for the event type (for debug output).
+fn event_type_name(event: &AgentStreamEvent) -> &'static str {
+    match event {
+        AgentStreamEvent::Start(_) => "Start",
+        AgentStreamEvent::Text(_) => "Text",
+        AgentStreamEvent::Tips(_) => "Tips",
+        AgentStreamEvent::ToolCall(_) => "ToolCall",
+        AgentStreamEvent::ToolGroup(_) => "ToolGroup",
+        AgentStreamEvent::AgentStatus(_) => "AgentStatus",
+        AgentStreamEvent::Thinking(_) => "Thinking",
+        AgentStreamEvent::Plan(_) => "Plan",
+        AgentStreamEvent::AcpPermission(_) => "AcpPermission",
+        AgentStreamEvent::AcpToolCall(_) => "AcpToolCall",
+        AgentStreamEvent::CodexPermission(_) => "CodexPermission",
+        AgentStreamEvent::CodexToolCall(_) => "CodexToolCall",
+        AgentStreamEvent::AvailableCommands(_) => "AvailableCommands",
+        AgentStreamEvent::SkillSuggest(_) => "SkillSuggest",
+        AgentStreamEvent::CronTrigger(_) => "CronTrigger",
+        AgentStreamEvent::AcpModelInfo(_) => "AcpModelInfo",
+        AgentStreamEvent::AcpContextUsage(_) => "AcpContextUsage",
+        AgentStreamEvent::Finish(_) => "Finish",
+        AgentStreamEvent::Error(_) => "Error",
+        AgentStreamEvent::System(_) => "System",
+        AgentStreamEvent::RequestTrace(_) => "RequestTrace",
+        AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
+    }
+}
+
+// -- Tests --
+
+#[tokio::test]
+async fn acp_agent_type_is_acp() {
+    let _guard = serial();
+    let (agent, _rx) =
+        make_mock_agent(r#"echo '{"type":"finish","data":{}}'"#, AcpBackend::Claude).await;
+
+    assert_eq!(agent.agent_type(), aionui_common::AgentType::Acp);
+    assert_eq!(agent.conversation_id(), "test-conv-1");
+    assert_eq!(agent.workspace(), "/tmp");
+    assert_eq!(agent.backend(), AcpBackend::Claude);
+}
+
+#[tokio::test]
+async fn acp_agent_receives_stream_events() {
+    let _guard = serial();
+    let (_agent, mut rx) = make_mock_agent(
+        r#"echo '{"type":"start","data":{"sessionId":"sess-1"}}' && echo '{"type":"text","data":{"content":"Hello"}}' && echo '{"type":"finish","data":{"sessionId":"sess-1"}}'"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    // Wait for finish event, collecting all events along the way
+    let events = wait_for_event(&mut rx, |e| matches!(e, AgentStreamEvent::Finish(_))).await;
+
+    assert!(
+        events.len() >= 2,
+        "Expected at least 2 events, got {}",
+        events.len()
+    );
+
+    let has_start = events
+        .iter()
+        .any(|e| matches!(e, AgentStreamEvent::Start(_)));
+    let has_text = events
+        .iter()
+        .any(|e| matches!(e, AgentStreamEvent::Text(_)));
+
+    assert!(has_start, "Should have received Start event");
+    assert!(has_text, "Should have received Text event");
+}
+
+#[tokio::test]
+async fn acp_agent_session_id_captured_from_start() {
+    let _guard = serial();
+    let (agent, mut rx) = make_mock_agent(
+        r#"echo '{"type":"start","data":{"sessionId":"sess-abc"}}' && sleep 1"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    wait_for_event(&mut rx, |e| matches!(e, AgentStreamEvent::Start(_))).await;
+
+    let session_id = agent.session_id().await;
+    assert_eq!(session_id, Some("sess-abc".into()));
+
+    agent.kill(None).unwrap();
+}
+
+#[tokio::test]
+async fn acp_agent_status_transitions() {
+    let _guard = serial();
+    let (agent, mut rx) = make_mock_agent(
+        r#"sleep 0.1 && echo '{"type":"start","data":{}}' && sleep 0.3 && echo '{"type":"finish","data":{}}'"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    // Initial status: None
+    assert_eq!(agent.status(), None);
+
+    // Wait for Start event
+    wait_for_event(&mut rx, |e| matches!(e, AgentStreamEvent::Start(_))).await;
+    assert_eq!(agent.status(), Some(ConversationStatus::Running));
+
+    // Wait for Finish event
+    wait_for_event(&mut rx, |e| matches!(e, AgentStreamEvent::Finish(_))).await;
+    assert_eq!(agent.status(), Some(ConversationStatus::Finished));
+}
+
+#[tokio::test]
+async fn acp_agent_error_event_sets_finished() {
+    let _guard = serial();
+    let (agent, mut rx) = make_mock_agent(
+        r#"echo '{"type":"start","data":{}}' && sleep 0.1 && echo '{"type":"error","data":{"message":"timeout"}}'"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    wait_for_event(&mut rx, |e| matches!(e, AgentStreamEvent::Error(_))).await;
+    assert_eq!(agent.status(), Some(ConversationStatus::Finished));
+}
+
+#[tokio::test]
+async fn acp_agent_model_info_captured() {
+    let _guard = serial();
+    let (agent, mut rx) = make_mock_agent(
+        r#"echo '{"type":"acpModelInfo","data":{"modelId":"claude-sonnet-4","modelName":"Claude Sonnet 4","provider":"anthropic"}}' && sleep 0.5"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    wait_for_event(&mut rx, |e| matches!(e, AgentStreamEvent::AcpModelInfo(_))).await;
+
+    let info = agent.get_model_info().await;
+    assert!(info.is_some(), "Model info should be captured");
+    let info = info.unwrap();
+    assert_eq!(info.model_id, "claude-sonnet-4");
+    assert_eq!(info.model_name, Some("Claude Sonnet 4".into()));
+    assert_eq!(info.provider, Some("anthropic".into()));
+
+    agent.kill(None).unwrap();
+}
+
+#[tokio::test]
+async fn acp_agent_confirmation_management() {
+    let _guard = serial();
+    let (agent, _rx) = make_mock_agent(r#"sleep 10"#, AcpBackend::Claude).await;
+
+    assert!(agent.get_confirmations().is_empty());
+
+    agent
+        .add_confirmation(aionui_common::Confirmation {
+            id: "c1".into(),
+            call_id: "call-1".into(),
+            title: Some("Edit file".into()),
+            action: Some("edit_file".into()),
+            description: "Edit main.rs".into(),
+            command_type: None,
+            options: vec![],
+        })
+        .await;
+    assert_eq!(agent.get_confirmations().len(), 1);
+
+    agent
+        .add_confirmation(aionui_common::Confirmation {
+            id: "c2".into(),
+            call_id: "call-2".into(),
+            title: Some("Run cmd".into()),
+            action: Some("run_command".into()),
+            description: "Run cargo test".into(),
+            command_type: Some("cargo".into()),
+            options: vec![],
+        })
+        .await;
+    assert_eq!(agent.get_confirmations().len(), 2);
+
+    let removed = agent.remove_confirmation("call-1").await;
+    assert!(removed.is_some());
+    assert_eq!(agent.get_confirmations().len(), 1);
+    assert_eq!(agent.get_confirmations()[0].call_id, "call-2");
+
+    agent.kill(None).unwrap();
+}
+
+#[tokio::test]
+async fn acp_agent_ensure_yolo_claude() {
+    let _guard = serial();
+    let (agent, _rx) = make_mock_agent(
+        r#"while read line; do echo "{\"type\":\"text\",\"data\":{\"content\":\"ok\"}}"; done"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    let result = agent.ensure_yolo_mode().await;
+    assert!(result, "Claude should support YOLO mode");
+
+    agent.kill(None).unwrap();
+}
+
+#[tokio::test]
+async fn acp_agent_ensure_yolo_unsupported_backend() {
+    let _guard = serial();
+    let (agent, _rx) = make_mock_agent(r#"sleep 10"#, AcpBackend::Kiro).await;
+
+    let result = agent.ensure_yolo_mode().await;
+    assert!(!result, "Kiro should not support YOLO mode");
+
+    agent.kill(None).unwrap();
+}
+
+#[tokio::test]
+async fn acp_agent_kill_terminates_process() {
+    let _guard = serial();
+    let (agent, _rx) = make_mock_agent(
+        r#"trap '' TERM; while true; do sleep 1; done"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    assert!(agent.last_activity_at() > 0);
+
+    agent
+        .kill(Some(aionui_common::AgentKillReason::IdleTimeout))
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+}
+
+#[tokio::test]
+async fn acp_agent_last_activity_updates() {
+    let _guard = serial();
+    let (agent, _rx) = make_mock_agent(r#"sleep 10"#, AcpBackend::Claude).await;
+
+    let initial = agent.last_activity_at();
+    assert!(initial > 0);
+
+    let now = aionui_common::now_ms();
+    assert!(now - initial < 5000, "Last activity should be recent");
+
+    agent.kill(None).unwrap();
+}
+
+#[tokio::test]
+async fn acp_agent_text_content_received() {
+    let _guard = serial();
+    let (_agent, mut rx) = make_mock_agent(
+        r#"echo '{"type":"text","data":{"content":"Hello from ACP"}}'"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    match tokio::time::timeout(EVENT_TIMEOUT, rx.recv()).await {
+        Ok(Ok(AgentStreamEvent::Text(data))) => {
+            assert_eq!(data.content, "Hello from ACP");
+        }
+        other => panic!("Expected Text event, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn acp_agent_agent_status_event_captures_session() {
+    let _guard = serial();
+    let (agent, mut rx) = make_mock_agent(
+        r#"echo '{"type":"agentStatus","data":{"backend":"claude","status":"running","sessionId":"sess-xyz"}}' && sleep 1"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    wait_for_event(&mut rx, |e| matches!(e, AgentStreamEvent::AgentStatus(_))).await;
+
+    let session = agent.session_id().await;
+    assert_eq!(session, Some("sess-xyz".into()));
+
+    agent.kill(None).unwrap();
+}
+
+#[tokio::test]
+async fn acp_agent_multiple_event_types() {
+    let _guard = serial();
+    let (_agent, mut rx) = make_mock_agent(
+        r#"echo '{"type":"start","data":{"sessionId":"sess-multi"}}' && echo '{"type":"thinking","data":{"content":"Analyzing...","subject":"code","duration":100,"status":"in_progress"}}' && echo '{"type":"text","data":{"content":"Result"}}' && echo '{"type":"finish","data":{"sessionId":"sess-multi"}}'"#,
+        AcpBackend::Claude,
+    )
+    .await;
+
+    let events = wait_for_event(&mut rx, |e| matches!(e, AgentStreamEvent::Finish(_))).await;
+
+    assert!(
+        events.len() >= 4,
+        "Expected 4+ events, got {}",
+        events.len()
+    );
+
+    assert!(
+        matches!(&events[0], AgentStreamEvent::Start(d) if d.session_id == Some("sess-multi".into()))
+    );
+    assert!(matches!(&events[1], AgentStreamEvent::Thinking(d) if d.content == "Analyzing..."));
+    assert!(matches!(&events[2], AgentStreamEvent::Text(d) if d.content == "Result"));
+    assert!(
+        matches!(&events[3], AgentStreamEvent::Finish(d) if d.session_id == Some("sess-multi".into()))
+    );
+}

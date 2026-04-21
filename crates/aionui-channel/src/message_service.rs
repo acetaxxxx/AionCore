@@ -1,0 +1,500 @@
+use std::sync::Arc;
+
+use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
+use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
+use aionui_common::{AgentType, ConversationSource, ProviderWithModel, generate_id};
+use aionui_conversation::ConversationService;
+use aionui_db::models::AssistantSessionRow;
+use tracing::{debug, info, warn};
+
+use crate::constants::{STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
+use crate::error::ChannelError;
+use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
+
+/// Bridges channel messages to the conversation + AI agent layer.
+///
+/// Responsibilities:
+/// - Creating conversations for channel sessions
+/// - Sending user messages to the AI agent
+/// - Receiving stream events and converting them to outgoing messages
+/// - Throttling editMessage calls for streaming responses
+/// - Handling tool confirmation with timeout
+pub struct ChannelMessageService {
+    conversation_svc: Arc<ConversationService>,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    default_model: ProviderWithModel,
+}
+
+impl ChannelMessageService {
+    pub fn new(
+        conversation_svc: Arc<ConversationService>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        default_model: ProviderWithModel,
+    ) -> Self {
+        Self {
+            conversation_svc,
+            task_manager,
+            default_model,
+        }
+    }
+
+    /// Sends a text message from a channel user to the AI agent.
+    ///
+    /// 1. Ensures the session has a backing conversation (creates one if needed)
+    /// 2. Sends the message via ConversationService
+    /// 3. Returns the conversation_id for stream subscription
+    ///
+    /// The caller is responsible for subscribing to stream events and
+    /// relaying them to the IM platform.
+    pub async fn send_to_agent(
+        &self,
+        session: &AssistantSessionRow,
+        text: &str,
+        platform: PluginType,
+    ) -> Result<SendResult, ChannelError> {
+        // Ensure conversation exists
+        let conversation_id = match &session.conversation_id {
+            Some(cid) => cid.clone(),
+            None => {
+                self.create_conversation_for_session(session, platform)
+                    .await?
+            }
+        };
+
+        let msg_id = generate_id();
+
+        // Send message through ConversationService
+        let req = SendMessageRequest {
+            content: text.to_owned(),
+            msg_id: msg_id.clone(),
+            files: vec![],
+            inject_skills: vec![],
+        };
+
+        // Use a fixed user_id for channel messages (they're system-level)
+        let user_id = "channel";
+        self.conversation_svc
+            .send_message(user_id, &conversation_id, req, &self.task_manager)
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+
+        info!(
+            conversation_id = %conversation_id,
+            session_id = %session.id,
+            msg_id = %msg_id,
+            "message sent to agent"
+        );
+
+        Ok(SendResult {
+            conversation_id,
+            msg_id,
+        })
+    }
+
+    /// Creates a new conversation for a channel session.
+    ///
+    /// Sets `source` to the appropriate platform and `channel_chat_id`
+    /// for per-chat isolation.
+    async fn create_conversation_for_session(
+        &self,
+        session: &AssistantSessionRow,
+        platform: PluginType,
+    ) -> Result<String, ChannelError> {
+        let source = platform_to_source(platform);
+        let agent_type = parse_agent_type(&session.agent_type);
+
+        let req = CreateConversationRequest {
+            r#type: agent_type,
+            name: None,
+            model: self.default_model.clone(),
+            source: Some(source),
+            channel_chat_id: session.chat_id.clone(),
+            extra: serde_json::Value::Object(Default::default()),
+        };
+
+        let user_id = "channel";
+        let response = self
+            .conversation_svc
+            .create(user_id, req)
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+
+        debug!(
+            conversation_id = %response.id,
+            session_id = %session.id,
+            "conversation created for channel session"
+        );
+
+        Ok(response.id)
+    }
+
+    /// Processes a stream event from the AI agent and converts it to
+    /// an optional outgoing message for the IM platform.
+    ///
+    /// Returns `None` for events that don't need to be sent to the user
+    /// (e.g., internal status updates, thinking traces).
+    pub fn process_stream_event(event: &AgentStreamEvent) -> Option<StreamAction> {
+        match event {
+            AgentStreamEvent::Text(data) => Some(StreamAction::AppendText(data.content.clone())),
+            AgentStreamEvent::Finish(_) => Some(StreamAction::Finish),
+            AgentStreamEvent::Error(data) => Some(StreamAction::Error(data.message.clone())),
+            AgentStreamEvent::Thinking(data) => Some(StreamAction::Thinking(data.content.clone())),
+            AgentStreamEvent::ToolCall(data) => Some(StreamAction::ToolCall {
+                name: data.name.clone(),
+                status: format!("{:?}", data.status),
+            }),
+            // Events that don't produce user-facing messages
+            AgentStreamEvent::Start(_)
+            | AgentStreamEvent::Tips(_)
+            | AgentStreamEvent::ToolGroup(_)
+            | AgentStreamEvent::AgentStatus(_)
+            | AgentStreamEvent::Plan(_)
+            | AgentStreamEvent::AcpPermission(_)
+            | AgentStreamEvent::AcpToolCall(_)
+            | AgentStreamEvent::CodexPermission(_)
+            | AgentStreamEvent::CodexToolCall(_)
+            | AgentStreamEvent::AvailableCommands(_)
+            | AgentStreamEvent::SkillSuggest(_)
+            | AgentStreamEvent::CronTrigger(_)
+            | AgentStreamEvent::AcpModelInfo(_)
+            | AgentStreamEvent::AcpContextUsage(_)
+            | AgentStreamEvent::System(_)
+            | AgentStreamEvent::RequestTrace(_)
+            | AgentStreamEvent::SlashCommandsUpdated(_) => None,
+        }
+    }
+
+    /// Builds the "thinking" placeholder message sent immediately after
+    /// receiving a user message, before the AI starts streaming.
+    pub fn build_thinking_message() -> UnifiedOutgoingMessage {
+        UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Text,
+            text: Some("\u{23f3} Thinking...".into()),
+            parse_mode: None,
+            buttons: None,
+            keyboard: None,
+            image_url: None,
+            file_url: None,
+            file_name: None,
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        }
+    }
+
+    /// Builds the final message after streaming completes, including
+    /// action buttons for the user.
+    pub fn build_final_message(text: &str) -> UnifiedOutgoingMessage {
+        UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Buttons,
+            text: Some(text.to_owned()),
+            parse_mode: None,
+            buttons: Some(vec![vec![
+                ActionButton {
+                    label: "\u{1f504} Regenerate".into(),
+                    action: "chat.regenerate".into(),
+                    params: None,
+                },
+                ActionButton {
+                    label: "\u{25b6}\u{fe0f} Continue".into(),
+                    action: "chat.continue".into(),
+                    params: None,
+                },
+                ActionButton {
+                    label: "\u{2795} New Session".into(),
+                    action: "session.new".into(),
+                    params: None,
+                },
+            ]]),
+            keyboard: None,
+            image_url: None,
+            file_url: None,
+            file_name: None,
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        }
+    }
+
+    /// Builds an intermediate streaming message (for editMessage calls).
+    pub fn build_streaming_message(text: &str) -> UnifiedOutgoingMessage {
+        UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Text,
+            text: Some(text.to_owned()),
+            parse_mode: None,
+            buttons: None,
+            keyboard: None,
+            image_url: None,
+            file_url: None,
+            file_name: None,
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        }
+    }
+
+    /// Returns the stream throttle interval for editMessage calls.
+    pub fn throttle_interval() -> std::time::Duration {
+        STREAM_THROTTLE_INTERVAL
+    }
+
+    /// Returns the tool confirmation timeout duration.
+    pub fn confirm_timeout() -> std::time::Duration {
+        TOOL_CONFIRM_TIMEOUT
+    }
+}
+
+/// Result of sending a message to the agent.
+#[derive(Debug, Clone)]
+pub struct SendResult {
+    pub conversation_id: String,
+    pub msg_id: String,
+}
+
+/// Actions derived from agent stream events.
+#[derive(Debug, Clone)]
+pub enum StreamAction {
+    /// Append text content to the current response.
+    AppendText(String),
+    /// Streaming finished.
+    Finish,
+    /// An error occurred.
+    Error(String),
+    /// Agent is thinking/reasoning.
+    Thinking(String),
+    /// Tool call status update.
+    ToolCall { name: String, status: String },
+}
+
+/// Maps a PluginType to the corresponding ConversationSource.
+fn platform_to_source(platform: PluginType) -> ConversationSource {
+    match platform {
+        PluginType::Telegram => ConversationSource::Telegram,
+        PluginType::Lark => ConversationSource::Lark,
+        PluginType::Dingtalk => ConversationSource::Dingtalk,
+        PluginType::Weixin => ConversationSource::Weixin,
+        // Reserved variants default to Aionui
+        PluginType::Slack | PluginType::Discord => ConversationSource::Aionui,
+    }
+}
+
+/// Parses an agent_type string to an AgentType enum.
+///
+/// Falls back to `AgentType::Acp` for unknown values.
+fn parse_agent_type(s: &str) -> AgentType {
+    match s {
+        "gemini" => AgentType::Gemini,
+        "acp" => AgentType::Acp,
+        "openclawGateway" | "openclaw-gateway" => AgentType::OpenclawGateway,
+        "nanobot" => AgentType::Nanobot,
+        "remote" => AgentType::Remote,
+        "aionrs" => AgentType::Aionrs,
+        _ => {
+            warn!(agent_type = %s, "unknown agent type, defaulting to Acp");
+            AgentType::Acp
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aionui_ai_agent::stream_event::{
+        ErrorEventData, FinishEventData, StartEventData, TextEventData, ThinkingEventData,
+        ToolCallEventData, ToolCallStatus,
+    };
+
+    // ── platform_to_source ─────────────────────────────────────────────
+
+    #[test]
+    fn platform_to_source_telegram() {
+        assert_eq!(
+            platform_to_source(PluginType::Telegram),
+            ConversationSource::Telegram
+        );
+    }
+
+    #[test]
+    fn platform_to_source_lark() {
+        assert_eq!(
+            platform_to_source(PluginType::Lark),
+            ConversationSource::Lark
+        );
+    }
+
+    #[test]
+    fn platform_to_source_dingtalk() {
+        assert_eq!(
+            platform_to_source(PluginType::Dingtalk),
+            ConversationSource::Dingtalk
+        );
+    }
+
+    #[test]
+    fn platform_to_source_weixin() {
+        assert_eq!(
+            platform_to_source(PluginType::Weixin),
+            ConversationSource::Weixin
+        );
+    }
+
+    #[test]
+    fn platform_to_source_reserved_defaults_to_aionui() {
+        assert_eq!(
+            platform_to_source(PluginType::Slack),
+            ConversationSource::Aionui
+        );
+        assert_eq!(
+            platform_to_source(PluginType::Discord),
+            ConversationSource::Aionui
+        );
+    }
+
+    // ── parse_agent_type ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_known_agent_types() {
+        assert_eq!(parse_agent_type("gemini"), AgentType::Gemini);
+        assert_eq!(parse_agent_type("acp"), AgentType::Acp);
+        assert_eq!(
+            parse_agent_type("openclawGateway"),
+            AgentType::OpenclawGateway
+        );
+        assert_eq!(
+            parse_agent_type("openclaw-gateway"),
+            AgentType::OpenclawGateway
+        );
+        assert_eq!(parse_agent_type("nanobot"), AgentType::Nanobot);
+        assert_eq!(parse_agent_type("remote"), AgentType::Remote);
+        assert_eq!(parse_agent_type("aionrs"), AgentType::Aionrs);
+    }
+
+    #[test]
+    fn parse_unknown_agent_type_defaults_to_acp() {
+        assert_eq!(parse_agent_type("unknown"), AgentType::Acp);
+        assert_eq!(parse_agent_type(""), AgentType::Acp);
+    }
+
+    // ── process_stream_event ───────────────────────────────────────────
+
+    #[test]
+    fn text_event_produces_append() {
+        let event = AgentStreamEvent::Text(TextEventData {
+            content: "Hello".into(),
+        });
+        let action = ChannelMessageService::process_stream_event(&event);
+        match action {
+            Some(StreamAction::AppendText(text)) => assert_eq!(text, "Hello"),
+            _ => panic!("Expected AppendText"),
+        }
+    }
+
+    #[test]
+    fn finish_event_produces_finish() {
+        let event = AgentStreamEvent::Finish(FinishEventData { session_id: None });
+        let action = ChannelMessageService::process_stream_event(&event);
+        assert!(matches!(action, Some(StreamAction::Finish)));
+    }
+
+    #[test]
+    fn error_event_produces_error() {
+        let event = AgentStreamEvent::Error(ErrorEventData {
+            message: "timeout".into(),
+            code: None,
+        });
+        let action = ChannelMessageService::process_stream_event(&event);
+        match action {
+            Some(StreamAction::Error(msg)) => assert_eq!(msg, "timeout"),
+            _ => panic!("Expected Error"),
+        }
+    }
+
+    #[test]
+    fn thinking_event_produces_thinking() {
+        let event = AgentStreamEvent::Thinking(ThinkingEventData {
+            content: "Analyzing...".into(),
+            subject: None,
+            duration: None,
+            status: None,
+        });
+        let action = ChannelMessageService::process_stream_event(&event);
+        match action {
+            Some(StreamAction::Thinking(text)) => assert_eq!(text, "Analyzing..."),
+            _ => panic!("Expected Thinking"),
+        }
+    }
+
+    #[test]
+    fn tool_call_event_produces_tool_call() {
+        let event = AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "c1".into(),
+            name: "read_file".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Running,
+        });
+        let action = ChannelMessageService::process_stream_event(&event);
+        match action {
+            Some(StreamAction::ToolCall { name, status }) => {
+                assert_eq!(name, "read_file");
+                assert_eq!(status, "Running");
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn start_event_produces_none() {
+        let event = AgentStreamEvent::Start(StartEventData { session_id: None });
+        assert!(ChannelMessageService::process_stream_event(&event).is_none());
+    }
+
+    // ── build_thinking_message ─────────────────────────────────────────
+
+    #[test]
+    fn thinking_message_has_text() {
+        let msg = ChannelMessageService::build_thinking_message();
+        assert_eq!(msg.message_type, OutgoingMessageType::Text);
+        let text = msg.text.unwrap();
+        assert!(text.contains("Thinking"));
+    }
+
+    // ── build_final_message ────────────────────────────────────────────
+
+    #[test]
+    fn final_message_has_buttons() {
+        let msg = ChannelMessageService::build_final_message("Response text");
+        assert_eq!(msg.message_type, OutgoingMessageType::Buttons);
+        assert_eq!(msg.text.as_deref(), Some("Response text"));
+        let buttons = msg.buttons.unwrap();
+        assert!(!buttons.is_empty());
+        assert!(buttons[0].len() >= 2);
+    }
+
+    // ── build_streaming_message ────────────────────────────────────────
+
+    #[test]
+    fn streaming_message_is_plain_text() {
+        let msg = ChannelMessageService::build_streaming_message("partial...");
+        assert_eq!(msg.message_type, OutgoingMessageType::Text);
+        assert_eq!(msg.text.as_deref(), Some("partial..."));
+        assert!(msg.buttons.is_none());
+    }
+
+    // ── throttle & timeout constants ───────────────────────────────────
+
+    #[test]
+    fn throttle_interval_is_500ms() {
+        assert_eq!(
+            ChannelMessageService::throttle_interval(),
+            std::time::Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn confirm_timeout_is_15s() {
+        assert_eq!(
+            ChannelMessageService::confirm_timeout(),
+            std::time::Duration::from_secs(15)
+        );
+    }
+}

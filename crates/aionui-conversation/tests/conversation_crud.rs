@@ -1,0 +1,557 @@
+use std::sync::Arc;
+
+use aionui_api_types::{
+    CreateConversationRequest, ListConversationsQuery, UpdateConversationRequest, WebSocketMessage,
+};
+use aionui_common::{AgentType, ConversationSource, ConversationStatus};
+use aionui_conversation::ConversationService;
+use aionui_db::{SqliteConversationRepository, init_database_memory};
+use aionui_realtime::EventBroadcaster;
+use serde_json::json;
+use std::sync::Mutex;
+
+// ── Test infrastructure ────────────────────────────────────────────
+
+struct TestBroadcaster {
+    events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+}
+
+impl TestBroadcaster {
+    fn new() -> Self {
+        Self {
+            events: Mutex::new(vec![]),
+        }
+    }
+
+    fn take_events(&self) -> Vec<WebSocketMessage<serde_json::Value>> {
+        std::mem::take(&mut self.events.lock().unwrap())
+    }
+}
+
+impl EventBroadcaster for TestBroadcaster {
+    fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+async fn setup() -> (ConversationService, Arc<TestBroadcaster>) {
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+    let broadcaster = Arc::new(TestBroadcaster::new());
+    let svc = ConversationService::new(repo, broadcaster.clone());
+    (svc, broadcaster)
+}
+
+const USER_ID: &str = "system_default_user";
+
+fn make_create_req() -> CreateConversationRequest {
+    serde_json::from_value(json!({
+        "type": "gemini",
+        "model": { "providerId": "p1", "model": "claude-sonnet-4-20250514" },
+        "extra": { "workspace": "/home/user/project" }
+    }))
+    .unwrap()
+}
+
+// ── T1: Create conversation ────────────────────────────────────────
+
+#[tokio::test]
+async fn t1_1_create_with_defaults() {
+    let (svc, broadcaster) = setup().await;
+
+    let resp = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    assert!(!resp.id.is_empty());
+    assert_eq!(resp.r#type, AgentType::Gemini);
+    assert_eq!(resp.status, ConversationStatus::Pending);
+    assert_eq!(resp.source, Some(ConversationSource::Aionui));
+    assert!(!resp.pinned);
+    assert!(resp.pinned_at.is_none());
+    assert_eq!(resp.extra["workspace"], "/home/user/project");
+    assert!(resp.created_at > 0);
+    assert_eq!(resp.created_at, resp.modified_at);
+
+    // Model preserved
+    let model = resp.model.unwrap();
+    assert_eq!(model.provider_id, "p1");
+    assert_eq!(model.model, "claude-sonnet-4-20250514");
+
+    // WebSocket event
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "conversation.listChanged");
+    assert_eq!(events[0].data["action"], "created");
+    assert_eq!(events[0].data["conversationId"], resp.id);
+    assert_eq!(events[0].data["source"], "aionui");
+}
+
+#[tokio::test]
+async fn t1_2_create_each_agent_type() {
+    let (svc, _) = setup().await;
+
+    let types = vec![
+        ("gemini", AgentType::Gemini),
+        ("acp", AgentType::Acp),
+        ("openclawGateway", AgentType::OpenclawGateway),
+        ("nanobot", AgentType::Nanobot),
+        ("remote", AgentType::Remote),
+        ("aionrs", AgentType::Aionrs),
+    ];
+
+    for (type_str, expected_type) in types {
+        let req: CreateConversationRequest = serde_json::from_value(json!({
+            "type": type_str,
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": {}
+        }))
+        .unwrap();
+        let resp = svc.create(USER_ID, req).await.unwrap();
+        assert_eq!(resp.r#type, expected_type, "Type mismatch for {type_str}");
+    }
+}
+
+#[tokio::test]
+async fn t1_3_create_with_optional_fields() {
+    let (svc, _) = setup().await;
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "gemini",
+        "name": "Custom Name",
+        "model": { "providerId": "p1", "model": "m1" },
+        "source": "telegram",
+        "channelChatId": "user:123",
+        "extra": { "workspace": "/path" }
+    }))
+    .unwrap();
+    let resp = svc.create(USER_ID, req).await.unwrap();
+
+    assert_eq!(resp.name, "Custom Name");
+    assert_eq!(resp.source, Some(ConversationSource::Telegram));
+    assert_eq!(resp.channel_chat_id.as_deref(), Some("user:123"));
+}
+
+// ── T2: List conversations ─────────────────────────────────────────
+
+#[tokio::test]
+async fn t2_1_list_empty() {
+    let (svc, _) = setup().await;
+    let result = svc
+        .list(USER_ID, ListConversationsQuery::default())
+        .await
+        .unwrap();
+    assert!(result.items.is_empty());
+    assert_eq!(result.total, 0);
+    assert!(!result.has_more);
+}
+
+#[tokio::test]
+async fn t2_2_list_basic() {
+    let (svc, _) = setup().await;
+    for _ in 0..3 {
+        svc.create(USER_ID, make_create_req()).await.unwrap();
+    }
+
+    let result = svc
+        .list(USER_ID, ListConversationsQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 3);
+    assert_eq!(result.total, 3);
+}
+
+#[tokio::test]
+async fn t2_3_cursor_pagination() {
+    let (svc, _) = setup().await;
+    for _ in 0..5 {
+        svc.create(USER_ID, make_create_req()).await.unwrap();
+    }
+
+    // First page: limit=2
+    let query = ListConversationsQuery {
+        limit: Some(2),
+        ..Default::default()
+    };
+    let page1 = svc.list(USER_ID, query).await.unwrap();
+    assert_eq!(page1.items.len(), 2);
+    assert!(page1.has_more);
+    assert_eq!(page1.total, 5);
+
+    // Second page: cursor = last ID from page 1
+    let cursor = page1.items.last().unwrap().id.clone();
+    let query2 = ListConversationsQuery {
+        cursor: Some(cursor),
+        limit: Some(2),
+        ..Default::default()
+    };
+    let page2 = svc.list(USER_ID, query2).await.unwrap();
+    assert_eq!(page2.items.len(), 2);
+    assert!(page2.has_more);
+
+    // Third page
+    let cursor2 = page2.items.last().unwrap().id.clone();
+    let query3 = ListConversationsQuery {
+        cursor: Some(cursor2),
+        limit: Some(2),
+        ..Default::default()
+    };
+    let page3 = svc.list(USER_ID, query3).await.unwrap();
+    assert_eq!(page3.items.len(), 1);
+    assert!(!page3.has_more);
+
+    // No overlap between pages
+    let all_ids: Vec<String> = page1
+        .items
+        .iter()
+        .chain(page2.items.iter())
+        .chain(page3.items.iter())
+        .map(|c| c.id.clone())
+        .collect();
+    let unique: std::collections::HashSet<&String> = all_ids.iter().collect();
+    assert_eq!(all_ids.len(), unique.len());
+}
+
+#[tokio::test]
+async fn t2_4_source_filter() {
+    let (svc, _) = setup().await;
+
+    // 2 aionui + 1 telegram
+    svc.create(USER_ID, make_create_req()).await.unwrap();
+    svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let telegram_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "gemini",
+        "model": { "providerId": "p1", "model": "m1" },
+        "source": "telegram",
+        "extra": {}
+    }))
+    .unwrap();
+    svc.create(USER_ID, telegram_req).await.unwrap();
+
+    let query = ListConversationsQuery {
+        source: Some("telegram".into()),
+        ..Default::default()
+    };
+    let result = svc.list(USER_ID, query).await.unwrap();
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].source, Some(ConversationSource::Telegram));
+}
+
+#[tokio::test]
+async fn t2_5_pinned_filter() {
+    let (svc, _) = setup().await;
+
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    // Pin one
+    let pin_req: UpdateConversationRequest =
+        serde_json::from_value(json!({ "pinned": true })).unwrap();
+    svc.update(USER_ID, &conv.id, pin_req).await.unwrap();
+
+    let query = ListConversationsQuery {
+        pinned: Some(true),
+        ..Default::default()
+    };
+    let result = svc.list(USER_ID, query).await.unwrap();
+    assert_eq!(result.items.len(), 1);
+    assert!(result.items[0].pinned);
+}
+
+// ── T3: Get single conversation ────────────────────────────────────
+
+#[tokio::test]
+async fn t3_1_get_existing() {
+    let (svc, _) = setup().await;
+    let created = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let fetched = svc.get(USER_ID, &created.id).await.unwrap();
+    assert_eq!(fetched.id, created.id);
+    assert_eq!(fetched.r#type, created.r#type);
+    assert_eq!(fetched.name, created.name);
+    assert_eq!(fetched.status, created.status);
+}
+
+#[tokio::test]
+async fn t3_2_get_not_found() {
+    let (svc, _) = setup().await;
+    let err = svc.get(USER_ID, "non-existent-uuid").await.unwrap_err();
+    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+}
+
+// ── T4: Update conversation ────────────────────────────────────────
+
+#[tokio::test]
+async fn t4_1_update_name() {
+    let (svc, broadcaster) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let req: UpdateConversationRequest =
+        serde_json::from_value(json!({ "name": "New Name" })).unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
+
+    assert_eq!(updated.name, "New Name");
+    assert!(updated.modified_at >= conv.modified_at);
+
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data["action"], "updated");
+}
+
+#[tokio::test]
+async fn t4_2_pin_conversation() {
+    let (svc, _) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
+
+    assert!(updated.pinned);
+    assert!(updated.pinned_at.is_some());
+}
+
+#[tokio::test]
+async fn t4_3_unpin_clears_pinned_at() {
+    let (svc, _) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    // Pin
+    let pin: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
+    let pinned = svc.update(USER_ID, &conv.id, pin).await.unwrap();
+    assert!(pinned.pinned_at.is_some());
+
+    // Unpin
+    let unpin: UpdateConversationRequest =
+        serde_json::from_value(json!({ "pinned": false })).unwrap();
+    let unpinned = svc.update(USER_ID, &conv.id, unpin).await.unwrap();
+    assert!(!unpinned.pinned);
+    assert!(unpinned.pinned_at.is_none());
+}
+
+#[tokio::test]
+async fn t4_4_extra_merge_preserves_existing_keys() {
+    let (svc, _) = setup().await;
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "gemini",
+        "model": { "providerId": "p1", "model": "m1" },
+        "extra": { "workspace": "/old", "contextFileName": "ctx.md" }
+    }))
+    .unwrap();
+    let conv = svc.create(USER_ID, req).await.unwrap();
+
+    // Update only workspace
+    let update_req: UpdateConversationRequest =
+        serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
+    let updated = svc.update(USER_ID, &conv.id, update_req).await.unwrap();
+
+    assert_eq!(updated.extra["workspace"], "/new");
+    assert_eq!(updated.extra["contextFileName"], "ctx.md");
+}
+
+#[tokio::test]
+async fn t4_5_update_model() {
+    let (svc, _) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({
+        "model": { "providerId": "p2", "model": "new-model" }
+    }))
+    .unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
+
+    let model = updated.model.unwrap();
+    assert_eq!(model.provider_id, "p2");
+    assert_eq!(model.model, "new-model");
+}
+
+#[tokio::test]
+async fn t4_6_update_not_found() {
+    let (svc, _) = setup().await;
+    let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
+    let err = svc.update(USER_ID, "non-existent", req).await.unwrap_err();
+    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+}
+
+// ── T5: Delete conversation ────────────────────────────────────────
+
+#[tokio::test]
+async fn t5_1_delete_conversation() {
+    let (svc, broadcaster) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    svc.delete(USER_ID, &conv.id).await.unwrap();
+
+    // Verify gone
+    let err = svc.get(USER_ID, &conv.id).await.unwrap_err();
+    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+
+    // Verify broadcast
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data["action"], "deleted");
+    assert_eq!(events[0].data["conversationId"], conv.id);
+}
+
+#[tokio::test]
+async fn t5_2_delete_then_get_returns_404() {
+    let (svc, _) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    svc.delete(USER_ID, &conv.id).await.unwrap();
+    let err = svc.get(USER_ID, &conv.id).await.unwrap_err();
+    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn t5_3_delete_not_found() {
+    let (svc, _) = setup().await;
+    let err = svc.delete(USER_ID, "non-existent").await.unwrap_err();
+    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+}
+
+// ── T11: WebSocket event verification ──────────────────────────────
+
+#[tokio::test]
+async fn t11_1_create_broadcasts_created() {
+    let (svc, broadcaster) = setup().await;
+    let resp = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "conversation.listChanged");
+    assert_eq!(events[0].data["action"], "created");
+    assert_eq!(events[0].data["conversationId"], resp.id);
+}
+
+#[tokio::test]
+async fn t11_2_update_broadcasts_updated() {
+    let (svc, broadcaster) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
+    svc.update(USER_ID, &conv.id, req).await.unwrap();
+
+    let events = broadcaster.take_events();
+    assert_eq!(events[0].data["action"], "updated");
+}
+
+#[tokio::test]
+async fn t11_3_delete_broadcasts_deleted() {
+    let (svc, broadcaster) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    svc.delete(USER_ID, &conv.id).await.unwrap();
+
+    let events = broadcaster.take_events();
+    assert_eq!(events[0].data["action"], "deleted");
+}
+
+// ── T12: Boundary scenarios ────────────────────────────────────────
+
+#[tokio::test]
+async fn t12_1_long_name() {
+    let (svc, _) = setup().await;
+    let long_name = "x".repeat(1000);
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "gemini",
+        "name": long_name,
+        "model": { "providerId": "p1", "model": "m1" },
+        "extra": {}
+    }))
+    .unwrap();
+    let resp = svc.create(USER_ID, req).await.unwrap();
+    assert_eq!(resp.name.len(), 1000);
+}
+
+#[tokio::test]
+async fn t12_2_large_extra_json() {
+    let (svc, _) = setup().await;
+
+    let large_extra = json!({
+        "workspace": "/project",
+        "nested": {
+            "deep": {
+                "array": [1, 2, 3, 4, 5],
+                "object": { "key": "value" }
+            }
+        },
+        "list": (0..100).collect::<Vec<_>>()
+    });
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "gemini",
+        "model": { "providerId": "p1", "model": "m1" },
+        "extra": large_extra
+    }))
+    .unwrap();
+    let resp = svc.create(USER_ID, req).await.unwrap();
+
+    assert_eq!(resp.extra["workspace"], "/project");
+    assert_eq!(resp.extra["nested"]["deep"]["array"][2], 3);
+}
+
+#[tokio::test]
+async fn t12_3_concurrent_creates() {
+    let (svc, _) = setup().await;
+
+    let mut handles = vec![];
+    for _ in 0..10 {
+        let svc = svc.clone();
+        handles.push(tokio::spawn(async move {
+            svc.create(USER_ID, make_create_req()).await.unwrap()
+        }));
+    }
+
+    let mut ids = vec![];
+    for handle in handles {
+        let resp = handle.await.unwrap();
+        ids.push(resp.id);
+    }
+
+    // All IDs unique
+    let unique: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len());
+}
+
+// ── Full lifecycle ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn full_lifecycle_create_get_update_delete() {
+    let (svc, broadcaster) = setup().await;
+
+    // Create
+    let created = svc.create(USER_ID, make_create_req()).await.unwrap();
+    assert_eq!(created.status, ConversationStatus::Pending);
+
+    // Get
+    let fetched = svc.get(USER_ID, &created.id).await.unwrap();
+    assert_eq!(fetched.id, created.id);
+
+    // Update
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "name": "Updated",
+        "pinned": true,
+        "extra": { "workspace": "/updated" }
+    }))
+    .unwrap();
+    let updated = svc.update(USER_ID, &created.id, update_req).await.unwrap();
+    assert_eq!(updated.name, "Updated");
+    assert!(updated.pinned);
+    assert_eq!(updated.extra["workspace"], "/updated");
+
+    // Delete
+    svc.delete(USER_ID, &created.id).await.unwrap();
+    assert!(svc.get(USER_ID, &created.id).await.is_err());
+
+    // Verify all events: created + updated + deleted
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].data["action"], "created");
+    assert_eq!(events[1].data["action"], "updated");
+    assert_eq!(events[2].data["action"], "deleted");
+}

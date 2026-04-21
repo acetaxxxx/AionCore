@@ -1,0 +1,299 @@
+//! Integration tests for agent type implementations and auxiliary features.
+//!
+//! These tests validate:
+//! - Each agent manager implements IAgentManager correctly
+//! - Agent factory can build all agent types
+//! - Idle scanner finds eligible tasks
+//! - Workspace browsing works with real filesystem
+//! - Aionrs stub returns appropriate errors
+
+use std::sync::Arc;
+
+use aionui_ai_agent::*;
+use aionui_common::{
+    AgentKillReason, AgentType, Confirmation, ConversationStatus, ProviderWithModel, TimestampMs,
+    now_ms,
+};
+use serde_json::json;
+use std::sync::atomic::{AtomicI64, Ordering};
+use tokio::sync::broadcast;
+
+// ---------------------------------------------------------------------------
+// Mock agent for WorkerTaskManager tests with different agent types
+// ---------------------------------------------------------------------------
+
+struct TypedMockAgent {
+    agent_type: AgentType,
+    conversation_id: String,
+    workspace: String,
+    status: Option<ConversationStatus>,
+    last_activity: AtomicI64,
+    event_tx: broadcast::Sender<AgentStreamEvent>,
+}
+
+impl TypedMockAgent {
+    fn new(
+        agent_type: AgentType,
+        conversation_id: &str,
+        status: Option<ConversationStatus>,
+    ) -> Self {
+        let (event_tx, _) = broadcast::channel(16);
+        Self {
+            agent_type,
+            conversation_id: conversation_id.to_owned(),
+            workspace: "/tmp/test".to_owned(),
+            status,
+            last_activity: AtomicI64::new(now_ms()),
+            event_tx,
+        }
+    }
+
+    fn with_last_activity(mut self, ts: TimestampMs) -> Self {
+        self.last_activity = AtomicI64::new(ts);
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentManager for TypedMockAgent {
+    fn agent_type(&self) -> AgentType {
+        self.agent_type
+    }
+    fn status(&self) -> Option<ConversationStatus> {
+        self.status
+    }
+    fn workspace(&self) -> &str {
+        &self.workspace
+    }
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+    fn last_activity_at(&self) -> TimestampMs {
+        self.last_activity.load(Ordering::Relaxed)
+    }
+    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+        self.event_tx.subscribe()
+    }
+    async fn send_message(&self, _data: SendMessageData) -> Result<(), aionui_common::AppError> {
+        Ok(())
+    }
+    async fn stop(&self) -> Result<(), aionui_common::AppError> {
+        Ok(())
+    }
+    fn confirm(
+        &self,
+        _msg_id: &str,
+        _call_id: &str,
+        _data: serde_json::Value,
+        _always_allow: bool,
+    ) -> Result<(), aionui_common::AppError> {
+        Ok(())
+    }
+    fn get_confirmations(&self) -> Vec<Confirmation> {
+        vec![]
+    }
+    fn check_approval(&self, _action: &str, _command_type: Option<&str>) -> bool {
+        false
+    }
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_common::AppError> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Aionrs stub tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn aionrs_stub_send_message_returns_error() {
+    let agent = AionrsAgentManager::new("conv-aionrs".into(), "/project".into());
+    let data = SendMessageData {
+        content: "hello".into(),
+        msg_id: "m1".into(),
+        files: vec![],
+        inject_skills: vec![],
+    };
+    let result = agent.send_message(data).await;
+    assert!(result.is_err());
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(err_msg.contains("not yet implemented"));
+}
+
+#[test]
+fn aionrs_stub_kill_succeeds() {
+    let agent = AionrsAgentManager::new("conv-1".into(), "/proj".into());
+    assert!(agent.kill(None).is_ok());
+    assert!(agent.kill(Some(AgentKillReason::IdleTimeout)).is_ok());
+}
+
+#[test]
+fn aionrs_stub_confirm_returns_error() {
+    let agent = AionrsAgentManager::new("conv-1".into(), "/proj".into());
+    let result = agent.confirm("msg", "call", json!({}), false);
+    assert!(result.is_err());
+}
+
+#[test]
+fn aionrs_stub_metadata() {
+    let agent = AionrsAgentManager::new("conv-abc".into(), "/work".into());
+    assert_eq!(agent.agent_type(), AgentType::Aionrs);
+    assert_eq!(agent.workspace(), "/work");
+    assert_eq!(agent.conversation_id(), "conv-abc");
+    assert!(agent.status().is_none());
+    assert!(agent.get_confirmations().is_empty());
+    assert!(!agent.check_approval("any", None));
+}
+
+// ---------------------------------------------------------------------------
+// Idle scanner: collect_idle only finds ACP tasks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn collect_idle_ignores_non_acp_agent_types() {
+    let old_ts = now_ms() - 600_000; // 10 min ago
+
+    // Build a factory that creates typed mocks (all finished + old)
+    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+        let mock = TypedMockAgent::new(
+            opts.agent_type,
+            &opts.conversation_id,
+            Some(ConversationStatus::Finished),
+        )
+        .with_last_activity(old_ts);
+        Ok(Arc::new(mock) as AgentManagerHandle)
+    });
+    let mgr = WorkerTaskManagerImpl::new(factory);
+
+    let make_opts = |agent_type: AgentType, id: &str| BuildTaskOptions {
+        agent_type,
+        workspace: "/tmp".into(),
+        model: ProviderWithModel {
+            provider_id: "p".into(),
+            model: "m".into(),
+            use_model: None,
+        },
+        conversation_id: id.into(),
+        extra: json!(null),
+    };
+
+    mgr.get_or_build_task("gem-1", make_opts(AgentType::Gemini, "gem-1"))
+        .unwrap();
+    mgr.get_or_build_task("nanobot-1", make_opts(AgentType::Nanobot, "nanobot-1"))
+        .unwrap();
+    mgr.get_or_build_task(
+        "openclaw-1",
+        make_opts(AgentType::OpenclawGateway, "openclaw-1"),
+    )
+    .unwrap();
+    mgr.get_or_build_task("acp-1", make_opts(AgentType::Acp, "acp-1"))
+        .unwrap();
+    mgr.get_or_build_task("remote-1", make_opts(AgentType::Remote, "remote-1"))
+        .unwrap();
+
+    assert_eq!(mgr.active_count(), 5);
+
+    // Only ACP should be collected
+    let idle = mgr.collect_idle(300_000); // 5-min threshold
+    assert_eq!(idle.len(), 1);
+    assert_eq!(idle[0], "acp-1");
+}
+
+// ---------------------------------------------------------------------------
+// Workspace browsing (uses real filesystem via tempdir)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn workspace_browse_reads_directory() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path();
+
+    // Create test files and dirs
+    std::fs::create_dir(base.join("src")).unwrap();
+    std::fs::create_dir(base.join("tests")).unwrap();
+    std::fs::write(base.join("Cargo.toml"), "# test").unwrap();
+    std::fs::write(base.join("README.md"), "# readme").unwrap();
+
+    let mut entries = Vec::new();
+    let mut dir_reader = tokio::fs::read_dir(base).await.unwrap();
+    while let Ok(Some(entry)) = dir_reader.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ft = entry.file_type().await.unwrap();
+        let entry_type = if ft.is_dir() { "directory" } else { "file" };
+        entries.push((name, entry_type.to_string()));
+    }
+
+    assert_eq!(entries.len(), 4);
+
+    // Check that directories exist
+    let dir_names: Vec<&str> = entries
+        .iter()
+        .filter(|(_, t)| t == "directory")
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert!(dir_names.contains(&"src"));
+    assert!(dir_names.contains(&"tests"));
+
+    // Check that files exist
+    let file_names: Vec<&str> = entries
+        .iter()
+        .filter(|(_, t)| t == "file")
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert!(file_names.contains(&"Cargo.toml"));
+    assert!(file_names.contains(&"README.md"));
+}
+
+// ---------------------------------------------------------------------------
+// build_system_instructions_with_skills_index (M-16 fix)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn build_system_instructions_with_skills_index_empty() {
+    let result = build_system_instructions_with_skills_index("Base prompt", &[]);
+    assert_eq!(result, "Base prompt");
+}
+
+#[test]
+fn build_system_instructions_with_skills_index_appends_index() {
+    let skills = vec![
+        SkillIndex {
+            name: "review".into(),
+            description: "Code review".into(),
+        },
+        SkillIndex {
+            name: "debug".into(),
+            description: "Debugging".into(),
+        },
+    ];
+    let result = build_system_instructions_with_skills_index("You are an AI assistant.", &skills);
+    assert!(result.starts_with("You are an AI assistant."));
+    assert!(result.contains("## Available Skills"));
+    assert!(result.contains("- **review**: Code review"));
+    assert!(result.contains("- **debug**: Debugging"));
+    assert!(result.contains("[LOAD_SKILL: skill-name]"));
+}
+
+// ---------------------------------------------------------------------------
+// Agent type metadata validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agent_type_serde_all_variants() {
+    // Verify that all AgentType variants serialize/deserialize correctly
+    for (variant, expected_json) in [
+        (AgentType::Gemini, "\"gemini\""),
+        (AgentType::Acp, "\"acp\""),
+        (AgentType::OpenclawGateway, "\"openclawGateway\""),
+        (AgentType::Nanobot, "\"nanobot\""),
+        (AgentType::Remote, "\"remote\""),
+        (AgentType::Aionrs, "\"aionrs\""),
+    ] {
+        let json = serde_json::to_string(&variant).unwrap();
+        assert_eq!(json, expected_json, "Failed for {:?}", variant);
+        let parsed: AgentType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, variant);
+    }
+}

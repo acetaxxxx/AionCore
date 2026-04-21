@@ -1,6 +1,150 @@
-[package]
-name = "aionui-backend"
+[workspace]
+resolver = "3"
+members = [
+    "crates/aionui-common",
+    "crates/aionui-db",
+    "crates/aionui-api-types",
+    "crates/aionui-realtime",
+    "crates/aionui-auth",
+    "crates/aionui-system",
+    "crates/aionui-file",
+    "crates/aionui-office",
+    "crates/aionui-shell",
+    "crates/aionui-ai-agent",
+    "crates/aionui-mcp",
+    "crates/aionui-conversation",
+    "crates/aionui-extension",
+    "crates/aionui-channel",
+    "crates/aionui-team",
+    "crates/aionui-cron",
+    "crates/aionui-app",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+aionui-common = { path = "crates/aionui-common" }
+aionui-db = { path = "crates/aionui-db" }
+aionui-api-types = { path = "crates/aionui-api-types" }
+aionui-realtime = { path = "crates/aionui-realtime" }
+aionui-auth = { path = "crates/aionui-auth" }
+aionui-system = { path = "crates/aionui-system" }
+aionui-file = { path = "crates/aionui-file" }
+aionui-office = { path = "crates/aionui-office" }
+aionui-shell = { path = "crates/aionui-shell" }
+aionui-ai-agent = { path = "crates/aionui-ai-agent" }
+aionui-mcp = { path = "crates/aionui-mcp" }
+aionui-conversation = { path = "crates/aionui-conversation" }
+aionui-extension = { path = "crates/aionui-extension" }
+aionui-channel = { path = "crates/aionui-channel" }
+aionui-team = { path = "crates/aionui-team" }
+aionui-cron = { path = "crates/aionui-cron" }
+aionui-app = { path = "crates/aionui-app" }
+
+# Core framework
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
+tower = { version = "0.5" }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async utilities
+futures-util = "0.3"
+
+# Async trait (dyn-compatible async traits)
+async-trait = "0.1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Auth / Crypto
+jsonwebtoken = "9"
+bcrypt = "0.17"
+aes-gcm = "0.10"
+
+# UUID
+uuid = { version = "1", features = ["v7"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+
+# Concurrency
+dashmap = "6"
+
+# WebSocket
+tokio-tungstenite = "0.26"
+
+# Semver
+semver = "1"
+
+# Directories
+dirs = "6"
+
+# Regex
+regex = "1"
+
+# File system
+notify = "8"
+walkdir = "2"
+ignore = "0.4"
+zip = "2"
+git2 = "0.20"
+mime_guess = "2"
+
+# Cron
+cron = "0.15"
+chrono = "0.4"
+chrono-tz = "0.10"
+
+# Shell
+open = "5"
+which = "7"
+
+# Office
+calamine = "0.26"
+rust_xlsxwriter = "0.82"
+sha1 = "0.10"
+sha2 = "0.10"
+
+# AWS
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-bedrock = "1"
+aws-sdk-bedrockruntime = "1"
+
+# OAuth / MCP
+oauth2 = "5.0.0-rc.1"
+toml = "0.8"
+
+# Ed25519
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Encoding
+base64 = "0.22"
+
+# HTTP body utilities (testing)
+http-body-util = "0.1"
+
+# Testing
+tempfile = "3"
+wiremock = "0.6"
+
+# Random
+getrandom = "0.2"

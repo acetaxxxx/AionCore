@@ -1,0 +1,13 @@
+pub mod error;
+pub mod routes;
+pub mod shell;
+pub mod state;
+pub mod stt;
+pub(crate) mod stt_deepgram;
+pub(crate) mod stt_openai;
+
+pub use error::{ShellError, SttError};
+pub use routes::shell_routes;
+pub use shell::ShellService;
+pub use state::ShellRouterState;
+pub use stt::SttService;

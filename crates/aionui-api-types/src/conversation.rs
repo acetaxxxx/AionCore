@@ -1,0 +1,607 @@
+use aionui_common::{
+    AgentType, ConversationSource, ConversationStatus, MessagePosition, MessageStatus, MessageType,
+    PaginatedResult, ProviderWithModel, TimestampMs,
+};
+use serde::{Deserialize, Serialize};
+
+// ── Request types ──────────────────────────────────────────────────
+
+/// Body for `POST /api/conversations`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateConversationRequest {
+    pub r#type: AgentType,
+    pub name: Option<String>,
+    pub model: ProviderWithModel,
+    pub source: Option<ConversationSource>,
+    pub channel_chat_id: Option<String>,
+    pub extra: serde_json::Value,
+}
+
+/// Body for `PATCH /api/conversations/:id`.
+///
+/// All fields optional — only supplied fields are applied.
+/// `extra` uses merge semantics (patch, not replace).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateConversationRequest {
+    pub name: Option<String>,
+    pub pinned: Option<bool>,
+    pub model: Option<ProviderWithModel>,
+    pub extra: Option<serde_json::Value>,
+}
+
+/// Body for `POST /api/conversations/clone`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneConversationRequest {
+    pub source_conversation_id: Option<String>,
+    pub conversation: CreateConversationRequest,
+    pub migrate_cron: Option<bool>,
+}
+
+/// Body for `POST /api/conversations/:id/messages`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageRequest {
+    pub content: String,
+    pub msg_id: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub inject_skills: Vec<String>,
+}
+
+// ── Query types ────────────────────────────────────────────────────
+
+/// Query parameters for `GET /api/conversations`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListConversationsQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+    pub source: Option<String>,
+    pub cron_job_id: Option<String>,
+    pub pinned: Option<bool>,
+}
+
+/// Query parameters for `GET /api/conversations/:id/messages`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListMessagesQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub order: Option<String>,
+}
+
+/// Query parameters for `GET /api/messages/search`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchMessagesQuery {
+    pub keyword: String,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+}
+
+// ── Response types ─────────────────────────────────────────────────
+
+/// Full conversation object returned in API responses (camelCase).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationResponse {
+    pub id: String,
+    pub name: String,
+    pub r#type: AgentType,
+    pub model: Option<ProviderWithModel>,
+    pub status: ConversationStatus,
+    pub source: Option<ConversationSource>,
+    pub pinned: bool,
+    pub pinned_at: Option<TimestampMs>,
+    pub channel_chat_id: Option<String>,
+    pub created_at: TimestampMs,
+    pub modified_at: TimestampMs,
+    pub extra: serde_json::Value,
+}
+
+/// Paginated list of conversations.
+pub type ConversationListResponse = PaginatedResult<ConversationResponse>;
+
+/// Single message object returned in API responses (camelCase).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageResponse {
+    pub id: String,
+    pub conversation_id: String,
+    pub msg_id: Option<String>,
+    pub r#type: MessageType,
+    pub content: serde_json::Value,
+    pub position: Option<MessagePosition>,
+    pub status: Option<MessageStatus>,
+    pub hidden: bool,
+    pub created_at: TimestampMs,
+}
+
+/// Paginated list of messages.
+pub type MessageListResponse = PaginatedResult<MessageResponse>;
+
+/// A single item from cross-conversation message search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSearchItem {
+    pub message_id: String,
+    pub conversation_id: String,
+    pub conversation_name: String,
+    pub r#type: String,
+    pub content: String,
+    pub created_at: TimestampMs,
+}
+
+/// Paginated search results for messages.
+pub type MessageSearchResponse = PaginatedResult<MessageSearchItem>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── CreateConversationRequest ───────────────────────────────────
+
+    #[test]
+    fn deserialize_create_request_full() {
+        let raw = json!({
+            "type": "gemini",
+            "name": "Code Review",
+            "model": { "providerId": "p1", "model": "claude-sonnet-4-20250514" },
+            "source": "aionui",
+            "channelChatId": "user:123",
+            "extra": { "workspace": "/project" }
+        });
+        let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.r#type, AgentType::Gemini);
+        assert_eq!(req.name.as_deref(), Some("Code Review"));
+        assert_eq!(req.model.model, "claude-sonnet-4-20250514");
+        assert_eq!(req.source, Some(ConversationSource::Aionui));
+        assert_eq!(req.channel_chat_id.as_deref(), Some("user:123"));
+        assert_eq!(req.extra["workspace"], "/project");
+    }
+
+    #[test]
+    fn deserialize_create_request_minimal() {
+        let raw = json!({
+            "type": "acp",
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": {}
+        });
+        let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.r#type, AgentType::Acp);
+        assert!(req.name.is_none());
+        assert!(req.source.is_none());
+        assert!(req.channel_chat_id.is_none());
+    }
+
+    #[test]
+    fn deserialize_create_request_missing_type() {
+        let raw = json!({
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": {}
+        });
+        assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
+    }
+
+    #[test]
+    fn deserialize_create_request_missing_model() {
+        let raw = json!({
+            "type": "gemini",
+            "extra": {}
+        });
+        assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
+    }
+
+    #[test]
+    fn deserialize_create_request_missing_extra() {
+        let raw = json!({
+            "type": "gemini",
+            "model": { "providerId": "p1", "model": "m1" }
+        });
+        assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
+    }
+
+    #[test]
+    fn deserialize_create_request_invalid_type() {
+        let raw = json!({
+            "type": "invalid_type",
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": {}
+        });
+        assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
+    }
+
+    // ── UpdateConversationRequest ───────────────────────────────────
+
+    #[test]
+    fn deserialize_update_request_partial() {
+        let raw = json!({ "name": "New Name" });
+        let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name.as_deref(), Some("New Name"));
+        assert!(req.pinned.is_none());
+        assert!(req.model.is_none());
+        assert!(req.extra.is_none());
+    }
+
+    #[test]
+    fn deserialize_update_request_all_fields() {
+        let raw = json!({
+            "name": "Updated",
+            "pinned": true,
+            "model": { "providerId": "p2", "model": "new-model" },
+            "extra": { "workspace": "/new" }
+        });
+        let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name.as_deref(), Some("Updated"));
+        assert_eq!(req.pinned, Some(true));
+        assert!(req.model.is_some());
+        assert_eq!(req.extra.as_ref().unwrap()["workspace"], "/new");
+    }
+
+    #[test]
+    fn deserialize_update_request_empty() {
+        let raw = json!({});
+        let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.name.is_none());
+        assert!(req.pinned.is_none());
+        assert!(req.model.is_none());
+        assert!(req.extra.is_none());
+    }
+
+    // ── CloneConversationRequest ────────────────────────────────────
+
+    #[test]
+    fn deserialize_clone_request_with_source() {
+        let raw = json!({
+            "sourceConversationId": "conv_abc",
+            "conversation": {
+                "type": "gemini",
+                "model": { "providerId": "p1", "model": "m1" },
+                "extra": {}
+            },
+            "migrateCron": true
+        });
+        let req: CloneConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.source_conversation_id.as_deref(), Some("conv_abc"));
+        assert_eq!(req.conversation.r#type, AgentType::Gemini);
+        assert_eq!(req.migrate_cron, Some(true));
+    }
+
+    #[test]
+    fn deserialize_clone_request_without_source() {
+        let raw = json!({
+            "conversation": {
+                "type": "acp",
+                "model": { "providerId": "p1", "model": "m1" },
+                "extra": {}
+            }
+        });
+        let req: CloneConversationRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.source_conversation_id.is_none());
+        assert!(req.migrate_cron.is_none());
+    }
+
+    // ── ListConversationsQuery ──────────────────────────────────────
+
+    #[test]
+    fn deserialize_list_query_full() {
+        let raw = json!({
+            "cursor": "conv_last",
+            "limit": 10,
+            "source": "telegram",
+            "cronJobId": "cron_1",
+            "pinned": true
+        });
+        let q: ListConversationsQuery = serde_json::from_value(raw).unwrap();
+        assert_eq!(q.cursor.as_deref(), Some("conv_last"));
+        assert_eq!(q.limit, Some(10));
+        assert_eq!(q.source.as_deref(), Some("telegram"));
+        assert_eq!(q.cron_job_id.as_deref(), Some("cron_1"));
+        assert_eq!(q.pinned, Some(true));
+    }
+
+    #[test]
+    fn deserialize_list_query_empty() {
+        let raw = json!({});
+        let q: ListConversationsQuery = serde_json::from_value(raw).unwrap();
+        assert!(q.cursor.is_none());
+        assert!(q.limit.is_none());
+        assert!(q.source.is_none());
+        assert!(q.cron_job_id.is_none());
+        assert!(q.pinned.is_none());
+    }
+
+    // ── ListMessagesQuery ───────────────────────────────────────────
+
+    #[test]
+    fn deserialize_messages_query_defaults() {
+        let raw = json!({});
+        let q: ListMessagesQuery = serde_json::from_value(raw).unwrap();
+        assert!(q.page.is_none());
+        assert!(q.page_size.is_none());
+        assert!(q.order.is_none());
+    }
+
+    #[test]
+    fn deserialize_messages_query_with_values() {
+        let raw = json!({ "page": 2, "pageSize": 30, "order": "ASC" });
+        let q: ListMessagesQuery = serde_json::from_value(raw).unwrap();
+        assert_eq!(q.page, Some(2));
+        assert_eq!(q.page_size, Some(30));
+        assert_eq!(q.order.as_deref(), Some("ASC"));
+    }
+
+    // ── SearchMessagesQuery ─────────────────────────────────────────
+
+    #[test]
+    fn deserialize_search_query() {
+        let raw = json!({ "keyword": "rust", "page": 1, "pageSize": 20 });
+        let q: SearchMessagesQuery = serde_json::from_value(raw).unwrap();
+        assert_eq!(q.keyword, "rust");
+        assert_eq!(q.page, Some(1));
+        assert_eq!(q.page_size, Some(20));
+    }
+
+    #[test]
+    fn deserialize_search_query_missing_keyword() {
+        let raw = json!({ "page": 1 });
+        assert!(serde_json::from_value::<SearchMessagesQuery>(raw).is_err());
+    }
+
+    // ── ConversationResponse ────────────────────────────────────────
+
+    #[test]
+    fn serialize_conversation_response_camel_case() {
+        let resp = ConversationResponse {
+            id: "conv_1".into(),
+            name: "Test".into(),
+            r#type: AgentType::Gemini,
+            model: Some(ProviderWithModel {
+                provider_id: "p1".into(),
+                model: "m1".into(),
+                use_model: None,
+            }),
+            status: ConversationStatus::Pending,
+            source: Some(ConversationSource::Aionui),
+            pinned: false,
+            pinned_at: None,
+            channel_chat_id: None,
+            created_at: 1712345678000,
+            modified_at: 1712345678000,
+            extra: json!({ "workspace": "/project" }),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["id"], "conv_1");
+        assert_eq!(json["type"], "gemini");
+        assert_eq!(json["status"], "pending");
+        assert_eq!(json["source"], "aionui");
+        assert_eq!(json["createdAt"], 1712345678000_i64);
+        assert_eq!(json["modifiedAt"], 1712345678000_i64);
+        assert_eq!(json["extra"]["workspace"], "/project");
+        // Verify camelCase keys
+        assert!(json.get("channel_chat_id").is_none());
+        assert!(json.get("channelChatId").is_some());
+        assert!(json.get("created_at").is_none());
+        assert!(json.get("pinned_at").is_none());
+    }
+
+    #[test]
+    fn conversation_response_roundtrip() {
+        let resp = ConversationResponse {
+            id: "conv_2".into(),
+            name: "Round".into(),
+            r#type: AgentType::Acp,
+            model: None,
+            status: ConversationStatus::Running,
+            source: None,
+            pinned: true,
+            pinned_at: Some(1712345678000),
+            channel_chat_id: Some("group:42".into()),
+            created_at: 1000,
+            modified_at: 2000,
+            extra: json!({}),
+        };
+        let serialized = serde_json::to_string(&resp).unwrap();
+        let deserialized: ConversationResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.id, resp.id);
+        assert_eq!(deserialized.pinned, true);
+        assert_eq!(deserialized.pinned_at, Some(1712345678000));
+        assert_eq!(deserialized.channel_chat_id.as_deref(), Some("group:42"));
+    }
+
+    // ── MessageResponse ─────────────────────────────────────────────
+
+    #[test]
+    fn serialize_message_response_camel_case() {
+        let resp = MessageResponse {
+            id: "msg_1".into(),
+            conversation_id: "conv_1".into(),
+            msg_id: Some("client_1".into()),
+            r#type: MessageType::Text,
+            content: json!({ "content": "Hello" }),
+            position: Some(MessagePosition::Right),
+            status: Some(MessageStatus::Finish),
+            hidden: false,
+            created_at: 1712345678000,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["id"], "msg_1");
+        assert_eq!(json["conversationId"], "conv_1");
+        assert_eq!(json["msgId"], "client_1");
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["position"], "right");
+        assert_eq!(json["status"], "finish");
+        assert_eq!(json["hidden"], false);
+        assert_eq!(json["createdAt"], 1712345678000_i64);
+        // Verify no snake_case leaks
+        assert!(json.get("conversation_id").is_none());
+        assert!(json.get("msg_id").is_none());
+        assert!(json.get("created_at").is_none());
+    }
+
+    #[test]
+    fn message_response_roundtrip() {
+        let resp = MessageResponse {
+            id: "msg_2".into(),
+            conversation_id: "conv_2".into(),
+            msg_id: None,
+            r#type: MessageType::ToolCall,
+            content: json!({ "callId": "c1", "name": "bash" }),
+            position: Some(MessagePosition::Left),
+            status: None,
+            hidden: true,
+            created_at: 5000,
+        };
+        let serialized = serde_json::to_string(&resp).unwrap();
+        let deserialized: MessageResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.r#type, MessageType::ToolCall);
+        assert_eq!(deserialized.hidden, true);
+        assert!(deserialized.msg_id.is_none());
+        assert!(deserialized.status.is_none());
+    }
+
+    // ── MessageSearchItem ───────────────────────────────────────────
+
+    #[test]
+    fn serialize_search_item_camel_case() {
+        let item = MessageSearchItem {
+            message_id: "msg_1".into(),
+            conversation_id: "conv_1".into(),
+            conversation_name: "Code Review".into(),
+            r#type: "text".into(),
+            content: "matched snippet".into(),
+            created_at: 1712345678000,
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["messageId"], "msg_1");
+        assert_eq!(json["conversationId"], "conv_1");
+        assert_eq!(json["conversationName"], "Code Review");
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["content"], "matched snippet");
+        assert_eq!(json["createdAt"], 1712345678000_i64);
+        // Verify no snake_case leaks
+        assert!(json.get("message_id").is_none());
+        assert!(json.get("conversation_id").is_none());
+        assert!(json.get("conversation_name").is_none());
+        assert!(json.get("created_at").is_none());
+    }
+
+    #[test]
+    fn search_item_roundtrip() {
+        let item = MessageSearchItem {
+            message_id: "msg_x".into(),
+            conversation_id: "conv_x".into(),
+            conversation_name: "Search Test".into(),
+            r#type: "tips".into(),
+            content: "some content".into(),
+            created_at: 9000,
+        };
+        let serialized = serde_json::to_string(&item).unwrap();
+        let deserialized: MessageSearchItem = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.message_id, "msg_x");
+        assert_eq!(deserialized.conversation_name, "Search Test");
+    }
+
+    // ── SendMessageRequest ──────────────────────────────────────────
+
+    #[test]
+    fn deserialize_send_message_full() {
+        let raw = json!({
+            "content": "Review this code",
+            "msgId": "msg-001",
+            "files": ["/tmp/a.rs"],
+            "injectSkills": ["security-review"]
+        });
+        let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.content, "Review this code");
+        assert_eq!(req.msg_id, "msg-001");
+        assert_eq!(req.files, vec!["/tmp/a.rs"]);
+        assert_eq!(req.inject_skills, vec!["security-review"]);
+    }
+
+    #[test]
+    fn deserialize_send_message_minimal() {
+        let raw = json!({ "content": "Hi", "msgId": "m1" });
+        let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.content, "Hi");
+        assert_eq!(req.msg_id, "m1");
+        assert!(req.files.is_empty());
+        assert!(req.inject_skills.is_empty());
+    }
+
+    #[test]
+    fn deserialize_send_message_missing_content() {
+        let raw = json!({ "msgId": "m1" });
+        assert!(serde_json::from_value::<SendMessageRequest>(raw).is_err());
+    }
+
+    #[test]
+    fn deserialize_send_message_missing_msg_id() {
+        let raw = json!({ "content": "Hello" });
+        assert!(serde_json::from_value::<SendMessageRequest>(raw).is_err());
+    }
+
+    // ── Paginated type aliases ──────────────────────────────────────
+
+    #[test]
+    fn conversation_list_response_serialization() {
+        let list: ConversationListResponse = PaginatedResult {
+            items: vec![ConversationResponse {
+                id: "conv_1".into(),
+                name: "Test".into(),
+                r#type: AgentType::Gemini,
+                model: None,
+                status: ConversationStatus::Pending,
+                source: None,
+                pinned: false,
+                pinned_at: None,
+                channel_chat_id: None,
+                created_at: 1000,
+                modified_at: 1000,
+                extra: json!({}),
+            }],
+            total: 1,
+            has_more: false,
+        };
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(json["items"].as_array().unwrap().len(), 1);
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["hasMore"], false);
+    }
+
+    #[test]
+    fn message_list_response_serialization() {
+        let list: MessageListResponse = PaginatedResult {
+            items: vec![],
+            total: 0,
+            has_more: false,
+        };
+        let json = serde_json::to_value(&list).unwrap();
+        assert!(json["items"].as_array().unwrap().is_empty());
+        assert_eq!(json["total"], 0);
+    }
+
+    #[test]
+    fn message_search_response_serialization() {
+        let resp: MessageSearchResponse = PaginatedResult {
+            items: vec![MessageSearchItem {
+                message_id: "m1".into(),
+                conversation_id: "c1".into(),
+                conversation_name: "Conv".into(),
+                r#type: "text".into(),
+                content: "matched".into(),
+                created_at: 5000,
+            }],
+            total: 1,
+            has_more: false,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["items"][0]["messageId"], "m1");
+        assert_eq!(json["total"], 1);
+    }
+}

@@ -1,0 +1,38 @@
+// --- File processing ---
+
+pub const AIONUI_TIMESTAMP_SEPARATOR: &str = "_aionui_";
+pub const AIONUI_FILES_MARKER: &str = "[[AION_FILES]]";
+
+// --- WebSocket ---
+
+pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+pub const HEARTBEAT_TIMEOUT_MS: u64 = 60_000;
+pub const WS_CLOSE_NORMAL: u16 = 1000;
+pub const WS_CLOSE_POLICY_VIOLATION: u16 = 1008;
+
+// --- Authentication ---
+
+pub const SESSION_EXPIRY: &str = "24h";
+pub const COOKIE_NAME: &str = "aionui-session";
+pub const COOKIE_MAX_AGE_DAYS: u32 = 30;
+pub const CSRF_COOKIE_NAME: &str = "aionui-csrf-token";
+pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
+
+// --- Server ---
+
+pub const DEFAULT_HOST: &str = "127.0.0.1";
+pub const REMOTE_HOST: &str = "0.0.0.0";
+pub const DEFAULT_PORT: u16 = 25808;
+/// Request body size limit (10 MB).
+pub const BODY_LIMIT: usize = 10 * 1024 * 1024;
+/// File upload size limit (30 MB).
+pub const UPLOAD_MAX_SIZE: usize = 30 * 1024 * 1024;
+
+// --- Image processing ---
+
+pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg",
+];
+/// Remote image download size limit (5 MB).
+pub const REMOTE_IMAGE_MAX_SIZE: usize = 5 * 1024 * 1024;
+pub const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 5;

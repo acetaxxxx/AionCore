@@ -1,0 +1,26 @@
+[package]
+name = "aionui-shell"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aionui-common.workspace = true
+aionui-api-types.workspace = true
+aionui-system.workspace = true
+axum.workspace = true
+open.workspace = true
+which.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+aionui-db.workspace = true
+http-body-util.workspace = true
+sqlx.workspace = true
+tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
+wiremock.workspace = true

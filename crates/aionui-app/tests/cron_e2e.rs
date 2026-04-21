@@ -1,0 +1,608 @@
+//! E2E tests for cron job HTTP endpoints.
+//!
+//! Covers test-plan items: CJ-1..CJ-12, SK-1..SK-6, SC-3..SC-8, AU-1..AU-2,
+//! RN-2 (run-now nonexistent).
+//! Items requiring real AI execution (RN-1, EV-*, SR-*, OC-*, CD-*) are tested
+//! at the service integration level in `aionui-cron/tests/service_integration.rs`.
+
+mod common;
+
+use axum::http::StatusCode;
+use serde_json::json;
+use tower::ServiceExt;
+
+use common::{
+    body_json, build_app, delete_with_token, get_request, get_with_token, json_with_token,
+    setup_and_login,
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+fn create_job_body(name: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "schedule": { "kind": "every", "everyMs": 60000, "description": "every minute" },
+        "message": "test message",
+        "conversationId": "conv_1",
+        "conversationTitle": "Test Conv",
+        "agentType": "acp",
+        "createdBy": "user"
+    })
+}
+
+fn create_at_job_body(name: &str, at_ms: i64) -> serde_json::Value {
+    json!({
+        "name": name,
+        "schedule": { "kind": "at", "atMs": at_ms, "description": "once" },
+        "message": "at message",
+        "conversationId": "conv_1",
+        "agentType": "acp",
+        "createdBy": "user"
+    })
+}
+
+fn create_cron_job_body(name: &str, expr: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "schedule": { "kind": "cron", "expr": expr },
+        "message": "cron message",
+        "conversationId": "conv_1",
+        "agentType": "acp",
+        "createdBy": "user"
+    })
+}
+
+async fn create_job(
+    app: &mut axum::Router,
+    token: &str,
+    csrf: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let req = json_with_token("POST", "/api/cron/jobs", body, token, csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    json["data"].clone()
+}
+
+// ── AU-1/AU-2: Unauthenticated requests ─────────────────────────────
+
+#[tokio::test]
+async fn au1_unauthenticated_list_returns_403() {
+    let (app, _services) = build_app().await;
+    let req = get_request("/api/cron/jobs");
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+        "expected 401 or 403, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn au2_unauthenticated_all_endpoints() {
+    let (app, _services) = build_app().await;
+
+    let endpoints = vec![
+        ("GET", "/api/cron/jobs"),
+        ("GET", "/api/cron/jobs/cron_test"),
+        ("GET", "/api/cron/jobs/cron_test/skill"),
+    ];
+
+    for (method, uri) in endpoints {
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert!(
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+            "{method} {uri} expected 401/403, got {}",
+            resp.status()
+        );
+    }
+}
+
+// ── CJ-1: Create cron job ───────────────────────────────────────────
+
+#[tokio::test]
+async fn cj1_create_cron_job() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_job(&mut app, &token, &csrf, create_job_body("Daily Report")).await;
+
+    assert!(data["id"].as_str().unwrap().starts_with("cron_"));
+    assert_eq!(data["name"], "Daily Report");
+    assert_eq!(data["enabled"], true);
+    assert!(data["state"]["nextRunAtMs"].as_i64().is_some());
+    assert_eq!(data["state"]["runCount"], 0);
+    assert_eq!(data["target"]["payload"]["kind"], "message");
+    assert_eq!(data["target"]["payload"]["text"], "test message");
+    assert_eq!(data["metadata"]["conversationId"], "conv_1");
+    assert_eq!(data["metadata"]["agentType"], "acp");
+    assert_eq!(data["metadata"]["createdBy"], "user");
+}
+
+// ── CJ-2: Create three schedule types ────────────────────────────────
+
+#[tokio::test]
+async fn cj2_create_three_schedule_types() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let now = aionui_common::now_ms();
+
+    let at = create_job(
+        &mut app,
+        &token,
+        &csrf,
+        create_at_job_body("At Job", now + 3_600_000),
+    )
+    .await;
+    assert_eq!(at["schedule"]["kind"], "at");
+    assert!(at["state"]["nextRunAtMs"].as_i64().unwrap() > now);
+
+    let every = create_job(&mut app, &token, &csrf, create_job_body("Every Job")).await;
+    assert_eq!(every["schedule"]["kind"], "every");
+    let next = every["state"]["nextRunAtMs"].as_i64().unwrap();
+    assert!((next - now - 60000).abs() < 3000);
+
+    let cron = create_job(
+        &mut app,
+        &token,
+        &csrf,
+        create_cron_job_body("Cron Job", "0 */5 * * * *"),
+    )
+    .await;
+    assert_eq!(cron["schedule"]["kind"], "cron");
+    assert!(cron["state"]["nextRunAtMs"].as_i64().unwrap() > now);
+}
+
+// ── CJ-3: Create parameter validation ────────────────────────────────
+
+#[tokio::test]
+async fn cj3_create_missing_required_fields() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let invalid_bodies = vec![
+        json!({"schedule": {"kind": "every", "everyMs": 60000}, "conversationId": "c1", "agentType": "acp", "createdBy": "user"}),
+        json!({"name": "X", "conversationId": "c1", "agentType": "acp", "createdBy": "user"}),
+        json!({"name": "X", "schedule": {"kind": "every", "everyMs": 60000}, "agentType": "acp", "createdBy": "user"}),
+        json!({"name": "X", "schedule": {"kind": "every", "everyMs": 60000}, "conversationId": "c1", "createdBy": "user"}),
+    ];
+
+    for body in invalid_bodies {
+        let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "missing field should return 400"
+        );
+    }
+}
+
+// ── CJ-4: Get single job ────────────────────────────────────────────
+
+#[tokio::test]
+async fn cj4_get_single_job() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(&mut app, &token, &csrf, create_job_body("Get Test")).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let req = get_with_token(&format!("/api/cron/jobs/{job_id}"), &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["id"], job_id);
+    assert_eq!(json["data"]["name"], "Get Test");
+}
+
+// ── CJ-5: Get nonexistent job ────────────────────────────────────────
+
+#[tokio::test]
+async fn cj5_get_nonexistent() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = get_with_token("/api/cron/jobs/cron_nonexistent", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── CJ-6: List all jobs ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn cj6_list_all_jobs() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    for i in 0..3 {
+        create_job(
+            &mut app,
+            &token,
+            &csrf,
+            create_job_body(&format!("Job {i}")),
+        )
+        .await;
+    }
+
+    let req = get_with_token("/api/cron/jobs", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let items = json["data"].as_array().unwrap();
+    assert!(items.len() >= 3);
+}
+
+// ── CJ-7: List by conversation ID ───────────────────────────────────
+
+#[tokio::test]
+async fn cj7_list_by_conversation() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let mut body_a = create_job_body("Job A");
+    body_a["conversationId"] = json!("conv_target");
+    create_job(&mut app, &token, &csrf, body_a).await;
+
+    let mut body_b = create_job_body("Job B");
+    body_b["conversationId"] = json!("conv_target");
+    create_job(&mut app, &token, &csrf, body_b).await;
+
+    let mut body_c = create_job_body("Job C");
+    body_c["conversationId"] = json!("conv_other");
+    create_job(&mut app, &token, &csrf, body_c).await;
+
+    let req = get_with_token("/api/cron/jobs?conversation_id=conv_target", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let items = json["data"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+}
+
+// ── CJ-8: Update job ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cj8_update_job() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(&mut app, &token, &csrf, create_job_body("Original")).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let update_body = json!({"name": "Updated Name", "enabled": false});
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/cron/jobs/{job_id}"),
+        update_body,
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["name"], "Updated Name");
+    assert_eq!(json["data"]["enabled"], false);
+    assert!(
+        json["data"]["metadata"]["updatedAt"].as_i64().unwrap()
+            >= created["metadata"]["createdAt"].as_i64().unwrap()
+    );
+}
+
+// ── CJ-9: Update schedule type ──────────────────────────────────────
+
+#[tokio::test]
+async fn cj9_update_schedule_type() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(&mut app, &token, &csrf, create_job_body("Schedule Change")).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let update_body = json!({"schedule": {"kind": "cron", "expr": "0 */5 * * * *"}});
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/cron/jobs/{job_id}"),
+        update_body,
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["schedule"]["kind"], "cron");
+    assert!(json["data"]["state"]["nextRunAtMs"].as_i64().is_some());
+}
+
+// ── CJ-10: Update nonexistent ────────────────────────────────────────
+
+#[tokio::test]
+async fn cj10_update_nonexistent() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let update_body = json!({"name": "X"});
+    let req = json_with_token(
+        "PUT",
+        "/api/cron/jobs/cron_nonexistent",
+        update_body,
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── CJ-11: Delete job ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn cj11_delete_job() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(&mut app, &token, &csrf, create_job_body("To Delete")).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let req = delete_with_token(&format!("/api/cron/jobs/{job_id}"), &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = get_with_token(&format!("/api/cron/jobs/{job_id}"), &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── CJ-12: Delete nonexistent ────────────────────────────────────────
+
+#[tokio::test]
+async fn cj12_delete_nonexistent() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = delete_with_token("/api/cron/jobs/cron_nonexistent", &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── RN-2: Run now nonexistent ────────────────────────────────────────
+
+#[tokio::test]
+async fn rn2_run_now_nonexistent() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/cron/jobs/cron_nonexistent/run",
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── SK-1: Save skill ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn sk1_save_skill() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(&mut app, &token, &csrf, create_job_body("Skill Job")).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let skill_body =
+        json!({"content": "---\nname: test\ndescription: test skill\n---\nDo something"});
+    let req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/skill"),
+        skill_body,
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── SK-2: Has skill (true) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn sk2_has_skill_true() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(&mut app, &token, &csrf, create_job_body("Skill Check")).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let skill_body = json!({"content": "---\nname: x\n---\nContent"});
+    let req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/skill"),
+        skill_body,
+        &token,
+        &csrf,
+    );
+    app.clone().oneshot(req).await.unwrap();
+
+    let req = get_with_token(&format!("/api/cron/jobs/{job_id}/skill"), &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["hasSkill"], true);
+}
+
+// ── SK-3: Has skill (false) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn sk3_has_skill_false() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(&mut app, &token, &csrf, create_job_body("No Skill")).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let req = get_with_token(&format!("/api/cron/jobs/{job_id}/skill"), &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["hasSkill"], false);
+}
+
+// ── SK-4: Save empty skill ──────────────────────────────────────────
+
+#[tokio::test]
+async fn sk4_save_empty_skill() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(&mut app, &token, &csrf, create_job_body("Empty Skill")).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let skill_body = json!({"content": ""});
+    let req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/skill"),
+        skill_body,
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── SK-5: Save placeholder skill ────────────────────────────────────
+
+#[tokio::test]
+async fn sk5_save_placeholder_skill() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(
+        &mut app,
+        &token,
+        &csrf,
+        create_job_body("Placeholder Skill"),
+    )
+    .await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let skill_body = json!({"content": "TODO: fill in later"});
+    let req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/skill"),
+        skill_body,
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── SK-6: Save skill for nonexistent job ─────────────────────────────
+
+#[tokio::test]
+async fn sk6_save_skill_nonexistent() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let skill_body = json!({"content": "---\nname: x\n---\nOk"});
+    let req = json_with_token(
+        "POST",
+        "/api/cron/jobs/cron_nonexistent/skill",
+        skill_body,
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── SC-5: Invalid cron expression ────────────────────────────────────
+
+#[tokio::test]
+async fn sc5_invalid_cron_expression() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = create_cron_job_body("Invalid Cron", "invalid cron");
+    let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── SC-6: Cron with timezone ─────────────────────────────────────────
+
+#[tokio::test]
+async fn sc6_cron_with_timezone() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = json!({
+        "name": "Shanghai Job",
+        "schedule": { "kind": "cron", "expr": "0 0 9 * * *", "tz": "Asia/Shanghai" },
+        "message": "hello",
+        "conversationId": "conv_1",
+        "agentType": "acp",
+        "createdBy": "user"
+    });
+
+    let data = create_job(&mut app, &token, &csrf, body).await;
+    let now = aionui_common::now_ms();
+    assert!(data["state"]["nextRunAtMs"].as_i64().unwrap() > now);
+}
+
+// ── SC-7: Every zero interval ────────────────────────────────────────
+
+#[tokio::test]
+async fn sc7_every_zero_interval() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = json!({
+        "name": "Zero Interval",
+        "schedule": { "kind": "every", "everyMs": 0 },
+        "message": "x",
+        "conversationId": "conv_1",
+        "agentType": "acp",
+        "createdBy": "user"
+    });
+    let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── SC-8: Every negative interval ────────────────────────────────────
+
+#[tokio::test]
+async fn sc8_every_negative_interval() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = json!({
+        "name": "Negative Interval",
+        "schedule": { "kind": "every", "everyMs": -1000 },
+        "message": "x",
+        "conversationId": "conv_1",
+        "agentType": "acp",
+        "createdBy": "user"
+    });
+    let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
