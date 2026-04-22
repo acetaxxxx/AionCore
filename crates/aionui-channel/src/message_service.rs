@@ -106,7 +106,7 @@ impl ChannelMessageService {
         let req = CreateConversationRequest {
             r#type: agent_type,
             name: None,
-            model: self.default_model.clone(),
+            model: Some(self.default_model.clone()),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
             extra: serde_json::Value::Object(Default::default()),

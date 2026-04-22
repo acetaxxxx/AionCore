@@ -76,10 +76,12 @@ impl ConversationService {
             r#type: enum_to_db(&req.r#type)?,
             extra: serde_json::to_string(&req.extra)
                 .map_err(|e| AppError::Internal(format!("Failed to serialize extra: {e}")))?,
-            model: Some(
-                serde_json::to_string(&req.model)
-                    .map_err(|e| AppError::Internal(format!("Failed to serialize model: {e}")))?,
-            ),
+            model: req
+                .model
+                .as_ref()
+                .map(|m| serde_json::to_string(m))
+                .transpose()
+                .map_err(|e| AppError::Internal(format!("Failed to serialize model: {e}")))?,
             status: Some(enum_to_db(&ConversationStatus::Pending)?),
             source: Some(enum_to_db(&source)?),
             channel_chat_id: req.channel_chat_id,

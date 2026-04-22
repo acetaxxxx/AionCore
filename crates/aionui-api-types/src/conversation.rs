@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 pub struct CreateConversationRequest {
     pub r#type: AgentType,
     pub name: Option<String>,
-    pub model: ProviderWithModel,
+    pub model: Option<ProviderWithModel>,
     pub source: Option<ConversationSource>,
     pub channel_chat_id: Option<String>,
     pub extra: serde_json::Value,
@@ -159,7 +159,7 @@ mod tests {
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.r#type, AgentType::Gemini);
         assert_eq!(req.name.as_deref(), Some("Code Review"));
-        assert_eq!(req.model.model, "claude-sonnet-4-20250514");
+        assert_eq!(req.model.unwrap().model, "claude-sonnet-4-20250514");
         assert_eq!(req.source, Some(ConversationSource::Aionui));
         assert_eq!(req.channel_chat_id.as_deref(), Some("user:123"));
         assert_eq!(req.extra["workspace"], "/project");
@@ -180,18 +180,20 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_create_request_missing_type() {
+    fn deserialize_create_request_without_model() {
         let raw = json!({
-            "model": { "providerId": "p1", "model": "m1" },
+            "type": "acp",
             "extra": {}
         });
-        assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
+        let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.r#type, AgentType::Acp);
+        assert!(req.model.is_none());
     }
 
     #[test]
-    fn deserialize_create_request_missing_model() {
+    fn deserialize_create_request_missing_type() {
         let raw = json!({
-            "type": "gemini",
+            "model": { "providerId": "p1", "model": "m1" },
             "extra": {}
         });
         assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());

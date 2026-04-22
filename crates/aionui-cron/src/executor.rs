@@ -160,7 +160,7 @@ impl JobExecutor {
         let req = CreateConversationRequest {
             r#type: agent_type,
             name: Some(job.name.clone()),
-            model,
+            model: Some(model),
             source: None,
             channel_chat_id: None,
             extra,

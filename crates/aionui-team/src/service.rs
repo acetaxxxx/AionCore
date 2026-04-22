@@ -63,11 +63,11 @@ impl TeamSessionService {
             let conv_req = CreateConversationRequest {
                 r#type: agent_type,
                 name: Some(input.name.clone()),
-                model: ProviderWithModel {
+                model: Some(ProviderWithModel {
                     provider_id: input.backend.clone(),
                     model: input.model.clone(),
                     use_model: None,
-                },
+                }),
                 source: None,
                 channel_chat_id: None,
                 extra: serde_json::json!({ "teamId": team_id }),
@@ -208,11 +208,11 @@ impl TeamSessionService {
         let conv_req = CreateConversationRequest {
             r#type: agent_type,
             name: Some(req.name.clone()),
-            model: ProviderWithModel {
+            model: Some(ProviderWithModel {
                 provider_id: req.backend.clone(),
                 model: req.model.clone(),
                 use_model: None,
-            },
+            }),
             source: None,
             channel_chat_id: None,
             extra: serde_json::json!({ "teamId": team_id }),
