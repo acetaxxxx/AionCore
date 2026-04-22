@@ -7,11 +7,12 @@ use axum::extract::{Json, Path as AxumPath, State};
 use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
-    AddExternalPathRequest, ApiResponse, ExportSkillRequest, ExternalSkillSourceResponse,
-    ImportSkillRequest, ImportSkillResponse, NamedPathResponse, ReadAssistantRuleRequest,
-    ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse,
-    RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
-    SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
+    AddExternalPathRequest, ApiResponse, BuiltinAutoSkillResponse, ExportSkillRequest,
+    ExternalSkillSourceResponse, ImportSkillRequest, ImportSkillResponse, NamedPathResponse,
+    ReadAssistantRuleRequest, ReadBuiltinResourceRequest, ReadSkillInfoRequest,
+    ReadSkillInfoResponse, RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse,
+    ScannedSkillResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse,
+    WriteAssistantRuleRequest,
 };
 use aionui_common::AppError;
 
@@ -48,6 +49,7 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
     Router::new()
         // Skill listing & info
         .route("/api/skills", get(list_skills))
+        .route("/api/skills/builtin-auto", get(list_builtin_auto_skills))
         .route("/api/skills/info", post(read_skill_info))
         .route("/api/skills/paths", get(get_skill_paths))
         // Import / export / delete
@@ -115,6 +117,21 @@ async fn list_skills(
             location: s.location,
             is_custom: s.is_custom,
             source: to_source_response(s.source),
+        })
+        .collect();
+    Ok(Json(ApiResponse::ok(resp)))
+}
+
+/// `GET /api/skills/builtin-auto` — list auto-injected built-in skills.
+async fn list_builtin_auto_skills(
+    State(state): State<SkillRouterState>,
+) -> Result<Json<ApiResponse<Vec<BuiltinAutoSkillResponse>>>, AppError> {
+    let items = skill_service::list_builtin_auto_skills(&state.skill_paths).await?;
+    let resp: Vec<BuiltinAutoSkillResponse> = items
+        .into_iter()
+        .map(|s| BuiltinAutoSkillResponse {
+            name: s.name,
+            description: s.description,
         })
         .collect();
     Ok(Json(ApiResponse::ok(resp)))

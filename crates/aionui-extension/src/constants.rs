@@ -61,6 +61,11 @@ pub const BUILTIN_SKILLS_DIR_NAME: &str = "builtin-skills";
 /// Default subdirectory name for built-in rules.
 pub const BUILTIN_RULES_DIR_NAME: &str = "builtin-rules";
 
+/// Subdirectory inside `BUILTIN_SKILLS_DIR_NAME` whose children are
+/// auto-injected into every assistant. Matches
+/// `getBuiltinAutoSkillsDir` in AionUi (`src/process/utils/initStorage.ts`).
+pub const BUILTIN_AUTO_SKILLS_SUBDIR: &str = "_builtin";
+
 /// Default subdirectory name for assistant-level rules.
 pub const ASSISTANT_RULES_DIR_NAME: &str = "assistant-rules";
 

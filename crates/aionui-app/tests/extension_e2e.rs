@@ -532,3 +532,71 @@ async fn sl3_list_skills_returns_empty_array_when_no_skills() {
     assert_eq!(json["success"], true);
     assert_eq!(json["data"].as_array().unwrap().len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// BA — Built-in auto skills (E2 / `GET /api/skills/builtin-auto`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ba1_auto_skills_lists_underscore_builtin_entries() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let auto_dir = paths.builtin_skills_dir.join("_builtin");
+    write_skill(&auto_dir, "cron", "Schedule recurring tasks");
+    write_skill(&auto_dir, "skill-creator", "Scaffold a new skill");
+    // A top-level builtin that must NOT appear in the auto list.
+    write_skill(&paths.builtin_skills_dir, "review", "Top-level");
+
+    let resp = app
+        .oneshot(get_with_token("/api/skills/builtin-auto", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    let arr = json["data"].as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    let names: std::collections::HashSet<_> = arr
+        .iter()
+        .map(|v| v["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains("cron"));
+    assert!(names.contains("skill-creator"));
+    assert!(!names.contains("review"));
+    // Must be `{ name, description }` — no path / isCustom leak.
+    for item in arr {
+        assert!(item.get("path").is_none());
+        assert!(item.get("isCustom").is_none());
+        assert!(item["description"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn ba2_auto_skills_returns_empty_array_when_subdir_missing() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let resp = app
+        .oneshot(get_with_token("/api/skills/builtin-auto", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn ba3_auto_skills_unauthenticated_rejected() {
+    let (app, _) = build_app().await;
+    let resp = app
+        .oneshot(common::get_request("/api/skills/builtin-auto"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

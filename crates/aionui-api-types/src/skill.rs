@@ -27,6 +27,14 @@ pub struct SkillListItemResponse {
     pub source: SkillSourceResponse,
 }
 
+/// An auto-injected built-in skill (`GET /api/skills/builtin-auto`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltinAutoSkillResponse {
+    pub name: String,
+    pub description: String,
+}
+
 /// Request body for `POST /api/skills/info`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

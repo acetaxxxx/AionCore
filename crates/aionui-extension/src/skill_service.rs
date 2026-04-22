@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 use crate::constants::{
-    ASSISTANT_RULES_DIR_NAME, ASSISTANT_SKILLS_DIR_NAME, BUILTIN_RULES_DIR_NAME,
-    BUILTIN_SKILLS_DIR_NAME, COMMON_SKILL_DIRS, SKILL_MANIFEST_FILE, SKILLS_DIR_NAME,
+    ASSISTANT_RULES_DIR_NAME, ASSISTANT_SKILLS_DIR_NAME, BUILTIN_AUTO_SKILLS_SUBDIR,
+    BUILTIN_RULES_DIR_NAME, BUILTIN_SKILLS_DIR_NAME, COMMON_SKILL_DIRS, SKILL_MANIFEST_FILE,
+    SKILLS_DIR_NAME,
 };
 use crate::error::ExtensionError;
 
@@ -223,6 +224,43 @@ pub struct ScannedSkill {
     pub name: String,
     pub description: String,
     pub path: String,
+}
+
+/// An auto-injected built-in skill.
+///
+/// Returned by `GET /api/skills/builtin-auto`. Matches the renderer
+/// `BuiltinAutoSkill` type in `AssistantSettings/types.ts`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltinAutoSkillItem {
+    pub name: String,
+    pub description: String,
+}
+
+/// List built-in skills that are auto-injected into every assistant.
+///
+/// Scans `<builtin_skills_dir>/_builtin/` for direct subdirectories
+/// containing a `SKILL.md` file. If the `_builtin/` subdirectory does not
+/// exist (e.g. on a fresh install or in dev before the resource copy has
+/// happened), returns an empty list rather than erroring — matching the
+/// graceful-degradation semantics used elsewhere in this module.
+pub async fn list_builtin_auto_skills(
+    paths: &SkillPaths,
+) -> Result<Vec<BuiltinAutoSkillItem>, ExtensionError> {
+    let auto_dir = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR);
+    let entries = match scan_skill_dirs(&auto_dir).await {
+        Ok(entries) => entries,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut items: Vec<BuiltinAutoSkillItem> = entries
+        .into_iter()
+        .map(|s| BuiltinAutoSkillItem {
+            name: s.name,
+            description: s.description,
+        })
+        .collect();
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(items)
 }
 
 /// Read skill info from a SKILL.md file without importing.
@@ -1010,6 +1048,44 @@ mod tests {
 
         let skills = list_available_skills(&paths).await.unwrap();
         assert!(skills.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Built-in auto skills
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_builtin_auto_skills_scans_underscore_builtin_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+        let auto_dir = paths.builtin_skills_dir.join("_builtin");
+
+        create_skill_in_dir(&auto_dir, "cron", "Schedule recurring tasks");
+        create_skill_in_dir(&auto_dir, "skill-creator", "Scaffold a new skill");
+
+        // A top-level built-in skill (NOT under _builtin/) must be excluded.
+        create_skill_in_dir(&paths.builtin_skills_dir, "review", "Top-level builtin");
+
+        let autos = list_builtin_auto_skills(&paths).await.unwrap();
+
+        assert_eq!(autos.len(), 2);
+        let names: std::collections::HashSet<_> = autos.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("cron"));
+        assert!(names.contains("skill-creator"));
+        assert!(!names.contains("review"));
+
+        let cron = autos.iter().find(|s| s.name == "cron").unwrap();
+        assert_eq!(cron.description, "Schedule recurring tasks");
+    }
+
+    #[tokio::test]
+    async fn list_builtin_auto_skills_missing_dir_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+        // No _builtin/ directory created.
+
+        let autos = list_builtin_auto_skills(&paths).await.unwrap();
+        assert!(autos.is_empty());
     }
 
     // -----------------------------------------------------------------------
