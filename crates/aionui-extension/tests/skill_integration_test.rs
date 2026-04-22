@@ -515,6 +515,45 @@ async fn detect_external_skills_from_custom_paths() {
     assert_eq!(external.skill_count, 2);
     assert!(external.skills.iter().any(|s| s.name == "ext-a"));
     assert!(external.skills.iter().any(|s| s.name == "ext-b"));
+    // `source` for custom paths is `custom-<abs-path>` — used by the renderer
+    // as a React key / testid suffix, and asserted by e2e spec
+    // `edge-cases.e2e.ts` (prefix `external-source-tab-custom-`).
+    assert_eq!(
+        external.source,
+        format!("custom-{}", ext_dir.to_string_lossy())
+    );
+    assert!(external.source.starts_with("custom-"));
+}
+
+/// Custom paths with distinct filesystem locations get distinct slugs so
+/// the renderer can use them as unique React keys / testid suffixes.
+#[tokio::test]
+async fn detect_external_skills_custom_sources_are_unique() {
+    let tmp = TempDir::new().unwrap();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    create_skill(&dir_a, "a-skill", "A");
+    create_skill(&dir_b, "b-skill", "B");
+
+    let custom_paths = vec![
+        NamedPath {
+            name: "A".into(),
+            path: dir_a.to_string_lossy().into_owned(),
+        },
+        NamedPath {
+            name: "B".into(),
+            path: dir_b.to_string_lossy().into_owned(),
+        },
+    ];
+
+    let sources = detect_and_count_external_skills(&custom_paths).await;
+    let slugs: Vec<&str> = sources
+        .iter()
+        .filter(|s| s.name == "A" || s.name == "B")
+        .map(|s| s.source.as_str())
+        .collect();
+    assert_eq!(slugs.len(), 2);
+    assert_ne!(slugs[0], slugs[1]);
 }
 
 /// Verify path traversal is blocked in skill deletion.

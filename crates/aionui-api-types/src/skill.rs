@@ -111,11 +111,17 @@ pub struct ScanForSkillsResponse {
 }
 
 /// An external skill source with count (`GET /api/skills/detect-external`).
+///
+/// `source` is a stable slug identifying the origin (e.g. `"claude"`,
+/// `"gemini"`, `"agents"`, or `"custom-<abs-path>"` for user-added paths).
+/// The renderer uses it as a React key and `data-testid` suffix in
+/// `SkillsHubSettings.tsx`, so it must be unique across the returned list.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalSkillSourceResponse {
     pub name: String,
     pub path: String,
+    pub source: String,
     pub skill_count: usize,
     pub skills: Vec<ScannedSkillResponse>,
 }
@@ -297,6 +303,7 @@ mod tests {
         let source = ExternalSkillSourceResponse {
             name: "Claude Skills".into(),
             path: "/home/user/.claude/skills".into(),
+            source: "claude".into(),
             skill_count: 2,
             skills: vec![
                 ScannedSkillResponse {
@@ -314,6 +321,40 @@ mod tests {
         let json = serde_json::to_value(&source).unwrap();
         assert_eq!(json["skillCount"], 2);
         assert_eq!(json["skills"].as_array().unwrap().len(), 2);
+        assert_eq!(json["source"], "claude");
+        // Ensure snake_case is not leaked.
+        assert!(json.get("skill_count").is_none());
+    }
+
+    #[test]
+    fn test_external_skill_source_response_custom_source() {
+        let source = ExternalSkillSourceResponse {
+            name: "My Extras".into(),
+            path: "/opt/extras".into(),
+            source: "custom-/opt/extras".into(),
+            skill_count: 0,
+            skills: vec![],
+        };
+        let json = serde_json::to_value(&source).unwrap();
+        assert_eq!(json["source"], "custom-/opt/extras");
+        assert_eq!(json["name"], "My Extras");
+    }
+
+    #[test]
+    fn test_external_skill_source_response_roundtrip() {
+        let raw = json!({
+            "name": "Gemini Skills",
+            "path": "/home/user/.gemini/skills",
+            "source": "gemini",
+            "skillCount": 0,
+            "skills": []
+        });
+        let parsed: ExternalSkillSourceResponse = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(parsed.source, "gemini");
+        assert_eq!(parsed.name, "Gemini Skills");
+        assert_eq!(parsed.skill_count, 0);
+        let round = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(round, raw);
     }
 
     #[test]

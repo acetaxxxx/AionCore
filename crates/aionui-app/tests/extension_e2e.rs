@@ -781,10 +781,8 @@ async fn ba1_auto_skills_lists_underscore_builtin_entries() {
     assert_eq!(json["success"], true);
     let arr = json["data"].as_array().unwrap();
     assert_eq!(arr.len(), 2);
-    let names: std::collections::HashSet<_> = arr
-        .iter()
-        .map(|v| v["name"].as_str().unwrap())
-        .collect();
+    let names: std::collections::HashSet<_> =
+        arr.iter().map(|v| v["name"].as_str().unwrap()).collect();
     assert!(names.contains("cron"));
     assert!(names.contains("skill-creator"));
     assert!(!names.contains("review"));
@@ -821,4 +819,116 @@ async fn ba3_auto_skills_unauthenticated_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// DE — `GET /api/skills/detect-external` (source slug contract)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn de1_detect_external_populates_custom_source_slug() {
+    // The renderer uses `source` as a React key / `data-testid` suffix
+    // (`external-source-tab-${source}` in `SkillsHubSettings.tsx`). Custom
+    // paths MUST produce slugs prefixed with `custom-` per the e2e contract
+    // in `tests/e2e/features/settings/skills/edge-cases.e2e.ts`.
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let ext_dir = tmp.path().join("external-skills");
+    let skill_dir = ext_dir.join("my-ext-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: my-ext-skill\ndescription: External skill\n---\nBody",
+    )
+    .unwrap();
+    let ext_path_str = ext_dir.to_string_lossy().into_owned();
+
+    // Register the custom path through the HTTP surface so the state the
+    // handler reads is the same as production.
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/external-paths",
+            json!({"name": "E2E Custom", "path": ext_path_str}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(get_with_token("/api/skills/detect-external", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    let arr = json["data"].as_array().expect("data should be an array");
+    let custom = arr
+        .iter()
+        .find(|s| s["name"] == "E2E Custom")
+        .expect("custom source should be returned");
+    assert_eq!(custom["source"], format!("custom-{ext_path_str}"));
+    assert!(
+        custom["source"].as_str().unwrap().starts_with("custom-"),
+        "custom source must start with `custom-` for e2e testid contract",
+    );
+    assert_eq!(custom["skillCount"], 1);
+}
+
+#[tokio::test]
+async fn de2_detect_external_source_slugs_are_unique() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let mk = |p: &std::path::Path, skill: &str| {
+        let dir = p.join(skill);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {skill}\ndescription: d\n---\nBody"),
+        )
+        .unwrap();
+    };
+    let dir_a = tmp.path().join("src-a");
+    let dir_b = tmp.path().join("src-b");
+    mk(&dir_a, "skill-a");
+    mk(&dir_b, "skill-b");
+    let path_a = dir_a.to_string_lossy().into_owned();
+    let path_b = dir_b.to_string_lossy().into_owned();
+
+    for (name, p) in [("Alpha", &path_a), ("Beta", &path_b)] {
+        let resp = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/skills/external-paths",
+                json!({"name": name, "path": p}),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let resp = app
+        .oneshot(get_with_token("/api/skills/detect-external", &token))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let arr = json["data"].as_array().unwrap();
+    let slugs: Vec<&str> = arr
+        .iter()
+        .filter(|s| s["name"] == "Alpha" || s["name"] == "Beta")
+        .map(|s| s["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(slugs.len(), 2);
+    assert_ne!(slugs[0], slugs[1], "distinct custom paths → distinct slugs");
 }

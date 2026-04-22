@@ -433,7 +433,7 @@ pub async fn detect_common_skill_paths() -> Vec<NamedPath> {
     };
 
     let mut result = Vec::new();
-    for (name, rel_path) in COMMON_SKILL_DIRS {
+    for (name, rel_path, _slug) in COMMON_SKILL_DIRS {
         let full_path = home.join(rel_path);
         if full_path.exists() {
             result.push(NamedPath {
@@ -447,28 +447,50 @@ pub async fn detect_common_skill_paths() -> Vec<NamedPath> {
 }
 
 /// An external skill source with discovered skills.
+///
+/// `source` is a stable slug identifying the origin — matches the
+/// `ExternalSkillSourceResponse.source` contract consumed by the renderer.
+/// Values are drawn from [`COMMON_SKILL_DIRS`] for built-in entries or
+/// `format!("custom-{path}")` for user-added paths, so they stay unique
+/// across the returned list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalSkillSource {
     pub name: String,
     pub path: String,
+    pub source: String,
     pub skill_count: usize,
     pub skills: Vec<ScannedSkill>,
 }
 
+/// Compute the stable `source` slug for a custom external path.
+fn custom_source_slug(path: &str) -> String {
+    format!("custom-{path}")
+}
+
 /// Discover external skills from common paths and custom external paths.
+///
+/// The returned list preserves deterministic `source` slugs — see
+/// [`ExternalSkillSource::source`] for the contract.
 pub async fn detect_and_count_external_skills(
     custom_paths: &[NamedPath],
 ) -> Vec<ExternalSkillSource> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+
     let mut sources = Vec::new();
 
-    // 1. Common paths
-    let common_paths = detect_common_skill_paths().await;
-    for np in &common_paths {
-        let path = Path::new(&np.path);
-        if let Ok(skills) = scan_skill_dirs(path).await {
+    // 1. Common paths (iterate the constant table so we keep the per-entry slug).
+    for (name, rel_path, slug) in COMMON_SKILL_DIRS {
+        let full_path = home.join(rel_path);
+        if !full_path.exists() {
+            continue;
+        }
+        if let Ok(skills) = scan_skill_dirs(&full_path).await {
             sources.push(ExternalSkillSource {
-                name: np.name.clone(),
-                path: np.path.clone(),
+                name: (*name).to_string(),
+                path: full_path.to_string_lossy().into_owned(),
+                source: (*slug).to_string(),
                 skill_count: skills.len(),
                 skills,
             });
@@ -482,6 +504,7 @@ pub async fn detect_and_count_external_skills(
             sources.push(ExternalSkillSource {
                 name: np.name.clone(),
                 path: np.path.clone(),
+                source: custom_source_slug(&np.path),
                 skill_count: skills.len(),
                 skills,
             });

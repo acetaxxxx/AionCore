@@ -90,10 +90,17 @@ pub const SKILLS_MARKET_NAME: &str = "aionui-skills";
 pub const SKILLS_MARKET_PATH: &str = "https://github.com/AionUI/aionui-skills";
 
 /// Common skill directory names to detect on the filesystem.
-pub const COMMON_SKILL_DIRS: &[(&str, &str)] = &[
-    ("Claude Skills", ".claude/skills"),
-    ("Gemini Skills", ".gemini/skills"),
-    ("Agents", ".agents"),
+///
+/// Each tuple is `(display_name, relative_path, source_slug)`:
+/// - `display_name` — user-facing label (e.g. the tab title).
+/// - `relative_path` — path under the user's home directory.
+/// - `source_slug` — stable machine-readable identifier mirrored to
+///   the renderer as `ExternalSkillSourceResponse.source`. Used as a
+///   React key and `data-testid` suffix in `SkillsHubSettings.tsx`.
+pub const COMMON_SKILL_DIRS: &[(&str, &str, &str)] = &[
+    ("Claude Skills", ".claude/skills", "claude"),
+    ("Gemini Skills", ".gemini/skills", "gemini"),
+    ("Agents", ".agents", "agents"),
 ];
 
 #[cfg(test)]

@@ -262,6 +262,7 @@ async fn detect_external(
         .map(|s| ExternalSkillSourceResponse {
             name: s.name,
             path: s.path,
+            source: s.source,
             skill_count: s.skill_count,
             skills: s
                 .skills
