@@ -154,3 +154,55 @@ If another backend-dev takes over before the pilot closes:
    pilot plan, base-branch integration is explicitly deferred until
    after the pilot closes and the coordinator schedules a separate
    user-approved integration step.
+
+---
+
+## Rerun fix — 2026-04-22 (post e2e rerun)
+
+### The gap
+
+During e2e-tester-2's full-suite rerun (17 pass / 12 fail), one failure
+was a real backend contract gap rather than a test-authoring issue:
+
+`ExternalSkillSourceResponse` in
+`crates/aionui-api-types/src/skill.rs` lacked a machine-readable
+`source` field. The renderer at
+`src/renderer/pages/settings/SkillsHubSettings.tsx:289` consumes
+`source.source` as both a React key and a `data-testid` suffix
+(`external-source-tab-${source}`). With the field missing, every tab
+rendered with `data-testid="external-source-tab-undefined"`, Playwright
+strict-mode found two matches, and **TC-S-09, TC-S-10, TC-S-12,
+TC-S-14, and TC-S-16** all failed at the first tab interaction.
+
+### The fix
+
+Single atomic commit — **`3a86d58`** on `feat/extension-skill-library`:
+
+| Layer                                            | Change                                                                                                                    |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `crates/aionui-api-types/src/skill.rs`           | Added `pub source: String` to `ExternalSkillSourceResponse` (camelCase on the wire) + 3 unit tests (shape, custom, roundtrip). |
+| `crates/aionui-extension/src/constants.rs`       | Extended `COMMON_SKILL_DIRS` from `(name, rel_path)` to `(name, rel_path, source_slug)`: `claude`, `gemini`, `agents`.   |
+| `crates/aionui-extension/src/skill_service.rs`   | Added `source: String` to `ExternalSkillSource` + rewrote `detect_and_count_external_skills` to iterate `COMMON_SKILL_DIRS` directly (so the slug survives). Custom paths now emit `format!("custom-{path}")`. |
+| `crates/aionui-extension/src/skill_routes.rs`    | Mapped `source` through to the HTTP DTO.                                                                                 |
+| `crates/aionui-extension/tests/skill_integration_test.rs` | Extended `detect_external_skills_from_custom_paths` + new `detect_external_skills_custom_sources_are_unique`.        |
+| `crates/aionui-app/tests/extension_e2e.rs`       | Added HTTP e2e tests `de1_detect_external_populates_custom_source_slug` and `de2_detect_external_source_slugs_are_unique` driving the full stack through `/api/skills/external-paths` + `/api/skills/detect-external`. |
+
+Slug convention matches the pre-migration TS handler (reconstructed from
+commit `0a00e937e:src/process/bridge/fsBridge.ts`) and satisfies the
+`external-source-tab-custom-` prefix assertion in
+`tests/e2e/features/settings/skills/edge-cases.e2e.ts:74`.
+
+### Verification
+
+- `cargo test -p aionui-api-types -p aionui-extension` → 911 passed (17 suites).
+- `cargo test -p aionui-app --test extension_e2e -- de1 de2 sl1 sl2 sl3` → 5 passed.
+- `cargo fmt --all -- --check` → clean.
+- `cargo clippy` has pre-existing errors in `snapshot.rs`,
+  `conversation.rs`, `lifecycle.rs`, and `handler_integration.rs`; none
+  in files touched by this fix. Verified these same errors exist on
+  the stashed (clean) tree.
+- Release binary rebuilt and reinstalled at
+  `~/.cargo/bin/aionui-backend` via `cargo install --path crates/aionui-app --locked`
+  so the next renderer e2e run hits the fixed contract.
+
+Commit SHA: **`3a86d58`**. Pushed to `origin/feat/extension-skill-library`.
