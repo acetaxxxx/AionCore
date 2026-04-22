@@ -23,7 +23,7 @@ pub fn row_to_response(row: ConversationRow) -> Result<ConversationResponse, App
     let model: Option<ProviderWithModel> = row
         .model
         .as_deref()
-        .map(|s| parse_provider_with_model(s))
+        .map(parse_provider_with_model)
         .transpose()?;
 
     let extra: serde_json::Value = serde_json::from_str(&row.extra)
@@ -52,14 +52,11 @@ pub fn row_to_response(row: ConversationRow) -> Result<ConversationResponse, App
 /// field that can be an array of model objects. The backend only needs
 /// `providerId`, `model` (the selected model name), and `useModel`.
 fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, AppError> {
-    let v: serde_json::Value =
-        serde_json::from_str(s).map_err(|e| AppError::Internal(format!("Invalid model JSON: {e}")))?;
+    let v: serde_json::Value = serde_json::from_str(s)
+        .map_err(|e| AppError::Internal(format!("Invalid model JSON: {e}")))?;
 
     if let Some(provider_id) = v.get("providerId").and_then(|v| v.as_str()) {
-        let model = v
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
+        let model = v.get("model").and_then(|v| v.as_str()).unwrap_or_default();
         let use_model = v.get("useModel").and_then(|v| v.as_str()).map(String::from);
         return Ok(ProviderWithModel {
             provider_id: provider_id.to_string(),
@@ -233,7 +230,8 @@ mod tests {
 
     #[test]
     fn parse_provider_with_model_backend_format() {
-        let json = r#"{"providerId":"p1","model":"claude-sonnet-4-20250514","useModel":"claude-sonnet"}"#;
+        let json =
+            r#"{"providerId":"p1","model":"claude-sonnet-4-20250514","useModel":"claude-sonnet"}"#;
         let result = parse_provider_with_model(json).unwrap();
         assert_eq!(result.provider_id, "p1");
         assert_eq!(result.model, "claude-sonnet-4-20250514");

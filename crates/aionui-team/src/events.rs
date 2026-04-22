@@ -226,7 +226,14 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 6);
-        let expected = ["idle", "working", "thinking", "tool_use", "completed", "error"];
+        let expected = [
+            "idle",
+            "working",
+            "thinking",
+            "tool_use",
+            "completed",
+            "error",
+        ];
         for (event, exp) in events.iter().zip(expected.iter()) {
             let payload: TeamAgentStatusPayload =
                 serde_json::from_value(event.data.clone()).unwrap();

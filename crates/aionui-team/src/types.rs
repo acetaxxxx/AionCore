@@ -401,10 +401,7 @@ mod tests {
             TeammateStatus::parse("active"),
             Some(TeammateStatus::Working)
         );
-        assert_eq!(
-            TeammateStatus::parse("failed"),
-            Some(TeammateStatus::Error)
-        );
+        assert_eq!(TeammateStatus::parse("failed"), Some(TeammateStatus::Error));
     }
 
     #[test]

@@ -79,7 +79,7 @@ impl ConversationService {
             model: req
                 .model
                 .as_ref()
-                .map(|m| serde_json::to_string(m))
+                .map(serde_json::to_string)
                 .transpose()
                 .map_err(|e| AppError::Internal(format!("Failed to serialize model: {e}")))?,
             status: Some(enum_to_db(&ConversationStatus::Pending)?),
