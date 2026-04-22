@@ -29,6 +29,14 @@ Thumbs.db
 # Temporary
 tmp/
 
+# Superpowers
+.superpowers/
+docs/superpowers/
+
+# Worktrees
+.worktrees/
+worktrees/
+
 # Profiling & debugging
 *.pdb
 perf.data
