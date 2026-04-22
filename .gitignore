@@ -29,6 +29,9 @@ Thumbs.db
 # Temporary
 tmp/
 
+# Superset
+.superset/
+
 # Superpowers
 .superpowers/
 docs/superpowers/
