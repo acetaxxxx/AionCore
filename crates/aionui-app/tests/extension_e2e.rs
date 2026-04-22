@@ -445,6 +445,56 @@ async fn rm1_read_builtin_rule_not_found() {
     assert_eq!(json["data"], "");
 }
 
+#[tokio::test]
+async fn rm2_read_builtin_rule_happy_path_returns_file_content() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    std::fs::write(
+        paths.builtin_rules_dir.join("code-review.md"),
+        "# Code Review Rules\n\nBe kind.\n",
+    )
+    .unwrap();
+
+    let resp = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/builtin-rule",
+            json!({"fileName": "code-review.md"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"], "# Code Review Rules\n\nBe kind.\n");
+}
+
+#[tokio::test]
+async fn rm3_read_builtin_rule_rejects_path_traversal() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let resp = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/builtin-rule",
+            json!({"fileName": "../etc/passwd"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], false);
+}
+
 // ---------------------------------------------------------------------------
 // SL — Skill listing (E1 / `GET /api/skills`)
 // ---------------------------------------------------------------------------
