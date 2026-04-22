@@ -373,6 +373,7 @@ dependencies = [
  "aionui-common",
  "aionui-db",
  "aionui-system",
+ "async-trait",
  "axum",
  "http-body-util",
  "open",

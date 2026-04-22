@@ -16,6 +16,17 @@ pub async fn build_app() -> (axum::Router, AppServices) {
     (router, services)
 }
 
+pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let services = AppServices::from_database(db).await.unwrap();
+    let mut states = build_module_states(&services).await;
+    states.shell.shell_service = std::sync::Arc::new(aionui_shell::ShellService::new(
+        std::sync::Arc::new(aionui_shell::NoopSystemOpener),
+    ));
+    let router = create_router_with_states(&services, states);
+    (router, services)
+}
+
 pub async fn build_app_with_mock_version(
     current_version: &str,
     mock_server: &MockServer,

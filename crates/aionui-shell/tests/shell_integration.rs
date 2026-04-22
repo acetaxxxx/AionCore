@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use aionui_api_types::ToolType;
-use aionui_shell::ShellService;
+use aionui_shell::{NoopSystemOpener, ShellService};
 
 fn service() -> ShellService {
-    ShellService::new()
+    ShellService::new(Arc::new(NoopSystemOpener))
 }
 
 // ---------------------------------------------------------------------------

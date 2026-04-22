@@ -226,6 +226,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn make_state() -> ShellRouterState {
+        use crate::opener::NoopSystemOpener;
         use crate::shell::ShellService;
         use crate::stt::SttService;
 
@@ -234,7 +235,7 @@ mod tests {
         let client_pref_service = aionui_system::ClientPrefService::new(repo);
 
         ShellRouterState {
-            shell_service: Arc::new(ShellService::new()),
+            shell_service: Arc::new(ShellService::new(Arc::new(NoopSystemOpener))),
             stt_service: Arc::new(SttService::new(reqwest::Client::new())),
             client_pref_service,
         }

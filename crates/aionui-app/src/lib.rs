@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use axum::http::Method;
 use axum::middleware::from_fn_with_state;
 use axum::routing::get;
 use axum::{Json, Router, middleware};
-use axum::http::Method;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tower_http::cors::{Any, CorsLayer};
@@ -507,7 +507,9 @@ pub fn build_shell_state(services: &AppServices) -> ShellRouterState {
     let client_pref_service = ClientPrefService::new(client_pref_repo);
 
     ShellRouterState {
-        shell_service: Arc::new(aionui_shell::ShellService::new()),
+        shell_service: Arc::new(aionui_shell::ShellService::new(Arc::new(
+            aionui_shell::DefaultSystemOpener,
+        ))),
         stt_service: Arc::new(aionui_shell::SttService::new(reqwest::Client::new())),
         client_pref_service,
     }

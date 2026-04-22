@@ -1,43 +1,55 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use aionui_api_types::ToolType;
-use tokio::process::Command;
 
 use crate::error::ShellError;
+use crate::opener::ISystemOpener;
 
 const ALLOWED_URL_SCHEMES: &[&str] = &["http", "https", "mailto"];
 
-#[derive(Default)]
-pub struct ShellService;
+pub struct ShellService {
+    opener: Arc<dyn ISystemOpener>,
+}
 
 impl ShellService {
-    pub fn new() -> Self {
-        Self
+    pub fn new(opener: Arc<dyn ISystemOpener>) -> Self {
+        Self { opener }
     }
 
     pub async fn open_file(&self, file_path: &str) -> Result<(), ShellError> {
         let path = validate_file_exists(file_path)?;
-        open::that_detached(path.as_os_str())
-            .map_err(|e| ShellError::CommandFailed(format!("open file: {e}")))?;
-        Ok(())
+        self.opener.open_detached(&path.to_string_lossy())
     }
 
     pub async fn show_item_in_folder(&self, file_path: &str) -> Result<(), ShellError> {
         let path = validate_path_exists(file_path)?;
-        show_in_folder(&path).await
+        if cfg!(target_os = "macos") {
+            self.opener
+                .run_command("open", &["-R", &path.to_string_lossy()])
+                .await
+        } else if cfg!(target_os = "windows") {
+            let parent = path.parent().unwrap_or(&path);
+            self.opener
+                .run_command("explorer", &[&parent.to_string_lossy()])
+                .await
+        } else {
+            let parent = path.parent().unwrap_or(&path);
+            self.opener
+                .run_command("xdg-open", &[&parent.to_string_lossy()])
+                .await
+        }
     }
 
     pub async fn open_external(&self, url: &str) -> Result<(), ShellError> {
         validate_url(url)?;
-        open::that_detached(url)
-            .map_err(|e| ShellError::CommandFailed(format!("open URL: {e}")))?;
-        Ok(())
+        self.opener.open_detached(url)
     }
 
     pub async fn check_tool_installed(&self, tool: ToolType) -> bool {
         match tool {
             ToolType::Terminal | ToolType::Explorer => true,
-            ToolType::Vscode => detect_vscode().await,
+            ToolType::Vscode => self.detect_vscode(),
         }
     }
 
@@ -48,10 +60,80 @@ impl ShellService {
     ) -> Result<(), ShellError> {
         let path = validate_directory_exists(folder_path)?;
         match tool {
-            ToolType::Vscode => open_folder_vscode(&path).await,
-            ToolType::Terminal => open_folder_terminal(&path).await,
-            ToolType::Explorer => open_folder_explorer(&path).await,
+            ToolType::Vscode => self.open_folder_vscode(&path).await,
+            ToolType::Terminal => self.open_folder_terminal(&path).await,
+            ToolType::Explorer => self.open_folder_explorer(&path).await,
         }
+    }
+
+    fn detect_vscode(&self) -> bool {
+        if self.opener.is_tool_available("code") {
+            return true;
+        }
+        if cfg!(target_os = "macos") {
+            let app_path = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code";
+            return Path::new(app_path).exists();
+        }
+        false
+    }
+
+    async fn open_folder_vscode(&self, path: &Path) -> Result<(), ShellError> {
+        if !self.detect_vscode() {
+            return Err(ShellError::ToolNotInstalled("vscode".to_owned()));
+        }
+        self.opener
+            .run_command("code", &[&path.to_string_lossy()])
+            .await
+    }
+
+    async fn open_folder_terminal(&self, path: &Path) -> Result<(), ShellError> {
+        let path_str = path.to_string_lossy();
+        if cfg!(target_os = "macos") {
+            self.opener
+                .run_command("open", &["-a", "Terminal", &path_str])
+                .await
+        } else if cfg!(target_os = "windows") {
+            self.opener
+                .run_command(
+                    "cmd",
+                    &["/c", "start", "cmd", "/K", &format!("cd /d {path_str}")],
+                )
+                .await
+        } else {
+            self.try_linux_terminal(&path_str).await
+        }
+    }
+
+    async fn open_folder_explorer(&self, path: &Path) -> Result<(), ShellError> {
+        let path_str = path.to_string_lossy();
+        if cfg!(target_os = "macos") {
+            self.opener.run_command("open", &[&path_str]).await
+        } else if cfg!(target_os = "windows") {
+            self.opener.run_command("explorer", &[&path_str]).await
+        } else {
+            self.opener.run_command("xdg-open", &[&path_str]).await
+        }
+    }
+
+    async fn try_linux_terminal(&self, path: &str) -> Result<(), ShellError> {
+        let terminals = [
+            "gnome-terminal",
+            "konsole",
+            "xfce4-terminal",
+            "x-terminal-emulator",
+            "terminator",
+        ];
+        for term in &terminals {
+            if self.opener.is_tool_available(term) {
+                let args: Vec<&str> = match *term {
+                    "gnome-terminal" => vec!["--working-directory", path],
+                    "konsole" => vec!["--workdir", path],
+                    _ => vec!["--working-directory", path],
+                };
+                return self.opener.run_command(term, &args).await;
+            }
+        }
+        Err(ShellError::ToolNotInstalled("terminal emulator".to_owned()))
     }
 }
 
@@ -99,106 +181,12 @@ fn validate_url(url: &str) -> Result<(), ShellError> {
     Ok(())
 }
 
-async fn show_in_folder(path: &Path) -> Result<(), ShellError> {
-    if cfg!(target_os = "macos") {
-        run_command("open", &["-R", &path.to_string_lossy()]).await
-    } else if cfg!(target_os = "windows") {
-        let parent = path.parent().unwrap_or(path);
-        run_command("explorer", &[&parent.to_string_lossy()]).await
-    } else {
-        let parent = path.parent().unwrap_or(path);
-        run_command("xdg-open", &[&parent.to_string_lossy()]).await
-    }
-}
-
-async fn detect_vscode() -> bool {
-    if which::which("code").is_ok() {
-        return true;
-    }
-    if cfg!(target_os = "macos") {
-        let app_path = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code";
-        return Path::new(app_path).exists();
-    }
-    false
-}
-
-async fn open_folder_vscode(path: &Path) -> Result<(), ShellError> {
-    if !detect_vscode().await {
-        return Err(ShellError::ToolNotInstalled("vscode".to_owned()));
-    }
-    run_command("code", &[&path.to_string_lossy()]).await
-}
-
-async fn open_folder_terminal(path: &Path) -> Result<(), ShellError> {
-    let path_str = path.to_string_lossy();
-    if cfg!(target_os = "macos") {
-        run_command("open", &["-a", "Terminal", &path_str]).await
-    } else if cfg!(target_os = "windows") {
-        run_command(
-            "cmd",
-            &["/c", "start", "cmd", "/K", &format!("cd /d {path_str}")],
-        )
-        .await
-    } else {
-        try_linux_terminal(&path_str).await
-    }
-}
-
-async fn open_folder_explorer(path: &Path) -> Result<(), ShellError> {
-    let path_str = path.to_string_lossy();
-    if cfg!(target_os = "macos") {
-        run_command("open", &[&path_str]).await
-    } else if cfg!(target_os = "windows") {
-        run_command("explorer", &[&path_str]).await
-    } else {
-        run_command("xdg-open", &[&path_str]).await
-    }
-}
-
-async fn try_linux_terminal(path: &str) -> Result<(), ShellError> {
-    let terminals = [
-        "gnome-terminal",
-        "konsole",
-        "xfce4-terminal",
-        "x-terminal-emulator",
-        "terminator",
-    ];
-    for term in &terminals {
-        if which::which(term).is_ok() {
-            let args: Vec<&str> = match *term {
-                "gnome-terminal" => vec!["--working-directory", path],
-                "konsole" => vec!["--workdir", path],
-                _ => vec!["--working-directory", path],
-            };
-            return run_command(term, &args).await;
-        }
-    }
-    Err(ShellError::ToolNotInstalled("terminal emulator".to_owned()))
-}
-
-async fn run_command(program: &str, args: &[&str]) -> Result<(), ShellError> {
-    let output = Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| ShellError::CommandFailed(format!("{program}: {e}")))?;
-
-    let result = output
-        .wait_with_output()
-        .await
-        .map_err(|e| ShellError::CommandFailed(format!("{program}: {e}")))?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        tracing::warn!(program, ?args, %stderr, "command exited with non-zero status");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::opener::NoopSystemOpener;
     use std::fs;
 
     #[test]
@@ -314,47 +302,47 @@ mod tests {
 
     #[tokio::test]
     async fn check_tool_terminal_always_true() {
-        let svc = ShellService::new();
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
         assert!(svc.check_tool_installed(ToolType::Terminal).await);
     }
 
     #[tokio::test]
     async fn check_tool_explorer_always_true() {
-        let svc = ShellService::new();
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
         assert!(svc.check_tool_installed(ToolType::Explorer).await);
     }
 
     #[tokio::test]
     async fn open_file_fails_for_missing_file() {
-        let svc = ShellService::new();
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
         let result = svc.open_file("/nonexistent/file.txt").await;
         assert!(matches!(result, Err(ShellError::FileNotFound(_))));
     }
 
     #[tokio::test]
     async fn show_item_in_folder_fails_for_missing_path() {
-        let svc = ShellService::new();
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
         let result = svc.show_item_in_folder("/nonexistent/path").await;
         assert!(matches!(result, Err(ShellError::FileNotFound(_))));
     }
 
     #[tokio::test]
     async fn open_external_fails_for_invalid_url() {
-        let svc = ShellService::new();
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
         let result = svc.open_external("; rm -rf /").await;
         assert!(matches!(result, Err(ShellError::InvalidUrl(_))));
     }
 
     #[tokio::test]
     async fn open_external_fails_for_file_scheme() {
-        let svc = ShellService::new();
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
         let result = svc.open_external("file:///etc/passwd").await;
         assert!(matches!(result, Err(ShellError::InvalidUrl(_))));
     }
 
     #[tokio::test]
     async fn open_folder_with_fails_for_missing_dir() {
-        let svc = ShellService::new();
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
         let result = svc
             .open_folder_with("/nonexistent/dir", ToolType::Explorer)
             .await;
@@ -366,7 +354,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
         std::fs::write(&file_path, "data").unwrap();
-        let svc = ShellService::new();
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
         let result = svc
             .open_folder_with(file_path.to_str().unwrap(), ToolType::Explorer)
             .await;

@@ -8,7 +8,8 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    body_json, build_app, extract_csrf_token, get_request, json_with_token, setup_and_login,
+    body_json, build_app_with_noop_opener, extract_csrf_token, get_request, json_with_token,
+    setup_and_login,
 };
 
 // ---------------------------------------------------------------------------
@@ -103,7 +104,7 @@ async fn set_stt_config(
 // SH-2: open-file — file not found
 #[tokio::test]
 async fn sh2_open_file_not_found() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -122,7 +123,7 @@ async fn sh2_open_file_not_found() {
 // SH-4: show-item-in-folder — path not found
 #[tokio::test]
 async fn sh4_show_item_in_folder_not_found() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -139,7 +140,7 @@ async fn sh4_show_item_in_folder_not_found() {
 // SH-6: open-external — command injection attempt
 #[tokio::test]
 async fn sh6_open_external_command_injection() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -158,7 +159,7 @@ async fn sh6_open_external_command_injection() {
 // SH-7: open-external — disallowed scheme
 #[tokio::test]
 async fn sh7_open_external_file_scheme() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -175,7 +176,7 @@ async fn sh7_open_external_file_scheme() {
 // SH-8: check-tool-installed — terminal always true
 #[tokio::test]
 async fn sh8_check_tool_terminal() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -195,7 +196,7 @@ async fn sh8_check_tool_terminal() {
 // SH-9: check-tool-installed — explorer always true
 #[tokio::test]
 async fn sh9_check_tool_explorer() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -215,7 +216,7 @@ async fn sh9_check_tool_explorer() {
 // SH-10: check-tool-installed — vscode (result depends on environment)
 #[tokio::test]
 async fn sh10_check_tool_vscode() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -235,7 +236,7 @@ async fn sh10_check_tool_vscode() {
 // SH-12: open-folder-with — directory not found
 #[tokio::test]
 async fn sh12_open_folder_with_nonexistent() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -252,7 +253,7 @@ async fn sh12_open_folder_with_nonexistent() {
 // SH-13: open-file — missing filePath
 #[tokio::test]
 async fn sh13_open_file_missing_field() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token("POST", "/api/shell/open-file", json!({}), &token, &csrf);
@@ -263,7 +264,7 @@ async fn sh13_open_file_missing_field() {
 // SH-14: open-external — empty URL
 #[tokio::test]
 async fn sh14_open_external_empty_url() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -284,7 +285,7 @@ async fn sh14_open_external_empty_url() {
 // ST-3: STT not enabled
 #[tokio::test]
 async fn st3_stt_disabled() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
@@ -311,7 +312,7 @@ async fn st3_stt_disabled() {
 // ST-4: STT config not set (treated as disabled)
 #[tokio::test]
 async fn st4_stt_config_not_set() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let (content_type, body) = MultipartBuilder::new()
@@ -330,7 +331,7 @@ async fn st4_stt_config_not_set() {
 // ST-5: OpenAI not configured (missing API key)
 #[tokio::test]
 async fn st5_openai_not_configured() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
@@ -361,7 +362,7 @@ async fn st5_openai_not_configured() {
 // ST-6: Deepgram not configured (missing API key)
 #[tokio::test]
 async fn st6_deepgram_not_configured() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
@@ -399,7 +400,7 @@ async fn st7_stt_api_failure() {
         .mount(&mock_server)
         .await;
 
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
@@ -434,7 +435,7 @@ async fn st7_stt_api_failure() {
 // ST-8: multipart missing fileName
 #[tokio::test]
 async fn st8_multipart_missing_filename() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
@@ -460,7 +461,7 @@ async fn st8_multipart_missing_filename() {
 // ST-9: multipart missing file
 #[tokio::test]
 async fn st9_multipart_missing_file() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
@@ -493,7 +494,7 @@ async fn st1_openai_transcription_success() {
         .mount(&mock_server)
         .await;
 
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
@@ -550,7 +551,7 @@ async fn st2_deepgram_transcription_success() {
         .mount(&mock_server)
         .await;
 
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
@@ -594,7 +595,7 @@ async fn st10_language_hint_passed() {
         .mount(&mock_server)
         .await;
 
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
@@ -635,7 +636,7 @@ async fn st10_language_hint_passed() {
 // AU-1: unauthenticated shell request rejected
 #[tokio::test]
 async fn au1_shell_unauthenticated() {
-    let (app, _services) = build_app().await;
+    let (app, _services) = build_app_with_noop_opener().await;
 
     let req = Request::builder()
         .method("POST")
@@ -650,7 +651,7 @@ async fn au1_shell_unauthenticated() {
 // AU-2: unauthenticated STT request rejected
 #[tokio::test]
 async fn au2_stt_unauthenticated() {
-    let (app, _services) = build_app().await;
+    let (app, _services) = build_app_with_noop_opener().await;
 
     let (content_type, body) = MultipartBuilder::new()
         .add_file("file", "test.wav", "audio/wav", b"fake audio")
@@ -671,7 +672,7 @@ async fn au2_stt_unauthenticated() {
 // M-145: mailto scheme URL positive test
 #[tokio::test]
 async fn sh_open_external_mailto_scheme() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = json_with_token(
@@ -682,15 +683,13 @@ async fn sh_open_external_mailto_scheme() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    // mailto: is allowed; the actual open may fail in CI (no mail client) but validation passes
-    // Accept either 200 (success) or 500 (command failed) — not 400 (validation error)
-    assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // M-147: multipart missing mimeType field
 #[tokio::test]
 async fn st_multipart_missing_mimetype() {
-    let (mut app, services) = build_app().await;
+    let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     set_stt_config(
