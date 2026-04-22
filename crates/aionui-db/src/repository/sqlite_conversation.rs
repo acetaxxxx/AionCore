@@ -587,7 +587,7 @@ mod tests {
             model: Some(
                 r#"{"providerId":"prov_1","model":"claude-sonnet-4-20250514"}"#.to_string(),
             ),
-            status: "pending".to_string(),
+            status: Some("pending".to_string()),
             source: Some("aionui".to_string()),
             channel_chat_id: None,
             pinned: false,
@@ -627,7 +627,7 @@ mod tests {
         assert_eq!(found.id, conv.id);
         assert_eq!(found.name, "Test Conversation");
         assert_eq!(found.r#type, "gemini");
-        assert_eq!(found.status, "pending");
+        assert_eq!(found.status.as_deref(), Some("pending"));
         assert!(!found.pinned);
     }
 

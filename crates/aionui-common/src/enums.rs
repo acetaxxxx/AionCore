@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 
 /// Type of AI agent backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum AgentType {
     Gemini,
     Acp,
+    #[serde(rename = "openclaw-gateway")]
     OpenclawGateway,
     Nanobot,
     Remote,
@@ -14,7 +15,7 @@ pub enum AgentType {
 
 /// ACP sub-backend identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum AcpBackend {
     Claude,
     Gemini,
@@ -22,19 +23,22 @@ pub enum AcpBackend {
     #[serde(rename = "iFlow")]
     IFlow,
     Codex,
-    CodeBuddy,
+    Codebuddy,
     Droid,
     Goose,
     Auggie,
     Kimi,
-    OpenCode,
+    Opencode,
     Copilot,
     Qoder,
+    #[serde(rename = "openclaw-gateway")]
     OpenclawGateway,
     Vibe,
     Nanobot,
     Cursor,
     Kiro,
+    Hermes,
+    Snow,
     Remote,
     Aionrs,
     Custom,
@@ -62,7 +66,7 @@ pub enum ConversationSource {
 
 /// Type discriminant for messages in a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum MessageType {
     Text,
     Tips,
@@ -208,9 +212,27 @@ mod tests {
     fn test_agent_type_serde_roundtrip() {
         let val = AgentType::OpenclawGateway;
         let json = serde_json::to_string(&val).unwrap();
-        assert_eq!(json, r#""openclawGateway""#);
+        assert_eq!(json, r#""openclaw-gateway""#);
         let parsed: AgentType = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, val);
+    }
+
+    #[test]
+    fn test_agent_type_all_variants() {
+        let cases = [
+            (AgentType::Gemini, "gemini"),
+            (AgentType::Acp, "acp"),
+            (AgentType::OpenclawGateway, "openclaw-gateway"),
+            (AgentType::Nanobot, "nanobot"),
+            (AgentType::Remote, "remote"),
+            (AgentType::Aionrs, "aionrs"),
+        ];
+        for (variant, expected) in cases {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, format!("\"{expected}\""), "serialize {variant:?}");
+            let parsed: AgentType = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant, "deserialize {expected}");
+        }
     }
 
     #[test]
@@ -218,6 +240,24 @@ mod tests {
         let val = AcpBackend::IFlow;
         let json = serde_json::to_string(&val).unwrap();
         assert_eq!(json, r#""iFlow""#);
+    }
+
+    #[test]
+    fn test_acp_backend_lowercase_variants() {
+        let cases = [
+            (AcpBackend::Claude, "claude"),
+            (AcpBackend::Codebuddy, "codebuddy"),
+            (AcpBackend::Opencode, "opencode"),
+            (AcpBackend::OpenclawGateway, "openclaw-gateway"),
+            (AcpBackend::Hermes, "hermes"),
+            (AcpBackend::Snow, "snow"),
+        ];
+        for (variant, expected) in cases {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, format!("\"{expected}\""), "serialize {variant:?}");
+            let parsed: AcpBackend = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant, "deserialize {expected}");
+        }
     }
 
     #[test]
@@ -237,10 +277,18 @@ mod tests {
     }
 
     #[test]
-    fn test_message_type_camel_case() {
+    fn test_message_type_snake_case() {
         let val = MessageType::ToolCall;
         let json = serde_json::to_string(&val).unwrap();
-        assert_eq!(json, r#""toolCall""#);
+        assert_eq!(json, r#""tool_call""#);
+
+        let val = MessageType::AcpToolCall;
+        let json = serde_json::to_string(&val).unwrap();
+        assert_eq!(json, r#""acp_tool_call""#);
+
+        let val = MessageType::AgentStatus;
+        let json = serde_json::to_string(&val).unwrap();
+        assert_eq!(json, r#""agent_status""#);
     }
 
     #[test]

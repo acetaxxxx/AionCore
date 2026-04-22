@@ -21,7 +21,7 @@ fn make_conversation(suffix: &str) -> ConversationRow {
         r#type: "gemini".to_string(),
         extra: r#"{"workspace":"/home/user/project"}"#.to_string(),
         model: Some(r#"{"providerId":"prov_1","model":"claude-sonnet-4-20250514"}"#.to_string()),
-        status: "pending".to_string(),
+        status: Some("pending".to_string()),
         source: Some("aionui".to_string()),
         channel_chat_id: None,
         pinned: false,
@@ -59,7 +59,7 @@ async fn create_get_update_delete_lifecycle() {
     // Get
     let found = repo.get(&conv.id).await.unwrap().unwrap();
     assert_eq!(found.name, "Conversation lifecycle");
-    assert_eq!(found.status, "pending");
+    assert_eq!(found.status.as_deref(), Some("pending"));
 
     // Update
     let now = aionui_common::now_ms();
@@ -77,7 +77,7 @@ async fn create_get_update_delete_lifecycle() {
 
     let updated = repo.get(&conv.id).await.unwrap().unwrap();
     assert_eq!(updated.name, "Updated Name");
-    assert_eq!(updated.status, "running");
+    assert_eq!(updated.status.as_deref(), Some("running"));
 
     // Delete
     repo.delete(&conv.id).await.unwrap();

@@ -3,8 +3,10 @@ use std::sync::Arc;
 use axum::middleware::from_fn_with_state;
 use axum::routing::get;
 use axum::{Json, Router, middleware};
+use axum::http::Method;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tower_http::cors::{Any, CorsLayer};
 
 use aionui_ai_agent::{
     AcpRouterState, AcpSkillManager, AgentFactoryDeps, AuxiliaryRouterState,
@@ -716,14 +718,34 @@ pub fn create_router_with_all_state(
     #[cfg(feature = "weixin")]
     let router = router.merge(weixin_login_authenticated);
 
-    router
-        .layer(middleware::from_fn_with_state(
+    let router = if services.local {
+        router
+    } else {
+        router.layer(middleware::from_fn_with_state(
             services.cookie_config.clone(),
             csrf_middleware,
         ))
-        .merge(ws_routes)
-        .merge(office_proxy)
-        .layer(middleware::from_fn(security_headers_middleware))
+    }
+    .merge(ws_routes)
+    .merge(office_proxy)
+    .layer(middleware::from_fn(security_headers_middleware));
+
+    if services.local {
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers(Any);
+        router.layer(cors)
+    } else {
+        router
+    }
 }
 
 #[cfg(test)]

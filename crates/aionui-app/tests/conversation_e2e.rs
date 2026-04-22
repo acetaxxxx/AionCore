@@ -67,7 +67,7 @@ async fn t1_2_create_various_agent_types() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let types = ["gemini", "acp", "openclawGateway", "nanobot", "remote"];
+    let types = ["gemini", "acp", "openclaw-gateway", "nanobot", "remote"];
     for agent_type in types {
         let body = json!({
             "type": agent_type,

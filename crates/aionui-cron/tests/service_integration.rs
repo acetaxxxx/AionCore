@@ -98,7 +98,7 @@ impl IConversationRepository for StubConvRepo {
             name: "stub".into(),
             r#type: "default".into(),
             model: None,
-            status: "active".into(),
+            status: Some("active".into()),
             source: None,
             channel_chat_id: None,
             extra: "{}".into(),

@@ -141,6 +141,8 @@ mod tests {
             model: "claude".into(),
             custom_agent_id: None,
             status: Some(TeammateStatus::Idle),
+            conversation_type: None,
+            cli_path: None,
         };
         emitter.broadcast_agent_spawned(&agent);
 
@@ -215,6 +217,7 @@ mod tests {
             TeammateStatus::Working,
             TeammateStatus::Thinking,
             TeammateStatus::ToolUse,
+            TeammateStatus::Completed,
             TeammateStatus::Error,
         ];
         for s in statuses {
@@ -222,8 +225,8 @@ mod tests {
         }
 
         let events = bc.events();
-        assert_eq!(events.len(), 5);
-        let expected = ["idle", "working", "thinking", "tool_use", "error"];
+        assert_eq!(events.len(), 6);
+        let expected = ["idle", "working", "thinking", "tool_use", "completed", "error"];
         for (event, exp) in events.iter().zip(expected.iter()) {
             let payload: TeamAgentStatusPayload =
                 serde_json::from_value(event.data.clone()).unwrap();

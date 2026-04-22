@@ -581,6 +581,7 @@ mod tests {
             agent_type: "acp".into(),
             created_by: CreatedBy::User,
             skill_content: None,
+            description: None,
             created_at: 1000,
             updated_at: 1000,
             next_run_at,

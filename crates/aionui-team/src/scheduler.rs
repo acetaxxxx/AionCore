@@ -573,6 +573,8 @@ mod tests {
             model: "claude".into(),
             custom_agent_id: None,
             status: None,
+            conversation_type: None,
+            cli_path: None,
         }
     }
 

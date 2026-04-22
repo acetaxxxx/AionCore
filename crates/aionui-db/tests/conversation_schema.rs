@@ -519,7 +519,7 @@ async fn conversation_row_from_row() {
         row.model.as_deref(),
         Some("{\"providerId\":\"p1\",\"model\":\"m1\"}")
     );
-    assert_eq!(row.status, "finished");
+    assert_eq!(row.status.as_deref(), Some("finished"));
     assert_eq!(row.source.as_deref(), Some("aionui"));
     assert_eq!(row.channel_chat_id.as_deref(), Some("group:42"));
     assert!(row.pinned);

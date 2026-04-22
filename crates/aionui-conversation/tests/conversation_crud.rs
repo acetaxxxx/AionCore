@@ -92,7 +92,7 @@ async fn t1_2_create_each_agent_type() {
     let types = vec![
         ("gemini", AgentType::Gemini),
         ("acp", AgentType::Acp),
-        ("openclawGateway", AgentType::OpenclawGateway),
+        ("openclaw-gateway", AgentType::OpenclawGateway),
         ("nanobot", AgentType::Nanobot),
         ("remote", AgentType::Remote),
         ("aionrs", AgentType::Aionrs),

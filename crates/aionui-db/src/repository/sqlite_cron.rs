@@ -24,10 +24,10 @@ impl ICronRepository for SqliteCronRepository {
                 id, name, enabled, schedule_kind, schedule_value, schedule_tz, \
                 schedule_description, payload_message, execution_mode, agent_config, \
                 conversation_id, conversation_title, agent_type, created_by, \
-                skill_content, created_at, updated_at, next_run_at, last_run_at, \
+                skill_content, description, created_at, updated_at, next_run_at, last_run_at, \
                 last_status, last_error, run_count, retry_count, max_retries\
             ) VALUES (\
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
             )",
         )
         .bind(&row.id)
@@ -45,6 +45,7 @@ impl ICronRepository for SqliteCronRepository {
         .bind(&row.agent_type)
         .bind(&row.created_by)
         .bind(&row.skill_content)
+        .bind(&row.description)
         .bind(row.created_at)
         .bind(row.updated_at)
         .bind(row.next_run_at)
@@ -116,6 +117,7 @@ impl ICronRepository for SqliteCronRepository {
         push_opt_str!(conversation_title);
         push_str!(agent_type);
         push_opt_str!(skill_content);
+        push_opt_str!(description);
         push_opt_i64!(next_run_at);
         push_opt_i64!(last_run_at);
         push_opt_str!(last_status);
@@ -273,6 +275,7 @@ mod tests {
             agent_type: "acp".into(),
             created_by: "user".into(),
             skill_content: None,
+            description: None,
             created_at: now,
             updated_at: now,
             next_run_at: Some(now + 60_000),

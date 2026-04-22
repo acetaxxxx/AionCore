@@ -104,7 +104,40 @@ async fn try_init_file(path: &Path) -> Result<Database, DbError> {
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), DbError> {
-    sqlx::migrate!().run(pool).await.map_err(DbError::Migration)
+    sqlx::migrate!().run(pool).await.map_err(DbError::Migration)?;
+    ensure_schema_columns(pool).await
+}
+
+/// Ensure columns expected by Rust models exist in the database.
+///
+/// `CREATE TABLE IF NOT EXISTS` does not modify existing tables, so columns
+/// added after a table was first created may be missing. This function
+/// safely adds any missing columns via `ALTER TABLE ADD COLUMN`.
+async fn ensure_schema_columns(pool: &SqlitePool) -> Result<(), DbError> {
+    let expected: &[(&str, &str, &str)] = &[
+        ("cron_jobs", "skill_content", "TEXT"),
+        ("cron_jobs", "description", "TEXT"),
+        ("conversations", "pinned", "INTEGER NOT NULL DEFAULT 0"),
+        ("conversations", "pinned_at", "INTEGER"),
+    ];
+
+    for &(table, column, col_def) in expected {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info(?) WHERE name = ?",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .map_err(DbError::Query)?;
+
+        if !exists {
+            let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_def}");
+            sqlx::query(&sql).execute(pool).await.map_err(DbError::Query)?;
+            info!("Added missing column {table}.{column}");
+        }
+    }
+    Ok(())
 }
 
 /// Ensure the system default user exists.

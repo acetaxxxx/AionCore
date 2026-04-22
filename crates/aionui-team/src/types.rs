@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TeammateRole {
+    #[serde(alias = "leader")]
     Lead,
     Teammate,
 }
@@ -27,7 +28,7 @@ impl fmt::Display for TeammateRole {
 impl TeammateRole {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "lead" => Some(Self::Lead),
+            "lead" | "leader" => Some(Self::Lead),
             "teammate" => Some(Self::Teammate),
             _ => None,
         }
@@ -41,10 +42,15 @@ impl TeammateRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TeammateStatus {
+    #[serde(alias = "pending")]
     Idle,
+    #[serde(alias = "active")]
     Working,
     Thinking,
     ToolUse,
+    #[serde(alias = "completed")]
+    Completed,
+    #[serde(alias = "failed")]
     Error,
 }
 
@@ -55,6 +61,7 @@ impl fmt::Display for TeammateStatus {
             Self::Working => write!(f, "working"),
             Self::Thinking => write!(f, "thinking"),
             Self::ToolUse => write!(f, "tool_use"),
+            Self::Completed => write!(f, "completed"),
             Self::Error => write!(f, "error"),
         }
     }
@@ -63,11 +70,12 @@ impl fmt::Display for TeammateStatus {
 impl TeammateStatus {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "idle" => Some(Self::Idle),
-            "working" => Some(Self::Working),
+            "idle" | "pending" => Some(Self::Idle),
+            "working" | "active" => Some(Self::Working),
             "thinking" => Some(Self::Thinking),
             "tool_use" => Some(Self::ToolUse),
-            "error" => Some(Self::Error),
+            "completed" => Some(Self::Completed),
+            "error" | "failed" => Some(Self::Error),
             _ => None,
         }
     }
@@ -81,15 +89,22 @@ impl TeammateStatus {
 #[serde(rename_all = "camelCase")]
 pub struct TeamAgent {
     pub slot_id: String,
+    #[serde(alias = "agentName")]
     pub name: String,
     pub role: TeammateRole,
     pub conversation_id: String,
+    #[serde(alias = "agentType")]
     pub backend: String,
+    #[serde(default)]
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<TeammateStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_path: Option<String>,
 }
 
 impl TeamAgent {
@@ -352,6 +367,7 @@ mod tests {
         assert_eq!(TeammateStatus::Working.to_string(), "working");
         assert_eq!(TeammateStatus::Thinking.to_string(), "thinking");
         assert_eq!(TeammateStatus::ToolUse.to_string(), "tool_use");
+        assert_eq!(TeammateStatus::Completed.to_string(), "completed");
         assert_eq!(TeammateStatus::Error.to_string(), "error");
     }
 
@@ -370,8 +386,25 @@ mod tests {
             TeammateStatus::parse("tool_use"),
             Some(TeammateStatus::ToolUse)
         );
+        assert_eq!(
+            TeammateStatus::parse("completed"),
+            Some(TeammateStatus::Completed)
+        );
         assert_eq!(TeammateStatus::parse("error"), Some(TeammateStatus::Error));
         assert_eq!(TeammateStatus::parse("bad"), None);
+    }
+
+    #[test]
+    fn teammate_status_parse_aionui_aliases() {
+        assert_eq!(TeammateStatus::parse("pending"), Some(TeammateStatus::Idle));
+        assert_eq!(
+            TeammateStatus::parse("active"),
+            Some(TeammateStatus::Working)
+        );
+        assert_eq!(
+            TeammateStatus::parse("failed"),
+            Some(TeammateStatus::Error)
+        );
     }
 
     #[test]
@@ -381,12 +414,31 @@ mod tests {
             TeammateStatus::Working,
             TeammateStatus::Thinking,
             TeammateStatus::ToolUse,
+            TeammateStatus::Completed,
             TeammateStatus::Error,
         ] {
             let json = serde_json::to_string(&status).unwrap();
             let parsed: TeammateStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, status);
         }
+    }
+
+    #[test]
+    fn teammate_status_serde_aionui_aliases() {
+        let pending: TeammateStatus = serde_json::from_str(r#""pending""#).unwrap();
+        assert_eq!(pending, TeammateStatus::Idle);
+        let active: TeammateStatus = serde_json::from_str(r#""active""#).unwrap();
+        assert_eq!(active, TeammateStatus::Working);
+        let completed: TeammateStatus = serde_json::from_str(r#""completed""#).unwrap();
+        assert_eq!(completed, TeammateStatus::Completed);
+        let failed: TeammateStatus = serde_json::from_str(r#""failed""#).unwrap();
+        assert_eq!(failed, TeammateStatus::Error);
+    }
+
+    #[test]
+    fn teammate_role_serde_leader_alias() {
+        let leader: TeammateRole = serde_json::from_str(r#""leader""#).unwrap();
+        assert_eq!(leader, TeammateRole::Lead);
     }
 
     // -- MailboxMessageType ---------------------------------------------------
@@ -483,6 +535,8 @@ mod tests {
             model: "claude".into(),
             custom_agent_id: Some("custom-1".into()),
             status: Some(TeammateStatus::Working),
+            conversation_type: None,
+            cli_path: None,
         };
         let resp = agent.to_response();
         assert_eq!(resp.slot_id, "s1");
@@ -502,6 +556,8 @@ mod tests {
             model: "claude".into(),
             custom_agent_id: None,
             status: None,
+            conversation_type: None,
+            cli_path: None,
         };
         let json = serde_json::to_string(&agent).unwrap();
         let parsed: TeamAgent = serde_json::from_str(&json).unwrap();
@@ -519,11 +575,33 @@ mod tests {
             model: "claude".into(),
             custom_agent_id: Some("x".into()),
             status: Some(TeammateStatus::Idle),
+            conversation_type: None,
+            cli_path: None,
         };
         let val = serde_json::to_value(&agent).unwrap();
         assert!(val.get("slotId").is_some());
         assert!(val.get("conversationId").is_some());
         assert!(val.get("customAgentId").is_some());
+    }
+
+    #[test]
+    fn team_agent_deserialize_aionui_format() {
+        let raw = serde_json::json!({
+            "slotId": "slot-abc",
+            "conversationId": "conv-1",
+            "role": "leader",
+            "agentType": "claude",
+            "agentName": "Leader",
+            "conversationType": "acp",
+            "status": "active",
+            "customAgentId": "custom-1"
+        });
+        let agent: TeamAgent = serde_json::from_value(raw).unwrap();
+        assert_eq!(agent.name, "Leader");
+        assert_eq!(agent.backend, "claude");
+        assert_eq!(agent.role, TeammateRole::Lead);
+        assert_eq!(agent.status, Some(TeammateStatus::Working));
+        assert_eq!(agent.conversation_type.as_deref(), Some("acp"));
     }
 
     // -- Team from_row --------------------------------------------------------
@@ -539,6 +617,8 @@ mod tests {
             model: "claude".into(),
             custom_agent_id: None,
             status: None,
+            conversation_type: None,
+            cli_path: None,
         }])
         .unwrap();
         let row = TeamRow {
@@ -574,6 +654,8 @@ mod tests {
                 model: "claude".into(),
                 custom_agent_id: None,
                 status: Some(TeammateStatus::Idle),
+                conversation_type: None,
+                cli_path: None,
             }],
             lead_agent_id: Some("s1".into()),
             created_at: 1000,

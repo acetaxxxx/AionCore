@@ -100,7 +100,7 @@ impl IConversationRepository for MockRepo {
             row.extra = extra.clone();
         }
         if let Some(status) = &updates.status {
-            row.status = status.clone();
+            row.status = Some(status.clone());
         }
         if let Some(updated_at) = updates.updated_at {
             row.updated_at = updated_at;

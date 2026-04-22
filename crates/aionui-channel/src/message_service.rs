@@ -285,7 +285,7 @@ fn parse_agent_type(s: &str) -> AgentType {
     match s {
         "gemini" => AgentType::Gemini,
         "acp" => AgentType::Acp,
-        "openclawGateway" | "openclaw-gateway" => AgentType::OpenclawGateway,
+        "openclaw-gateway" => AgentType::OpenclawGateway,
         "nanobot" => AgentType::Nanobot,
         "remote" => AgentType::Remote,
         "aionrs" => AgentType::Aionrs,
@@ -356,10 +356,6 @@ mod tests {
     fn parse_known_agent_types() {
         assert_eq!(parse_agent_type("gemini"), AgentType::Gemini);
         assert_eq!(parse_agent_type("acp"), AgentType::Acp);
-        assert_eq!(
-            parse_agent_type("openclawGateway"),
-            AgentType::OpenclawGateway
-        );
         assert_eq!(
             parse_agent_type("openclaw-gateway"),
             AgentType::OpenclawGateway

@@ -12,7 +12,10 @@ use aionui_db::models::MessageRow;
 /// Parses string enum fields and JSON text fields back into typed values.
 pub fn row_to_response(row: ConversationRow) -> Result<ConversationResponse, AppError> {
     let agent_type: AgentType = string_to_enum(&row.r#type)?;
-    let status: ConversationStatus = string_to_enum(&row.status)?;
+    let status: ConversationStatus = match row.status.as_deref() {
+        None | Some("") => ConversationStatus::Finished,
+        Some(s) => string_to_enum(s)?,
+    };
 
     let source: Option<ConversationSource> =
         row.source.as_deref().map(string_to_enum).transpose()?;
@@ -20,10 +23,7 @@ pub fn row_to_response(row: ConversationRow) -> Result<ConversationResponse, App
     let model: Option<ProviderWithModel> = row
         .model
         .as_deref()
-        .map(|s| {
-            serde_json::from_str(s)
-                .map_err(|e| AppError::Internal(format!("Invalid model JSON: {e}")))
-        })
+        .map(|s| parse_provider_with_model(s))
         .transpose()?;
 
     let extra: serde_json::Value = serde_json::from_str(&row.extra)
@@ -43,6 +43,43 @@ pub fn row_to_response(row: ConversationRow) -> Result<ConversationResponse, App
         modified_at: row.updated_at,
         extra,
     })
+}
+
+/// Parse the model JSON column into `ProviderWithModel`.
+///
+/// AionUi stores the full provider object (`TProviderWithModel`) which includes
+/// fields like `id`, `platform`, `baseUrl`, `apiKey`, `useModel`, and a `model`
+/// field that can be an array of model objects. The backend only needs
+/// `providerId`, `model` (the selected model name), and `useModel`.
+fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, AppError> {
+    let v: serde_json::Value =
+        serde_json::from_str(s).map_err(|e| AppError::Internal(format!("Invalid model JSON: {e}")))?;
+
+    if let Some(provider_id) = v.get("providerId").and_then(|v| v.as_str()) {
+        let model = v
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let use_model = v.get("useModel").and_then(|v| v.as_str()).map(String::from);
+        return Ok(ProviderWithModel {
+            provider_id: provider_id.to_string(),
+            model: model.to_string(),
+            use_model,
+        });
+    }
+
+    if let Some(id) = v.get("id").and_then(|v| v.as_str()) {
+        let use_model_str = v.get("useModel").and_then(|v| v.as_str()).map(String::from);
+        return Ok(ProviderWithModel {
+            provider_id: id.to_string(),
+            model: use_model_str.clone().unwrap_or_default(),
+            use_model: use_model_str,
+        });
+    }
+
+    Err(AppError::Internal(format!(
+        "Model JSON missing both 'providerId' and 'id': {s}"
+    )))
 }
 
 /// Parse a DB string value into a typed enum via serde.
@@ -110,7 +147,7 @@ mod tests {
             r#type: agent_type.into(),
             extra: extra_json.into(),
             model: model_json.map(|s| s.into()),
-            status: status.into(),
+            status: Some(status.into()),
             source: source.map(|s| s.into()),
             channel_chat_id: None,
             pinned: false,
@@ -164,7 +201,7 @@ mod tests {
             r#type: "gemini".into(),
             extra: "not-json".into(),
             model: None,
-            status: "pending".into(),
+            status: Some("pending".into()),
             source: None,
             channel_chat_id: None,
             pinned: false,
@@ -195,6 +232,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_provider_with_model_backend_format() {
+        let json = r#"{"providerId":"p1","model":"claude-sonnet-4-20250514","useModel":"claude-sonnet"}"#;
+        let result = parse_provider_with_model(json).unwrap();
+        assert_eq!(result.provider_id, "p1");
+        assert_eq!(result.model, "claude-sonnet-4-20250514");
+        assert_eq!(result.use_model.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[test]
+    fn parse_provider_with_model_aionui_format() {
+        let json = r#"{"id":"prov_1","platform":"openai","name":"My Provider","baseUrl":"https://api.openai.com","apiKey":"sk-xxx","model":[{"id":"gpt-4","name":"GPT-4"}],"capabilities":["text","vision"],"useModel":"gpt-4-turbo","enabled":true}"#;
+        let result = parse_provider_with_model(json).unwrap();
+        assert_eq!(result.provider_id, "prov_1");
+        assert_eq!(result.model, "gpt-4-turbo");
+        assert_eq!(result.use_model.as_deref(), Some("gpt-4-turbo"));
+    }
+
+    #[test]
+    fn parse_provider_with_model_missing_both_ids() {
+        let json = r#"{"name":"invalid"}"#;
+        assert!(parse_provider_with_model(json).is_err());
+    }
+
+    #[test]
     fn row_with_pinned_at() {
         let row = ConversationRow {
             id: "conv_2".into(),
@@ -203,7 +264,7 @@ mod tests {
             r#type: "gemini".into(),
             extra: "{}".into(),
             model: None,
-            status: "pending".into(),
+            status: Some("pending".into()),
             source: Some("aionui".into()),
             channel_chat_id: Some("chat:1".into()),
             pinned: true,

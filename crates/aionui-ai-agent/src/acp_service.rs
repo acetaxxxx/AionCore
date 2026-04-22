@@ -17,9 +17,9 @@ fn cli_binary_name(backend: AcpBackend) -> Option<&'static str> {
         AcpBackend::Claude => Some("claude"),
         AcpBackend::Qwen => Some("qwen"),
         AcpBackend::Codex => Some("codex"),
-        AcpBackend::CodeBuddy => Some("codebuddy"),
+        AcpBackend::Codebuddy => Some("codebuddy"),
         AcpBackend::Kiro => Some("kiro"),
-        AcpBackend::OpenCode => Some("opencode"),
+        AcpBackend::Opencode => Some("opencode"),
         AcpBackend::Copilot => Some("copilot"),
         AcpBackend::Goose => Some("goose"),
         AcpBackend::Cursor => Some("cursor"),
@@ -29,6 +29,8 @@ fn cli_binary_name(backend: AcpBackend) -> Option<&'static str> {
         AcpBackend::Qoder => Some("qoder"),
         AcpBackend::Vibe => Some("vibe"),
         AcpBackend::Nanobot => Some("nanobot"),
+        AcpBackend::Hermes => Some("hermes"),
+        AcpBackend::Snow => Some("snow"),
         // These backends don't have a direct CLI to detect
         AcpBackend::IFlow => None,
         AcpBackend::Gemini => None,
@@ -57,7 +59,7 @@ fn known_agents() -> Vec<AcpAgentInfo> {
         AcpAgentInfo {
             id: "codebuddy".into(),
             name: "CodeBuddy".into(),
-            backend: AcpBackend::CodeBuddy,
+            backend: AcpBackend::Codebuddy,
             available: false,
         },
         AcpAgentInfo {
@@ -75,7 +77,7 @@ fn known_agents() -> Vec<AcpAgentInfo> {
         AcpAgentInfo {
             id: "opencode".into(),
             name: "OpenCode".into(),
-            backend: AcpBackend::OpenCode,
+            backend: AcpBackend::Opencode,
             available: false,
         },
         AcpAgentInfo {
@@ -187,7 +189,7 @@ mod tests {
         assert_eq!(cli_binary_name(AcpBackend::Claude), Some("claude"));
         assert_eq!(cli_binary_name(AcpBackend::Qwen), Some("qwen"));
         assert_eq!(cli_binary_name(AcpBackend::Codex), Some("codex"));
-        assert_eq!(cli_binary_name(AcpBackend::CodeBuddy), Some("codebuddy"));
+        assert_eq!(cli_binary_name(AcpBackend::Codebuddy), Some("codebuddy"));
         assert_eq!(cli_binary_name(AcpBackend::Kiro), Some("kiro"));
     }
 

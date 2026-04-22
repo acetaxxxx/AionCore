@@ -95,6 +95,7 @@ impl CronService {
             agent_type: req.agent_type,
             created_by,
             skill_content: None,
+            description: None,
             created_at: now,
             updated_at: now,
             next_run_at,
@@ -566,6 +567,7 @@ impl CronService {
             agent_type: String::new(),
             created_by: CreatedBy::User,
             skill_content: None,
+            description: None,
             created_at: 0,
             updated_at: 0,
             next_run_at: Some(next_run),
@@ -779,6 +781,7 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         conversation_title: req.conversation_title.as_ref().map(|t| Some(t.clone())),
         agent_type: None,
         skill_content: None,
+        description: None,
         next_run_at: if req.schedule.is_some() || req.enabled.is_some() {
             Some(job.next_run_at)
         } else {
@@ -922,6 +925,7 @@ mod tests {
             agent_type: "acp".into(),
             created_by: CreatedBy::User,
             skill_content: None,
+            description: None,
             created_at: 1000,
             updated_at: 2000,
             next_run_at: Some(61000),

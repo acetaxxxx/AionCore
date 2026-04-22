@@ -57,6 +57,7 @@ fn make_job(id: &str) -> CronJobRow {
         agent_type: "acp".into(),
         created_by: "user".into(),
         skill_content: None,
+        description: None,
         created_at: now,
         updated_at: now,
         next_run_at: Some(now + 60_000),

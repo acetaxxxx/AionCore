@@ -80,7 +80,7 @@ impl ConversationService {
                 serde_json::to_string(&req.model)
                     .map_err(|e| AppError::Internal(format!("Failed to serialize model: {e}")))?,
             ),
-            status: enum_to_db(&ConversationStatus::Pending)?,
+            status: Some(enum_to_db(&ConversationStatus::Pending)?),
             source: Some(enum_to_db(&source)?),
             channel_chat_id: req.channel_chat_id,
             pinned: false,
@@ -517,7 +517,10 @@ impl ConversationService {
             })?;
 
         // Check if conversation is already processing (simple guard)
-        let status: ConversationStatus = string_to_enum(&row.status)?;
+        let status: ConversationStatus = match row.status.as_deref() {
+            None | Some("") => ConversationStatus::Finished,
+            Some(s) => string_to_enum(s)?,
+        };
         if status == ConversationStatus::Running {
             return Err(AppError::Conflict(
                 "Conversation is already processing a message".into(),
@@ -717,7 +720,7 @@ mod tests {
         assert_eq!(enum_to_db(&AgentType::Acp).unwrap(), "acp");
         assert_eq!(
             enum_to_db(&AgentType::OpenclawGateway).unwrap(),
-            "openclawGateway"
+            "openclaw-gateway"
         );
     }
 

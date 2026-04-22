@@ -51,7 +51,7 @@ impl SessionResumeStrategy {
     fn for_backend(backend: AcpBackend) -> Self {
         match backend {
             AcpBackend::Codex => Self::SessionLoad,
-            AcpBackend::Claude | AcpBackend::CodeBuddy => Self::ClaudeResumeMeta,
+            AcpBackend::Claude | AcpBackend::Codebuddy => Self::ClaudeResumeMeta,
             _ => Self::ResumeSessionId,
         }
     }
@@ -61,7 +61,7 @@ impl SessionResumeStrategy {
 /// Returns `None` for backends that don't support YOLO.
 fn yolo_mode_value(backend: AcpBackend) -> Option<&'static str> {
     match backend {
-        AcpBackend::Claude | AcpBackend::CodeBuddy => Some("bypassPermissions"),
+        AcpBackend::Claude | AcpBackend::Codebuddy => Some("bypassPermissions"),
         AcpBackend::Qwen | AcpBackend::IFlow => Some("yolo"),
         _ => None,
     }
@@ -731,7 +731,7 @@ mod tests {
             SessionResumeStrategy::ClaudeResumeMeta
         );
         assert_eq!(
-            SessionResumeStrategy::for_backend(AcpBackend::CodeBuddy),
+            SessionResumeStrategy::for_backend(AcpBackend::Codebuddy),
             SessionResumeStrategy::ClaudeResumeMeta
         );
         assert_eq!(
@@ -751,7 +751,7 @@ mod tests {
             Some("bypassPermissions")
         );
         assert_eq!(
-            yolo_mode_value(AcpBackend::CodeBuddy),
+            yolo_mode_value(AcpBackend::Codebuddy),
             Some("bypassPermissions")
         );
         assert_eq!(yolo_mode_value(AcpBackend::Qwen), Some("yolo"));

@@ -89,6 +89,8 @@ impl TeamSessionService {
                 model: input.model.clone(),
                 custom_agent_id: input.custom_agent_id.clone(),
                 status: None,
+                conversation_type: None,
+                cli_path: None,
             });
         }
 
@@ -232,6 +234,8 @@ impl TeamSessionService {
             model: req.model,
             custom_agent_id: req.custom_agent_id,
             status: None,
+            conversation_type: None,
+            cli_path: None,
         };
 
         team.agents.push(agent.clone());
@@ -423,9 +427,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_type_camel_case() {
+    fn parse_agent_type_openclaw_gateway() {
         assert_eq!(
-            parse_agent_type("openclawGateway").unwrap(),
+            parse_agent_type("openclaw-gateway").unwrap(),
             AgentType::OpenclawGateway
         );
     }
