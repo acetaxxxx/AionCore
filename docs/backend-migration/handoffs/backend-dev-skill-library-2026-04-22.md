@@ -27,6 +27,34 @@ Green at the last pass:
 - `cargo test -p aionui-app --test extension_e2e` → 39 passed (+11 new:
   `sl1–sl3`, `ba1–ba3`, `rm2–rm3`, `sk2–sk3`, `si1–si3`)
 
+### Scope breakdown — new vs. adapted (for successor calibration)
+
+Back-of-the-envelope for the next module's backend-dev: roughly 1/5
+endpoints was net-new code, 1/5 required a shape change, 3/5 needed
+only test supplementation. Full wall-clock for the pilot (once the
+toolchain was installed) was dominated by test authorship and HTTP
+integration plumbing, not by business logic.
+
+| ID | Category          | What was already there                                        | What Task 2 added                                                                              |
+| -- | ----------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| E1 | **Adapted**       | `list_skills` route + `list_available_skills` service, minus `source` | `SkillSource` enum + `SkillSourceResponse` DTO + field population + 3 HTTP tests + 1 extended unit test |
+| E2 | **Net-new**       | nothing — route, service, DTO, constant all absent             | Full vertical slice: constant `BUILTIN_AUTO_SKILLS_SUBDIR`, `BuiltinAutoSkillItem`, `list_builtin_auto_skills`, `BuiltinAutoSkillResponse`, route mount, 2 unit tests, 3 HTTP tests |
+| E3 | **Adapted (test only)** | Route + service + unit tests all green                  | 2 HTTP tests (`rm2` happy path, `rm3` traversal) — existing `rm1` covered file-not-found       |
+| E4 | **Adapted (test only)** | Route + service + unit tests all green                  | 3 HTTP tests (`sk1`–`sk3`); confirmed via renderer grep that `validate_filename` strictness is correct (no preset sends nested paths) |
+| E5 | **Adapted (test only)** | Route + service + unit tests all green                  | 3 HTTP tests (`si1` happy path, `si2` empty-`name` → dir basename fallback, `si3` 404 missing path) |
+
+Notes for strict TDD bookkeeping:
+
+- **E1 and E2 followed a real red→green loop** (wrote failing unit test
+  asserting missing `source` field and `list_builtin_auto_skills`
+  respectively → saw FAIL → implemented → saw PASS).
+- **E3/E4/E5 did not have a red stage** because the implementations were
+  already correct. I still wrote net-new HTTP tests that exercise the
+  wire contract end-to-end (auth → handler → service → response), but
+  calling this "strict TDD" would be inaccurate — it is better
+  characterised as contract-locking test supplementation. Flagging
+  this as a deviation from Step 2.2–2.6's wording for transparency.
+
 ### Contract highlights (for frontend-dev / e2e-tester)
 
 - `GET /api/skills` → `ApiResponse<SkillListItem[]>` where
