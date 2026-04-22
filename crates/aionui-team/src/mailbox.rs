@@ -34,6 +34,7 @@ impl Mailbox {
             msg_type: msg_type.to_string(),
             content: content.to_owned(),
             summary: summary.map(str::to_owned),
+            files: None,
             read: false,
             created_at: now_ms(),
         };

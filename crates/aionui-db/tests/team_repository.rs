@@ -28,9 +28,13 @@ fn make_team(id: &str, name: &str) -> TeamRow {
     let now = now_ms();
     TeamRow {
         id: id.into(),
+        user_id: "system_default_user".into(),
         name: name.into(),
+        workspace: String::new(),
+        workspace_mode: "shared".into(),
         agents: r#"[{"slotId":"a1","name":"Lead","role":"lead"}]"#.into(),
         lead_agent_id: Some("a1".into()),
+        session_mode: None,
         created_at: now,
         updated_at: now,
     }
@@ -51,6 +55,7 @@ fn make_mailbox_msg(
         msg_type: msg_type.into(),
         content: format!("content-{id}"),
         summary: None,
+        files: None,
         read: false,
         created_at: now_ms(),
     }

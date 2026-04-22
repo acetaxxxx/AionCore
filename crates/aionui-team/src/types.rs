@@ -543,9 +543,13 @@ mod tests {
         .unwrap();
         let row = TeamRow {
             id: "t1".into(),
+            user_id: "system_default_user".into(),
             name: "Alpha".into(),
+            workspace: String::new(),
+            workspace_mode: "shared".into(),
             agents: agents_json,
             lead_agent_id: Some("s1".into()),
+            session_mode: None,
             created_at: 1000,
             updated_at: 2000,
         };
@@ -589,9 +593,13 @@ mod tests {
     fn team_from_row_invalid_json() {
         let row = TeamRow {
             id: "t1".into(),
+            user_id: "system_default_user".into(),
             name: "Bad".into(),
+            workspace: String::new(),
+            workspace_mode: "shared".into(),
             agents: "not-json".into(),
             lead_agent_id: None,
+            session_mode: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -610,6 +618,7 @@ mod tests {
             msg_type: "message".into(),
             content: "hello".into(),
             summary: None,
+            files: None,
             read: false,
             created_at: 1000,
         };
@@ -628,6 +637,7 @@ mod tests {
             msg_type: "idle_notification".into(),
             content: "done".into(),
             summary: Some("Finished task".into()),
+            files: None,
             read: false,
             created_at: 2000,
         };
@@ -646,6 +656,7 @@ mod tests {
             msg_type: "unknown_type".into(),
             content: "x".into(),
             summary: None,
+            files: None,
             read: false,
             created_at: 0,
         };

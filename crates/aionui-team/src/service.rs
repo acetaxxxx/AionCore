@@ -97,9 +97,13 @@ impl TeamSessionService {
 
         let row = TeamRow {
             id: team_id.clone(),
+            user_id: user_id.to_owned(),
             name: req.name.clone(),
+            workspace: String::new(),
+            workspace_mode: "shared".into(),
             agents: agents_json,
             lead_agent_id: lead_agent_id.clone(),
+            session_mode: None,
             created_at: now,
             updated_at: now,
         };

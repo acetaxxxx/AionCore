@@ -23,13 +23,17 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO teams (id, name, agents, lead_agent_id, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
+        .bind(&row.user_id)
         .bind(&row.name)
+        .bind(&row.workspace)
+        .bind(&row.workspace_mode)
         .bind(&row.agents)
         .bind(&row.lead_agent_id)
+        .bind(&row.session_mode)
         .bind(row.created_at)
         .bind(row.updated_at)
         .execute(&self.pool)
@@ -107,8 +111,8 @@ impl ITeamRepository for SqliteTeamRepository {
     async fn write_message(&self, row: &MailboxMessageRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO mailbox \
-                (id, team_id, to_agent_id, from_agent_id, type, content, summary, read, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.team_id)
@@ -117,6 +121,7 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.msg_type)
         .bind(&row.content)
         .bind(&row.summary)
+        .bind(&row.files)
         .bind(row.read)
         .bind(row.created_at)
         .execute(&self.pool)
@@ -141,7 +146,7 @@ impl ITeamRepository for SqliteTeamRepository {
 
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, read, created_at \
+                    type, content, summary, files, read, created_at \
              FROM mailbox \
              WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
              ORDER BY created_at ASC",
@@ -175,7 +180,7 @@ impl ITeamRepository for SqliteTeamRepository {
         let rows = if let Some(limit) = limit {
             sqlx::query_as::<_, MailboxMessageRow>(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, read, created_at \
+                        type, content, summary, files, read, created_at \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? \
                  ORDER BY created_at ASC \
@@ -189,7 +194,7 @@ impl ITeamRepository for SqliteTeamRepository {
         } else {
             sqlx::query_as::<_, MailboxMessageRow>(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, read, created_at \
+                        type, content, summary, files, read, created_at \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? \
                  ORDER BY created_at ASC",

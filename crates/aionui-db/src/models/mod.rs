@@ -1,3 +1,4 @@
+mod acp_session;
 mod channel;
 mod client_preference;
 mod conversation;
@@ -11,6 +12,7 @@ mod system_settings;
 mod team;
 mod user;
 
+pub use acp_session::AcpSessionRow;
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;
 pub use conversation::ConversationRow;

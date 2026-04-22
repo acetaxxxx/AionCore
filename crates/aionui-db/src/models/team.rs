@@ -7,10 +7,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TeamRow {
     pub id: String,
+    pub user_id: String,
     pub name: String,
+    pub workspace: String,
+    pub workspace_mode: String,
     /// JSON array: serialized `TeamAgent[]`.
     pub agents: String,
     pub lead_agent_id: Option<String>,
+    pub session_mode: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -30,6 +34,8 @@ pub struct MailboxMessageRow {
     pub msg_type: String,
     pub content: String,
     pub summary: Option<String>,
+    /// JSON-serialized file paths attached to the message.
+    pub files: Option<String>,
     pub read: bool,
     pub created_at: TimestampMs,
 }
@@ -65,9 +71,13 @@ mod tests {
     fn team_row_default_agents_is_empty_json_array() {
         let row = TeamRow {
             id: "t1".into(),
+            user_id: "system_default_user".into(),
             name: "Team".into(),
+            workspace: "/tmp/ws".into(),
+            workspace_mode: "shared".into(),
             agents: "[]".into(),
             lead_agent_id: None,
+            session_mode: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -86,6 +96,7 @@ mod tests {
             msg_type: "message".into(),
             content: "hello".into(),
             summary: None,
+            files: None,
             read: false,
             created_at: 0,
         };
