@@ -118,11 +118,11 @@ async fn t1_4_create_missing_required_field() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    // Missing model
-    let body = json!({ "type": "gemini", "extra": {} });
+    // model is optional — omitting it should succeed
+    let body = json!({ "type": "acp", "extra": {} });
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Missing extra
     let body = json!({

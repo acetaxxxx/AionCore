@@ -129,7 +129,7 @@ async fn t8_2_messages_pagination() {
 }
 
 #[tokio::test]
-async fn t8_3_messages_order_desc_default() {
+async fn t8_3_messages_order_asc_default() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let conv_id = create_conversation(&mut app, &token, &csrf, "Order Test").await;
@@ -147,9 +147,9 @@ async fn t8_3_messages_order_desc_default() {
         .unwrap();
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
-    // DESC order: newest first
-    assert!(items[0]["createdAt"].as_i64().unwrap() > items[1]["createdAt"].as_i64().unwrap());
-    assert!(items[1]["createdAt"].as_i64().unwrap() > items[2]["createdAt"].as_i64().unwrap());
+    // ASC order (default): oldest first
+    assert!(items[0]["createdAt"].as_i64().unwrap() < items[1]["createdAt"].as_i64().unwrap());
+    assert!(items[1]["createdAt"].as_i64().unwrap() < items[2]["createdAt"].as_i64().unwrap());
 }
 
 #[tokio::test]

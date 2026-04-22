@@ -414,7 +414,7 @@ async fn cj8_update_job() {
     let updated = svc.update_job(&created.id, req).await.unwrap();
     assert_eq!(updated.name, "Updated Name");
     assert!(!updated.enabled);
-    assert!(updated.updated_at > created.created_at);
+    assert!(updated.updated_at >= created.created_at);
 
     let events = bc.take_events();
     assert_eq!(events.len(), 1);

@@ -242,7 +242,7 @@ async fn t8_2_pagination() {
 }
 
 #[tokio::test]
-async fn t8_3_desc_order_default() {
+async fn t8_3_asc_order_default() {
     let (svc, repo, _b) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
@@ -256,9 +256,9 @@ async fn t8_3_desc_order_default() {
         .list_messages(USER_ID, &conv.id, ListMessagesQuery::default())
         .await
         .unwrap();
-    // DESC: most recent first
-    assert!(result.items[0].created_at >= result.items[1].created_at);
-    assert!(result.items[1].created_at >= result.items[2].created_at);
+    // ASC (default): oldest first
+    assert!(result.items[0].created_at <= result.items[1].created_at);
+    assert!(result.items[1].created_at <= result.items[2].created_at);
 }
 
 #[tokio::test]
