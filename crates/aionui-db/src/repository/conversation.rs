@@ -104,8 +104,8 @@ pub trait IConversationRepository: Send + Sync {
 /// Sort direction for message listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortOrder {
-    Asc,
     #[default]
+    Asc,
     Desc,
 }
 

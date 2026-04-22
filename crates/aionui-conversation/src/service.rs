@@ -340,8 +340,8 @@ impl ConversationService {
         let page = query.page.unwrap_or(1);
         let page_size = query.page_size.unwrap_or(50);
         let order = match query.order.as_deref() {
-            Some("ASC" | "asc") => SortOrder::Asc,
-            _ => SortOrder::Desc,
+            Some("DESC" | "desc") => SortOrder::Desc,
+            _ => SortOrder::Asc,
         };
 
         let result = self

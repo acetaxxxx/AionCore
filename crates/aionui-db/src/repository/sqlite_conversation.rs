@@ -1282,8 +1282,8 @@ mod tests {
     }
 
     #[test]
-    fn default_sort_order_is_desc() {
-        assert_eq!(SortOrder::default(), SortOrder::Desc);
+    fn default_sort_order_is_asc() {
+        assert_eq!(SortOrder::default(), SortOrder::Asc);
     }
 
     // ── Filters tests ───────────────────────────────────────────────
