@@ -576,6 +576,98 @@ async fn sk3_read_builtin_skill_rejects_path_traversal() {
 }
 
 // ---------------------------------------------------------------------------
+// SI — Skill info (E5 / `POST /api/skills/info`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn si1_read_skill_info_from_directory_path() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let skill_dir = tmp.path().join("my-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: Handy little thing\n---\nBody",
+    )
+    .unwrap();
+
+    let resp = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/info",
+            json!({ "skillPath": skill_dir.to_str().unwrap() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"]["name"], "my-skill");
+    assert_eq!(json["data"]["description"], "Handy little thing");
+}
+
+#[tokio::test]
+async fn si2_read_skill_info_falls_back_to_directory_name_when_name_empty() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let skill_dir = tmp.path().join("fallback-dir");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: \ndescription: Empty-name skill\n---\nBody",
+    )
+    .unwrap();
+
+    let resp = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/info",
+            json!({ "skillPath": skill_dir.to_str().unwrap() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"]["name"], "fallback-dir");
+    assert_eq!(json["data"]["description"], "Empty-name skill");
+}
+
+#[tokio::test]
+async fn si3_read_skill_info_returns_not_found_for_missing_path() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let missing = tmp.path().join("no-such-skill");
+
+    let resp = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/info",
+            json!({ "skillPath": missing.to_str().unwrap() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], false);
+}
+
+// ---------------------------------------------------------------------------
 // SL — Skill listing (E1 / `GET /api/skills`)
 // ---------------------------------------------------------------------------
 
