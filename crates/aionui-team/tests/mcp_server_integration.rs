@@ -431,7 +431,7 @@ async fn ttc2_create_task_with_dependency() {
         &mut stream,
         4,
         "team_task_create",
-        json!({"subject": "Task B", "blockedBy": [task_a_id]}),
+        json!({"subject": "Task B", "blocked_by": [task_a_id]}),
     )
     .await;
 
@@ -443,7 +443,7 @@ async fn ttc2_create_task_with_dependency() {
 
     let task_b = tasks2.iter().find(|t| t["subject"] == "Task B").unwrap();
     let blocked_by: Vec<String> =
-        serde_json::from_value(task_b["blockedBy"].clone()).unwrap_or_default();
+        serde_json::from_value(task_b["blocked_by"].clone()).unwrap_or_default();
     assert!(blocked_by.contains(&task_a_id.to_string()));
 
     env.server.stop();
@@ -511,7 +511,7 @@ async fn ttu1_update_task_status() {
         &mut stream,
         4,
         "team_task_update",
-        json!({"taskId": task_id, "status": "completed"}),
+        json!({"task_id": task_id, "status": "completed"}),
     )
     .await;
 
@@ -533,7 +533,7 @@ async fn ttu3_update_nonexistent_task() {
         &mut stream,
         2,
         "team_task_update",
-        json!({"taskId": "nonexistent-id", "status": "completed"}),
+        json!({"task_id": "nonexistent-id", "status": "completed"}),
     )
     .await;
 
@@ -581,7 +581,7 @@ async fn tra1_rename_existing_agent() {
         &mut stream,
         2,
         "team_rename_agent",
-        json!({"slotId": "worker-1", "newName": "Senior Worker"}),
+        json!({"slot_id": "worker-1", "new_name": "Senior Worker"}),
     )
     .await;
 
@@ -601,7 +601,7 @@ async fn tra2_rename_nonexistent_agent() {
         &mut stream,
         2,
         "team_rename_agent",
-        json!({"slotId": "nonexistent", "newName": "X"}),
+        json!({"slot_id": "nonexistent", "new_name": "X"}),
     )
     .await;
 
@@ -623,7 +623,7 @@ async fn tsa1_lead_sends_shutdown_request() {
         &mut stream,
         2,
         "team_shutdown_agent",
-        json!({"slotId": "worker-1", "reason": "Task complete"}),
+        json!({"slot_id": "worker-1", "reason": "Task complete"}),
     )
     .await;
 
@@ -643,7 +643,7 @@ async fn tsa4_non_lead_cannot_shutdown() {
         &mut stream,
         2,
         "team_shutdown_agent",
-        json!({"slotId": "lead-1"}),
+        json!({"slot_id": "lead-1"}),
     )
     .await;
 

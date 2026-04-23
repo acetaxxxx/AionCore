@@ -11,7 +11,7 @@ fn mv1_valid_manifest_parses_and_validates() {
     let json = serde_json::json!({
         "name": "my-cool-extension",
         "version": "1.0.0",
-        "displayName": "My Cool Extension",
+        "display_name": "My Cool Extension",
         "description": "A test extension",
         "contributes": {
             "skills": [{ "name": "test-skill" }]
@@ -98,21 +98,21 @@ fn manifest_with_all_optional_fields() {
     let json = serde_json::json!({
         "name": "full-ext",
         "version": "2.0.0",
-        "displayName": "Full Extension",
+        "display_name": "Full Extension",
         "description": "Has everything",
         "author": "Test",
         "license": "MIT",
         "homepage": "https://example.com",
         "icon": "icon.png",
         "engine": { "aionui": "^1.0.0" },
-        "apiVersion": "1.0.0",
+        "api_version": "1.0.0",
         "dependencies": { "other-ext": "^1.0.0" },
-        "entryPoint": "main.js",
+        "entry_point": "main.js",
         "permissions": { "storage": true, "events": true },
         "contributes": {},
         "lifecycle": {
-            "onInstall": "scripts/install.sh",
-            "onActivate": "scripts/activate.sh"
+            "on_install": "scripts/install.sh",
+            "on_activate": "scripts/activate.sh"
         },
         "i18n": { "locales": ["en", "zh-CN"] }
     });

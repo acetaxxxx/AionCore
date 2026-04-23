@@ -38,11 +38,11 @@ async fn t8_1_bedrock_missing_region() {
         "POST",
         "/api/bedrock/test-connection",
         json!({
-            "bedrockConfig": {
-                "authMethod": "accessKey",
+            "bedrock_config": {
+                "auth_method": "accessKey",
                 "region": "",
-                "accessKeyId": "AKIAIOSFODNN7",
-                "secretAccessKey": "wJalrXUtnFEMI"
+                "access_key_id": "AKIAIOSFODNN7",
+                "secret_access_key": "wJalrXUtnFEMI"
             }
         }),
         &token,
@@ -65,10 +65,10 @@ async fn t8_1_bedrock_access_key_missing_key_id() {
         "POST",
         "/api/bedrock/test-connection",
         json!({
-            "bedrockConfig": {
-                "authMethod": "accessKey",
+            "bedrock_config": {
+                "auth_method": "accessKey",
                 "region": "us-east-1",
-                "secretAccessKey": "wJalrXUtnFEMI"
+                "secret_access_key": "wJalrXUtnFEMI"
             }
         }),
         &token,
@@ -90,10 +90,10 @@ async fn t8_1_bedrock_access_key_missing_secret() {
         "POST",
         "/api/bedrock/test-connection",
         json!({
-            "bedrockConfig": {
-                "authMethod": "accessKey",
+            "bedrock_config": {
+                "auth_method": "accessKey",
                 "region": "us-east-1",
-                "accessKeyId": "AKIAIOSFODNN7"
+                "access_key_id": "AKIAIOSFODNN7"
             }
         }),
         &token,
@@ -115,8 +115,8 @@ async fn t8_1_bedrock_profile_missing() {
         "POST",
         "/api/bedrock/test-connection",
         json!({
-            "bedrockConfig": {
-                "authMethod": "profile",
+            "bedrock_config": {
+                "auth_method": "profile",
                 "region": "us-east-1"
             }
         }),
@@ -140,11 +140,11 @@ async fn t8_1_bedrock_unauthenticated() {
         .header("content-type", "application/json")
         .body(axum::body::Body::from(
             serde_json::to_vec(&json!({
-                "bedrockConfig": {
-                    "authMethod": "accessKey",
+                "bedrock_config": {
+                    "auth_method": "accessKey",
                     "region": "us-east-1",
-                    "accessKeyId": "AKIA",
-                    "secretAccessKey": "secret"
+                    "access_key_id": "AKIA",
+                    "secret_access_key": "secret"
                 }
             }))
             .unwrap(),
@@ -164,11 +164,11 @@ async fn t8_1_bedrock_invalid_credentials() {
         "POST",
         "/api/bedrock/test-connection",
         json!({
-            "bedrockConfig": {
-                "authMethod": "accessKey",
+            "bedrock_config": {
+                "auth_method": "accessKey",
                 "region": "us-east-1",
-                "accessKeyId": "AKIAFAKEKEY1234567890",
-                "secretAccessKey": "fakesecretkey1234567890abcdefghijklmnopq"
+                "access_key_id": "AKIAFAKEKEY1234567890",
+                "secret_access_key": "fakesecretkey1234567890abcdefghijklmnopq"
             }
         }),
         &token,

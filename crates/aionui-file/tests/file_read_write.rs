@@ -268,16 +268,16 @@ async fn write_file_emits_content_update_event() {
     assert_eq!(event.data["content"], "event content");
     assert_eq!(event.data["workspace"], ws);
     assert_eq!(event.data["operation"], "write");
-    // filePath should be the canonical path
+    // file_path should be the canonical path
     assert!(
-        event.data["filePath"]
+        event.data["file_path"]
             .as_str()
             .unwrap()
             .contains("event_test.txt"),
-        "filePath should contain the file name"
+        "file_path should contain the file name"
     );
-    // relativePath should be relative to workspace
-    assert_eq!(event.data["relativePath"], "event_test.txt");
+    // relative_path should be relative to workspace
+    assert_eq!(event.data["relative_path"], "event_test.txt");
 }
 
 #[tokio::test]
@@ -320,7 +320,7 @@ async fn write_file_nested_relative_path() {
 
     let events = recorder.take_events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].data["relativePath"], "src/utils/helper.ts");
+    assert_eq!(events[0].data["relative_path"], "src/utils/helper.ts");
 }
 
 // -----------------------------------------------------------------------

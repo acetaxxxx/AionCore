@@ -462,7 +462,7 @@ impl ConversationService {
 
         // Broadcast confirmation.remove
         let payload = serde_json::json!({
-            "conversationId": conversation_id,
+            "conversation_id": conversation_id,
             "id": conf_id,
         });
         let msg = WebSocketMessage::new("confirmation.remove", payload);
@@ -688,7 +688,7 @@ impl ConversationService {
         source: Option<&ConversationSource>,
     ) {
         let payload = serde_json::json!({
-            "conversationId": conversation_id,
+            "conversation_id": conversation_id,
             "action": action,
             "source": source,
         });

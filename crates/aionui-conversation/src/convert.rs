@@ -48,16 +48,25 @@ pub fn row_to_response(row: ConversationRow) -> Result<ConversationResponse, App
 /// Parse the model JSON column into `ProviderWithModel`.
 ///
 /// AionUi stores the full provider object (`TProviderWithModel`) which includes
-/// fields like `id`, `platform`, `baseUrl`, `apiKey`, `useModel`, and a `model`
+/// fields like `id`, `platform`, `base_url`, `api_key`, `use_model`, and a `model`
 /// field that can be an array of model objects. The backend only needs
-/// `providerId`, `model` (the selected model name), and `useModel`.
+/// `provider_id`, `model` (the selected model name), and `use_model`.
+/// Accepts both snake_case and legacy camelCase key names for backward compatibility.
 fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, AppError> {
     let v: serde_json::Value = serde_json::from_str(s)
         .map_err(|e| AppError::Internal(format!("Invalid model JSON: {e}")))?;
 
-    if let Some(provider_id) = v.get("providerId").and_then(|v| v.as_str()) {
+    if let Some(provider_id) = v
+        .get("provider_id")
+        .or_else(|| v.get("providerId"))
+        .and_then(|v| v.as_str())
+    {
         let model = v.get("model").and_then(|v| v.as_str()).unwrap_or_default();
-        let use_model = v.get("useModel").and_then(|v| v.as_str()).map(String::from);
+        let use_model = v
+            .get("use_model")
+            .or_else(|| v.get("useModel"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
         return Ok(ProviderWithModel {
             provider_id: provider_id.to_string(),
             model: model.to_string(),
@@ -66,7 +75,11 @@ fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, AppError> {
     }
 
     if let Some(id) = v.get("id").and_then(|v| v.as_str()) {
-        let use_model_str = v.get("useModel").and_then(|v| v.as_str()).map(String::from);
+        let use_model_str = v
+            .get("use_model")
+            .or_else(|| v.get("useModel"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
         return Ok(ProviderWithModel {
             provider_id: id.to_string(),
             model: use_model_str.clone().unwrap_or_default(),
@@ -75,7 +88,7 @@ fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, AppError> {
     }
 
     Err(AppError::Internal(format!(
-        "Model JSON missing both 'providerId' and 'id': {s}"
+        "Model JSON missing both 'provider_id'/'providerId' and 'id': {s}"
     )))
 }
 

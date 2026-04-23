@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 /// Each agent gets its own conversation; the first agent in a create
 /// request becomes the team lead.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TeamAgentInput {
     pub name: String,
     pub role: String,
@@ -25,7 +24,6 @@ pub struct TeamAgentInput {
 /// Creates a team with the given name and agent list.
 /// The first agent in the array is designated as the lead.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateTeamRequest {
     pub name: String,
     pub agents: Vec<TeamAgentInput>,
@@ -33,7 +31,6 @@ pub struct CreateTeamRequest {
 
 /// Request body for `PATCH /api/teams/:id/name`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RenameTeamRequest {
     pub name: String,
 }
@@ -47,7 +44,6 @@ pub struct RenameTeamRequest {
 /// Adds a new agent to an existing team. A conversation is
 /// created automatically for the new agent.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AddAgentRequest {
     pub name: String,
     pub role: String,
@@ -59,7 +55,6 @@ pub struct AddAgentRequest {
 
 /// Request body for `PATCH /api/teams/:id/agents/:slotId/name`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RenameAgentRequest {
     pub name: String,
 }
@@ -73,7 +68,6 @@ pub struct RenameAgentRequest {
 /// Sends a user message to the team lead's mailbox, triggering a
 /// wake cycle.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SendTeamMessageRequest {
     pub content: String,
 }
@@ -82,7 +76,6 @@ pub struct SendTeamMessageRequest {
 ///
 /// Sends a user message directly to a specific agent's mailbox.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SendAgentMessageRequest {
     pub content: String,
 }
@@ -95,7 +88,6 @@ pub struct SendAgentMessageRequest {
 ///
 /// Corresponds to the `TeamAgent` shared type in the API Spec.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct TeamAgentResponse {
     pub slot_id: String,
     pub name: String,
@@ -113,7 +105,6 @@ pub struct TeamAgentResponse {
 ///
 /// Corresponds to the `TTeam` shared type in the API Spec.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct TeamResponse {
     pub id: String,
     pub name: String,
@@ -135,7 +126,6 @@ pub type TeamListResponse = Vec<TeamResponse>;
 ///
 /// Pushed when an agent's runtime status changes (e.g., idle → working).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct TeamAgentStatusPayload {
     pub team_id: String,
     pub slot_id: String,
@@ -147,7 +137,6 @@ pub struct TeamAgentStatusPayload {
 /// Pushed when the lead dynamically creates a new agent via
 /// `team_spawn_agent`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct TeamAgentSpawnedPayload {
     pub team_id: String,
     pub agent: TeamAgentResponse,
@@ -157,7 +146,6 @@ pub struct TeamAgentSpawnedPayload {
 ///
 /// Pushed when an agent is removed from the team.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct TeamAgentRemovedPayload {
     pub team_id: String,
     pub slot_id: String,
@@ -167,7 +155,6 @@ pub struct TeamAgentRemovedPayload {
 ///
 /// Pushed when an agent's display name is changed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct TeamAgentRenamedPayload {
     pub team_id: String,
     pub slot_id: String,
@@ -195,7 +182,7 @@ mod tests {
                     "role": "lead",
                     "backend": "acp",
                     "model": "claude",
-                    "customAgentId": "agent-x"
+                    "custom_agent_id": "agent-x"
                 },
                 {
                     "name": "Worker",
@@ -277,7 +264,7 @@ mod tests {
             "role": "teammate",
             "backend": "acp",
             "model": "claude",
-            "customAgentId": "custom-1"
+            "custom_agent_id": "custom-1"
         });
         let req: AddAgentRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.custom_agent_id.as_deref(), Some("custom-1"));
@@ -344,7 +331,7 @@ mod tests {
     // -- D. Response DTOs -----------------------------------------------------
 
     #[test]
-    fn serialize_team_agent_response_camel_case() {
+    fn serialize_team_agent_response_snake_case() {
         let agent = TeamAgentResponse {
             slot_id: "slot-1".into(),
             name: "Lead Agent".into(),
@@ -356,13 +343,13 @@ mod tests {
             status: Some("idle".into()),
         };
         let json = serde_json::to_value(&agent).unwrap();
-        assert_eq!(json["slotId"], "slot-1");
+        assert_eq!(json["slot_id"], "slot-1");
         assert_eq!(json["name"], "Lead Agent");
         assert_eq!(json["role"], "lead");
-        assert_eq!(json["conversationId"], "conv-1");
+        assert_eq!(json["conversation_id"], "conv-1");
         assert_eq!(json["backend"], "acp");
         assert_eq!(json["model"], "claude");
-        assert_eq!(json["customAgentId"], "agent-x");
+        assert_eq!(json["custom_agent_id"], "agent-x");
         assert_eq!(json["status"], "idle");
     }
 
@@ -379,12 +366,12 @@ mod tests {
             status: None,
         };
         let json = serde_json::to_value(&agent).unwrap();
-        assert!(json.get("customAgentId").is_none());
+        assert!(json.get("custom_agent_id").is_none());
         assert!(json.get("status").is_none());
     }
 
     #[test]
-    fn serialize_team_response_camel_case() {
+    fn serialize_team_response_snake_case() {
         let team = TeamResponse {
             id: "team-1".into(),
             name: "Alpha".into(),
@@ -405,11 +392,11 @@ mod tests {
         let json = serde_json::to_value(&team).unwrap();
         assert_eq!(json["id"], "team-1");
         assert_eq!(json["name"], "Alpha");
-        assert_eq!(json["leadAgentId"], "slot-1");
-        assert_eq!(json["createdAt"], 1700000000000_i64);
-        assert_eq!(json["updatedAt"], 1700001000000_i64);
+        assert_eq!(json["lead_agent_id"], "slot-1");
+        assert_eq!(json["created_at"], 1700000000000_i64);
+        assert_eq!(json["updated_at"], 1700001000000_i64);
         assert_eq!(json["agents"].as_array().unwrap().len(), 1);
-        assert_eq!(json["agents"][0]["slotId"], "slot-1");
+        assert_eq!(json["agents"][0]["slot_id"], "slot-1");
     }
 
     #[test]
@@ -423,7 +410,7 @@ mod tests {
             updated_at: 1700000000000,
         };
         let json = serde_json::to_value(&team).unwrap();
-        assert!(json.get("leadAgentId").is_none());
+        assert!(json.get("lead_agent_id").is_none());
         assert!(json["agents"].as_array().unwrap().is_empty());
     }
 
@@ -437,8 +424,8 @@ mod tests {
             status: "working".into(),
         };
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["teamId"], "team-1");
-        assert_eq!(json["slotId"], "slot-1");
+        assert_eq!(json["team_id"], "team-1");
+        assert_eq!(json["slot_id"], "slot-1");
         assert_eq!(json["status"], "working");
     }
 
@@ -458,8 +445,8 @@ mod tests {
             },
         };
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["teamId"], "team-1");
-        assert_eq!(json["agent"]["slotId"], "slot-3");
+        assert_eq!(json["team_id"], "team-1");
+        assert_eq!(json["agent"]["slot_id"], "slot-3");
         assert_eq!(json["agent"]["name"], "Dynamic Worker");
         assert_eq!(json["agent"]["role"], "teammate");
         assert_eq!(json["agent"]["status"], "idle");
@@ -472,8 +459,8 @@ mod tests {
             slot_id: "slot-2".into(),
         };
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["teamId"], "team-1");
-        assert_eq!(json["slotId"], "slot-2");
+        assert_eq!(json["team_id"], "team-1");
+        assert_eq!(json["slot_id"], "slot-2");
     }
 
     #[test]
@@ -484,8 +471,8 @@ mod tests {
             name: "Renamed Agent".into(),
         };
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["teamId"], "team-1");
-        assert_eq!(json["slotId"], "slot-1");
+        assert_eq!(json["team_id"], "team-1");
+        assert_eq!(json["slot_id"], "slot-1");
         assert_eq!(json["name"], "Renamed Agent");
     }
 
@@ -599,18 +586,18 @@ mod tests {
         assert_eq!(parsed, payload);
     }
 
-    // -- Deserialize from camelCase JSON (simulating client input) -------------
+    // -- Deserialize from snake_case JSON (matching Rust field names) -----------
 
     #[test]
-    fn deserialize_team_agent_response_from_camel_case() {
+    fn deserialize_team_agent_response_from_snake_case() {
         let raw = json!({
-            "slotId": "s1",
+            "slot_id": "s1",
             "name": "Agent",
             "role": "lead",
-            "conversationId": "c1",
+            "conversation_id": "c1",
             "backend": "acp",
             "model": "claude",
-            "customAgentId": "cust-1",
+            "custom_agent_id": "cust-1",
             "status": "idle"
         });
         let agent: TeamAgentResponse = serde_json::from_value(raw).unwrap();
@@ -621,14 +608,14 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_team_response_from_camel_case() {
+    fn deserialize_team_response_from_snake_case() {
         let raw = json!({
             "id": "team-1",
             "name": "Alpha",
             "agents": [],
-            "leadAgentId": "s1",
-            "createdAt": 1000,
-            "updatedAt": 2000
+            "lead_agent_id": "s1",
+            "created_at": 1000,
+            "updated_at": 2000
         });
         let team: TeamResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(team.id, "team-1");

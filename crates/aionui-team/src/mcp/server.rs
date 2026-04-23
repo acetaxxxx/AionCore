@@ -435,7 +435,7 @@ async fn exec_task_list(scheduler: &TeammateManager) -> Result<String, String> {
                 "description": t.description,
                 "status": t.status,
                 "owner": t.owner,
-                "blockedBy": t.blocked_by,
+                "blocked_by": t.blocked_by,
                 "blocks": t.blocks,
             })
         })
@@ -449,7 +449,7 @@ async fn exec_members(scheduler: &TeammateManager) -> Result<String, String> {
         .iter()
         .map(|a| {
             json!({
-                "slotId": a.slot_id,
+                "slot_id": a.slot_id,
                 "name": a.name,
                 "role": a.role,
                 "status": a.status,

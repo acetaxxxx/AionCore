@@ -15,7 +15,6 @@ use crate::types::{HubExtensionStatus, HubExtensionWithStatus};
 
 /// Schema envelope for a Hub index file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct HubIndexFile {
     /// Schema version — we only support [`HUB_SUPPORTED_SCHEMA_VERSION`].
     #[serde(default = "default_schema_version")]
@@ -31,7 +30,6 @@ fn default_schema_version() -> u32 {
 
 /// A single entry in the Hub index file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct HubIndexEntry {
     pub name: String,
     pub version: String,
@@ -402,7 +400,7 @@ mod tests {
         let json = serde_json::json!({
             "name": "my-ext",
             "version": "2.0.0",
-            "displayName": "My Extension",
+            "display_name": "My Extension",
             "tags": ["ai", "tools"],
             "bundled": true
         });

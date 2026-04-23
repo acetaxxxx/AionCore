@@ -576,9 +576,9 @@ mod tests {
         let events = bc.take_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "channel.pairing-requested");
-        assert_eq!(events[0].data["platformUserId"], "tg_42");
-        assert_eq!(events[0].data["platformType"], "telegram");
-        assert_eq!(events[0].data["displayName"], "Alice");
+        assert_eq!(events[0].data["platform_user_id"], "tg_42");
+        assert_eq!(events[0].data["platform_type"], "telegram");
+        assert_eq!(events[0].data["display_name"], "Alice");
     }
 
     #[tokio::test]
@@ -664,9 +664,9 @@ mod tests {
         let events = bc.take_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "channel.user-authorized");
-        assert_eq!(events[0].data["platformUserId"], "tg_42");
-        assert_eq!(events[0].data["platformType"], "telegram");
-        assert_eq!(events[0].data["displayName"], "Alice");
+        assert_eq!(events[0].data["platform_user_id"], "tg_42");
+        assert_eq!(events[0].data["platform_type"], "telegram");
+        assert_eq!(events[0].data["display_name"], "Alice");
         assert!(events[0].data["id"].is_string());
     }
 

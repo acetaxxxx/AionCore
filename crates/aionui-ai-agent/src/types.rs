@@ -4,7 +4,6 @@ use aionui_common::{AcpBackend, AgentType, ProviderWithModel};
 
 /// Data payload for sending a user message to an Agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SendMessageData {
     /// User message content.
     pub content: String,
@@ -20,7 +19,6 @@ pub struct SendMessageData {
 
 /// Options for building (creating or resuming) an Agent task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BuildTaskOptions {
     /// Type of agent to create.
     pub agent_type: AgentType,
@@ -37,7 +35,6 @@ pub struct BuildTaskOptions {
 
 /// ACP-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpBuildExtra {
     /// ACP sub-backend identifier.
     pub backend: AcpBackend,
@@ -71,7 +68,6 @@ pub struct AcpBuildExtra {
 
 /// Gemini-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GeminiBuildExtra {
     /// Whether the user picked a custom workspace path.
     #[serde(default)]
@@ -110,7 +106,6 @@ pub struct GeminiBuildExtra {
 
 /// OpenClaw gateway configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OpenClawGatewayConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
@@ -123,7 +118,6 @@ pub struct OpenClawGatewayConfig {
 
 /// OpenClaw-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OpenClawBuildExtra {
     /// ACP sub-backend identifier.
     pub backend: AcpBackend,
@@ -148,15 +142,40 @@ pub struct OpenClawBuildExtra {
 
 /// Remote agent-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RemoteBuildExtra {
     /// Remote agent configuration ID.
     pub remote_agent_id: String,
 }
 
+/// Aionrs-specific fields extracted from `extra` in [`BuildTaskOptions`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AionrsBuildExtra {
+    /// LLM provider name (anthropic, openai, bedrock, vertex).
+    pub provider: String,
+    /// API key for the provider.
+    pub api_key: String,
+    /// Model identifier.
+    pub model: String,
+    /// Provider base URL override.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// System prompt override.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Max tokens per response.
+    #[serde(default = "default_aionrs_max_tokens")]
+    pub max_tokens: u32,
+    /// Max agentic turns.
+    #[serde(default)]
+    pub max_turns: Option<usize>,
+}
+
+fn default_aionrs_max_tokens() -> u32 {
+    8192
+}
+
 /// ACP model information returned by the ACP backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpModelInfo {
     pub model_id: String,
     pub model_name: Option<String>,
@@ -165,7 +184,6 @@ pub struct AcpModelInfo {
 
 /// ACP session configuration option.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpSessionConfigOption {
     pub config_id: String,
     pub label: String,
@@ -176,7 +194,6 @@ pub struct AcpSessionConfigOption {
 
 /// A slash command item available in a conversation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SlashCommandItem {
     pub command: String,
     pub description: String,
@@ -197,9 +214,9 @@ mod tests {
         };
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["content"], "Hello");
-        assert_eq!(json["msgId"], "msg-001");
+        assert_eq!(json["msg_id"], "msg-001");
         assert_eq!(json["files"], json!(["/tmp/a.txt"]));
-        assert_eq!(json["injectSkills"], json!(["review"]));
+        assert_eq!(json["inject_skills"], json!(["review"]));
 
         let parsed: SendMessageData = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.content, "Hello");
@@ -208,7 +225,7 @@ mod tests {
 
     #[test]
     fn send_message_data_defaults_optional_fields() {
-        let json = json!({ "content": "Hi", "msgId": "m1" });
+        let json = json!({ "content": "Hi", "msg_id": "m1" });
         let data: SendMessageData = serde_json::from_value(json).unwrap();
         assert!(data.files.is_empty());
         assert!(data.inject_skills.is_empty());
@@ -228,9 +245,9 @@ mod tests {
             extra: json!({ "backend": "claude" }),
         };
         let json = serde_json::to_value(&opts).unwrap();
-        assert_eq!(json["agentType"], "acp");
+        assert_eq!(json["agent_type"], "acp");
         assert_eq!(json["workspace"], "/project");
-        assert_eq!(json["conversationId"], "conv-1");
+        assert_eq!(json["conversation_id"], "conv-1");
     }
 
     #[test]
@@ -241,8 +258,8 @@ mod tests {
             provider: Some("anthropic".into()),
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["modelId"], "claude-sonnet-4");
-        assert_eq!(json["modelName"], "Claude Sonnet 4");
+        assert_eq!(json["model_id"], "claude-sonnet-4");
+        assert_eq!(json["model_name"], "Claude Sonnet 4");
     }
 
     #[test]
@@ -254,7 +271,7 @@ mod tests {
             options: Some(vec!["light".into(), "dark".into()]),
         };
         let json = serde_json::to_value(&opt).unwrap();
-        assert_eq!(json["configId"], "theme");
+        assert_eq!(json["config_id"], "theme");
         assert_eq!(json["options"], json!(["light", "dark"]));
     }
 
@@ -275,5 +292,40 @@ mod tests {
         assert!(!config.use_external_gateway);
         assert!(config.host.is_none());
         assert!(config.port.is_none());
+    }
+
+    #[test]
+    fn aionrs_build_extra_serde_minimal() {
+        let json = json!({
+            "provider": "anthropic",
+            "api_key": "sk-test",
+            "model": "claude-sonnet-4-20250514"
+        });
+        let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
+        assert_eq!(extra.provider, "anthropic");
+        assert_eq!(extra.api_key, "sk-test");
+        assert_eq!(extra.model, "claude-sonnet-4-20250514");
+        assert!(extra.base_url.is_none());
+        assert!(extra.system_prompt.is_none());
+        assert_eq!(extra.max_tokens, 8192);
+        assert!(extra.max_turns.is_none());
+    }
+
+    #[test]
+    fn aionrs_build_extra_serde_full() {
+        let json = json!({
+            "provider": "openai",
+            "api_key": "sk-openai",
+            "model": "gpt-4o",
+            "base_url": "https://api.openai.com/v1",
+            "system_prompt": "You are a helpful assistant.",
+            "max_tokens": 4096,
+            "max_turns": 10
+        });
+        let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
+        assert_eq!(extra.provider, "openai");
+        assert_eq!(extra.base_url.unwrap(), "https://api.openai.com/v1");
+        assert_eq!(extra.max_tokens, 4096);
+        assert_eq!(extra.max_turns.unwrap(), 10);
     }
 }

@@ -837,7 +837,7 @@ mod tests {
     fn parse_stream_event_finish() {
         let raw = json!({
             "type": "finish",
-            "data": { "sessionId": "sess-123" }
+            "data": { "session_id": "sess-123" }
         });
         let event = AcpAgentManager::parse_stream_event(&raw);
         assert!(event.is_some());
@@ -868,7 +868,7 @@ mod tests {
     fn parse_stream_event_start() {
         let raw = json!({
             "type": "start",
-            "data": { "sessionId": "sess-abc" }
+            "data": { "session_id": "sess-abc" }
         });
         let event = AcpAgentManager::parse_stream_event(&raw);
         assert!(event.is_some());
@@ -903,12 +903,12 @@ mod tests {
     #[test]
     fn parse_stream_event_agent_status() {
         let raw = json!({
-            "type": "agentStatus",
+            "type": "agent_status",
             "data": {
                 "backend": "claude",
                 "status": "running",
-                "agentName": "default",
-                "sessionId": "sess-xyz"
+                "agent_name": "default",
+                "session_id": "sess-xyz"
             }
         });
         let event = AcpAgentManager::parse_stream_event(&raw);
@@ -934,9 +934,9 @@ mod tests {
     #[test]
     fn parse_stream_event_acp_permission() {
         let raw = json!({
-            "type": "acpPermission",
+            "type": "acp_permission",
             "data": {
-                "callId": "call-1",
+                "call_id": "call-1",
                 "action": "edit_file",
                 "description": "Edit main.rs"
             }
@@ -949,9 +949,9 @@ mod tests {
     #[test]
     fn parse_stream_event_tool_call() {
         let raw = json!({
-            "type": "toolCall",
+            "type": "tool_call",
             "data": {
-                "callId": "tc-1",
+                "call_id": "tc-1",
                 "name": "read_file",
                 "args": { "path": "/tmp/test.rs" },
                 "status": "running"
@@ -972,7 +972,7 @@ mod tests {
         let raw = json!({
             "type": "plan",
             "data": {
-                "sessionId": "sess-1",
+                "session_id": "sess-1",
                 "entries": [{ "step": 1, "description": "Read file" }]
             }
         });
@@ -1146,8 +1146,8 @@ mod tests {
     async fn update_state_from_model_info_event() {
         let manager = make_test_state();
         let event = AgentStreamEvent::AcpModelInfo(json!({
-            "modelId": "claude-sonnet-4",
-            "modelName": "Claude Sonnet 4",
+            "model_id": "claude-sonnet-4",
+            "model_name": "Claude Sonnet 4",
             "provider": "anthropic"
         }));
         manager.update_state_from_event(&event).await;
@@ -1279,11 +1279,11 @@ mod tests {
         let manager = make_test_state_with_permission();
         let event = AgentStreamEvent::AcpPermission(json!({
             "id": "c1",
-            "callId": "call-1",
+            "call_id": "call-1",
             "title": "Allow file edit",
             "action": "edit_file",
             "description": "Edit main.rs",
-            "commandType": "bash",
+            "command_type": "bash",
             "options": []
         }));
         manager.update_state_from_event(&event).await;

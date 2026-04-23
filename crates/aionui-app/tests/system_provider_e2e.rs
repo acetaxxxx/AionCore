@@ -38,8 +38,8 @@ async fn provider_full_crud_with_auth() {
         json!({
             "platform": "anthropic",
             "name": "Anthropic",
-            "baseUrl": "https://api.anthropic.com",
-            "apiKey": "sk-ant-api03-test1234"
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-api03-test1234"
         }),
         &token,
         &csrf,
@@ -50,7 +50,7 @@ async fn provider_full_crud_with_auth() {
     let id = json["data"]["id"].as_str().unwrap().to_string();
     assert_eq!(json["data"]["platform"], "anthropic");
     assert_eq!(json["data"]["name"], "Anthropic");
-    let api_key = json["data"]["apiKey"].as_str().unwrap();
+    let api_key = json["data"]["api_key"].as_str().unwrap();
     assert!(api_key.contains("***"), "API key should be masked");
     assert!(api_key.ends_with("1234"), "mask should show last 4 chars");
 
@@ -107,7 +107,7 @@ async fn provider_create_validation_with_auth() {
     let req = json_with_token(
         "POST",
         "/api/providers",
-        json!({"name": "Test", "baseUrl": "https://api.example.com", "apiKey": "sk-test"}),
+        json!({"name": "Test", "base_url": "https://api.example.com", "api_key": "sk-test"}),
         &token,
         &csrf,
     );
@@ -118,7 +118,7 @@ async fn provider_create_validation_with_auth() {
     let req = json_with_token(
         "POST",
         "/api/providers",
-        json!({"platform": "openai", "name": "Test", "baseUrl": "not-a-url", "apiKey": "sk-test"}),
+        json!({"platform": "openai", "name": "Test", "base_url": "not-a-url", "api_key": "sk-test"}),
         &token,
         &csrf,
     );
@@ -182,8 +182,8 @@ async fn model_fetch_openai_with_auth() {
         json!({
             "platform": "openai",
             "name": "OpenAI Mock",
-            "baseUrl": mock_server.uri(),
-            "apiKey": "test-api-key"
+            "base_url": mock_server.uri(),
+            "api_key": "test-api-key"
         }),
         &token,
         &csrf,
@@ -196,7 +196,7 @@ async fn model_fetch_openai_with_auth() {
     let req = json_with_token(
         "POST",
         &format!("/api/providers/{id}/models"),
-        json!({"tryFix": false}),
+        json!({"try_fix": false}),
         &token,
         &csrf,
     );
@@ -247,8 +247,8 @@ async fn protocol_detect_openai_with_auth() {
         "POST",
         "/api/providers/detect-protocol",
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "sk-test-key"
+            "base_url": mock_server.uri(),
+            "api_key": "sk-test-key"
         }),
         &token,
         &csrf,
@@ -277,8 +277,8 @@ async fn protocol_detect_all_fail_with_auth() {
         "POST",
         "/api/providers/detect-protocol",
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "sk-unknown"
+            "base_url": mock_server.uri(),
+            "api_key": "sk-unknown"
         }),
         &token,
         &csrf,
@@ -299,7 +299,7 @@ async fn protocol_detect_validation_with_auth() {
     let req = json_with_token(
         "POST",
         "/api/providers/detect-protocol",
-        json!({"apiKey": "sk-test"}),
+        json!({"api_key": "sk-test"}),
         &token,
         &csrf,
     );
@@ -310,7 +310,7 @@ async fn protocol_detect_validation_with_auth() {
     let req = json_with_token(
         "POST",
         "/api/providers/detect-protocol",
-        json!({"baseUrl": "https://api.example.com"}),
+        json!({"base_url": "https://api.example.com"}),
         &token,
         &csrf,
     );
@@ -337,9 +337,9 @@ async fn protocol_detect_switch_platform_suggestion_with_auth() {
         "POST",
         "/api/providers/detect-protocol",
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "sk-test",
-            "preferredProtocol": "anthropic"
+            "base_url": mock_server.uri(),
+            "api_key": "sk-test",
+            "preferred_protocol": "anthropic"
         }),
         &token,
         &csrf,

@@ -301,8 +301,8 @@ async fn t6_1_status_needs_setup() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
-    assert_eq!(json["needsSetup"], true);
-    assert_eq!(json["isAuthenticated"], false);
+    assert_eq!(json["needs_setup"], true);
+    assert_eq!(json["is_authenticated"], false);
 }
 
 #[tokio::test]
@@ -315,7 +315,7 @@ async fn t6_2_status_has_users() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["needsSetup"], false);
+    assert_eq!(json["needs_setup"], false);
 }
 
 #[tokio::test]
@@ -328,7 +328,7 @@ async fn t6_3_status_authenticated() {
     let resp = app.oneshot(req).await.unwrap();
 
     let json = body_json(resp).await;
-    assert_eq!(json["isAuthenticated"], true);
+    assert_eq!(json["is_authenticated"], true);
 }
 
 #[tokio::test]
@@ -339,7 +339,7 @@ async fn t6_4_status_unauthenticated() {
     let resp = app.oneshot(req).await.unwrap();
 
     let json = body_json(resp).await;
-    assert_eq!(json["isAuthenticated"], false);
+    assert_eq!(json["is_authenticated"], false);
 }
 
 // ===========================================================================
@@ -394,7 +394,7 @@ async fn t8_1_change_password_success() {
 
     let req = json_post_with_token(
         "/api/auth/change-password",
-        r#"{"currentPassword":"OldP@ssword1","newPassword":"NewP@ssword2"}"#,
+        r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
         &token,
     );
     let resp = app.oneshot(req).await.unwrap();
@@ -414,7 +414,7 @@ async fn t8_2_change_password_old_token_invalidated() {
     // Change password
     let req = json_post_with_token(
         "/api/auth/change-password",
-        r#"{"currentPassword":"OldP@ssword1","newPassword":"NewP@ssword2"}"#,
+        r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
         &token,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -434,7 +434,7 @@ async fn t8_3_change_password_wrong_current() {
 
     let req = json_post_with_token(
         "/api/auth/change-password",
-        r#"{"currentPassword":"WrongP@ss1","newPassword":"NewP@ssword2"}"#,
+        r#"{"current_password":"WrongP@ss1","new_password":"NewP@ssword2"}"#,
         &token,
     );
     let resp = app.oneshot(req).await.unwrap();
@@ -450,7 +450,7 @@ async fn t8_4_change_password_new_too_short() {
 
     let req = json_post_with_token(
         "/api/auth/change-password",
-        r#"{"currentPassword":"OldP@ssword1","newPassword":"short"}"#,
+        r#"{"current_password":"OldP@ssword1","new_password":"short"}"#,
         &token,
     );
     let resp = app.oneshot(req).await.unwrap();
@@ -466,7 +466,7 @@ async fn t8_6_change_password_weak() {
 
     let req = json_post_with_token(
         "/api/auth/change-password",
-        r#"{"currentPassword":"OldP@ssword1","newPassword":"password"}"#,
+        r#"{"current_password":"OldP@ssword1","new_password":"password"}"#,
         &token,
     );
     let resp = app.oneshot(req).await.unwrap();
@@ -483,7 +483,7 @@ async fn t8_7_change_password_missing_fields() {
     // Missing newPassword
     let req = json_post_with_token(
         "/api/auth/change-password",
-        r#"{"currentPassword":"OldP@ssword1"}"#,
+        r#"{"current_password":"OldP@ssword1"}"#,
         &token,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -492,7 +492,7 @@ async fn t8_7_change_password_missing_fields() {
     // Missing currentPassword
     let req = json_post_with_token(
         "/api/auth/change-password",
-        r#"{"newPassword":"NewP@ssword2"}"#,
+        r#"{"new_password":"NewP@ssword2"}"#,
         &token,
     );
     let resp = app.oneshot(req).await.unwrap();
@@ -559,11 +559,11 @@ async fn t10_1_ws_token_success() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
-    assert!(json["wsToken"].is_string());
-    assert!(json["expiresIn"].is_number());
+    assert!(json["ws_token"].is_string());
+    assert!(json["expires_in"].is_number());
 
-    // expiresIn should be 30 days in milliseconds
-    let expires_in = json["expiresIn"].as_u64().unwrap();
+    // expires_in should be 30 days in milliseconds
+    let expires_in = json["expires_in"].as_u64().unwrap();
     assert_eq!(expires_in, 30 * 24 * 60 * 60 * 1000);
 }
 
@@ -595,7 +595,7 @@ async fn t11_1_qr_login_success() {
     // Generate QR token
     let qr_token = ctx.qr_token_store.generate();
 
-    let body = format!(r#"{{"qrToken":"{qr_token}"}}"#);
+    let body = format!(r#"{{"qr_token":"{qr_token}"}}"#);
     let req = json_post("/api/auth/qr-login", &body);
     let resp = app.oneshot(req).await.unwrap();
 
@@ -620,7 +620,7 @@ async fn t11_1_qr_login_success() {
 async fn t11_2_qr_login_invalid_token() {
     let (app, _ctx) = test_app().await;
 
-    let req = json_post("/api/auth/qr-login", r#"{"qrToken":"nonexistent"}"#);
+    let req = json_post("/api/auth/qr-login", r#"{"qr_token":"nonexistent"}"#);
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -639,7 +639,7 @@ async fn t11_4_qr_login_already_used() {
     let qr_token = ctx.qr_token_store.generate();
 
     // First use succeeds
-    let body = format!(r#"{{"qrToken":"{qr_token}"}}"#);
+    let body = format!(r#"{{"qr_token":"{qr_token}"}}"#);
     let req = json_post("/api/auth/qr-login", &body);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

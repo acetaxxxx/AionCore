@@ -31,9 +31,9 @@ async fn system_info_with_auth() {
     assert_eq!(json["success"], true);
 
     let data = &json["data"];
-    assert!(data["cacheDir"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(data["workDir"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(data["logDir"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(data["cache_dir"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(data["work_dir"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(data["log_dir"].as_str().is_some_and(|s| !s.is_empty()));
     assert!(["darwin", "win32", "linux"].contains(&data["platform"].as_str().unwrap()));
     assert!(["x64", "arm64"].contains(&data["arch"].as_str().unwrap()));
 }
@@ -92,7 +92,7 @@ async fn version_check_has_update_with_auth() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["updateAvailable"], true);
+    assert_eq!(json["data"]["update_available"], true);
     assert_eq!(json["data"]["latest"]["version"], "2.0.0");
 }
 
@@ -119,7 +119,7 @@ async fn version_check_no_update_with_auth() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["updateAvailable"], false);
+    assert_eq!(json["data"]["update_available"], false);
 }
 
 #[tokio::test]
@@ -209,8 +209,8 @@ async fn full_system_flow_e2e() {
         json!({
             "platform": "openai",
             "name": "OpenAI",
-            "baseUrl": "https://api.openai.com",
-            "apiKey": "sk-proj-test-key-1234"
+            "base_url": "https://api.openai.com",
+            "api_key": "sk-proj-test-key-1234"
         }),
         &token,
         &csrf,
@@ -219,7 +219,7 @@ async fn full_system_flow_e2e() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
     let provider_id = json["data"]["id"].as_str().unwrap().to_string();
-    assert!(json["data"]["apiKey"].as_str().unwrap().contains("***"));
+    assert!(json["data"]["api_key"].as_str().unwrap().contains("***"));
 
     // 7. List providers
     let resp = app

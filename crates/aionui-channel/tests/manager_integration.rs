@@ -188,8 +188,8 @@ fn make_telegram_config() -> serde_json::Value {
 fn make_lark_config() -> serde_json::Value {
     serde_json::json!({
         "credentials": {
-            "appId": "cli_abc",
-            "appSecret": "secret123"
+            "app_id": "cli_abc",
+            "app_secret": "secret123"
         }
     })
 }
@@ -294,7 +294,7 @@ async fn ep2_re_enable_updates_config() {
     // Re-enable with different config
     let new_config = serde_json::json!({
         "credentials": { "token": "bot:new_token_456" },
-        "config": { "mode": "webhook", "webhookUrl": "https://example.com" }
+        "config": { "mode": "webhook", "webhook_url": "https://example.com" }
     });
     mgr.enable_plugin("telegram", &new_config, &factory)
         .await
@@ -503,7 +503,7 @@ async fn ws2_enable_broadcasts_status_change() {
         .filter(|e| e.name == "channel.plugin-status-changed")
         .collect();
     assert!(!status_events.is_empty());
-    assert_eq!(status_events.last().unwrap().data["pluginId"], "telegram");
+    assert_eq!(status_events.last().unwrap().data["plugin_id"], "telegram");
 }
 
 #[tokio::test]

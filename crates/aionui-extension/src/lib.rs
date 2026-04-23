@@ -1,3 +1,5 @@
+//! Extension registry: manifest parsing, hub installer, skill scanning, and lifecycle hooks.
+
 pub mod classifier;
 pub mod constants;
 pub mod dependency;

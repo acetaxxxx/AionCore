@@ -1,3 +1,4 @@
+//! AI agent lifecycle, LLM API clients, worker task dispatch, and skill management.
 pub mod acp_agent;
 pub mod acp_routes;
 pub mod acp_service;
@@ -5,6 +6,7 @@ pub mod agent_manager;
 pub mod aionrs_agent;
 pub mod api_client;
 pub mod auxiliary_routes;
+pub mod backend_output_sink;
 pub mod cli_process;
 pub mod connection_test_routes;
 pub mod connection_test_service;
@@ -32,6 +34,7 @@ pub use api_client::{
     create_rotating_client, is_retryable_status, normalize_base_url,
 };
 pub use auxiliary_routes::{AuxiliaryRouterState, auxiliary_routes};
+pub use backend_output_sink::BackendOutputSink;
 pub use cli_process::{CliAgentProcess, CliSpawnConfig};
 pub use connection_test_routes::{ConnectionTestRouterState, connection_test_routes};
 pub use connection_test_service::ConnectionTestService;
@@ -56,6 +59,7 @@ pub use skill_manager::{
 pub use stream_event::AgentStreamEvent;
 pub use task_manager::{AgentFactory, IWorkerTaskManager, WorkerTaskManagerImpl};
 pub use types::{
-    AcpBuildExtra, AcpModelInfo, AcpSessionConfigOption, BuildTaskOptions, GeminiBuildExtra,
-    OpenClawBuildExtra, OpenClawGatewayConfig, RemoteBuildExtra, SendMessageData, SlashCommandItem,
+    AcpBuildExtra, AcpModelInfo, AcpSessionConfigOption, AionrsBuildExtra, BuildTaskOptions,
+    GeminiBuildExtra, OpenClawBuildExtra, OpenClawGatewayConfig, RemoteBuildExtra, SendMessageData,
+    SlashCommandItem,
 };

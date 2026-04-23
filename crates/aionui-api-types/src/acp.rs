@@ -5,14 +5,12 @@ use serde::{Deserialize, Serialize};
 
 /// Request body for detecting an ACP CLI executable.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DetectCliRequest {
     pub backend: AcpBackend,
 }
 
 /// Response for CLI detection.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DetectCliResponse {
     /// Path to the detected CLI, `None` if not found.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21,7 +19,6 @@ pub struct DetectCliResponse {
 
 /// Information about an available ACP agent.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpAgentInfo {
     pub id: String,
     pub name: String,
@@ -31,14 +28,12 @@ pub struct AcpAgentInfo {
 
 /// Request body for ACP health check.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpHealthCheckRequest {
     pub backend: AcpBackend,
 }
 
 /// Response for ACP health check.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpHealthCheckResponse {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,14 +44,12 @@ pub struct AcpHealthCheckResponse {
 
 /// Response for ACP environment variables.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpEnvResponse {
     pub env: HashMap<String, String>,
 }
 
 /// Response for ACP session mode.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpModeResponse {
     pub mode: String,
     pub initialized: bool,
@@ -64,35 +57,30 @@ pub struct AcpModeResponse {
 
 /// Request body for setting ACP session mode.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SetModeRequest {
     pub mode: String,
 }
 
 /// Request body for setting ACP session model.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SetModelRequest {
     pub model_id: String,
 }
 
 /// Request body for probing model information.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProbeModelRequest {
     pub backend: AcpBackend,
 }
 
 /// Request body for setting a config option.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SetConfigOptionRequest {
     pub value: String,
 }
 
 /// Request body for testing a custom ACP agent.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TestCustomAgentRequest {
     pub command: String,
     #[serde(default)]
@@ -103,7 +91,6 @@ pub struct TestCustomAgentRequest {
 
 /// Response for testing a custom ACP agent.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TestCustomAgentResponse {
     pub step: String,
 }
@@ -184,7 +171,7 @@ mod tests {
 
     #[test]
     fn set_model_request_serde() {
-        let json = json!({ "modelId": "claude-sonnet-4" });
+        let json = json!({ "model_id": "claude-sonnet-4" });
         let req: SetModelRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.model_id, "claude-sonnet-4");
     }
@@ -200,7 +187,7 @@ mod tests {
     fn test_custom_agent_request_serde() {
         let json = json!({
             "command": "/path/to/agent",
-            "acpArgs": ["--flag"],
+            "acp_args": ["--flag"],
             "env": { "KEY": "value" }
         });
         let req: TestCustomAgentRequest = serde_json::from_value(json).unwrap();

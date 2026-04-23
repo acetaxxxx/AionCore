@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 /// Summary of a loaded extension returned by `GET /api/extensions`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ExtensionSummaryResponse {
     pub name: String,
     pub version: String,
@@ -20,14 +19,12 @@ pub struct ExtensionSummaryResponse {
 
 /// Response for `GET /api/hub/extensions`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct HubExtensionListResponse {
     pub extensions: Vec<HubExtensionListItem>,
 }
 
 /// Single item in the Hub extension list.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct HubExtensionListItem {
     pub name: String,
     pub version: String,
@@ -52,7 +49,6 @@ pub struct HubExtensionListItem {
 
 /// Response for `POST /api/extensions/permissions`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PermissionSummaryResponse {
     pub permissions: serde_json::Value,
     pub risk_level: String,
@@ -61,7 +57,6 @@ pub struct PermissionSummaryResponse {
 
 /// A single permission entry in the summary response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PermissionDetailResponse {
     pub permission: String,
     pub level: String,
@@ -74,21 +69,18 @@ pub struct PermissionDetailResponse {
 
 /// Request body for `POST /api/hub/install` and `POST /api/hub/update`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct InstallExtensionRequest {
     pub name: String,
 }
 
 /// Request body for `POST /api/extensions/enable`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct EnableExtensionRequest {
     pub name: String,
 }
 
 /// Request body for `POST /api/extensions/disable`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DisableExtensionRequest {
     pub name: String,
     #[serde(default)]
@@ -97,28 +89,24 @@ pub struct DisableExtensionRequest {
 
 /// Request body for `POST /api/extensions/permissions`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GetPermissionsRequest {
     pub name: String,
 }
 
 /// Request body for `POST /api/extensions/risk-level`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GetRiskLevelRequest {
     pub name: String,
 }
 
 /// Request body for `POST /api/extensions/i18n`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GetI18nRequest {
     pub locale: String,
 }
 
 /// Response for Hub install/update/uninstall operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct HubOperationResponse {
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,7 +115,6 @@ pub struct HubOperationResponse {
 
 /// Hub update info returned by `POST /api/hub/check-updates`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct HubUpdateInfo {
     pub name: String,
     pub current_version: String,
@@ -151,7 +138,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["name"], "my-ext");
-        assert_eq!(json["displayName"], "My Extension");
+        assert_eq!(json["display_name"], "My Extension");
         assert_eq!(json["enabled"], true);
         assert!(json.get("description").is_none());
     }
@@ -172,7 +159,7 @@ mod tests {
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["status"], "installed");
         assert_eq!(json["tags"], json!(["tools"]));
-        assert!(json.get("displayName").is_none());
+        assert!(json.get("display_name").is_none());
     }
 
     #[test]
@@ -231,7 +218,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["permissions"]["storage"], true);
-        assert_eq!(json["riskLevel"], "moderate");
+        assert_eq!(json["risk_level"], "moderate");
         assert_eq!(json["details"][0]["permission"], "network");
         assert_eq!(json["details"][0]["level"], "limited");
     }
@@ -266,7 +253,7 @@ mod tests {
             latest_version: "2.0.0".into(),
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["currentVersion"], "1.0.0");
-        assert_eq!(json["latestVersion"], "2.0.0");
+        assert_eq!(json["current_version"], "1.0.0");
+        assert_eq!(json["latest_version"], "2.0.0");
     }
 }

@@ -154,7 +154,7 @@ fn test_paginated_result_serialize() {
         has_more: true,
     };
     let json = serde_json::to_value(&result).unwrap();
-    assert_eq!(json["hasMore"], true);
+    assert_eq!(json["has_more"], true);
     assert_eq!(json["total"], 100);
 }
 

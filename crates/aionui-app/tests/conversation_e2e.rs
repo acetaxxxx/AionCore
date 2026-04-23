@@ -17,7 +17,7 @@ fn create_body(name: &str) -> serde_json::Value {
     json!({
         "type": "gemini",
         "name": name,
-        "model": { "providerId": "p1", "model": "claude-sonnet-4-20250514" },
+        "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
         "extra": { "workspace": "/project" }
     })
 }
@@ -26,7 +26,7 @@ fn create_body_with_extra(name: &str, extra: serde_json::Value) -> serde_json::V
     json!({
         "type": "gemini",
         "name": name,
-        "model": { "providerId": "p1", "model": "claude-sonnet-4-20250514" },
+        "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
         "extra": extra
     })
 }
@@ -57,8 +57,8 @@ async fn t1_1_create_conversation_success() {
     assert_eq!(data["source"], "aionui");
     assert_eq!(data["pinned"], false);
     assert!(data["id"].as_str().is_some());
-    assert!(data["createdAt"].as_i64().is_some());
-    assert!(data["modifiedAt"].as_i64().is_some());
+    assert!(data["created_at"].as_i64().is_some());
+    assert!(data["modified_at"].as_i64().is_some());
     assert_eq!(data["extra"]["workspace"], "/project");
 }
 
@@ -71,7 +71,7 @@ async fn t1_2_create_various_agent_types() {
     for agent_type in types {
         let body = json!({
             "type": agent_type,
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         });
         let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
@@ -90,9 +90,9 @@ async fn t1_3_create_with_optional_fields() {
     let body = json!({
         "type": "gemini",
         "name": "Telegram Bot",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "source": "telegram",
-        "channelChatId": "user:123",
+        "channel_chat_id": "user:123",
         "extra": {}
     });
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
@@ -101,7 +101,7 @@ async fn t1_3_create_with_optional_fields() {
 
     let json = body_json(resp).await;
     assert_eq!(json["data"]["source"], "telegram");
-    assert_eq!(json["data"]["channelChatId"], "user:123");
+    assert_eq!(json["data"]["channel_chat_id"], "user:123");
 }
 
 #[tokio::test]
@@ -111,7 +111,7 @@ async fn t1_4_create_missing_required_field() {
 
     // Missing type
     let body = json!({
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": {}
     });
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
@@ -127,7 +127,7 @@ async fn t1_4_create_missing_required_field() {
     // Missing extra
     let body = json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" }
+        "model": { "provider_id": "p1", "model": "m1" }
     });
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -141,7 +141,7 @@ async fn t1_5_create_invalid_type() {
 
     let body = json!({
         "type": "invalid_type",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": {}
     });
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
@@ -181,7 +181,7 @@ async fn t2_1_list_empty() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 0);
     assert_eq!(json["data"]["total"], 0);
-    assert_eq!(json["data"]["hasMore"], false);
+    assert_eq!(json["data"]["has_more"], false);
 }
 
 #[tokio::test]
@@ -233,7 +233,7 @@ async fn t2_3_list_cursor_pagination() {
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
-    assert_eq!(json["data"]["hasMore"], true);
+    assert_eq!(json["data"]["has_more"], true);
 
     // Second page using cursor
     let cursor = items.last().unwrap()["id"].as_str().unwrap();
@@ -248,7 +248,7 @@ async fn t2_3_list_cursor_pagination() {
     let json = body_json(resp).await;
     let items2 = json["data"]["items"].as_array().unwrap();
     assert_eq!(items2.len(), 2);
-    assert_eq!(json["data"]["hasMore"], true);
+    assert_eq!(json["data"]["has_more"], true);
 
     // Third page
     let cursor2 = items2.last().unwrap()["id"].as_str().unwrap();
@@ -262,7 +262,7 @@ async fn t2_3_list_cursor_pagination() {
     let json = body_json(resp).await;
     let items3 = json["data"]["items"].as_array().unwrap();
     assert_eq!(items3.len(), 1);
-    assert_eq!(json["data"]["hasMore"], false);
+    assert_eq!(json["data"]["has_more"], false);
 }
 
 #[tokio::test]
@@ -285,7 +285,7 @@ async fn t2_4_list_source_filter() {
     let tg_body = json!({
         "type": "gemini",
         "name": "TG Conv",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "source": "telegram",
         "extra": {}
     });
@@ -425,7 +425,7 @@ async fn t4_1_update_name() {
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
     let id = json["data"]["id"].as_str().unwrap().to_owned();
-    let original_modified = json["data"]["modifiedAt"].as_i64().unwrap();
+    let original_modified = json["data"]["modified_at"].as_i64().unwrap();
 
     let req = json_with_token(
         "PATCH",
@@ -439,7 +439,7 @@ async fn t4_1_update_name() {
 
     let json = body_json(resp).await;
     assert_eq!(json["data"]["name"], "Updated");
-    assert!(json["data"]["modifiedAt"].as_i64().unwrap() >= original_modified);
+    assert!(json["data"]["modified_at"].as_i64().unwrap() >= original_modified);
 }
 
 #[tokio::test]
@@ -469,7 +469,7 @@ async fn t4_2_update_pin_and_unpin() {
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["pinned"], true);
-    assert!(json["data"]["pinnedAt"].as_i64().is_some());
+    assert!(json["data"]["pinned_at"].as_i64().is_some());
 
     // Unpin
     let req = json_with_token(
@@ -482,7 +482,7 @@ async fn t4_2_update_pin_and_unpin() {
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["pinned"], false);
-    assert!(json["data"]["pinnedAt"].is_null());
+    assert!(json["data"]["pinned_at"].is_null());
 }
 
 #[tokio::test]
@@ -492,7 +492,7 @@ async fn t4_3_update_extra_merge() {
 
     let body = create_body_with_extra(
         "Merge Test",
-        json!({"workspace": "/old", "contextFileName": "ctx.md"}),
+        json!({"workspace": "/old", "context_file_name": "ctx.md"}),
     );
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -510,7 +510,7 @@ async fn t4_3_update_extra_merge() {
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["extra"]["workspace"], "/new");
-    assert_eq!(json["data"]["extra"]["contextFileName"], "ctx.md");
+    assert_eq!(json["data"]["extra"]["context_file_name"], "ctx.md");
 }
 
 #[tokio::test]
@@ -532,13 +532,13 @@ async fn t4_4_update_model() {
     let req = json_with_token(
         "PATCH",
         &format!("/api/conversations/{id}"),
-        json!({"model": {"providerId": "p2", "model": "new-model"}}),
+        json!({"model": {"provider_id": "p2", "model": "new-model"}}),
         &token,
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["model"]["providerId"], "p2");
+    assert_eq!(json["data"]["model"]["provider_id"], "p2");
     assert_eq!(json["data"]["model"]["model"], "new-model");
 }
 
@@ -643,7 +643,7 @@ async fn t6_1_clone_from_source() {
     // Create source
     let body = create_body_with_extra(
         "Source Conv",
-        json!({"workspace": "/src", "contextFileName": "ctx.md"}),
+        json!({"workspace": "/src", "context_file_name": "ctx.md"}),
     );
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -652,10 +652,10 @@ async fn t6_1_clone_from_source() {
 
     // Clone from source
     let clone_body = json!({
-        "sourceConversationId": source_id,
+        "source_conversation_id": source_id,
         "conversation": {
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": { "newKey": "value" }
         }
     });
@@ -674,7 +674,7 @@ async fn t6_1_clone_from_source() {
     assert_ne!(cloned["id"].as_str().unwrap(), source_id);
     assert_eq!(cloned["name"], "Source Conv"); // inherited
     assert_eq!(cloned["extra"]["workspace"], "/src"); // inherited from source
-    assert_eq!(cloned["extra"]["contextFileName"], "ctx.md"); // inherited
+    assert_eq!(cloned["extra"]["context_file_name"], "ctx.md"); // inherited
     assert_eq!(cloned["extra"]["newKey"], "value"); // from clone request
 }
 
@@ -687,7 +687,7 @@ async fn t6_2_clone_without_source() {
         "conversation": {
             "type": "acp",
             "name": "Fresh Clone",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         }
     });
@@ -712,10 +712,10 @@ async fn t6_3_clone_source_not_found() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let clone_body = json!({
-        "sourceConversationId": "non-existent-id",
+        "source_conversation_id": "non-existent-id",
         "conversation": {
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         }
     });

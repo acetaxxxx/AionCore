@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 /// Body for `POST /api/conversations/:id/confirmations/:callId/confirm`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ConfirmRequest {
     pub msg_id: String,
     pub data: serde_json::Value,
@@ -17,7 +16,6 @@ pub struct ConfirmRequest {
 
 /// Query parameters for `GET /api/conversations/:id/approvals/check`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ApprovalCheckQuery {
     pub action: String,
     #[serde(default)]
@@ -28,7 +26,6 @@ pub struct ApprovalCheckQuery {
 
 /// Response for the approval check endpoint.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ApprovalCheckResponse {
     pub approved: bool,
 }
@@ -46,9 +43,9 @@ mod tests {
     #[test]
     fn deserialize_confirm_request_full() {
         let raw = json!({
-            "msgId": "msg-001",
+            "msg_id": "msg-001",
             "data": { "label": "Allow", "value": "allow" },
-            "alwaysAllow": true
+            "always_allow": true
         });
         let req: ConfirmRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.msg_id, "msg-001");
@@ -59,7 +56,7 @@ mod tests {
     #[test]
     fn deserialize_confirm_request_minimal() {
         let raw = json!({
-            "msgId": "msg-001",
+            "msg_id": "msg-001",
             "data": "allow"
         });
         let req: ConfirmRequest = serde_json::from_value(raw).unwrap();
@@ -75,7 +72,7 @@ mod tests {
 
     #[test]
     fn deserialize_confirm_request_missing_data() {
-        let raw = json!({ "msgId": "msg-001" });
+        let raw = json!({ "msg_id": "msg-001" });
         assert!(serde_json::from_value::<ConfirmRequest>(raw).is_err());
     }
 
@@ -83,7 +80,7 @@ mod tests {
     fn deserialize_approval_check_query() {
         let raw = json!({
             "action": "edit_file",
-            "commandType": "bash"
+            "command_type": "bash"
         });
         let q: ApprovalCheckQuery = serde_json::from_value(raw).unwrap();
         assert_eq!(q.action, "edit_file");
@@ -129,7 +126,7 @@ mod tests {
         let json = serde_json::to_value(&list).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["callId"], "call-1");
+        assert_eq!(arr[0]["call_id"], "call-1");
         assert_eq!(arr[0]["action"], "edit_file");
     }
 }

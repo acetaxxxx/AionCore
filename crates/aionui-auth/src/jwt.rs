@@ -21,7 +21,6 @@ const JWT_AUDIENCE: &str = "aionui-webui";
 
 /// JWT payload (claims embedded in the token).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TokenPayload {
     /// User ID.
     pub user_id: String,

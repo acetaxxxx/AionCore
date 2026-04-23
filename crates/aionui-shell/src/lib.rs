@@ -1,3 +1,4 @@
+//! OS shell integration: file/folder opener, tool detection, and speech-to-text.
 pub mod error;
 pub mod opener;
 pub mod routes;

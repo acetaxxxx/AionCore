@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 
 /// Request body for creating a remote agent.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateRemoteAgentRequest {
     pub name: String,
     pub protocol: RemoteAgentProtocol,
@@ -21,7 +20,6 @@ pub struct CreateRemoteAgentRequest {
 
 /// Request body for updating a remote agent (partial update).
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateRemoteAgentRequest {
     #[serde(default)]
     pub name: Option<String>,
@@ -45,7 +43,6 @@ pub struct UpdateRemoteAgentRequest {
 
 /// Remote agent response for list endpoint (auth_token omitted).
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RemoteAgentListItem {
     pub id: String,
     pub name: String,
@@ -66,7 +63,6 @@ pub struct RemoteAgentListItem {
 
 /// Remote agent response for detail endpoint (auth_token masked, device keys visible).
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RemoteAgentResponse {
     pub id: String,
     pub name: String,
@@ -94,7 +90,6 @@ pub struct RemoteAgentResponse {
 
 /// Request body for testing a remote agent WebSocket connection.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TestRemoteAgentConnectionRequest {
     pub url: String,
     #[serde(default)]
@@ -107,7 +102,6 @@ pub struct TestRemoteAgentConnectionRequest {
 
 /// Response for OpenClaw handshake.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct HandshakeResponse {
     pub status: String,
 }

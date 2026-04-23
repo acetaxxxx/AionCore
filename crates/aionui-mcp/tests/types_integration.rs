@@ -45,7 +45,7 @@ fn stdio_server_full_pipeline() {
     });
     let tools_json = serde_json::json!([
         { "name": "echo", "description": "Echo input back" },
-        { "name": "add", "description": "Add numbers", "inputSchema": { "type": "object" } }
+        { "name": "add", "description": "Add numbers", "input_schema": { "type": "object" } }
     ]);
 
     let r = row(

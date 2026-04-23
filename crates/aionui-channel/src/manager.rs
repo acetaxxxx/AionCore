@@ -962,7 +962,7 @@ mod tests {
         assert!(!events.is_empty());
         let last = events.last().unwrap();
         assert_eq!(last.name, "channel.plugin-status-changed");
-        assert_eq!(last.data["pluginId"], "telegram");
+        assert_eq!(last.data["plugin_id"], "telegram");
     }
 
     #[tokio::test]

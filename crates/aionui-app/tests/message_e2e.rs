@@ -15,7 +15,7 @@ fn create_conv_body(name: &str) -> serde_json::Value {
     json!({
         "type": "gemini",
         "name": name,
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/project" }
     })
 }
@@ -101,11 +101,11 @@ async fn t8_2_messages_pagination() {
         .await;
     }
 
-    // Page 1, pageSize 3
+    // Page 1, page_size 3
     let resp = app
         .clone()
         .oneshot(get_with_token(
-            &format!("/api/conversations/{conv_id}/messages?page=1&pageSize=3"),
+            &format!("/api/conversations/{conv_id}/messages?page=1&page_size=3"),
             &token,
         ))
         .await
@@ -113,19 +113,19 @@ async fn t8_2_messages_pagination() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 3);
     assert_eq!(json["data"]["total"], 10);
-    assert_eq!(json["data"]["hasMore"], true);
+    assert_eq!(json["data"]["has_more"], true);
 
     // Last page
     let resp = app
         .oneshot(get_with_token(
-            &format!("/api/conversations/{conv_id}/messages?page=4&pageSize=3"),
+            &format!("/api/conversations/{conv_id}/messages?page=4&page_size=3"),
             &token,
         ))
         .await
         .unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 1);
-    assert_eq!(json["data"]["hasMore"], false);
+    assert_eq!(json["data"]["has_more"], false);
 }
 
 #[tokio::test]
@@ -148,8 +148,8 @@ async fn t8_3_messages_order_asc_default() {
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
     // ASC order (default): oldest first
-    assert!(items[0]["createdAt"].as_i64().unwrap() < items[1]["createdAt"].as_i64().unwrap());
-    assert!(items[1]["createdAt"].as_i64().unwrap() < items[2]["createdAt"].as_i64().unwrap());
+    assert!(items[0]["created_at"].as_i64().unwrap() < items[1]["created_at"].as_i64().unwrap());
+    assert!(items[1]["created_at"].as_i64().unwrap() < items[2]["created_at"].as_i64().unwrap());
 }
 
 #[tokio::test]
@@ -172,8 +172,8 @@ async fn t8_4_messages_order_asc() {
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
     // ASC order: oldest first
-    assert!(items[0]["createdAt"].as_i64().unwrap() < items[1]["createdAt"].as_i64().unwrap());
-    assert!(items[1]["createdAt"].as_i64().unwrap() < items[2]["createdAt"].as_i64().unwrap());
+    assert!(items[0]["created_at"].as_i64().unwrap() < items[1]["created_at"].as_i64().unwrap());
+    assert!(items[1]["created_at"].as_i64().unwrap() < items[2]["created_at"].as_i64().unwrap());
 }
 
 #[tokio::test]
@@ -220,7 +220,7 @@ async fn t9_1_search_keyword_match() {
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["conversationName"], "Search Conv");
+    assert_eq!(items[0]["conversation_name"], "Search Conv");
 }
 
 #[tokio::test]
@@ -263,7 +263,7 @@ async fn t9_3_search_pagination() {
     let resp = app
         .clone()
         .oneshot(get_with_token(
-            "/api/messages/search?keyword=Matching&page=1&pageSize=2",
+            "/api/messages/search?keyword=Matching&page=1&page_size=2",
             &token,
         ))
         .await
@@ -271,7 +271,7 @@ async fn t9_3_search_pagination() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 2);
     assert_eq!(json["data"]["total"], 5);
-    assert_eq!(json["data"]["hasMore"], true);
+    assert_eq!(json["data"]["has_more"], true);
 }
 
 #[tokio::test]
@@ -336,18 +336,18 @@ async fn message_response_has_correct_fields() {
     let json = body_json(resp).await;
     let msg = &json["data"]["items"][0];
 
-    // Verify camelCase fields exist
+    // Verify snake_case fields exist
     assert!(msg.get("id").is_some());
-    assert!(msg.get("conversationId").is_some());
+    assert!(msg.get("conversation_id").is_some());
     assert!(msg.get("type").is_some());
     assert!(msg.get("content").is_some());
     assert!(msg.get("position").is_some());
     assert!(msg.get("status").is_some());
-    assert!(msg.get("createdAt").is_some());
-    // Verify no snake_case leaks
-    assert!(msg.get("conversation_id").is_none());
-    assert!(msg.get("created_at").is_none());
-    assert!(msg.get("msg_id").is_none());
+    assert!(msg.get("created_at").is_some());
+    // Verify no camelCase leaks
+    assert!(msg.get("conversationId").is_none());
+    assert!(msg.get("createdAt").is_none());
+    assert!(msg.get("msgId").is_none());
 }
 
 // ── Delete cascades messages ──────────────────────────────────────────
@@ -414,7 +414,7 @@ async fn t2_1_send_message_accepted() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let conv_id = create_conversation(&mut app, &token, &csrf, "Send Test").await;
 
-    let body = json!({ "content": "Hello AI", "msgId": "msg-user-1" });
+    let body = json!({ "content": "Hello AI", "msg_id": "msg-user-1" });
     let req = common::json_with_token(
         "POST",
         &format!("/api/conversations/{conv_id}/messages"),
@@ -440,7 +440,7 @@ async fn t2_1_send_message_empty_content_bad_request() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let conv_id = create_conversation(&mut app, &token, &csrf, "Empty Content").await;
 
-    let body = json!({ "content": "", "msgId": "msg-user-1" });
+    let body = json!({ "content": "", "msg_id": "msg-user-1" });
     let req = common::json_with_token(
         "POST",
         &format!("/api/conversations/{conv_id}/messages"),
@@ -457,7 +457,7 @@ async fn t2_1_send_message_conversation_not_found() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let body = json!({ "content": "Hello", "msgId": "msg-1" });
+    let body = json!({ "content": "Hello", "msg_id": "msg-1" });
     let req = common::json_with_token(
         "POST",
         "/api/conversations/non-existent/messages",
@@ -473,7 +473,7 @@ async fn t2_1_send_message_conversation_not_found() {
 async fn t2_1_send_message_requires_auth() {
     let (app, _services) = build_app().await;
 
-    let body = json!({ "content": "Hello", "msgId": "msg-1" });
+    let body = json!({ "content": "Hello", "msg_id": "msg-1" });
     let req = axum::http::Request::builder()
         .method("POST")
         .uri("/api/conversations/some-id/messages")

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// This is intentionally separate from [`FileChangeOperation`] which tracks
 /// git-style changes (Create/Modify/Delete) in the snapshot system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum ContentUpdateOperation {
     Write,
     Delete,
@@ -68,7 +68,6 @@ pub struct FileMetadata {
 /// Emitted after `write_file` (operation = Write) or `remove_entry`
 /// (operation = Delete).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ContentUpdateEvent {
     pub file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,7 +79,6 @@ pub struct ContentUpdateEvent {
 
 /// Payload for the `fileWatch.fileChanged` WebSocket event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct FileWatchEvent {
     pub file_path: String,
     pub event_type: String,
@@ -88,7 +86,6 @@ pub struct FileWatchEvent {
 
 /// Payload for the `workspaceOfficeWatch.fileAdded` WebSocket event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OfficeFileAddedEvent {
     pub file_path: String,
     pub workspace: String,
@@ -164,10 +161,10 @@ mod tests {
             operation: ContentUpdateOperation::Write,
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["filePath"], "/ws/src/main.rs");
+        assert_eq!(json["file_path"], "/ws/src/main.rs");
         assert_eq!(json["content"], "fn main() {}");
         assert_eq!(json["workspace"], "/ws");
-        assert_eq!(json["relativePath"], "src/main.rs");
+        assert_eq!(json["relative_path"], "src/main.rs");
         assert_eq!(json["operation"], "write");
     }
 
@@ -192,8 +189,8 @@ mod tests {
             event_type: "change".into(),
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["filePath"], "/path/to/file.txt");
-        assert_eq!(json["eventType"], "change");
+        assert_eq!(json["file_path"], "/path/to/file.txt");
+        assert_eq!(json["event_type"], "change");
     }
 
     #[test]
@@ -203,17 +200,17 @@ mod tests {
             workspace: "/ws".into(),
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["filePath"], "/ws/report.docx");
+        assert_eq!(json["file_path"], "/ws/report.docx");
         assert_eq!(json["workspace"], "/ws");
     }
 
     #[test]
     fn content_update_event_deserialization() {
         let raw = json!({
-            "filePath": "/ws/a.txt",
+            "file_path": "/ws/a.txt",
             "content": "hello",
             "workspace": "/ws",
-            "relativePath": "a.txt",
+            "relative_path": "a.txt",
             "operation": "write"
         });
         let event: ContentUpdateEvent = serde_json::from_value(raw).unwrap();

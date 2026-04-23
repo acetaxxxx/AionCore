@@ -50,7 +50,6 @@ pub struct WriteFileRequest {
 
 /// Request body for `POST /api/fs/copy` — copy files to workspace.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CopyFilesRequest {
     pub file_paths: Vec<String>,
     pub workspace: String,
@@ -71,7 +70,6 @@ pub struct RemoveEntryRequest {
 
 /// Request body for `POST /api/fs/rename` — rename file or directory.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RenameRequest {
     pub path: String,
     pub new_name: String,
@@ -79,7 +77,6 @@ pub struct RenameRequest {
 
 /// Request body for `POST /api/fs/temp` — create temp file.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateTempFileRequest {
     pub file_name: String,
 }
@@ -98,7 +95,6 @@ pub struct FetchRemoteImageRequest {
 
 /// A single entry in a ZIP creation request.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ZipFileEntry {
     pub name: String,
     #[serde(default)]
@@ -109,7 +105,6 @@ pub struct ZipFileEntry {
 
 /// Request body for `POST /api/fs/zip` — create ZIP archive.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ZipRequest {
     pub path: String,
     #[serde(default)]
@@ -119,7 +114,6 @@ pub struct ZipRequest {
 
 /// Request body for `POST /api/fs/zip/cancel` — cancel ZIP creation.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CancelZipRequest {
     pub request_id: String,
 }
@@ -130,7 +124,6 @@ pub struct CancelZipRequest {
 
 /// A node in the directory tree returned by `getFilesByDir`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct DirOrFileResponse {
     pub name: String,
     pub full_path: String,
@@ -143,7 +136,6 @@ pub struct DirOrFileResponse {
 
 /// A flat file entry returned by `listWorkspaceFiles`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct WorkspaceFlatFileResponse {
     pub name: String,
     pub full_path: String,
@@ -152,7 +144,6 @@ pub struct WorkspaceFlatFileResponse {
 
 /// File metadata returned by `getFileMetadata`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct FileMetadataResponse {
     pub name: String,
     pub path: String,
@@ -166,7 +157,6 @@ pub struct FileMetadataResponse {
 
 /// Result of a batch copy operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CopyFilesResponse {
     pub copied_files: Vec<String>,
     pub failed_files: Vec<String>,
@@ -174,7 +164,6 @@ pub struct CopyFilesResponse {
 
 /// Result of a rename operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RenameResponse {
     pub new_path: String,
 }
@@ -185,7 +174,6 @@ pub struct RenameResponse {
 
 /// Request body for `POST /api/fs/watch/start` and `/stop`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct FileWatchRequest {
     pub file_path: String,
 }
@@ -208,7 +196,6 @@ pub struct SnapshotWorkspaceRequest {
 
 /// Request body for snapshot getBaselineContent.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SnapshotBaselineRequest {
     pub workspace: String,
     pub file_path: String,
@@ -216,7 +203,6 @@ pub struct SnapshotBaselineRequest {
 
 /// Request body for snapshot stageFile / unstageFile.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SnapshotStageRequest {
     pub workspace: String,
     pub file_path: String,
@@ -224,7 +210,6 @@ pub struct SnapshotStageRequest {
 
 /// Request body for snapshot discardFile / resetFile.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SnapshotDiscardRequest {
     pub workspace: String,
     pub file_path: String,
@@ -254,7 +239,6 @@ pub struct SnapshotInfoResponse {
 
 /// A single file change entry in a compare result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct FileChangeInfoResponse {
     pub file_path: String,
     pub relative_path: String,
@@ -284,11 +268,11 @@ mod tests {
     }
 
     #[test]
-    fn copy_files_request_camel_case() {
+    fn copy_files_request_snake_case() {
         let raw = json!({
-            "filePaths": ["/a.txt", "/b.txt"],
+            "file_paths": ["/a.txt", "/b.txt"],
             "workspace": "/ws",
-            "sourceRoot": "/src"
+            "source_root": "/src"
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.file_paths, vec!["/a.txt", "/b.txt"]);
@@ -299,7 +283,7 @@ mod tests {
     #[test]
     fn copy_files_request_optional_source_root() {
         let raw = json!({
-            "filePaths": ["/a.txt"],
+            "file_paths": ["/a.txt"],
             "workspace": "/ws"
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
@@ -307,21 +291,21 @@ mod tests {
     }
 
     #[test]
-    fn rename_request_camel_case() {
-        let raw = r#"{"path":"/ws/old.txt","newName":"new.txt"}"#;
+    fn rename_request_snake_case() {
+        let raw = r#"{"path":"/ws/old.txt","new_name":"new.txt"}"#;
         let req: RenameRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(req.path, "/ws/old.txt");
         assert_eq!(req.new_name, "new.txt");
     }
 
     #[test]
-    fn zip_request_camel_case() {
+    fn zip_request_snake_case() {
         let raw = json!({
             "path": "/out.zip",
-            "requestId": "req-1",
+            "request_id": "req-1",
             "files": [
                 { "name": "a.txt", "content": "hello" },
-                { "name": "b.bin", "filePath": "/src/b.bin" }
+                { "name": "b.bin", "file_path": "/src/b.bin" }
             ]
         });
         let req: ZipRequest = serde_json::from_value(raw).unwrap();
@@ -345,8 +329,8 @@ mod tests {
     }
 
     #[test]
-    fn file_watch_request_camel_case() {
-        let raw = r#"{"filePath":"/path/to/file.txt"}"#;
+    fn file_watch_request_snake_case() {
+        let raw = r#"{"file_path":"/path/to/file.txt"}"#;
         let req: FileWatchRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(req.file_path, "/path/to/file.txt");
     }
@@ -355,7 +339,7 @@ mod tests {
     fn snapshot_discard_request_deserialization() {
         let raw = json!({
             "workspace": "/ws",
-            "filePath": "src/main.rs",
+            "file_path": "src/main.rs",
             "operation": "modify"
         });
         let req: SnapshotDiscardRequest = serde_json::from_value(raw).unwrap();
@@ -385,10 +369,10 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["name"], "src");
-        assert_eq!(json["fullPath"], "/project/src");
-        assert_eq!(json["relativePath"], "src");
-        assert_eq!(json["isDir"], true);
-        assert_eq!(json["isFile"], false);
+        assert_eq!(json["full_path"], "/project/src");
+        assert_eq!(json["relative_path"], "src");
+        assert_eq!(json["is_dir"], true);
+        assert_eq!(json["is_file"], false);
         assert_eq!(json["children"][0]["name"], "main.rs");
     }
 
@@ -415,8 +399,8 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["name"], "lib.rs");
-        assert_eq!(json["fullPath"], "/project/src/lib.rs");
-        assert_eq!(json["relativePath"], "src/lib.rs");
+        assert_eq!(json["full_path"], "/project/src/lib.rs");
+        assert_eq!(json["relative_path"], "src/lib.rs");
     }
 
     #[test]
@@ -434,8 +418,8 @@ mod tests {
         assert_eq!(json["path"], "/project/readme.md");
         assert_eq!(json["size"], 1024);
         assert_eq!(json["type"], "text/markdown");
-        assert_eq!(json["lastModified"], 1700000000000_i64);
-        assert!(json.get("isDirectory").is_none());
+        assert_eq!(json["last_modified"], 1700000000000_i64);
+        assert!(json.get("is_directory").is_none());
     }
 
     #[test]
@@ -449,7 +433,7 @@ mod tests {
             is_directory: Some(true),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["isDirectory"], true);
+        assert_eq!(json["is_directory"], true);
     }
 
     #[test]
@@ -459,8 +443,8 @@ mod tests {
             failed_files: vec!["/missing.txt".into()],
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["copiedFiles"][0], "/ws/a.txt");
-        assert_eq!(json["failedFiles"][0], "/missing.txt");
+        assert_eq!(json["copied_files"][0], "/ws/a.txt");
+        assert_eq!(json["failed_files"][0], "/missing.txt");
     }
 
     #[test]
@@ -521,8 +505,8 @@ mod tests {
             }],
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["staged"][0]["filePath"], "/ws/a.txt");
-        assert_eq!(json["staged"][0]["relativePath"], "a.txt");
+        assert_eq!(json["staged"][0]["file_path"], "/ws/a.txt");
+        assert_eq!(json["staged"][0]["relative_path"], "a.txt");
         assert_eq!(json["staged"][0]["operation"], "create");
         assert_eq!(json["unstaged"][0]["operation"], "modify");
     }
@@ -531,7 +515,7 @@ mod tests {
     fn snapshot_compare_response_deserialization() {
         let raw = json!({
             "staged": [
-                { "filePath": "/ws/x.rs", "relativePath": "x.rs", "operation": "delete" }
+                { "file_path": "/ws/x.rs", "relative_path": "x.rs", "operation": "delete" }
             ],
             "unstaged": []
         });

@@ -9,7 +9,6 @@ use crate::types::TeammateRole;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ToolDescriptor {
     pub name: String,
     pub description: String,
@@ -24,7 +23,7 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "Target agent slotId or \"*\" for broadcast" },
+                    "to": { "type": "string", "description": "Target agent slot_id or \"*\" for broadcast" },
                     "message": { "type": "string", "description": "Message content" }
                 },
                 "required": ["to", "message"]
@@ -52,7 +51,7 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
                     "subject": { "type": "string", "description": "Task subject" },
                     "description": { "type": "string", "description": "Task description" },
                     "owner": { "type": "string", "description": "Owning agent slotId" },
-                    "blockedBy": { "type": "array", "items": { "type": "string" }, "description": "Task IDs this task depends on" }
+                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Task IDs this task depends on" }
                 },
                 "required": ["subject"]
             }),
@@ -63,13 +62,13 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "taskId": { "type": "string", "description": "Task ID to update" },
+                    "task_id": { "type": "string", "description": "Task ID to update" },
                     "status": { "type": "string", "description": "New status: pending, in_progress, completed, deleted" },
                     "description": { "type": "string", "description": "New description" },
                     "owner": { "type": "string", "description": "New owning agent slotId" },
-                    "blockedBy": { "type": "array", "items": { "type": "string" }, "description": "New dependency list" }
+                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "New dependency list" }
                 },
-                "required": ["taskId"]
+                "required": ["task_id"]
             }),
         },
         ToolDescriptor {
@@ -94,10 +93,10 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "slotId": { "type": "string", "description": "Agent slotId to rename" },
-                    "newName": { "type": "string", "description": "New display name" }
+                    "slot_id": { "type": "string", "description": "Agent slot_id to rename" },
+                    "new_name": { "type": "string", "description": "New display name" }
                 },
-                "required": ["slotId", "newName"]
+                "required": ["slot_id", "new_name"]
             }),
         },
         ToolDescriptor {
@@ -106,10 +105,10 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "slotId": { "type": "string", "description": "Agent slotId to shut down" },
+                    "slot_id": { "type": "string", "description": "Agent slot_id to shut down" },
                     "reason": { "type": "string", "description": "Reason for shutdown" }
                 },
-                "required": ["slotId"]
+                "required": ["slot_id"]
             }),
         },
     ]
@@ -133,7 +132,6 @@ pub struct SpawnAgentInput {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TaskCreateInput {
     pub subject: String,
     pub description: Option<String>,
@@ -142,7 +140,6 @@ pub struct TaskCreateInput {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TaskUpdateInput {
     pub task_id: String,
     pub status: Option<String>,
@@ -152,14 +149,12 @@ pub struct TaskUpdateInput {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RenameAgentInput {
     pub slot_id: String,
     pub new_name: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ShutdownAgentInput {
     pub slot_id: String,
     pub reason: Option<String>,
@@ -322,7 +317,7 @@ mod tests {
 
     #[test]
     fn parse_task_update() {
-        let args = json!({"taskId": "tk-1", "status": "completed"});
+        let args = json!({"task_id": "tk-1", "status": "completed"});
         let action = parse_tool_call("team_task_update", &args, TeammateRole::Teammate).unwrap();
         assert!(matches!(
             action,
@@ -365,7 +360,7 @@ mod tests {
 
     #[test]
     fn task_create_with_blocked_by() {
-        let args = json!({"subject": "Test", "blockedBy": ["tk-a", "tk-b"]});
+        let args = json!({"subject": "Test", "blocked_by": ["tk-a", "tk-b"]});
         let action = parse_tool_call("team_task_create", &args, TeammateRole::Lead).unwrap();
         assert!(matches!(
             action,
@@ -390,7 +385,7 @@ mod tests {
 
     #[test]
     fn parse_rename_agent_handled_by_server() {
-        let args = json!({"slotId": "s1", "newName": "X"});
+        let args = json!({"slot_id": "s1", "new_name": "X"});
         let result = parse_tool_call("team_rename_agent", &args, TeammateRole::Lead);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("handled directly by server"));
@@ -398,7 +393,7 @@ mod tests {
 
     #[test]
     fn parse_shutdown_agent_handled_by_server() {
-        let args = json!({"slotId": "s1"});
+        let args = json!({"slot_id": "s1"});
         let result = parse_tool_call("team_shutdown_agent", &args, TeammateRole::Lead);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("handled directly by server"));

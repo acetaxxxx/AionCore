@@ -46,7 +46,7 @@ pub enum AcpBackend {
 
 /// Runtime status of a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum ConversationStatus {
     Pending,
     Running,
@@ -55,7 +55,7 @@ pub enum ConversationStatus {
 
 /// Origin of a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum ConversationSource {
     Aionui,
     Telegram,
@@ -86,7 +86,7 @@ pub enum MessageType {
 
 /// Display position of a message in the chat UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum MessagePosition {
     Right,
     Left,
@@ -96,7 +96,7 @@ pub enum MessagePosition {
 
 /// Processing status of a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum MessageStatus {
     Finish,
     Pending,
@@ -106,7 +106,7 @@ pub enum MessageStatus {
 
 /// LLM API protocol type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum ProtocolType {
     #[serde(rename = "openai")]
     OpenAI,
@@ -117,7 +117,7 @@ pub enum ProtocolType {
 
 /// Remote Agent protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum RemoteAgentProtocol {
     OpenClaw,
     ZeroClaw,
@@ -126,7 +126,7 @@ pub enum RemoteAgentProtocol {
 
 /// Remote Agent authentication method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum RemoteAgentAuthType {
     Bearer,
     Password,
@@ -135,7 +135,7 @@ pub enum RemoteAgentAuthType {
 
 /// Remote Agent connection status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum RemoteAgentStatus {
     Unknown,
     Connected,
@@ -145,14 +145,14 @@ pub enum RemoteAgentStatus {
 
 /// Reason for terminating an Agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum AgentKillReason {
     IdleTimeout,
 }
 
 /// Preview content type for document preview history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum PreviewContentType {
     Markdown,
     Diff,
@@ -168,7 +168,7 @@ pub enum PreviewContentType {
 
 /// File change operation type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum FileChangeOperation {
     Create,
     Modify,
@@ -177,7 +177,7 @@ pub enum FileChangeOperation {
 
 /// AI Agent CLI source identifier for MCP configuration sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum McpSource {
     Claude,
     Gemini,
@@ -196,7 +196,7 @@ pub enum McpSource {
 
 /// MCP server connection status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum McpServerStatus {
     Connected,
     Disconnected,

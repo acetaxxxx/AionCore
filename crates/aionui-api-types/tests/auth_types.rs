@@ -63,37 +63,37 @@ fn login_response_serialization_matches_spec() {
 // --- ChangePasswordRequest ---
 
 #[test]
-fn change_password_request_camel_case() {
-    let json = r#"{"currentPassword":"old_pass","newPassword":"new_pass_123"}"#;
+fn change_password_request_snake_case() {
+    let json = r#"{"current_password":"old_pass","new_password":"new_pass_123"}"#;
     let req: ChangePasswordRequest = serde_json::from_str(json).unwrap();
     assert_eq!(req.current_password, "old_pass");
     assert_eq!(req.new_password, "new_pass_123");
 }
 
 #[test]
-fn change_password_request_rejects_snake_case() {
-    let json = r#"{"current_password":"old","new_password":"new"}"#;
+fn change_password_request_rejects_camel_case() {
+    let json = r#"{"currentPassword":"old","newPassword":"new"}"#;
     assert!(serde_json::from_str::<ChangePasswordRequest>(json).is_err());
 }
 
 #[test]
 fn change_password_request_missing_new_password() {
-    let json = r#"{"currentPassword":"old"}"#;
+    let json = r#"{"current_password":"old"}"#;
     assert!(serde_json::from_str::<ChangePasswordRequest>(json).is_err());
 }
 
 // --- QrLoginRequest ---
 
 #[test]
-fn qr_login_request_camel_case() {
-    let json = r#"{"qrToken":"token_abc_123"}"#;
+fn qr_login_request_snake_case() {
+    let json = r#"{"qr_token":"token_abc_123"}"#;
     let req: QrLoginRequest = serde_json::from_str(json).unwrap();
     assert_eq!(req.qr_token, "token_abc_123");
 }
 
 #[test]
-fn qr_login_request_rejects_snake_case() {
-    let json = r#"{"qr_token":"abc"}"#;
+fn qr_login_request_rejects_camel_case() {
+    let json = r#"{"qrToken":"abc"}"#;
     assert!(serde_json::from_str::<QrLoginRequest>(json).is_err());
 }
 
@@ -116,9 +116,9 @@ fn auth_status_response_needs_setup() {
     let json = serde_json::to_value(&resp).unwrap();
 
     assert_eq!(json["success"], true);
-    assert_eq!(json["needsSetup"], true);
-    assert_eq!(json["userCount"], 0);
-    assert_eq!(json["isAuthenticated"], false);
+    assert_eq!(json["needs_setup"], true);
+    assert_eq!(json["user_count"], 0);
+    assert_eq!(json["is_authenticated"], false);
 }
 
 #[test]
@@ -131,13 +131,13 @@ fn auth_status_response_authenticated() {
     };
     let json = serde_json::to_value(&resp).unwrap();
 
-    assert_eq!(json["needsSetup"], false);
-    assert_eq!(json["userCount"], 2);
-    assert_eq!(json["isAuthenticated"], true);
+    assert_eq!(json["needs_setup"], false);
+    assert_eq!(json["user_count"], 2);
+    assert_eq!(json["is_authenticated"], true);
 }
 
 #[test]
-fn auth_status_response_uses_camel_case_keys() {
+fn auth_status_response_uses_snake_case_keys() {
     let resp = AuthStatusResponse {
         success: true,
         needs_setup: false,
@@ -147,12 +147,12 @@ fn auth_status_response_uses_camel_case_keys() {
     let json = serde_json::to_value(&resp).unwrap();
     let obj = json.as_object().unwrap();
 
-    assert!(obj.contains_key("needsSetup"));
-    assert!(obj.contains_key("userCount"));
-    assert!(obj.contains_key("isAuthenticated"));
-    assert!(!obj.contains_key("needs_setup"));
-    assert!(!obj.contains_key("user_count"));
-    assert!(!obj.contains_key("is_authenticated"));
+    assert!(obj.contains_key("needs_setup"));
+    assert!(obj.contains_key("user_count"));
+    assert!(obj.contains_key("is_authenticated"));
+    assert!(!obj.contains_key("needsSetup"));
+    assert!(!obj.contains_key("userCount"));
+    assert!(!obj.contains_key("isAuthenticated"));
 }
 
 #[test]

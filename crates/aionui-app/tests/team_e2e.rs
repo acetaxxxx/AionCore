@@ -42,8 +42,8 @@ async fn tc1_create_team_with_multiple_agents() {
     assert_eq!(data["agents"].as_array().unwrap().len(), 2);
     assert_eq!(data["agents"][0]["role"], "lead");
     assert_eq!(data["agents"][1]["role"], "teammate");
-    assert!(data["leadAgentId"].is_string());
-    assert_eq!(data["leadAgentId"], data["agents"][0]["slotId"]);
+    assert!(data["lead_agent_id"].is_string());
+    assert_eq!(data["lead_agent_id"], data["agents"][0]["slot_id"]);
 }
 
 // TC-2: Create single agent team
@@ -71,12 +71,12 @@ async fn tc3_each_agent_has_conversation_id() {
 
     let data = create_team(&mut app, &token, &csrf).await;
     for agent in data["agents"].as_array().unwrap() {
-        assert!(agent["conversationId"].is_string());
-        assert!(!agent["conversationId"].as_str().unwrap().is_empty());
+        assert!(agent["conversation_id"].is_string());
+        assert!(!agent["conversation_id"].as_str().unwrap().is_empty());
     }
     assert_ne!(
-        data["agents"][0]["conversationId"],
-        data["agents"][1]["conversationId"]
+        data["agents"][0]["conversation_id"],
+        data["agents"][1]["conversation_id"]
     );
 }
 
@@ -98,8 +98,8 @@ async fn tc4_first_agent_is_lead() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["agents"][0]["role"], "lead");
     assert_eq!(
-        json["data"]["leadAgentId"],
-        json["data"]["agents"][0]["slotId"]
+        json["data"]["lead_agent_id"],
+        json["data"]["agents"][0]["slot_id"]
     );
 }
 
@@ -190,10 +190,10 @@ async fn tl3_teams_contain_full_agent_info() {
     let json = body_json(resp).await;
     let teams = json["data"].as_array().unwrap();
     let agent = &teams[0]["agents"][0];
-    assert!(agent["slotId"].is_string());
+    assert!(agent["slot_id"].is_string());
     assert!(agent["name"].is_string());
     assert!(agent["role"].is_string());
-    assert!(agent["conversationId"].is_string());
+    assert!(agent["conversation_id"].is_string());
     assert!(agent["backend"].is_string());
     assert!(agent["model"].is_string());
 }
@@ -360,7 +360,7 @@ async fn aa1_add_agent_to_team() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["name"], "New Agent");
-    assert!(json["data"]["conversationId"].is_string());
+    assert!(json["data"]["conversation_id"].is_string());
 }
 
 // AA-2: After adding, agent count increases
@@ -429,7 +429,7 @@ async fn ar1_remove_agent_from_team() {
 
     let data = create_team(&mut app, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
-    let slot_id = data["agents"][1]["slotId"].as_str().unwrap();
+    let slot_id = data["agents"][1]["slot_id"].as_str().unwrap();
 
     let req = delete_with_token(
         &format!("/api/teams/{team_id}/agents/{slot_id}"),
@@ -448,7 +448,7 @@ async fn ar2_after_removal_agent_gone() {
 
     let data = create_team(&mut app, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
-    let slot_id = data["agents"][1]["slotId"].as_str().unwrap();
+    let slot_id = data["agents"][1]["slot_id"].as_str().unwrap();
 
     let req = delete_with_token(
         &format!("/api/teams/{team_id}/agents/{slot_id}"),
@@ -462,7 +462,7 @@ async fn ar2_after_removal_agent_gone() {
     let json = body_json(resp).await;
     let agents = json["data"]["agents"].as_array().unwrap();
     assert_eq!(agents.len(), 1);
-    assert!(agents.iter().all(|a| a["slotId"] != slot_id));
+    assert!(agents.iter().all(|a| a["slot_id"] != slot_id));
 }
 
 // AR-4: Remove nonexistent agent returns 404
@@ -491,7 +491,7 @@ async fn an1_rename_agent() {
 
     let data = create_team(&mut app, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
-    let slot_id = data["agents"][1]["slotId"].as_str().unwrap();
+    let slot_id = data["agents"][1]["slot_id"].as_str().unwrap();
 
     let req = json_with_token(
         "PATCH",
@@ -512,7 +512,7 @@ async fn an2_rename_then_get_confirms_name() {
 
     let data = create_team(&mut app, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
-    let slot_id = data["agents"][1]["slotId"].as_str().unwrap();
+    let slot_id = data["agents"][1]["slot_id"].as_str().unwrap();
 
     let req = json_with_token(
         "PATCH",
@@ -527,7 +527,7 @@ async fn an2_rename_then_get_confirms_name() {
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
     let agents = json["data"]["agents"].as_array().unwrap();
-    let agent = agents.iter().find(|a| a["slotId"] == slot_id).unwrap();
+    let agent = agents.iter().find(|a| a["slot_id"] == slot_id).unwrap();
     assert_eq!(agent["name"], "Senior Worker");
 }
 
@@ -738,7 +738,7 @@ async fn sa1_send_message_to_agent() {
 
     let data = create_team(&mut app, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
-    let slot_id = data["agents"][1]["slotId"].as_str().unwrap();
+    let slot_id = data["agents"][1]["slot_id"].as_str().unwrap();
 
     // Start session first
     let req = json_with_token(
@@ -788,7 +788,7 @@ async fn full_team_lifecycle() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let added = body_json(resp).await;
-    let new_slot = added["data"]["slotId"].as_str().unwrap().to_owned();
+    let new_slot = added["data"]["slot_id"].as_str().unwrap().to_owned();
 
     // Verify 3 agents
     let req = get_with_token(&format!("/api/teams/{team_id}"), &token);

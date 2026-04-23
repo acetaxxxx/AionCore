@@ -79,8 +79,8 @@ async fn start_watch_and_detect_change() {
         .iter()
         .find(|e| e.name == "fileWatch.fileChanged")
         .unwrap();
-    assert!(ev.data["filePath"].as_str().is_some());
-    assert!(ev.data["eventType"].as_str().is_some());
+    assert!(ev.data["file_path"].as_str().is_some());
+    assert!(ev.data["event_type"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -306,10 +306,10 @@ async fn office_watch_event_has_correct_fields() {
 
     let data = &ev.unwrap().data;
     assert!(
-        data["filePath"]
+        data["file_path"]
             .as_str()
             .is_some_and(|p| p.ends_with("check.docx")),
-        "filePath should end with check.docx: {data:?}"
+        "file_path should end with check.docx: {data:?}"
     );
     assert!(
         data["workspace"].as_str().is_some(),

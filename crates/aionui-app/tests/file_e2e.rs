@@ -103,13 +103,13 @@ async fn get_files_by_dir_returns_directory_contents() {
 
     // Check directory has isDir=true
     let subdir_entry = data.iter().find(|e| e["name"] == "subdir").unwrap();
-    assert_eq!(subdir_entry["isDir"], true);
-    assert_eq!(subdir_entry["isFile"], false);
+    assert_eq!(subdir_entry["is_dir"], true);
+    assert_eq!(subdir_entry["is_file"], false);
 
     // Check file has isFile=true
     let file_entry = data.iter().find(|e| e["name"] == "hello.txt").unwrap();
-    assert_eq!(file_entry["isDir"], false);
-    assert_eq!(file_entry["isFile"], true);
+    assert_eq!(file_entry["is_dir"], false);
+    assert_eq!(file_entry["is_file"], true);
 }
 
 #[tokio::test]
@@ -164,7 +164,7 @@ async fn get_file_metadata_returns_info() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["name"], "test.txt");
     assert_eq!(json["data"]["size"], 11); // "hello world" = 11 bytes
-    assert!(json["data"]["lastModified"].as_i64().unwrap() > 0);
+    assert!(json["data"]["last_modified"].as_i64().unwrap() > 0);
 }
 
 // ===========================================================================
@@ -293,7 +293,7 @@ async fn copy_files_to_workspace() {
         "POST",
         "/api/fs/copy",
         json!({
-            "filePaths": [src_dir.path().join("source.txt").to_str().unwrap()],
+            "file_paths": [src_dir.path().join("source.txt").to_str().unwrap()],
             "workspace": ws_dir.path().to_str().unwrap()
         }),
         &token,
@@ -304,7 +304,7 @@ async fn copy_files_to_workspace() {
 
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
-    assert!(!json["data"]["copiedFiles"].as_array().unwrap().is_empty());
+    assert!(!json["data"]["copied_files"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -345,7 +345,7 @@ async fn rename_entry_returns_new_path() {
         "/api/fs/rename",
         json!({
             "path": old_path.to_str().unwrap(),
-            "newName": "new.txt"
+            "new_name": "new.txt"
         }),
         &token,
         &csrf,
@@ -354,7 +354,7 @@ async fn rename_entry_returns_new_path() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
-    let new_path = json["data"]["newPath"].as_str().unwrap();
+    let new_path = json["data"]["new_path"].as_str().unwrap();
     assert!(new_path.contains("new.txt"));
     assert!(!old_path.exists());
 }
@@ -367,7 +367,7 @@ async fn create_temp_file_returns_path() {
     let req = json_with_token(
         "POST",
         "/api/fs/temp",
-        json!({ "fileName": "temp_test.txt" }),
+        json!({ "file_name": "temp_test.txt" }),
         &token,
         &csrf,
     );
@@ -482,7 +482,7 @@ async fn cancel_zip_nonexistent_returns_false() {
     let req = json_with_token(
         "POST",
         "/api/fs/zip/cancel",
-        json!({ "requestId": "nonexistent-id" }),
+        json!({ "request_id": "nonexistent-id" }),
         &token,
         &csrf,
     );
@@ -575,7 +575,7 @@ async fn snapshot_init_and_compare_on_plain_dir() {
         "/api/fs/snapshot/baseline",
         json!({
             "workspace": workspace.to_str().unwrap(),
-            "filePath": "file.txt"
+            "file_path": "file.txt"
         }),
         &token,
         &csrf,

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// `http` represents Streamable HTTP (the MCP standard); `sse` is legacy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type")]
 pub enum McpTransport {
     #[serde(rename = "stdio")]
     Stdio {
@@ -41,7 +41,6 @@ pub enum McpTransport {
 
 /// MCP tool description returned from connection tests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct McpToolResponse {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,7 +55,6 @@ pub struct McpToolResponse {
 
 /// Request body for `POST /api/mcp/servers` — create (or upsert by name).
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateMcpServerRequest {
     pub name: String,
     #[serde(default)]
@@ -70,7 +68,6 @@ pub struct CreateMcpServerRequest {
 
 /// Request body for `PUT /api/mcp/servers/:id` — partial update.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateMcpServerRequest {
     #[serde(default)]
     pub name: Option<String>,
@@ -84,7 +81,6 @@ pub struct UpdateMcpServerRequest {
 
 /// Request body for `POST /api/mcp/servers/import` — batch import.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BatchImportMcpServersRequest {
     pub servers: Vec<CreateMcpServerRequest>,
 }
@@ -95,7 +91,6 @@ pub struct BatchImportMcpServersRequest {
 
 /// Full MCP server configuration response.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct McpServerResponse {
     pub id: String,
     pub name: String,
@@ -121,21 +116,18 @@ pub struct McpServerResponse {
 
 /// Request body for `POST /api/mcp/sync-to-agents`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SyncToAgentsRequest {
     pub servers: Vec<String>,
 }
 
 /// Request body for `POST /api/mcp/remove-from-agents`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RemoveFromAgentsRequest {
     pub server_names: Vec<String>,
 }
 
 /// Per-agent sync result.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct McpAgentSyncResult {
     pub agent: McpSource,
     pub success: bool,
@@ -145,7 +137,6 @@ pub struct McpAgentSyncResult {
 
 /// Aggregated sync result across all agents.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct McpSyncResult {
     pub success: bool,
     pub results: Vec<McpAgentSyncResult>,
@@ -153,7 +144,6 @@ pub struct McpSyncResult {
 
 /// Detected MCP servers for a single agent.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DetectedMcpServerResponse {
     pub source: McpSource,
     pub servers: Vec<McpServerResponse>,
@@ -165,7 +155,6 @@ pub struct DetectedMcpServerResponse {
 
 /// Request body for `POST /api/mcp/test-connection`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TestMcpConnectionRequest {
     pub name: String,
     pub transport: McpTransport,
@@ -173,7 +162,7 @@ pub struct TestMcpConnectionRequest {
 
 /// Authentication method detected during connection test.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum McpAuthMethod {
     Oauth,
     Basic,
@@ -181,7 +170,6 @@ pub enum McpAuthMethod {
 
 /// Result of an MCP server connection test.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct McpConnectionTestResult {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,28 +190,24 @@ pub struct McpConnectionTestResult {
 
 /// Request body for `POST /api/mcp/oauth/check-status`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OAuthCheckStatusRequest {
     pub server_url: String,
 }
 
 /// Response for OAuth status check.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OAuthStatusResponse {
     pub authenticated: bool,
 }
 
 /// Request body for `POST /api/mcp/oauth/login`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OAuthLoginRequest {
     pub server_url: String,
 }
 
 /// Response for OAuth login initiation.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OAuthLoginResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,7 +216,6 @@ pub struct OAuthLoginResponse {
 
 /// Request body for `POST /api/mcp/oauth/logout`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OAuthLogoutRequest {
     pub server_url: String,
 }
@@ -493,7 +476,7 @@ mod tests {
         assert_eq!(json["success"], true);
         assert_eq!(json["tools"][0]["name"], "read_file");
         assert!(json.get("error").is_none());
-        assert!(json.get("needsAuth").is_none());
+        assert!(json.get("needs_auth").is_none());
     }
 
     #[test]
@@ -507,9 +490,9 @@ mod tests {
             www_authenticate: Some("Bearer realm=\"mcp\"".into()),
         };
         let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(json["needsAuth"], true);
-        assert_eq!(json["authMethod"], "oauth");
-        assert_eq!(json["wwwAuthenticate"], "Bearer realm=\"mcp\"");
+        assert_eq!(json["needs_auth"], true);
+        assert_eq!(json["auth_method"], "oauth");
+        assert_eq!(json["www_authenticate"], "Bearer realm=\"mcp\"");
     }
 
     // -- TestMcpConnectionRequest ---------------------------------------------
@@ -576,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_remove_from_agents_request() {
-        let json = serde_json::json!({ "serverNames": ["test-mcp"] });
+        let json = serde_json::json!({ "server_names": ["test-mcp"] });
         let req: RemoveFromAgentsRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.server_names, vec!["test-mcp"]);
     }

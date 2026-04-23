@@ -37,7 +37,6 @@ pub enum DependencyIssue {
 
 /// Outcome of dependency validation across a set of extensions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DependencyValidationResult {
     /// `true` when no issues were found.
     pub valid: bool,

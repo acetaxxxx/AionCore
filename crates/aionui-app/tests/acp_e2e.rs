@@ -251,7 +251,7 @@ async fn set_model_no_active_task() {
     let req = json_with_token(
         "PUT",
         "/api/conversations/nonexistent/acp/model",
-        json!({ "modelId": "claude-sonnet-4" }),
+        json!({ "model_id": "claude-sonnet-4" }),
         &token,
         &csrf,
     );

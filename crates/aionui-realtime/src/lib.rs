@@ -1,3 +1,4 @@
+//! WebSocket connection manager, event broadcasting, and token-validated upgrade handler.
 pub mod broadcaster;
 pub mod handler;
 pub mod manager;

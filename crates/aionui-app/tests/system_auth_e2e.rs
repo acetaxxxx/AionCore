@@ -65,7 +65,7 @@ async fn auth_required_post_providers() {
         .method("POST")
         .uri("/api/providers")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"platform":"openai","name":"Test","baseUrl":"https://api.openai.com","apiKey":"sk-test"}"#))
+        .body(Body::from(r#"{"platform":"openai","name":"Test","base_url":"https://api.openai.com","api_key":"sk-test"}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -111,7 +111,7 @@ async fn auth_required_detect_protocol() {
         .uri("/api/providers/detect-protocol")
         .header("content-type", "application/json")
         .body(Body::from(
-            r#"{"baseUrl":"https://api.example.com","apiKey":"sk-test"}"#,
+            r#"{"base_url":"https://api.example.com","api_key":"sk-test"}"#,
         ))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();

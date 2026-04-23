@@ -1,3 +1,4 @@
+//! Application entry point: assembles all crates into an Axum server with DI and middleware.
 use std::sync::Arc;
 
 use axum::http::Method;

@@ -1,3 +1,4 @@
+//! JWT authentication, password hashing, CSRF protection, rate limiting, and auth middleware.
 mod cookie;
 mod csrf;
 mod error;

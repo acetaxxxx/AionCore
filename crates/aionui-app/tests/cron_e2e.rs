@@ -21,23 +21,23 @@ use common::{
 fn create_job_body(name: &str) -> serde_json::Value {
     json!({
         "name": name,
-        "schedule": { "kind": "every", "everyMs": 60000, "description": "every minute" },
+        "schedule": { "kind": "every", "every_ms": 60000, "description": "every minute" },
         "message": "test message",
-        "conversationId": "conv_1",
-        "conversationTitle": "Test Conv",
-        "agentType": "acp",
-        "createdBy": "user"
+        "conversation_id": "conv_1",
+        "conversation_title": "Test Conv",
+        "agent_type": "acp",
+        "created_by": "user"
     })
 }
 
 fn create_at_job_body(name: &str, at_ms: i64) -> serde_json::Value {
     json!({
         "name": name,
-        "schedule": { "kind": "at", "atMs": at_ms, "description": "once" },
+        "schedule": { "kind": "at", "at_ms": at_ms, "description": "once" },
         "message": "at message",
-        "conversationId": "conv_1",
-        "agentType": "acp",
-        "createdBy": "user"
+        "conversation_id": "conv_1",
+        "agent_type": "acp",
+        "created_by": "user"
     })
 }
 
@@ -46,9 +46,9 @@ fn create_cron_job_body(name: &str, expr: &str) -> serde_json::Value {
         "name": name,
         "schedule": { "kind": "cron", "expr": expr },
         "message": "cron message",
-        "conversationId": "conv_1",
-        "agentType": "acp",
-        "createdBy": "user"
+        "conversation_id": "conv_1",
+        "agent_type": "acp",
+        "created_by": "user"
     })
 }
 
@@ -117,13 +117,13 @@ async fn cj1_create_cron_job() {
     assert!(data["id"].as_str().unwrap().starts_with("cron_"));
     assert_eq!(data["name"], "Daily Report");
     assert_eq!(data["enabled"], true);
-    assert!(data["state"]["nextRunAtMs"].as_i64().is_some());
-    assert_eq!(data["state"]["runCount"], 0);
+    assert!(data["state"]["next_run_at_ms"].as_i64().is_some());
+    assert_eq!(data["state"]["run_count"], 0);
     assert_eq!(data["target"]["payload"]["kind"], "message");
     assert_eq!(data["target"]["payload"]["text"], "test message");
-    assert_eq!(data["metadata"]["conversationId"], "conv_1");
-    assert_eq!(data["metadata"]["agentType"], "acp");
-    assert_eq!(data["metadata"]["createdBy"], "user");
+    assert_eq!(data["metadata"]["conversation_id"], "conv_1");
+    assert_eq!(data["metadata"]["agent_type"], "acp");
+    assert_eq!(data["metadata"]["created_by"], "user");
 }
 
 // ── CJ-2: Create three schedule types ────────────────────────────────
@@ -143,11 +143,11 @@ async fn cj2_create_three_schedule_types() {
     )
     .await;
     assert_eq!(at["schedule"]["kind"], "at");
-    assert!(at["state"]["nextRunAtMs"].as_i64().unwrap() > now);
+    assert!(at["state"]["next_run_at_ms"].as_i64().unwrap() > now);
 
     let every = create_job(&mut app, &token, &csrf, create_job_body("Every Job")).await;
     assert_eq!(every["schedule"]["kind"], "every");
-    let next = every["state"]["nextRunAtMs"].as_i64().unwrap();
+    let next = every["state"]["next_run_at_ms"].as_i64().unwrap();
     assert!((next - now - 60000).abs() < 3000);
 
     let cron = create_job(
@@ -158,7 +158,7 @@ async fn cj2_create_three_schedule_types() {
     )
     .await;
     assert_eq!(cron["schedule"]["kind"], "cron");
-    assert!(cron["state"]["nextRunAtMs"].as_i64().unwrap() > now);
+    assert!(cron["state"]["next_run_at_ms"].as_i64().unwrap() > now);
 }
 
 // ── CJ-3: Create parameter validation ────────────────────────────────
@@ -169,10 +169,10 @@ async fn cj3_create_missing_required_fields() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let invalid_bodies = vec![
-        json!({"schedule": {"kind": "every", "everyMs": 60000}, "conversationId": "c1", "agentType": "acp", "createdBy": "user"}),
-        json!({"name": "X", "conversationId": "c1", "agentType": "acp", "createdBy": "user"}),
-        json!({"name": "X", "schedule": {"kind": "every", "everyMs": 60000}, "agentType": "acp", "createdBy": "user"}),
-        json!({"name": "X", "schedule": {"kind": "every", "everyMs": 60000}, "conversationId": "c1", "createdBy": "user"}),
+        json!({"schedule": {"kind": "every", "every_ms": 60000}, "conversation_id": "c1", "agent_type": "acp", "created_by": "user"}),
+        json!({"name": "X", "conversation_id": "c1", "agent_type": "acp", "created_by": "user"}),
+        json!({"name": "X", "schedule": {"kind": "every", "every_ms": 60000}, "agent_type": "acp", "created_by": "user"}),
+        json!({"name": "X", "schedule": {"kind": "every", "every_ms": 60000}, "conversation_id": "c1", "created_by": "user"}),
     ];
 
     for body in invalid_bodies {
@@ -251,15 +251,15 @@ async fn cj7_list_by_conversation() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let mut body_a = create_job_body("Job A");
-    body_a["conversationId"] = json!("conv_target");
+    body_a["conversation_id"] = json!("conv_target");
     create_job(&mut app, &token, &csrf, body_a).await;
 
     let mut body_b = create_job_body("Job B");
-    body_b["conversationId"] = json!("conv_target");
+    body_b["conversation_id"] = json!("conv_target");
     create_job(&mut app, &token, &csrf, body_b).await;
 
     let mut body_c = create_job_body("Job C");
-    body_c["conversationId"] = json!("conv_other");
+    body_c["conversation_id"] = json!("conv_other");
     create_job(&mut app, &token, &csrf, body_c).await;
 
     let req = get_with_token("/api/cron/jobs?conversation_id=conv_target", &token);
@@ -296,8 +296,8 @@ async fn cj8_update_job() {
     assert_eq!(json["data"]["name"], "Updated Name");
     assert_eq!(json["data"]["enabled"], false);
     assert!(
-        json["data"]["metadata"]["updatedAt"].as_i64().unwrap()
-            >= created["metadata"]["createdAt"].as_i64().unwrap()
+        json["data"]["metadata"]["updated_at"].as_i64().unwrap()
+            >= created["metadata"]["created_at"].as_i64().unwrap()
     );
 }
 
@@ -324,7 +324,7 @@ async fn cj9_update_schedule_type() {
 
     let json = body_json(resp).await;
     assert_eq!(json["data"]["schedule"]["kind"], "cron");
-    assert!(json["data"]["state"]["nextRunAtMs"].as_i64().is_some());
+    assert!(json["data"]["state"]["next_run_at_ms"].as_i64().is_some());
 }
 
 // ── CJ-10: Update nonexistent ────────────────────────────────────────
@@ -443,7 +443,7 @@ async fn sk2_has_skill_true() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["hasSkill"], true);
+    assert_eq!(json["data"]["has_skill"], true);
 }
 
 // ── SK-3: Has skill (false) ─────────────────────────────────────────
@@ -461,7 +461,7 @@ async fn sk3_has_skill_false() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["hasSkill"], false);
+    assert_eq!(json["data"]["has_skill"], false);
 }
 
 // ── SK-4: Save empty skill ──────────────────────────────────────────
@@ -557,14 +557,14 @@ async fn sc6_cron_with_timezone() {
         "name": "Shanghai Job",
         "schedule": { "kind": "cron", "expr": "0 0 9 * * *", "tz": "Asia/Shanghai" },
         "message": "hello",
-        "conversationId": "conv_1",
-        "agentType": "acp",
-        "createdBy": "user"
+        "conversation_id": "conv_1",
+        "agent_type": "acp",
+        "created_by": "user"
     });
 
     let data = create_job(&mut app, &token, &csrf, body).await;
     let now = aionui_common::now_ms();
-    assert!(data["state"]["nextRunAtMs"].as_i64().unwrap() > now);
+    assert!(data["state"]["next_run_at_ms"].as_i64().unwrap() > now);
 }
 
 // ── SC-7: Every zero interval ────────────────────────────────────────
@@ -576,11 +576,11 @@ async fn sc7_every_zero_interval() {
 
     let body = json!({
         "name": "Zero Interval",
-        "schedule": { "kind": "every", "everyMs": 0 },
+        "schedule": { "kind": "every", "every_ms": 0 },
         "message": "x",
-        "conversationId": "conv_1",
-        "agentType": "acp",
-        "createdBy": "user"
+        "conversation_id": "conv_1",
+        "agent_type": "acp",
+        "created_by": "user"
     });
     let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -596,11 +596,11 @@ async fn sc8_every_negative_interval() {
 
     let body = json!({
         "name": "Negative Interval",
-        "schedule": { "kind": "every", "everyMs": -1000 },
+        "schedule": { "kind": "every", "every_ms": -1000 },
         "message": "x",
-        "conversationId": "conv_1",
-        "agentType": "acp",
-        "createdBy": "user"
+        "conversation_id": "conv_1",
+        "agent_type": "acp",
+        "created_by": "user"
     });
     let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();

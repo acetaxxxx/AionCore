@@ -86,7 +86,6 @@ impl TeammateStatus {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TeamAgent {
     pub slot_id: String,
     #[serde(alias = "agentName")]
@@ -127,7 +126,6 @@ impl TeamAgent {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Team {
     pub id: String,
     pub name: String,
@@ -176,7 +174,6 @@ impl MailboxMessageType {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct MailboxMessage {
     pub id: String,
     pub team_id: String,
@@ -232,7 +229,6 @@ impl TaskStatus {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TeamTask {
     pub id: String,
     pub team_id: String,
@@ -562,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn team_agent_camel_case_serialization() {
+    fn team_agent_snake_case_serialization() {
         let agent = TeamAgent {
             slot_id: "s1".into(),
             name: "A".into(),
@@ -576,22 +572,22 @@ mod tests {
             cli_path: None,
         };
         let val = serde_json::to_value(&agent).unwrap();
-        assert!(val.get("slotId").is_some());
-        assert!(val.get("conversationId").is_some());
-        assert!(val.get("customAgentId").is_some());
+        assert!(val.get("slot_id").is_some());
+        assert!(val.get("conversation_id").is_some());
+        assert!(val.get("custom_agent_id").is_some());
     }
 
     #[test]
     fn team_agent_deserialize_aionui_format() {
         let raw = serde_json::json!({
-            "slotId": "slot-abc",
-            "conversationId": "conv-1",
+            "slot_id": "slot-abc",
+            "conversation_id": "conv-1",
             "role": "leader",
             "agentType": "claude",
             "agentName": "Leader",
-            "conversationType": "acp",
+            "conversation_type": "acp",
             "status": "active",
-            "customAgentId": "custom-1"
+            "custom_agent_id": "custom-1"
         });
         let agent: TeamAgent = serde_json::from_value(raw).unwrap();
         assert_eq!(agent.name, "Leader");

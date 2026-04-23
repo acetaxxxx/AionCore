@@ -47,6 +47,13 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
+# Aionrs agent engine (external git dependency)
+aion-agent = { git = "ssh://git@github.com/iOfficeAI/aionrs.git", tag = "v0.1.14" }
+aion-types = { git = "ssh://git@github.com/iOfficeAI/aionrs.git", tag = "v0.1.14" }
+aion-protocol = { git = "ssh://git@github.com/iOfficeAI/aionrs.git", tag = "v0.1.14" }
+aion-config = { git = "ssh://git@github.com/iOfficeAI/aionrs.git", tag = "v0.1.14" }
+aion-tools = { git = "ssh://git@github.com/iOfficeAI/aionrs.git", tag = "v0.1.14" }
+
 # Core framework
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["multipart", "ws"] }
@@ -150,3 +157,14 @@ wiremock = "0.6"
 
 # Random
 getrandom = "0.2"
+
+# Shrink target/debug: minimal debuginfo, sidecar files, no incremental cache.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+incremental = false

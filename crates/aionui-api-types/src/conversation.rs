@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 /// Body for `POST /api/conversations`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateConversationRequest {
     pub r#type: AgentType,
     pub name: Option<String>,
@@ -23,7 +22,6 @@ pub struct CreateConversationRequest {
 /// All fields optional — only supplied fields are applied.
 /// `extra` uses merge semantics (patch, not replace).
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateConversationRequest {
     pub name: Option<String>,
     pub pinned: Option<bool>,
@@ -33,7 +31,6 @@ pub struct UpdateConversationRequest {
 
 /// Body for `POST /api/conversations/clone`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CloneConversationRequest {
     pub source_conversation_id: Option<String>,
     pub conversation: CreateConversationRequest,
@@ -42,7 +39,6 @@ pub struct CloneConversationRequest {
 
 /// Body for `POST /api/conversations/:id/messages`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SendMessageRequest {
     pub content: String,
     pub msg_id: String,
@@ -56,7 +52,6 @@ pub struct SendMessageRequest {
 
 /// Query parameters for `GET /api/conversations`.
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ListConversationsQuery {
     pub cursor: Option<String>,
     pub limit: Option<u32>,
@@ -67,7 +62,6 @@ pub struct ListConversationsQuery {
 
 /// Query parameters for `GET /api/conversations/:id/messages`.
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ListMessagesQuery {
     pub page: Option<u32>,
     pub page_size: Option<u32>,
@@ -76,7 +70,6 @@ pub struct ListMessagesQuery {
 
 /// Query parameters for `GET /api/messages/search`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SearchMessagesQuery {
     pub keyword: String,
     pub page: Option<u32>,
@@ -85,9 +78,8 @@ pub struct SearchMessagesQuery {
 
 // ── Response types ─────────────────────────────────────────────────
 
-/// Full conversation object returned in API responses (camelCase).
+/// Full conversation object returned in API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ConversationResponse {
     pub id: String,
     pub name: String,
@@ -106,9 +98,8 @@ pub struct ConversationResponse {
 /// Paginated list of conversations.
 pub type ConversationListResponse = PaginatedResult<ConversationResponse>;
 
-/// Single message object returned in API responses (camelCase).
+/// Single message object returned in API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct MessageResponse {
     pub id: String,
     pub conversation_id: String,
@@ -126,7 +117,6 @@ pub type MessageListResponse = PaginatedResult<MessageResponse>;
 
 /// A single item from cross-conversation message search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct MessageSearchItem {
     pub message_id: String,
     pub conversation_id: String,
@@ -151,9 +141,9 @@ mod tests {
         let raw = json!({
             "type": "gemini",
             "name": "Code Review",
-            "model": { "providerId": "p1", "model": "claude-sonnet-4-20250514" },
+            "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
             "source": "aionui",
-            "channelChatId": "user:123",
+            "channel_chat_id": "user:123",
             "extra": { "workspace": "/project" }
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
@@ -169,7 +159,7 @@ mod tests {
     fn deserialize_create_request_minimal() {
         let raw = json!({
             "type": "acp",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
@@ -193,7 +183,7 @@ mod tests {
     #[test]
     fn deserialize_create_request_missing_type() {
         let raw = json!({
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         });
         assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
@@ -203,7 +193,7 @@ mod tests {
     fn deserialize_create_request_missing_extra() {
         let raw = json!({
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" }
+            "model": { "provider_id": "p1", "model": "m1" }
         });
         assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
     }
@@ -212,7 +202,7 @@ mod tests {
     fn deserialize_create_request_invalid_type() {
         let raw = json!({
             "type": "invalid_type",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         });
         assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
@@ -235,7 +225,7 @@ mod tests {
         let raw = json!({
             "name": "Updated",
             "pinned": true,
-            "model": { "providerId": "p2", "model": "new-model" },
+            "model": { "provider_id": "p2", "model": "new-model" },
             "extra": { "workspace": "/new" }
         });
         let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
@@ -260,13 +250,13 @@ mod tests {
     #[test]
     fn deserialize_clone_request_with_source() {
         let raw = json!({
-            "sourceConversationId": "conv_abc",
+            "source_conversation_id": "conv_abc",
             "conversation": {
                 "type": "gemini",
-                "model": { "providerId": "p1", "model": "m1" },
+                "model": { "provider_id": "p1", "model": "m1" },
                 "extra": {}
             },
-            "migrateCron": true
+            "migrate_cron": true
         });
         let req: CloneConversationRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.source_conversation_id.as_deref(), Some("conv_abc"));
@@ -279,7 +269,7 @@ mod tests {
         let raw = json!({
             "conversation": {
                 "type": "acp",
-                "model": { "providerId": "p1", "model": "m1" },
+                "model": { "provider_id": "p1", "model": "m1" },
                 "extra": {}
             }
         });
@@ -296,7 +286,7 @@ mod tests {
             "cursor": "conv_last",
             "limit": 10,
             "source": "telegram",
-            "cronJobId": "cron_1",
+            "cron_job_id": "cron_1",
             "pinned": true
         });
         let q: ListConversationsQuery = serde_json::from_value(raw).unwrap();
@@ -331,7 +321,7 @@ mod tests {
 
     #[test]
     fn deserialize_messages_query_with_values() {
-        let raw = json!({ "page": 2, "pageSize": 30, "order": "ASC" });
+        let raw = json!({ "page": 2, "page_size": 30, "order": "ASC" });
         let q: ListMessagesQuery = serde_json::from_value(raw).unwrap();
         assert_eq!(q.page, Some(2));
         assert_eq!(q.page_size, Some(30));
@@ -342,7 +332,7 @@ mod tests {
 
     #[test]
     fn deserialize_search_query() {
-        let raw = json!({ "keyword": "rust", "page": 1, "pageSize": 20 });
+        let raw = json!({ "keyword": "rust", "page": 1, "page_size": 20 });
         let q: SearchMessagesQuery = serde_json::from_value(raw).unwrap();
         assert_eq!(q.keyword, "rust");
         assert_eq!(q.page, Some(1));
@@ -358,7 +348,7 @@ mod tests {
     // ── ConversationResponse ────────────────────────────────────────
 
     #[test]
-    fn serialize_conversation_response_camel_case() {
+    fn serialize_conversation_response_snake_case() {
         let resp = ConversationResponse {
             id: "conv_1".into(),
             name: "Test".into(),
@@ -382,14 +372,14 @@ mod tests {
         assert_eq!(json["type"], "gemini");
         assert_eq!(json["status"], "pending");
         assert_eq!(json["source"], "aionui");
-        assert_eq!(json["createdAt"], 1712345678000_i64);
-        assert_eq!(json["modifiedAt"], 1712345678000_i64);
+        assert_eq!(json["created_at"], 1712345678000_i64);
+        assert_eq!(json["modified_at"], 1712345678000_i64);
         assert_eq!(json["extra"]["workspace"], "/project");
-        // Verify camelCase keys
-        assert!(json.get("channel_chat_id").is_none());
-        assert!(json.get("channelChatId").is_some());
-        assert!(json.get("created_at").is_none());
-        assert!(json.get("pinned_at").is_none());
+        // Verify snake_case keys
+        assert!(json.get("channel_chat_id").is_some());
+        assert!(json.get("channelChatId").is_none());
+        assert!(json.get("createdAt").is_none());
+        assert!(json.get("pinnedAt").is_none());
     }
 
     #[test]
@@ -419,7 +409,7 @@ mod tests {
     // ── MessageResponse ─────────────────────────────────────────────
 
     #[test]
-    fn serialize_message_response_camel_case() {
+    fn serialize_message_response_snake_case() {
         let resp = MessageResponse {
             id: "msg_1".into(),
             conversation_id: "conv_1".into(),
@@ -433,17 +423,17 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "msg_1");
-        assert_eq!(json["conversationId"], "conv_1");
-        assert_eq!(json["msgId"], "client_1");
+        assert_eq!(json["conversation_id"], "conv_1");
+        assert_eq!(json["msg_id"], "client_1");
         assert_eq!(json["type"], "text");
         assert_eq!(json["position"], "right");
         assert_eq!(json["status"], "finish");
         assert_eq!(json["hidden"], false);
-        assert_eq!(json["createdAt"], 1712345678000_i64);
-        // Verify no snake_case leaks
-        assert!(json.get("conversation_id").is_none());
-        assert!(json.get("msg_id").is_none());
-        assert!(json.get("created_at").is_none());
+        assert_eq!(json["created_at"], 1712345678000_i64);
+        // Verify no camelCase leaks
+        assert!(json.get("conversationId").is_none());
+        assert!(json.get("msgId").is_none());
+        assert!(json.get("createdAt").is_none());
     }
 
     #[test]
@@ -470,7 +460,7 @@ mod tests {
     // ── MessageSearchItem ───────────────────────────────────────────
 
     #[test]
-    fn serialize_search_item_camel_case() {
+    fn serialize_search_item_snake_case() {
         let item = MessageSearchItem {
             message_id: "msg_1".into(),
             conversation_id: "conv_1".into(),
@@ -480,17 +470,17 @@ mod tests {
             created_at: 1712345678000,
         };
         let json = serde_json::to_value(&item).unwrap();
-        assert_eq!(json["messageId"], "msg_1");
-        assert_eq!(json["conversationId"], "conv_1");
-        assert_eq!(json["conversationName"], "Code Review");
+        assert_eq!(json["message_id"], "msg_1");
+        assert_eq!(json["conversation_id"], "conv_1");
+        assert_eq!(json["conversation_name"], "Code Review");
         assert_eq!(json["type"], "text");
         assert_eq!(json["content"], "matched snippet");
-        assert_eq!(json["createdAt"], 1712345678000_i64);
-        // Verify no snake_case leaks
-        assert!(json.get("message_id").is_none());
-        assert!(json.get("conversation_id").is_none());
-        assert!(json.get("conversation_name").is_none());
-        assert!(json.get("created_at").is_none());
+        assert_eq!(json["created_at"], 1712345678000_i64);
+        // Verify no camelCase leaks
+        assert!(json.get("messageId").is_none());
+        assert!(json.get("conversationId").is_none());
+        assert!(json.get("conversationName").is_none());
+        assert!(json.get("createdAt").is_none());
     }
 
     #[test]
@@ -515,9 +505,9 @@ mod tests {
     fn deserialize_send_message_full() {
         let raw = json!({
             "content": "Review this code",
-            "msgId": "msg-001",
+            "msg_id": "msg-001",
             "files": ["/tmp/a.rs"],
-            "injectSkills": ["security-review"]
+            "inject_skills": ["security-review"]
         });
         let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Review this code");
@@ -528,7 +518,7 @@ mod tests {
 
     #[test]
     fn deserialize_send_message_minimal() {
-        let raw = json!({ "content": "Hi", "msgId": "m1" });
+        let raw = json!({ "content": "Hi", "msg_id": "m1" });
         let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Hi");
         assert_eq!(req.msg_id, "m1");
@@ -538,7 +528,7 @@ mod tests {
 
     #[test]
     fn deserialize_send_message_missing_content() {
-        let raw = json!({ "msgId": "m1" });
+        let raw = json!({ "msg_id": "m1" });
         assert!(serde_json::from_value::<SendMessageRequest>(raw).is_err());
     }
 
@@ -573,7 +563,7 @@ mod tests {
         let json = serde_json::to_value(&list).unwrap();
         assert_eq!(json["items"].as_array().unwrap().len(), 1);
         assert_eq!(json["total"], 1);
-        assert_eq!(json["hasMore"], false);
+        assert_eq!(json["has_more"], false);
     }
 
     #[test]
@@ -603,7 +593,7 @@ mod tests {
             has_more: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["items"][0]["messageId"], "m1");
+        assert_eq!(json["items"][0]["message_id"], "m1");
         assert_eq!(json["total"], 1);
     }
 }

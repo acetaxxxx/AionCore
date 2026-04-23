@@ -134,9 +134,9 @@ async fn test_system_info_returns_all_fields() {
     assert_eq!(json["success"], true);
 
     let data = &json["data"];
-    assert!(data["cacheDir"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(data["workDir"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(data["logDir"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(data["cache_dir"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(data["work_dir"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(data["log_dir"].as_str().is_some_and(|s| !s.is_empty()));
     assert!(data["platform"].as_str().is_some_and(|s| !s.is_empty()));
     assert!(data["arch"].as_str().is_some_and(|s| !s.is_empty()));
 }
@@ -163,17 +163,17 @@ async fn test_system_info_arch_is_known() {
 }
 
 #[tokio::test]
-async fn test_system_info_camel_case_keys() {
+async fn test_system_info_snake_case_keys() {
     let app = setup().await;
     let resp = app.oneshot(get_request("/api/system/info")).await.unwrap();
     let json = body_json(resp).await;
     let data = &json["data"];
-    assert!(data.get("cacheDir").is_some());
-    assert!(data.get("workDir").is_some());
-    assert!(data.get("logDir").is_some());
-    assert!(data.get("cache_dir").is_none());
-    assert!(data.get("work_dir").is_none());
-    assert!(data.get("log_dir").is_none());
+    assert!(data.get("cache_dir").is_some());
+    assert!(data.get("work_dir").is_some());
+    assert!(data.get("log_dir").is_some());
+    assert!(data.get("cacheDir").is_none());
+    assert!(data.get("workDir").is_none());
+    assert!(data.get("logDir").is_none());
 }
 
 // ===========================================================================
@@ -209,11 +209,11 @@ async fn test_check_update_has_new_version() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["currentVersion"], "1.0.0");
-    assert_eq!(json["data"]["updateAvailable"], true);
+    assert_eq!(json["data"]["current_version"], "1.0.0");
+    assert_eq!(json["data"]["update_available"], true);
 
     let latest = &json["data"]["latest"];
-    assert_eq!(latest["tagName"], "v2.0.0");
+    assert_eq!(latest["tag_name"], "v2.0.0");
     assert_eq!(latest["version"], "2.0.0");
     assert!(!latest["assets"].as_array().unwrap().is_empty());
 }
@@ -238,7 +238,7 @@ async fn test_check_update_no_update_available() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["updateAvailable"], false);
+    assert_eq!(json["data"]["update_available"], false);
     assert!(json["data"].get("latest").is_none());
 }
 
@@ -262,7 +262,7 @@ async fn test_check_update_skips_draft() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["updateAvailable"], true);
+    assert_eq!(json["data"]["update_available"], true);
     assert_eq!(json["data"]["latest"]["version"], "2.0.0");
 }
 
@@ -283,7 +283,7 @@ async fn test_check_update_skips_prerelease_by_default() {
         .oneshot(json_request(
             "POST",
             "/api/system/check-update",
-            json!({"includePrerelease": false}),
+            json!({"include_prerelease": false}),
         ))
         .await
         .unwrap();
@@ -310,7 +310,7 @@ async fn test_check_update_includes_prerelease_when_requested() {
         .oneshot(json_request(
             "POST",
             "/api/system/check-update",
-            json!({"includePrerelease": true}),
+            json!({"include_prerelease": true}),
         ))
         .await
         .unwrap();
@@ -348,7 +348,7 @@ async fn test_check_update_recommended_asset_matches_platform() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    let recommended = &json["data"]["latest"]["recommendedAsset"];
+    let recommended = &json["data"]["latest"]["recommended_asset"];
     // On the CI runner's actual platform, the recommended asset should match
     if recommended.is_object() {
         let name = recommended["name"].as_str().unwrap();
@@ -397,7 +397,7 @@ async fn test_check_update_empty_releases() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["updateAvailable"], false);
+    assert_eq!(json["data"]["update_available"], false);
 }
 
 #[tokio::test]
@@ -428,7 +428,7 @@ async fn test_check_update_custom_repo() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["updateAvailable"], true);
+    assert_eq!(json["data"]["update_available"], true);
     assert_eq!(json["data"]["latest"]["version"], "3.0.0");
 }
 
@@ -480,11 +480,11 @@ async fn test_check_update_response_format() {
     let json = body_json(resp).await;
     let latest = &json["data"]["latest"];
 
-    // Verify camelCase serialization
-    assert!(latest.get("tagName").is_some());
-    assert!(latest.get("htmlUrl").is_some());
-    assert!(latest.get("publishedAt").is_some());
-    // Verify snake_case is NOT used
-    assert!(latest.get("tag_name").is_none());
-    assert!(latest.get("html_url").is_none());
+    // Verify snake_case serialization
+    assert!(latest.get("tag_name").is_some());
+    assert!(latest.get("html_url").is_some());
+    assert!(latest.get("published_at").is_some());
+    // Verify camelCase is NOT used
+    assert!(latest.get("tagName").is_none());
+    assert!(latest.get("htmlUrl").is_none());
 }

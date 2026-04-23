@@ -406,8 +406,8 @@ async fn we1_status_change_broadcasts_event() {
 
     let events = h.broadcaster.events_by_name("team.agent.status");
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].data["teamId"], "team-1");
-    assert_eq!(events[0].data["slotId"], "w1");
+    assert_eq!(events[0].data["team_id"], "team-1");
+    assert_eq!(events[0].data["slot_id"], "w1");
     assert_eq!(events[0].data["status"], "working");
 }
 
@@ -423,7 +423,7 @@ async fn we2_add_agent_broadcasts_spawned() {
 
     let events = h.broadcaster.events_by_name("team.agent.spawned");
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].data["teamId"], "team-1");
+    assert_eq!(events[0].data["team_id"], "team-1");
     assert!(events[0].data["agent"].is_object());
 }
 
@@ -441,7 +441,7 @@ async fn we3_remove_agent_broadcasts_removed() {
 
     let events = h.broadcaster.events_by_name("team.agent.removed");
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].data["slotId"], "w1");
+    assert_eq!(events[0].data["slot_id"], "w1");
 }
 
 // -- WE-4: Rename agent broadcasts team.agent.renamed ----------------------
@@ -455,7 +455,7 @@ async fn we4_rename_agent_broadcasts_renamed() {
 
     let events = h.broadcaster.events_by_name("team.agent.renamed");
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].data["slotId"], "w1");
+    assert_eq!(events[0].data["slot_id"], "w1");
     assert_eq!(events[0].data["name"], "SuperWorker");
 }
 

@@ -73,7 +73,7 @@ async fn detect(router: &axum::Router, body: serde_json::Value) -> (StatusCode, 
 #[tokio::test]
 async fn detect_protocol_missing_base_url() {
     let router = setup().await;
-    let (status, json) = detect(&router, json!({"apiKey": "sk-xxx"})).await;
+    let (status, json) = detect(&router, json!({"api_key": "sk-xxx"})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(!json["success"].as_bool().unwrap());
 }
@@ -81,7 +81,7 @@ async fn detect_protocol_missing_base_url() {
 #[tokio::test]
 async fn detect_protocol_missing_api_key() {
     let router = setup().await;
-    let (status, json) = detect(&router, json!({"baseUrl": "https://example.com"})).await;
+    let (status, json) = detect(&router, json!({"base_url": "https://example.com"})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(!json["success"].as_bool().unwrap());
 }
@@ -89,7 +89,7 @@ async fn detect_protocol_missing_api_key() {
 #[tokio::test]
 async fn detect_protocol_empty_base_url() {
     let router = setup().await;
-    let (status, _) = detect(&router, json!({"baseUrl": "  ", "apiKey": "sk-test"})).await;
+    let (status, _) = detect(&router, json!({"base_url": "  ", "api_key": "sk-test"})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -98,7 +98,7 @@ async fn detect_protocol_empty_api_key() {
     let router = setup().await;
     let (status, _) = detect(
         &router,
-        json!({"baseUrl": "https://example.com", "apiKey": "  "}),
+        json!({"base_url": "https://example.com", "api_key": "  "}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -128,8 +128,8 @@ async fn detect_openai_protocol_success() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "sk-test-key"
+            "base_url": mock_server.uri(),
+            "api_key": "sk-test-key"
         }),
     )
     .await;
@@ -170,9 +170,9 @@ async fn detect_anthropic_protocol_success() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "sk-ant-test-key",
-            "preferredProtocol": "anthropic"
+            "base_url": mock_server.uri(),
+            "api_key": "sk-ant-test-key",
+            "preferred_protocol": "anthropic"
         }),
     )
     .await;
@@ -209,9 +209,9 @@ async fn detect_gemini_protocol_success() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "AIzaSyBtest",
-            "preferredProtocol": "gemini"
+            "base_url": mock_server.uri(),
+            "api_key": "AIzaSyBtest",
+            "preferred_protocol": "gemini"
         }),
     )
     .await;
@@ -244,8 +244,8 @@ async fn detect_protocol_all_fail_returns_unknown() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "sk-unknown-key"
+            "base_url": mock_server.uri(),
+            "api_key": "sk-unknown-key"
         }),
     )
     .await;
@@ -285,8 +285,8 @@ async fn detect_protocol_auth_failure_returns_check_key() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "invalid-key"
+            "base_url": mock_server.uri(),
+            "api_key": "invalid-key"
         }),
     )
     .await;
@@ -326,8 +326,8 @@ async fn detect_openai_via_v1_variant() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "sk-test"
+            "base_url": mock_server.uri(),
+            "api_key": "sk-test"
         }),
     )
     .await;
@@ -335,9 +335,9 @@ async fn detect_openai_via_v1_variant() {
     assert_eq!(status, StatusCode::OK);
     let data = &json["data"];
     assert_eq!(data["protocol"], "openai");
-    // fixedBaseUrl should be set when using /v1 variant
-    assert!(data["fixedBaseUrl"].is_string());
-    assert!(data["fixedBaseUrl"].as_str().unwrap().ends_with("/v1"));
+    // fixed_base_url should be set when using /v1 variant
+    assert!(data["fixed_base_url"].is_string());
+    assert!(data["fixed_base_url"].as_str().unwrap().ends_with("/v1"));
 }
 
 // ---------------------------------------------------------------------------
@@ -361,9 +361,9 @@ async fn detect_with_multi_key_test() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "key1,key2,key3",
-            "testAllKeys": true
+            "base_url": mock_server.uri(),
+            "api_key": "key1,key2,key3",
+            "test_all_keys": true
         }),
     )
     .await;
@@ -372,7 +372,7 @@ async fn detect_with_multi_key_test() {
     let data = &json["data"];
     assert_eq!(data["protocol"], "openai");
 
-    let mkr = &data["multiKeyResult"];
+    let mkr = &data["multi_key_result"];
     assert_eq!(mkr["total"], 3);
     assert_eq!(mkr["details"].as_array().unwrap().len(), 3);
     // All keys should be valid (mock returns 200 for any key)
@@ -409,16 +409,16 @@ async fn detect_multi_key_partial_validity() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "good-key,bad-key",
-            "testAllKeys": true
+            "base_url": mock_server.uri(),
+            "api_key": "good-key,bad-key",
+            "test_all_keys": true
         }),
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
     let data = &json["data"];
-    let mkr = &data["multiKeyResult"];
+    let mkr = &data["multi_key_result"];
     assert_eq!(mkr["total"], 2);
     assert_eq!(mkr["valid"], 1);
     assert_eq!(mkr["invalid"], 1);
@@ -453,9 +453,9 @@ async fn preferred_protocol_tested_first() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "test-key",
-            "preferredProtocol": "anthropic"
+            "base_url": mock_server.uri(),
+            "api_key": "test-key",
+            "preferred_protocol": "anthropic"
         }),
     )
     .await;
@@ -485,17 +485,17 @@ async fn single_key_no_multi_key_result() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "sk-single-key",
-            "testAllKeys": true
+            "base_url": mock_server.uri(),
+            "api_key": "sk-single-key",
+            "test_all_keys": true
         }),
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
     let data = &json["data"];
-    // Single key → multiKeyResult should be null
-    assert!(data["multiKeyResult"].is_null());
+    // Single key → multi_key_result should be null
+    assert!(data["multi_key_result"].is_null());
 }
 
 // ---------------------------------------------------------------------------
@@ -521,8 +521,8 @@ async fn detect_protocol_with_custom_timeout() {
     let (status, json) = detect(
         &router,
         json!({
-            "baseUrl": mock_server.uri(),
-            "apiKey": "sk-test",
+            "base_url": mock_server.uri(),
+            "api_key": "sk-test",
             "timeout": 5000
         }),
     )
