@@ -1,3 +1,4 @@
+//! SQLite database layer: init, migrations, repository traits, and implementations.
 mod database;
 mod error;
 pub mod models;

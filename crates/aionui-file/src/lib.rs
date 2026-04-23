@@ -1,3 +1,4 @@
+//! File system operations: read/write, path safety, file watching, snapshots, and zip.
 pub mod path_safety;
 pub mod routes;
 pub mod service;

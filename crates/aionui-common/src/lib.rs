@@ -1,3 +1,4 @@
+//! Shared primitives: error types, enums, ID generation, crypto, timestamps, and pagination.
 pub mod constants;
 
 mod crypto;

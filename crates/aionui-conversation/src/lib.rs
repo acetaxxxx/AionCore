@@ -1,3 +1,4 @@
+//! Conversation and message CRUD with streaming relay and event emission.
 mod convert;
 pub mod routes;
 pub mod service;

@@ -42,6 +42,50 @@ Never introduce circular dependencies or upward references.
 - `cargo clippy` must pass without warnings
 - `cargo fmt` must pass
 - Comments in English, commit messages in English
+- Each `.rs` file follows single responsibility — one module, one concern
+- Max 1000 lines per `.rs` file; split into submodules when approaching the limit
+
+## Route Map
+
+| Prefix | Crate | Auth |
+|--------|-------|------|
+| `POST /login`, `/api/auth/*` | aionui-auth | Public (rate-limited) |
+| `POST /logout`, `/api/auth/user`, `/api/auth/change-password`, `/api/ws-token` | aionui-auth | Yes |
+| `/api/conversations/*`, `/api/messages/*` | aionui-conversation | Yes |
+| `/api/acp/*`, `/api/conversations/{id}/acp/*` | aionui-ai-agent | Yes |
+| `/api/bedrock/*`, `/api/gemini/*` | aionui-ai-agent | Yes |
+| `/api/conversations/{id}/workspace`, `/api/conversations/{id}/side-question`, `/api/conversations/{id}/slash-commands`, `/api/conversations/{id}/reload-context` | aionui-ai-agent | Yes |
+| `/api/remote-agents/*` | aionui-ai-agent | Yes |
+| `/api/settings/*`, `/api/providers/*`, `/api/system/*` | aionui-system | Yes |
+| `/api/fs/*` | aionui-file | Yes |
+| `/api/mcp/*` | aionui-mcp | Yes |
+| `/api/extensions/*`, `/api/hub/*`, `/api/skills/*` | aionui-extension | Yes |
+| `/api/channel/*` | aionui-channel | Yes |
+| `/api/teams/*` | aionui-team | Yes |
+| `/api/cron/*` | aionui-cron | Yes |
+| `/api/word-preview/*`, `/api/excel-preview/*`, `/api/ppt-preview/*`, `/api/preview-history/*`, `/api/star-office/*`, `/api/document/*` | aionui-office | Yes |
+| `/api/ppt-proxy/*`, `/api/office-watch-proxy/*` | aionui-office | Public (iframe) |
+| `/api/shell/*`, `/api/stt` | aionui-shell | Yes |
+| `/ws` | aionui-realtime | Token callback |
+| `/health` | aionui-app | Public |
+
+## Quick Recipes
+
+**Add endpoint to existing crate:**
+1. Request/response types → `aionui-api-types/src/{domain}.rs`
+2. Handler function → `crates/aionui-{domain}/src/routes.rs`
+3. Business logic → `crates/aionui-{domain}/src/service.rs`
+4. Register route in `domain_routes()` function
+5. Add test → `crates/aionui-{domain}/tests/` or `crates/aionui-app/tests/`
+
+**Add migration:**
+1. Next number → `ls crates/aionui-db/migrations/`
+2. Create `NNN_descriptive_name.sql` with `IF NOT EXISTS`
+
+**Add WebSocket event:**
+1. Event type → `aionui-api-types`
+2. Emit via `event_bus.broadcast()` in service
+3. Naming: `domain.camelCaseAction`
 
 ## Architecture Rules
 

@@ -1,3 +1,4 @@
+//! Scheduled job engine: cron scheduler, executor, and lifecycle event emitter.
 pub mod busy_guard;
 pub mod error;
 pub mod events;

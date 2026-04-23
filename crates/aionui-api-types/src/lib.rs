@@ -1,3 +1,4 @@
+//! All HTTP request/response DTOs shared across the API surface.
 mod acp;
 mod auth;
 mod channel;

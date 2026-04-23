@@ -1,3 +1,4 @@
+//! System services: provider management, model fetching, settings, and version checks.
 pub mod client_pref;
 pub mod model_fetcher;
 pub mod protocol;
