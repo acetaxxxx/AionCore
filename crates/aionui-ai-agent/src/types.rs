@@ -147,6 +147,33 @@ pub struct RemoteBuildExtra {
     pub remote_agent_id: String,
 }
 
+/// Aionrs-specific fields extracted from `extra` in [`BuildTaskOptions`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AionrsBuildExtra {
+    /// LLM provider name (anthropic, openai, bedrock, vertex).
+    pub provider: String,
+    /// API key for the provider.
+    pub api_key: String,
+    /// Model identifier.
+    pub model: String,
+    /// Provider base URL override.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// System prompt override.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Max tokens per response.
+    #[serde(default = "default_aionrs_max_tokens")]
+    pub max_tokens: u32,
+    /// Max agentic turns.
+    #[serde(default)]
+    pub max_turns: Option<usize>,
+}
+
+fn default_aionrs_max_tokens() -> u32 {
+    8192
+}
+
 /// ACP model information returned by the ACP backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpModelInfo {
@@ -265,5 +292,40 @@ mod tests {
         assert!(!config.use_external_gateway);
         assert!(config.host.is_none());
         assert!(config.port.is_none());
+    }
+
+    #[test]
+    fn aionrs_build_extra_serde_minimal() {
+        let json = json!({
+            "provider": "anthropic",
+            "api_key": "sk-test",
+            "model": "claude-sonnet-4-20250514"
+        });
+        let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
+        assert_eq!(extra.provider, "anthropic");
+        assert_eq!(extra.api_key, "sk-test");
+        assert_eq!(extra.model, "claude-sonnet-4-20250514");
+        assert!(extra.base_url.is_none());
+        assert!(extra.system_prompt.is_none());
+        assert_eq!(extra.max_tokens, 8192);
+        assert!(extra.max_turns.is_none());
+    }
+
+    #[test]
+    fn aionrs_build_extra_serde_full() {
+        let json = json!({
+            "provider": "openai",
+            "api_key": "sk-openai",
+            "model": "gpt-4o",
+            "base_url": "https://api.openai.com/v1",
+            "system_prompt": "You are a helpful assistant.",
+            "max_tokens": 4096,
+            "max_turns": 10
+        });
+        let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
+        assert_eq!(extra.provider, "openai");
+        assert_eq!(extra.base_url.unwrap(), "https://api.openai.com/v1");
+        assert_eq!(extra.max_tokens, 4096);
+        assert_eq!(extra.max_turns.unwrap(), 10);
     }
 }
