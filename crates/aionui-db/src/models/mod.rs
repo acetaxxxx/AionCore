@@ -1,4 +1,5 @@
 mod acp_session;
+mod assistant;
 mod channel;
 mod client_preference;
 mod conversation;
@@ -13,6 +14,10 @@ mod team;
 mod user;
 
 pub use acp_session::AcpSessionRow;
+pub use assistant::{
+    AssistantOverrideRow, AssistantRow, CreateAssistantParams, UpdateAssistantParams,
+    UpsertOverrideParams,
+};
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;
 pub use conversation::ConversationRow;

@@ -14,6 +14,9 @@ use aionui_ai_agent::{
     RemoteAgentService, WorkerTaskManagerImpl, acp_routes, auxiliary_routes, build_agent_factory,
     connection_test_routes, remote_agent_routes,
 };
+use aionui_assistant::{
+    AssistantRouterState, AssistantService, BuiltinAssistantRegistry, assistant_routes,
+};
 use aionui_auth::{
     AuthRouterState, AuthState, CookieConfig, JwtService, QrTokenStore, auth_middleware,
     auth_routes, csrf_middleware, extract_token_from_ws_headers, resolve_jwt_secret,
@@ -25,9 +28,10 @@ use aionui_channel::{ChannelRouterState, channel_routes};
 use aionui_conversation::{ConversationRouterState, ConversationService, conversation_routes};
 use aionui_cron::{CronEventEmitter, CronRouterState, cron_routes};
 use aionui_db::{
-    Database, IUserRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
-    SqliteUserRepository,
+    Database, IAssistantOverrideRepository, IAssistantRepository, IUserRepository,
+    SqliteAssistantOverrideRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteSettingsRepository, SqliteUserRepository,
 };
 use aionui_extension::{
     ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -217,11 +221,13 @@ pub struct ModuleStates {
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
+    pub assistant: AssistantRouterState,
 }
 
 /// Build all default `ModuleStates` from application services.
 pub async fn build_module_states(services: &AppServices) -> ModuleStates {
     let (ext_state, hub_state, skill_state) = build_extension_states(services).await;
+    let assistant = build_assistant_state(services, ext_state.registry.clone());
     ModuleStates {
         system: build_system_state(services),
         conversation: build_conversation_state(services),
@@ -239,7 +245,32 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
         cron: build_cron_state(services),
         office: build_office_state(services),
         shell: build_shell_state(services),
+        assistant,
     }
+}
+
+/// Build the default `AssistantRouterState` from application services.
+///
+/// T1a scaffolding: wires the stub service (whose repository methods are
+/// `unimplemented!()`) behind a route skeleton that returns 500 for every
+/// endpoint. T1b replaces both the service and repository bodies.
+pub fn build_assistant_state(
+    services: &AppServices,
+    extension_registry: ExtensionRegistry,
+) -> AssistantRouterState {
+    let pool = services.database.pool().clone();
+    let repo: Arc<dyn IAssistantRepository> =
+        Arc::new(SqliteAssistantRepository::new(pool.clone()));
+    let override_repo: Arc<dyn IAssistantOverrideRepository> =
+        Arc::new(SqliteAssistantOverrideRepository::new(pool));
+    let builtin = Arc::new(BuiltinAssistantRegistry::empty());
+    let service = Arc::new(AssistantService::new(
+        repo,
+        override_repo,
+        builtin,
+        extension_registry,
+    ));
+    AssistantRouterState { service }
 }
 
 /// Build the default `SystemRouterState` from application services.
@@ -684,8 +715,13 @@ pub fn create_router_with_all_state(
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Shell + STT routes protected by auth middleware
-    let shell_authenticated =
-        shell_routes(states.shell).route_layer(from_fn_with_state(auth_mw_state, auth_middleware));
+    let shell_authenticated = shell_routes(states.shell)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    // Assistant routes protected by auth middleware (T1a skeleton: all
+    // handlers return 500 "not implemented"; T1b wires real service)
+    let assistant_authenticated = assistant_routes(states.assistant)
+        .route_layer(from_fn_with_state(auth_mw_state, auth_middleware));
 
     // Office proxy routes — exempt from auth (serve iframe content)
     let office_proxy = office_proxy_routes(states.office);
@@ -714,7 +750,8 @@ pub fn create_router_with_all_state(
         .merge(team_authenticated)
         .merge(cron_authenticated)
         .merge(office_authenticated)
-        .merge(shell_authenticated);
+        .merge(shell_authenticated)
+        .merge(assistant_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]

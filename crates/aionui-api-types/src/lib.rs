@@ -1,4 +1,5 @@
 mod acp;
+mod assistant;
 mod auth;
 mod channel;
 mod confirmation;
@@ -23,6 +24,10 @@ pub use acp::{
     AcpAgentInfo, AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AcpModeResponse,
     DetectCliRequest, DetectCliResponse, ProbeModelRequest, SetConfigOptionRequest, SetModeRequest,
     SetModelRequest, TestCustomAgentRequest, TestCustomAgentResponse,
+};
+pub use assistant::{
+    AssistantResponse, AssistantSource, CreateAssistantRequest, ImportAssistantsRequest,
+    ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
 };
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser,

@@ -99,6 +99,7 @@ version = "0.1.0"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
+ "aionui-assistant",
  "aionui-auth",
  "aionui-channel",
  "aionui-common",
@@ -135,6 +136,29 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+]
+
+[[package]]
+name = "aionui-assistant"
+version = "0.1.0"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-extension",
+ "async-trait",
+ "axum",
+ "chrono",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
