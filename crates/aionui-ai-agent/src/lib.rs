@@ -4,6 +4,7 @@ pub mod acp_routes;
 pub mod acp_service;
 pub mod agent_manager;
 pub mod aionrs_agent;
+pub mod backend_output_sink;
 pub mod api_client;
 pub mod auxiliary_routes;
 pub mod cli_process;
@@ -27,6 +28,7 @@ pub use acp_agent::AcpAgentManager;
 pub use acp_routes::{AcpRouterState, acp_routes};
 pub use agent_manager::{AgentManagerHandle, IAgentManager, approval_key};
 pub use aionrs_agent::AionrsAgentManager;
+pub use backend_output_sink::BackendOutputSink;
 pub use api_client::{
     AnthropicRotatingClient, ApiClientError, ApiKeyManager, ApiKeyStatus, ClientOptions,
     GeminiRotatingClient, LlmClient, OpenAIRotatingClient, RotatingClient, clean_function_name,
