@@ -17,12 +17,18 @@ pub struct DetectCliResponse {
     pub path: Option<String>,
 }
 
-/// Information about an available ACP agent.
+/// Information about an available agent (ACP or non-ACP execution engine).
+///
+/// The `backend` field is a free-form string rather than `AcpBackend` because
+/// the frontend consumer (`getAvailableAgents`) lists both ACP CLIs and
+/// execution engines that live outside the `AcpBackend` enum — Gemini,
+/// Aionrs, nanobot, openclaw-gateway — which the renderer references by
+/// string tag (see AionUi `src/renderer/pages/settings/AionrsSettings.tsx`).
 #[derive(Debug, Clone, Serialize)]
 pub struct AcpAgentInfo {
     pub id: String,
     pub name: String,
-    pub backend: AcpBackend,
+    pub backend: String,
     pub available: bool,
 }
 
@@ -128,7 +134,7 @@ mod tests {
         let info = AcpAgentInfo {
             id: "claude".into(),
             name: "Claude".into(),
-            backend: AcpBackend::Claude,
+            backend: "claude".into(),
             available: true,
         };
         let json = serde_json::to_value(&info).unwrap();
