@@ -10,13 +10,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind")]
 pub enum CronScheduleDto {
-    #[serde(rename = "at", rename_all = "camelCase")]
+    #[serde(rename = "at")]
     At {
         at_ms: TimestampMs,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
-    #[serde(rename = "every", rename_all = "camelCase")]
+    #[serde(rename = "every")]
     Every {
         every_ms: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,7 +37,6 @@ pub enum CronScheduleDto {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct CronAgentConfigDto {
     pub backend: String,
     pub name: String,
@@ -71,7 +70,6 @@ pub enum CronJobPayloadDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct CronJobTargetDto {
     pub payload: CronJobPayloadDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,7 +77,6 @@ pub struct CronJobTargetDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct CronJobMetadataDto {
     pub conversation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,7 +90,6 @@ pub struct CronJobMetadataDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct CronJobStateDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_run_at_ms: Option<TimestampMs>,
@@ -109,7 +105,6 @@ pub struct CronJobStateDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct CronJobResponse {
     pub id: String,
     pub name: String,
@@ -125,7 +120,6 @@ pub struct CronJobResponse {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateCronJobRequest {
     pub name: String,
     pub schedule: CronScheduleDto,
@@ -145,7 +139,6 @@ pub struct CreateCronJobRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateCronJobRequest {
     #[serde(default)]
     pub name: Option<String>,
@@ -179,7 +172,6 @@ pub struct ListCronJobsQuery {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct RunNowResponse {
     pub conversation_id: String,
 }
@@ -190,7 +182,6 @@ pub struct SaveCronSkillRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct HasSkillResponse {
     pub has_skill: bool,
 }
@@ -200,7 +191,6 @@ pub struct HasSkillResponse {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct CronJobExecutedEvent {
     pub job_id: String,
     pub status: String,
@@ -209,7 +199,6 @@ pub struct CronJobExecutedEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct CronJobRemovedPayload {
     pub job_id: String,
 }
@@ -233,13 +222,13 @@ mod tests {
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["kind"], "at");
-        assert_eq!(json["atMs"], 1700000000000_i64);
+        assert_eq!(json["at_ms"], 1700000000000_i64);
         assert_eq!(json["description"], "Run at specific time");
     }
 
     #[test]
     fn schedule_at_deserialize() {
-        let raw = json!({"kind": "at", "atMs": 1700000000000_i64, "description": "once"});
+        let raw = json!({"kind": "at", "at_ms": 1700000000000_i64, "description": "once"});
         let s: CronScheduleDto = serde_json::from_value(raw).unwrap();
         assert_eq!(
             s,
@@ -252,7 +241,7 @@ mod tests {
 
     #[test]
     fn schedule_at_without_description() {
-        let raw = json!({"kind": "at", "atMs": 1000});
+        let raw = json!({"kind": "at", "at_ms": 1000});
         let s: CronScheduleDto = serde_json::from_value(raw).unwrap();
         assert_eq!(
             s,
@@ -273,13 +262,13 @@ mod tests {
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["kind"], "every");
-        assert_eq!(json["everyMs"], 60000);
+        assert_eq!(json["every_ms"], 60000);
         assert_eq!(json["description"], "Every minute");
     }
 
     #[test]
     fn schedule_every_deserialize() {
-        let raw = json!({"kind": "every", "everyMs": 300000});
+        let raw = json!({"kind": "every", "every_ms": 300000});
         let s: CronScheduleDto = serde_json::from_value(raw).unwrap();
         assert_eq!(
             s,
@@ -377,13 +366,13 @@ mod tests {
         let raw = json!({
             "backend": "acp",
             "name": "Claude Agent",
-            "cliPath": "/usr/bin/claude",
-            "isPreset": true,
-            "customAgentId": "agent-1",
-            "presetAgentType": "claude",
+            "cli_path": "/usr/bin/claude",
+            "is_preset": true,
+            "custom_agent_id": "agent-1",
+            "preset_agent_type": "claude",
             "mode": "auto",
-            "modelId": "claude-sonnet-4-6",
-            "configOptions": {"key": "value"},
+            "model_id": "claude-sonnet-4-6",
+            "config_options": {"key": "value"},
             "workspace": "/tmp/ws"
         });
         let c: CronAgentConfigDto = serde_json::from_value(raw).unwrap();
@@ -422,9 +411,9 @@ mod tests {
             workspace: None,
         };
         let json = serde_json::to_value(&c).unwrap();
-        assert!(json.get("cliPath").is_none());
-        assert!(json.get("isPreset").is_none());
-        assert!(json.get("configOptions").is_none());
+        assert!(json.get("cli_path").is_none());
+        assert!(json.get("is_preset").is_none());
+        assert!(json.get("config_options").is_none());
     }
 
     #[test]
@@ -497,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn cron_job_response_serialize_camel_case() {
+    fn cron_job_response_serialize_snake_case() {
         let resp = sample_cron_job_response();
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "cron_abc");
@@ -507,17 +496,17 @@ mod tests {
         assert_eq!(json["schedule"]["expr"], "0 0 9 * * *");
         assert_eq!(json["target"]["payload"]["kind"], "message");
         assert_eq!(json["target"]["payload"]["text"], "Generate report");
-        assert_eq!(json["target"]["executionMode"], "new_conversation");
-        assert_eq!(json["metadata"]["conversationId"], "conv_1");
-        assert_eq!(json["metadata"]["agentType"], "acp");
-        assert_eq!(json["metadata"]["createdBy"], "user");
-        assert_eq!(json["metadata"]["createdAt"], 1700000000000_i64);
-        assert_eq!(json["state"]["nextRunAtMs"], 1700100000000_i64);
-        assert_eq!(json["state"]["lastStatus"], "ok");
-        assert_eq!(json["state"]["runCount"], 5);
-        assert_eq!(json["state"]["retryCount"], 0);
-        assert_eq!(json["state"]["maxRetries"], 3);
-        assert!(json["state"].get("lastError").is_none());
+        assert_eq!(json["target"]["execution_mode"], "new_conversation");
+        assert_eq!(json["metadata"]["conversation_id"], "conv_1");
+        assert_eq!(json["metadata"]["agent_type"], "acp");
+        assert_eq!(json["metadata"]["created_by"], "user");
+        assert_eq!(json["metadata"]["created_at"], 1700000000000_i64);
+        assert_eq!(json["state"]["next_run_at_ms"], 1700100000000_i64);
+        assert_eq!(json["state"]["last_status"], "ok");
+        assert_eq!(json["state"]["run_count"], 5);
+        assert_eq!(json["state"]["retry_count"], 0);
+        assert_eq!(json["state"]["max_retries"], 3);
+        assert!(json["state"].get("last_error").is_none());
     }
 
     #[test]
@@ -564,11 +553,11 @@ mod tests {
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert!(json["target"].get("executionMode").is_none());
-        assert!(json["metadata"].get("conversationTitle").is_none());
-        assert!(json["metadata"].get("agentConfig").is_none());
-        assert!(json["state"].get("nextRunAtMs").is_none());
-        assert!(json["state"].get("lastStatus").is_none());
+        assert!(json["target"].get("execution_mode").is_none());
+        assert!(json["metadata"].get("conversation_title").is_none());
+        assert!(json["metadata"].get("agent_config").is_none());
+        assert!(json["state"].get("next_run_at_ms").is_none());
+        assert!(json["state"].get("last_status").is_none());
     }
 
     // -- D. CreateCronJobRequest ----------------------------------------------
@@ -579,12 +568,12 @@ mod tests {
             "name": "Daily task",
             "schedule": {"kind": "cron", "expr": "0 0 9 * * *", "tz": "UTC"},
             "message": "Do the thing",
-            "conversationId": "conv_1",
-            "conversationTitle": "Tasks",
-            "agentType": "acp",
-            "createdBy": "user",
-            "executionMode": "new_conversation",
-            "agentConfig": {"backend": "acp", "name": "Claude"}
+            "conversation_id": "conv_1",
+            "conversation_title": "Tasks",
+            "agent_type": "acp",
+            "created_by": "user",
+            "execution_mode": "new_conversation",
+            "agent_config": {"backend": "acp", "name": "Claude"}
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Daily task");
@@ -600,10 +589,10 @@ mod tests {
     fn create_request_minimal() {
         let raw = json!({
             "name": "Ping",
-            "schedule": {"kind": "every", "everyMs": 60000},
-            "conversationId": "conv_1",
-            "agentType": "acp",
-            "createdBy": "agent"
+            "schedule": {"kind": "every", "every_ms": 60000},
+            "conversation_id": "conv_1",
+            "agent_type": "acp",
+            "created_by": "agent"
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Ping");
@@ -617,11 +606,11 @@ mod tests {
     fn create_request_with_prompt() {
         let raw = json!({
             "name": "Task",
-            "schedule": {"kind": "at", "atMs": 1000},
+            "schedule": {"kind": "at", "at_ms": 1000},
             "prompt": "Do something",
-            "conversationId": "conv_1",
-            "agentType": "gemini",
-            "createdBy": "user"
+            "conversation_id": "conv_1",
+            "agent_type": "gemini",
+            "created_by": "user"
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.prompt.as_deref(), Some("Do something"));
@@ -631,10 +620,10 @@ mod tests {
     #[test]
     fn create_request_missing_name() {
         let raw = json!({
-            "schedule": {"kind": "every", "everyMs": 1000},
-            "conversationId": "c1",
-            "agentType": "acp",
-            "createdBy": "user"
+            "schedule": {"kind": "every", "every_ms": 1000},
+            "conversation_id": "c1",
+            "agent_type": "acp",
+            "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }
@@ -643,9 +632,9 @@ mod tests {
     fn create_request_missing_schedule() {
         let raw = json!({
             "name": "X",
-            "conversationId": "c1",
-            "agentType": "acp",
-            "createdBy": "user"
+            "conversation_id": "c1",
+            "agent_type": "acp",
+            "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }
@@ -654,9 +643,9 @@ mod tests {
     fn create_request_missing_conversation_id() {
         let raw = json!({
             "name": "X",
-            "schedule": {"kind": "every", "everyMs": 1000},
-            "agentType": "acp",
-            "createdBy": "user"
+            "schedule": {"kind": "every", "every_ms": 1000},
+            "agent_type": "acp",
+            "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }
@@ -665,9 +654,9 @@ mod tests {
     fn create_request_missing_agent_type() {
         let raw = json!({
             "name": "X",
-            "schedule": {"kind": "every", "everyMs": 1000},
-            "conversationId": "c1",
-            "createdBy": "user"
+            "schedule": {"kind": "every", "every_ms": 1000},
+            "conversation_id": "c1",
+            "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }
@@ -676,9 +665,9 @@ mod tests {
     fn create_request_missing_created_by() {
         let raw = json!({
             "name": "X",
-            "schedule": {"kind": "every", "everyMs": 1000},
-            "conversationId": "c1",
-            "agentType": "acp"
+            "schedule": {"kind": "every", "every_ms": 1000},
+            "conversation_id": "c1",
+            "agent_type": "acp"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }
@@ -720,7 +709,7 @@ mod tests {
 
     #[test]
     fn update_request_with_max_retries() {
-        let raw = json!({"maxRetries": 5});
+        let raw = json!({"max_retries": 5});
         let req: UpdateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.max_retries, Some(5));
     }
@@ -749,7 +738,7 @@ mod tests {
             conversation_id: "conv_new".into(),
         };
         let json = serde_json::to_value(&r).unwrap();
-        assert_eq!(json["conversationId"], "conv_new");
+        assert_eq!(json["conversation_id"], "conv_new");
     }
 
     #[test]
@@ -766,14 +755,14 @@ mod tests {
     fn has_skill_response_true() {
         let r = HasSkillResponse { has_skill: true };
         let json = serde_json::to_value(&r).unwrap();
-        assert_eq!(json["hasSkill"], true);
+        assert_eq!(json["has_skill"], true);
     }
 
     #[test]
     fn has_skill_response_false() {
         let r = HasSkillResponse { has_skill: false };
         let json = serde_json::to_value(&r).unwrap();
-        assert_eq!(json["hasSkill"], false);
+        assert_eq!(json["has_skill"], false);
     }
 
     #[test]
@@ -807,7 +796,7 @@ mod tests {
             error: None,
         };
         let json = serde_json::to_value(&e).unwrap();
-        assert_eq!(json["jobId"], "cron_1");
+        assert_eq!(json["job_id"], "cron_1");
         assert_eq!(json["status"], "ok");
         assert!(json.get("error").is_none());
     }
@@ -842,7 +831,7 @@ mod tests {
             job_id: "cron_del".into(),
         };
         let json = serde_json::to_value(&p).unwrap();
-        assert_eq!(json["jobId"], "cron_del");
+        assert_eq!(json["job_id"], "cron_del");
     }
 
     #[test]

@@ -22,7 +22,6 @@ pub enum ModelType {
 
 /// A single model capability entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ModelCapability {
     #[serde(rename = "type")]
     pub capability_type: ModelType,
@@ -32,7 +31,7 @@ pub struct ModelCapability {
 
 /// Health status values for a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum HealthStatus {
     Unknown,
     Healthy,
@@ -41,7 +40,6 @@ pub enum HealthStatus {
 
 /// Per-model health check information.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ModelHealthStatus {
     pub status: HealthStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,7 +61,6 @@ pub enum BedrockAuthMethod {
 
 /// AWS Bedrock-specific configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct BedrockConfig {
     pub auth_method: BedrockAuthMethod,
     pub region: String,
@@ -80,7 +77,6 @@ pub struct BedrockConfig {
 /// The `api_key` field is always masked (e.g. `sk-ant-***abcd`).
 /// Full API keys are never included in responses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ProviderResponse {
     pub id: String,
     pub platform: String,
@@ -107,7 +103,6 @@ pub struct ProviderResponse {
 
 /// Request body for `POST /api/providers`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateProviderRequest {
     pub platform: String,
     pub name: String,
@@ -134,7 +129,6 @@ fn default_true() -> bool {
 ///
 /// All fields are optional — partial update semantics.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateProviderRequest {
     pub platform: Option<String>,
     pub name: Option<String>,
@@ -152,7 +146,6 @@ pub struct UpdateProviderRequest {
 
 /// Request body for `POST /api/providers/:id/models`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct FetchModelsRequest {
     #[serde(default)]
     pub try_fix: bool,
@@ -169,7 +162,6 @@ pub enum ModelInfo {
 
 /// Response for `POST /api/providers/:id/models`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct FetchModelsResponse {
     pub models: Vec<ModelInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,7 +170,6 @@ pub struct FetchModelsResponse {
 
 /// Request body for `POST /api/providers/detect-protocol`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DetectProtocolRequest {
     pub base_url: String,
     /// Plain-text API key (supports multi-key).
@@ -202,7 +193,6 @@ pub enum SuggestionType {
 
 /// Actionable suggestion from protocol detection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct DetectionSuggestion {
     #[serde(rename = "type")]
     pub suggestion_type: SuggestionType,
@@ -213,7 +203,6 @@ pub struct DetectionSuggestion {
 
 /// Per-key test result in multi-key protocol detection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct KeyTestResult {
     pub index: usize,
     pub masked_key: String,
@@ -226,7 +215,6 @@ pub struct KeyTestResult {
 
 /// Aggregated result of testing multiple API keys.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct MultiKeyResult {
     pub total: usize,
     pub valid: usize,
@@ -236,7 +224,6 @@ pub struct MultiKeyResult {
 
 /// Response for `POST /api/providers/detect-protocol`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ProtocolDetectionResponse {
     pub protocol: ProtocolType,
     pub confidence: u8,
@@ -302,7 +289,7 @@ mod tests {
         };
         let json = serde_json::to_value(&cap).unwrap();
         assert_eq!(json["type"], "vision");
-        assert_eq!(json["isUserSelected"], true);
+        assert_eq!(json["is_user_selected"], true);
     }
 
     #[test]
@@ -313,7 +300,7 @@ mod tests {
         };
         let json = serde_json::to_value(&cap).unwrap();
         assert_eq!(json["type"], "text");
-        assert!(json.get("isUserSelected").is_none());
+        assert!(json.get("is_user_selected").is_none());
     }
 
     // -- HealthStatus / ModelHealthStatus --
@@ -344,7 +331,7 @@ mod tests {
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["status"], "healthy");
-        assert_eq!(json["lastCheck"], 1712345678000_i64);
+        assert_eq!(json["last_check"], 1712345678000_i64);
         assert_eq!(json["latency"], 320);
         assert!(json.get("error").is_none());
     }
@@ -359,7 +346,7 @@ mod tests {
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["status"], "unknown");
-        assert!(json.get("lastCheck").is_none());
+        assert!(json.get("last_check").is_none());
     }
 
     // -- BedrockConfig --
@@ -374,9 +361,9 @@ mod tests {
             profile: None,
         };
         let json = serde_json::to_value(&cfg).unwrap();
-        assert_eq!(json["authMethod"], "accessKey");
+        assert_eq!(json["auth_method"], "accessKey");
         assert_eq!(json["region"], "us-east-1");
-        assert_eq!(json["accessKeyId"], "AKIAIOSFODNN7");
+        assert_eq!(json["access_key_id"], "AKIAIOSFODNN7");
         assert!(json.get("profile").is_none());
     }
 
@@ -390,9 +377,9 @@ mod tests {
             profile: Some("my-profile".into()),
         };
         let json = serde_json::to_value(&cfg).unwrap();
-        assert_eq!(json["authMethod"], "profile");
+        assert_eq!(json["auth_method"], "profile");
         assert_eq!(json["profile"], "my-profile");
-        assert!(json.get("accessKeyId").is_none());
+        assert!(json.get("access_key_id").is_none());
     }
 
     // -- ProviderResponse --
@@ -422,13 +409,13 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "uuid-xxx");
         assert_eq!(json["platform"], "anthropic");
-        assert_eq!(json["apiKey"], "sk-ant-***abcd");
-        assert_eq!(json["baseUrl"], "https://api.anthropic.com");
+        assert_eq!(json["api_key"], "sk-ant-***abcd");
+        assert_eq!(json["base_url"], "https://api.anthropic.com");
         assert_eq!(json["models"][0], "claude-sonnet-4-20250514");
-        assert_eq!(json["modelEnabled"]["claude-sonnet-4-20250514"], true);
-        assert!(json.get("contextLimit").is_none());
-        assert!(json.get("modelProtocols").is_none());
-        assert!(json.get("bedrockConfig").is_none());
+        assert_eq!(json["model_enabled"]["claude-sonnet-4-20250514"], true);
+        assert!(json.get("context_limit").is_none());
+        assert!(json.get("model_protocols").is_none());
+        assert!(json.get("bedrock_config").is_none());
     }
 
     // -- CreateProviderRequest --
@@ -438,8 +425,8 @@ mod tests {
         let raw = json!({
             "platform": "anthropic",
             "name": "Anthropic",
-            "baseUrl": "https://api.anthropic.com",
-            "apiKey": "sk-ant-api03-test"
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-api03-test"
         });
         let req: CreateProviderRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.platform, "anthropic");
@@ -465,17 +452,17 @@ mod tests {
         let raw = json!({
             "platform": "bedrock",
             "name": "AWS Bedrock",
-            "baseUrl": "https://bedrock.us-east-1.amazonaws.com",
-            "apiKey": "",
+            "base_url": "https://bedrock.us-east-1.amazonaws.com",
+            "api_key": "",
             "models": ["anthropic.claude-3-sonnet"],
             "enabled": false,
-            "capabilities": [{"type": "text"}, {"type": "vision", "isUserSelected": true}],
-            "contextLimit": 200000,
-            "bedrockConfig": {
-                "authMethod": "accessKey",
+            "capabilities": [{"type": "text"}, {"type": "vision", "is_user_selected": true}],
+            "context_limit": 200000,
+            "bedrock_config": {
+                "auth_method": "accessKey",
                 "region": "us-east-1",
-                "accessKeyId": "AKIA...",
-                "secretAccessKey": "secret"
+                "access_key_id": "AKIA...",
+                "secret_access_key": "secret"
             }
         });
         let req: CreateProviderRequest = serde_json::from_value(raw).unwrap();
@@ -516,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_fetch_models_request_with_try_fix() {
-        let raw = json!({"tryFix": true});
+        let raw = json!({"try_fix": true});
         let req: FetchModelsRequest = serde_json::from_value(raw).unwrap();
         assert!(req.try_fix);
     }
@@ -563,7 +550,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["models"].as_array().unwrap().len(), 2);
-        assert!(json.get("fixedBaseUrl").is_none());
+        assert!(json.get("fixed_base_url").is_none());
     }
 
     #[test]
@@ -573,7 +560,7 @@ mod tests {
             fixed_base_url: Some("https://api.openai.com/v1".into()),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["fixedBaseUrl"], "https://api.openai.com/v1");
+        assert_eq!(json["fixed_base_url"], "https://api.openai.com/v1");
     }
 
     // -- DetectProtocolRequest --
@@ -581,8 +568,8 @@ mod tests {
     #[test]
     fn test_detect_protocol_request_required_only() {
         let raw = json!({
-            "baseUrl": "https://api.example.com",
-            "apiKey": "sk-xxx"
+            "base_url": "https://api.example.com",
+            "api_key": "sk-xxx"
         });
         let req: DetectProtocolRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.base_url, "https://api.example.com");
@@ -595,11 +582,11 @@ mod tests {
     #[test]
     fn test_detect_protocol_request_full() {
         let raw = json!({
-            "baseUrl": "https://api.anthropic.com",
-            "apiKey": "sk-ant-xxx",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-xxx",
             "timeout": 10000,
-            "testAllKeys": true,
-            "preferredProtocol": "anthropic"
+            "test_all_keys": true,
+            "preferred_protocol": "anthropic"
         });
         let req: DetectProtocolRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.timeout, Some(10000));
@@ -640,10 +627,10 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["protocol"], "unknown");
         assert_eq!(json["confidence"], 0);
-        assert!(json.get("fixedBaseUrl").is_none());
+        assert!(json.get("fixed_base_url").is_none());
         assert!(json.get("models").is_none());
         assert!(json.get("suggestion").is_none());
-        assert!(json.get("multiKeyResult").is_none());
+        assert!(json.get("multi_key_result").is_none());
     }
 
     #[test]
@@ -665,7 +652,7 @@ mod tests {
         assert_eq!(json["confidence"], 95);
         assert_eq!(json["suggestion"]["type"], "none");
         assert_eq!(json["suggestion"]["message"], "Detected Anthropic protocol");
-        assert_eq!(json["suggestion"]["i18nKey"], "settings.protocolDetected");
+        assert_eq!(json["suggestion"]["i18n_key"], "settings.protocolDetected");
     }
 
     #[test]
@@ -706,12 +693,12 @@ mod tests {
             }),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        let mkr = &json["multiKeyResult"];
+        let mkr = &json["multi_key_result"];
         assert_eq!(mkr["total"], 3);
         assert_eq!(mkr["valid"], 2);
         assert_eq!(mkr["invalid"], 1);
         assert_eq!(mkr["details"].as_array().unwrap().len(), 3);
-        assert_eq!(mkr["details"][0]["maskedKey"], "sk-***abcd");
+        assert_eq!(mkr["details"][0]["masked_key"], "sk-***abcd");
         assert_eq!(mkr["details"][2]["error"], "Invalid API key");
     }
 }

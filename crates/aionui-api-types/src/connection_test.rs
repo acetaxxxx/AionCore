@@ -4,7 +4,6 @@ use super::provider::BedrockConfig;
 
 /// Request body for `POST /api/bedrock/test-connection`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TestBedrockConnectionRequest {
     pub bedrock_config: BedrockConfig,
 }
@@ -17,7 +16,6 @@ pub struct GeminiSubscriptionQuery {
 
 /// Response data for `GET /api/gemini/subscription-status`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct GeminiSubscriptionData {
     pub subscription_status: String,
 }
@@ -32,11 +30,11 @@ mod tests {
     #[test]
     fn test_bedrock_request_access_key() {
         let raw = json!({
-            "bedrockConfig": {
-                "authMethod": "accessKey",
+            "bedrock_config": {
+                "auth_method": "accessKey",
                 "region": "us-east-1",
-                "accessKeyId": "AKIAIOSFODNN7",
-                "secretAccessKey": "wJalrXUtnFEMI"
+                "access_key_id": "AKIAIOSFODNN7",
+                "secret_access_key": "wJalrXUtnFEMI"
             }
         });
         let req: TestBedrockConnectionRequest = serde_json::from_value(raw).unwrap();
@@ -54,8 +52,8 @@ mod tests {
     #[test]
     fn test_bedrock_request_profile() {
         let raw = json!({
-            "bedrockConfig": {
-                "authMethod": "profile",
+            "bedrock_config": {
+                "auth_method": "profile",
                 "region": "eu-west-1",
                 "profile": "my-profile"
             }
@@ -78,10 +76,10 @@ mod tests {
     #[test]
     fn test_bedrock_request_missing_region() {
         let raw = json!({
-            "bedrockConfig": {
-                "authMethod": "accessKey",
-                "accessKeyId": "AKIA...",
-                "secretAccessKey": "secret"
+            "bedrock_config": {
+                "auth_method": "accessKey",
+                "access_key_id": "AKIA...",
+                "secret_access_key": "secret"
             }
         });
         let result = serde_json::from_value::<TestBedrockConnectionRequest>(raw);
@@ -115,12 +113,12 @@ mod tests {
             subscription_status: "active".into(),
         };
         let json = serde_json::to_value(&data).unwrap();
-        assert_eq!(json["subscriptionStatus"], "active");
+        assert_eq!(json["subscription_status"], "active");
     }
 
     #[test]
     fn test_gemini_subscription_data_roundtrip() {
-        let raw = json!({ "subscriptionStatus": "inactive" });
+        let raw = json!({ "subscription_status": "inactive" });
         let data: GeminiSubscriptionData = serde_json::from_value(raw).unwrap();
         assert_eq!(data.subscription_status, "inactive");
     }

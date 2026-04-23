@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 /// field is a JSON object containing platform-specific credentials and
 /// connection options (`{ credentials, config }`).
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct EnablePluginRequest {
     pub plugin_id: String,
     pub config: serde_json::Value,
@@ -19,7 +18,6 @@ pub struct EnablePluginRequest {
 
 /// Request body for `POST /api/channel/plugins/disable`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DisablePluginRequest {
     pub plugin_id: String,
 }
@@ -30,7 +28,6 @@ pub struct DisablePluginRequest {
 /// additional config (e.g., Lark requires `appId` + `appSecret`),
 /// pass them in `extra_config`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TestPluginRequest {
     pub plugin_id: String,
     pub token: String,
@@ -43,7 +40,6 @@ pub struct TestPluginRequest {
 /// Used by platforms that require more than a single token
 /// (e.g., Lark needs `app_id` + `app_secret`).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TestPluginExtraConfig {
     #[serde(default)]
     pub app_id: Option<String>,
@@ -57,14 +53,12 @@ pub struct TestPluginExtraConfig {
 
 /// Request body for `POST /api/channel/pairings/approve`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ApprovePairingRequest {
     pub code: String,
 }
 
 /// Request body for `POST /api/channel/pairings/reject`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RejectPairingRequest {
     pub code: String,
 }
@@ -75,7 +69,6 @@ pub struct RejectPairingRequest {
 
 /// Request body for `POST /api/channel/users/revoke`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RevokeUserRequest {
     pub user_id: String,
 }
@@ -89,7 +82,6 @@ pub struct RevokeUserRequest {
 /// Synchronizes agent and model configuration for a specific IM platform
 /// to the running plugin instance.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SyncChannelSettingsRequest {
     pub platform: String,
     pub agent: ChannelAgentConfig,
@@ -99,7 +91,6 @@ pub struct SyncChannelSettingsRequest {
 
 /// Agent configuration within a channel settings sync request.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ChannelAgentConfig {
     pub backend: String,
     #[serde(default)]
@@ -110,7 +101,6 @@ pub struct ChannelAgentConfig {
 
 /// Model configuration within a channel settings sync request.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ChannelModelConfig {
     pub id: String,
     pub use_model: bool,
@@ -125,7 +115,6 @@ pub struct ChannelModelConfig {
 /// Corresponds to `IChannelPluginStatus` in the original TypeScript.
 /// Excludes encrypted config data for security.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PluginStatusResponse {
     pub plugin_id: String,
     #[serde(rename = "type")]
@@ -142,7 +131,6 @@ pub struct PluginStatusResponse {
 
 /// Result of a plugin credential test.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct TestPluginResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,7 +144,6 @@ pub struct TestPluginResponse {
 /// Used by enable/disable plugin, approve/reject pairing, revoke user,
 /// and sync settings endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct BridgeResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,7 +160,6 @@ pub struct BridgeResponse {
 ///
 /// Corresponds to `IChannelPairingRequest`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PairingRequestResponse {
     pub code: String,
     pub platform_user_id: String,
@@ -192,7 +178,6 @@ pub struct PairingRequestResponse {
 ///
 /// Corresponds to `IChannelUser`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ChannelUserResponse {
     pub id: String,
     pub platform_user_id: String,
@@ -212,7 +197,6 @@ pub struct ChannelUserResponse {
 ///
 /// Corresponds to `IChannelSession`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ChannelSessionResponse {
     pub id: String,
     pub user_id: String,
@@ -236,7 +220,6 @@ pub struct ChannelSessionResponse {
 /// Pushed when an IM user sends their first message and triggers the
 /// pairing authorization flow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PairingRequestedPayload {
     pub code: String,
     pub platform_user_id: String,
@@ -250,7 +233,6 @@ pub struct PairingRequestedPayload {
 ///
 /// Pushed when a plugin starts, stops, or encounters an error.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PluginStatusChangedPayload {
     pub plugin_id: String,
     pub status: PluginStatusResponse,
@@ -260,7 +242,6 @@ pub struct PluginStatusChangedPayload {
 ///
 /// Pushed after a pairing code is approved and the user record is created.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct UserAuthorizedPayload {
     pub id: String,
     pub platform_user_id: String,
@@ -283,7 +264,7 @@ mod tests {
     #[test]
     fn test_enable_plugin_request_deserialize() {
         let raw = json!({
-            "pluginId": "telegram",
+            "plugin_id": "telegram",
             "config": {
                 "credentials": { "token": "bot123:ABC" },
                 "config": { "mode": "polling" }
@@ -304,14 +285,14 @@ mod tests {
 
     #[test]
     fn test_enable_plugin_request_missing_config() {
-        let raw = json!({ "pluginId": "telegram" });
+        let raw = json!({ "plugin_id": "telegram" });
         let result = serde_json::from_value::<EnablePluginRequest>(raw);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_disable_plugin_request_deserialize() {
-        let raw = json!({ "pluginId": "lark" });
+        let raw = json!({ "plugin_id": "lark" });
         let req: DisablePluginRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.plugin_id, "lark");
     }
@@ -326,7 +307,7 @@ mod tests {
     #[test]
     fn test_test_plugin_request_telegram() {
         let raw = json!({
-            "pluginId": "telegram",
+            "plugin_id": "telegram",
             "token": "bot123:ABC"
         });
         let req: TestPluginRequest = serde_json::from_value(raw).unwrap();
@@ -338,11 +319,11 @@ mod tests {
     #[test]
     fn test_test_plugin_request_lark_with_extra_config() {
         let raw = json!({
-            "pluginId": "lark",
+            "plugin_id": "lark",
             "token": "xxx",
-            "extraConfig": {
-                "appId": "cli_abc",
-                "appSecret": "secret123"
+            "extra_config": {
+                "app_id": "cli_abc",
+                "app_secret": "secret123"
             }
         });
         let req: TestPluginRequest = serde_json::from_value(raw).unwrap();
@@ -354,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_test_plugin_request_missing_token() {
-        let raw = json!({ "pluginId": "telegram" });
+        let raw = json!({ "plugin_id": "telegram" });
         let result = serde_json::from_value::<TestPluginRequest>(raw);
         assert!(result.is_err());
     }
@@ -362,9 +343,9 @@ mod tests {
     #[test]
     fn test_test_plugin_extra_config_partial() {
         let raw = json!({
-            "pluginId": "lark",
+            "plugin_id": "lark",
             "token": "xxx",
-            "extraConfig": { "appId": "cli_abc" }
+            "extra_config": { "app_id": "cli_abc" }
         });
         let req: TestPluginRequest = serde_json::from_value(raw).unwrap();
         let extra = req.extra_config.unwrap();
@@ -399,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_revoke_user_request_deserialize() {
-        let raw = json!({ "userId": "user-1" });
+        let raw = json!({ "user_id": "user-1" });
         let req: RevokeUserRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.user_id, "user-1");
     }
@@ -419,12 +400,12 @@ mod tests {
             "platform": "telegram",
             "agent": {
                 "backend": "acp",
-                "customAgentId": "agent-x",
+                "custom_agent_id": "agent-x",
                 "name": "My Agent"
             },
             "model": {
                 "id": "gemini-pro",
-                "useModel": true
+                "use_model": true
             }
         });
         let req: SyncChannelSettingsRequest = serde_json::from_value(raw).unwrap();
@@ -480,14 +461,14 @@ mod tests {
             updated_at: 1700000000000,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["pluginId"], "telegram");
+        assert_eq!(json["plugin_id"], "telegram");
         assert_eq!(json["type"], "telegram");
         assert_eq!(json["name"], "Telegram Bot");
         assert_eq!(json["enabled"], true);
         assert_eq!(json["status"], "running");
-        assert_eq!(json["lastConnected"], 1700000000000_i64);
-        assert_eq!(json["createdAt"], 1699000000000_i64);
-        assert_eq!(json["updatedAt"], 1700000000000_i64);
+        assert_eq!(json["last_connected"], 1700000000000_i64);
+        assert_eq!(json["created_at"], 1699000000000_i64);
+        assert_eq!(json["updated_at"], 1700000000000_i64);
     }
 
     #[test]
@@ -504,7 +485,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("status").is_none());
-        assert!(json.get("lastConnected").is_none());
+        assert!(json.get("last_connected").is_none());
     }
 
     // -- E. Test plugin response ----------------------------------------------
@@ -518,7 +499,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], true);
-        assert_eq!(json["botUsername"], "my_bot");
+        assert_eq!(json["bot_username"], "my_bot");
         assert!(json.get("error").is_none());
     }
 
@@ -531,7 +512,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], false);
-        assert!(json.get("botUsername").is_none());
+        assert!(json.get("bot_username").is_none());
         assert_eq!(json["error"], "Invalid token");
     }
 
@@ -590,11 +571,11 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["code"], "123456");
-        assert_eq!(json["platformUserId"], "tg_user_42");
-        assert_eq!(json["platformType"], "telegram");
-        assert_eq!(json["displayName"], "Alice");
-        assert_eq!(json["requestedAt"], 1700000000000_i64);
-        assert_eq!(json["expiresAt"], 1700000600000_i64);
+        assert_eq!(json["platform_user_id"], "tg_user_42");
+        assert_eq!(json["platform_type"], "telegram");
+        assert_eq!(json["display_name"], "Alice");
+        assert_eq!(json["requested_at"], 1700000000000_i64);
+        assert_eq!(json["expires_at"], 1700000600000_i64);
     }
 
     #[test]
@@ -608,7 +589,7 @@ mod tests {
             expires_at: 1700000600000,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert!(json.get("displayName").is_none());
+        assert!(json.get("display_name").is_none());
     }
 
     // -- G. User response -----------------------------------------------------
@@ -625,11 +606,11 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "usr_1");
-        assert_eq!(json["platformUserId"], "tg_42");
-        assert_eq!(json["platformType"], "telegram");
-        assert_eq!(json["displayName"], "Bob");
-        assert_eq!(json["authorizedAt"], 1700000000000_i64);
-        assert_eq!(json["lastActive"], 1700001000000_i64);
+        assert_eq!(json["platform_user_id"], "tg_42");
+        assert_eq!(json["platform_type"], "telegram");
+        assert_eq!(json["display_name"], "Bob");
+        assert_eq!(json["authorized_at"], 1700000000000_i64);
+        assert_eq!(json["last_active"], 1700001000000_i64);
     }
 
     #[test]
@@ -643,8 +624,8 @@ mod tests {
             last_active: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert!(json.get("displayName").is_none());
-        assert!(json.get("lastActive").is_none());
+        assert!(json.get("display_name").is_none());
+        assert!(json.get("last_active").is_none());
     }
 
     // -- H. Session response --------------------------------------------------
@@ -663,13 +644,13 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "sess_1");
-        assert_eq!(json["userId"], "usr_1");
-        assert_eq!(json["agentType"], "gemini");
-        assert_eq!(json["conversationId"], "conv_abc");
+        assert_eq!(json["user_id"], "usr_1");
+        assert_eq!(json["agent_type"], "gemini");
+        assert_eq!(json["conversation_id"], "conv_abc");
         assert_eq!(json["workspace"], "/workspace");
-        assert_eq!(json["chatId"], "chat_123");
-        assert_eq!(json["createdAt"], 1700000000000_i64);
-        assert_eq!(json["lastActivity"], 1700001000000_i64);
+        assert_eq!(json["chat_id"], "chat_123");
+        assert_eq!(json["created_at"], 1700000000000_i64);
+        assert_eq!(json["last_activity"], 1700001000000_i64);
     }
 
     #[test]
@@ -685,9 +666,9 @@ mod tests {
             last_activity: 1700000000000,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert!(json.get("conversationId").is_none());
+        assert!(json.get("conversation_id").is_none());
         assert!(json.get("workspace").is_none());
-        assert!(json.get("chatId").is_none());
+        assert!(json.get("chat_id").is_none());
     }
 
     // -- I. WebSocket event payloads ------------------------------------------
@@ -703,10 +684,10 @@ mod tests {
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["code"], "123456");
-        assert_eq!(json["platformUserId"], "tg_42");
-        assert_eq!(json["platformType"], "telegram");
-        assert_eq!(json["displayName"], "Alice");
-        assert_eq!(json["expiresAt"], 1700000600000_i64);
+        assert_eq!(json["platform_user_id"], "tg_42");
+        assert_eq!(json["platform_type"], "telegram");
+        assert_eq!(json["display_name"], "Alice");
+        assert_eq!(json["expires_at"], 1700000600000_i64);
     }
 
     #[test]
@@ -719,7 +700,7 @@ mod tests {
             expires_at: 1700000600000,
         };
         let json = serde_json::to_value(&payload).unwrap();
-        assert!(json.get("displayName").is_none());
+        assert!(json.get("display_name").is_none());
     }
 
     #[test]
@@ -738,7 +719,7 @@ mod tests {
             },
         };
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["pluginId"], "telegram");
+        assert_eq!(json["plugin_id"], "telegram");
         assert_eq!(json["status"]["type"], "telegram");
         assert_eq!(json["status"]["status"], "running");
         assert_eq!(json["status"]["enabled"], true);
@@ -754,9 +735,9 @@ mod tests {
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["id"], "usr_1");
-        assert_eq!(json["platformUserId"], "tg_42");
-        assert_eq!(json["platformType"], "telegram");
-        assert_eq!(json["displayName"], "Alice");
+        assert_eq!(json["platform_user_id"], "tg_42");
+        assert_eq!(json["platform_type"], "telegram");
+        assert_eq!(json["display_name"], "Alice");
     }
 
     #[test]
@@ -768,7 +749,7 @@ mod tests {
             display_name: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
-        assert!(json.get("displayName").is_none());
+        assert!(json.get("display_name").is_none());
     }
 
     // -- Roundtrip tests ------------------------------------------------------

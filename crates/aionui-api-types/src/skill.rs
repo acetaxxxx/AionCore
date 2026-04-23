@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 /// Single item in the available skills list (`GET /api/skills`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct SkillListItemResponse {
     pub name: String,
     pub description: String,
@@ -16,14 +15,12 @@ pub struct SkillListItemResponse {
 
 /// Request body for `POST /api/skills/info`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ReadSkillInfoRequest {
     pub skill_path: String,
 }
 
 /// Response for `POST /api/skills/info`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ReadSkillInfoResponse {
     pub name: String,
     pub description: String,
@@ -35,21 +32,18 @@ pub struct ReadSkillInfoResponse {
 
 /// Request body for `POST /api/skills/import` and `POST /api/skills/import-symlink`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ImportSkillRequest {
     pub skill_path: String,
 }
 
 /// Response for skill import operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ImportSkillResponse {
     pub skill_name: String,
 }
 
 /// Request body for `POST /api/skills/export-symlink`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ExportSkillRequest {
     pub skill_path: String,
     pub target_dir: String,
@@ -57,7 +51,6 @@ pub struct ExportSkillRequest {
 
 /// Request body for `DELETE /api/skills/:name` (path param, but also usable as body).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DeleteSkillRequest {
     pub skill_name: String,
 }
@@ -68,14 +61,12 @@ pub struct DeleteSkillRequest {
 
 /// Request body for `POST /api/skills/scan`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ScanForSkillsRequest {
     pub folder_path: String,
 }
 
 /// A skill discovered by directory scanning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ScannedSkillResponse {
     pub name: String,
     pub description: String,
@@ -84,14 +75,12 @@ pub struct ScannedSkillResponse {
 
 /// Response for `POST /api/skills/scan`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ScanForSkillsResponse {
     pub skills: Vec<ScannedSkillResponse>,
 }
 
 /// An external skill source with count (`GET /api/skills/detect-external`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ExternalSkillSourceResponse {
     pub name: String,
     pub path: String,
@@ -101,7 +90,6 @@ pub struct ExternalSkillSourceResponse {
 
 /// A named filesystem path (`GET /api/skills/detect-paths`, external paths).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct NamedPathResponse {
     pub name: String,
     pub path: String,
@@ -109,7 +97,6 @@ pub struct NamedPathResponse {
 
 /// Response for `GET /api/skills/paths`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct SkillPathsResponse {
     pub user_skills_dir: String,
     pub builtin_skills_dir: String,
@@ -122,7 +109,6 @@ pub struct SkillPathsResponse {
 /// Request body for `POST /api/skills/assistant-rule/read` and
 /// `POST /api/skills/assistant-skill/read`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ReadAssistantRuleRequest {
     pub assistant_id: String,
     #[serde(default)]
@@ -132,7 +118,6 @@ pub struct ReadAssistantRuleRequest {
 /// Request body for `POST /api/skills/assistant-rule/write` and
 /// `POST /api/skills/assistant-skill/write`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct WriteAssistantRuleRequest {
     pub assistant_id: String,
     pub content: String,
@@ -143,7 +128,6 @@ pub struct WriteAssistantRuleRequest {
 /// Request body for `POST /api/skills/builtin-rule` and
 /// `POST /api/skills/builtin-skill`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ReadBuiltinResourceRequest {
     pub file_name: String,
 }
@@ -154,7 +138,6 @@ pub struct ReadBuiltinResourceRequest {
 
 /// Request body for `POST /api/skills/external-paths`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AddExternalPathRequest {
     pub name: String,
     pub path: String,
@@ -162,7 +145,6 @@ pub struct AddExternalPathRequest {
 
 /// Request body for `DELETE /api/skills/external-paths`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RemoveExternalPathRequest {
     pub path: String,
 }
@@ -184,13 +166,13 @@ mod tests {
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["name"], "my-skill");
-        assert_eq!(json["isCustom"], true);
-        assert!(json.get("is_custom").is_none());
+        assert_eq!(json["is_custom"], true);
+        assert!(json.get("isCustom").is_none());
     }
 
     #[test]
     fn test_read_skill_info_request() {
-        let raw = json!({"skillPath": "/path/to/skill"});
+        let raw = json!({"skill_path": "/path/to/skill"});
         let req: ReadSkillInfoRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.skill_path, "/path/to/skill");
     }
@@ -210,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_import_skill_request() {
-        let raw = json!({"skillPath": "/external/skill"});
+        let raw = json!({"skill_path": "/external/skill"});
         let req: ImportSkillRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.skill_path, "/external/skill");
     }
@@ -221,12 +203,12 @@ mod tests {
             skill_name: "imported-skill".into(),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["skillName"], "imported-skill");
+        assert_eq!(json["skill_name"], "imported-skill");
     }
 
     #[test]
     fn test_export_skill_request() {
-        let raw = json!({"skillPath": "/user/skill", "targetDir": "/external/dir"});
+        let raw = json!({"skill_path": "/user/skill", "target_dir": "/external/dir"});
         let req: ExportSkillRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.skill_path, "/user/skill");
         assert_eq!(req.target_dir, "/external/dir");
@@ -236,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_scan_for_skills_request() {
-        let raw = json!({"folderPath": "/some/dir"});
+        let raw = json!({"folder_path": "/some/dir"});
         let req: ScanForSkillsRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.folder_path, "/some/dir");
     }
@@ -273,7 +255,7 @@ mod tests {
             ],
         };
         let json = serde_json::to_value(&source).unwrap();
-        assert_eq!(json["skillCount"], 2);
+        assert_eq!(json["skill_count"], 2);
         assert_eq!(json["skills"].as_array().unwrap().len(), 2);
     }
 
@@ -295,15 +277,15 @@ mod tests {
             builtin_skills_dir: "/app/resources/skills".into(),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["userSkillsDir"], "/home/user/.aionui/skills");
-        assert_eq!(json["builtinSkillsDir"], "/app/resources/skills");
+        assert_eq!(json["user_skills_dir"], "/home/user/.aionui/skills");
+        assert_eq!(json["builtin_skills_dir"], "/app/resources/skills");
     }
 
     // -- Assistant rules --
 
     #[test]
     fn test_read_assistant_rule_request_with_locale() {
-        let raw = json!({"assistantId": "abc123", "locale": "zh-CN"});
+        let raw = json!({"assistant_id": "abc123", "locale": "zh-CN"});
         let req: ReadAssistantRuleRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.assistant_id, "abc123");
         assert_eq!(req.locale.as_deref(), Some("zh-CN"));
@@ -311,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_read_assistant_rule_request_without_locale() {
-        let raw = json!({"assistantId": "abc123"});
+        let raw = json!({"assistant_id": "abc123"});
         let req: ReadAssistantRuleRequest = serde_json::from_value(raw).unwrap();
         assert!(req.locale.is_none());
     }
@@ -319,7 +301,7 @@ mod tests {
     #[test]
     fn test_write_assistant_rule_request() {
         let raw = json!({
-            "assistantId": "abc123",
+            "assistant_id": "abc123",
             "content": "# Rules\nBe helpful.",
             "locale": "en-US"
         });
@@ -331,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_read_builtin_resource_request() {
-        let raw = json!({"fileName": "code-review.md"});
+        let raw = json!({"file_name": "code-review.md"});
         let req: ReadBuiltinResourceRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.file_name, "code-review.md");
     }

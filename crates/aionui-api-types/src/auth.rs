@@ -38,7 +38,6 @@ impl LoginResponse {
 
 /// Change password request body for `POST /api/auth/change-password`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
@@ -46,14 +45,12 @@ pub struct ChangePasswordRequest {
 
 /// QR code login request body for `POST /api/auth/qr-login`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct QrLoginRequest {
     pub qr_token: String,
 }
 
 /// Auth status response for `GET /api/auth/status`.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AuthStatusResponse {
     pub success: bool,
     pub needs_setup: bool,
@@ -83,7 +80,6 @@ pub struct RefreshResponse {
 
 /// WebSocket token response for `GET /api/ws-token`.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct WsTokenResponse {
     pub success: bool,
     pub ws_token: String,
@@ -152,36 +148,36 @@ mod tests {
     }
 
     #[test]
-    fn test_change_password_request_camel_case() {
-        let raw = r#"{"currentPassword":"old123","newPassword":"new456"}"#;
+    fn test_change_password_request_snake_case() {
+        let raw = r#"{"current_password":"old123","new_password":"new456"}"#;
         let req: ChangePasswordRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(req.current_password, "old123");
         assert_eq!(req.new_password, "new456");
     }
 
     #[test]
-    fn test_change_password_request_snake_case_rejected() {
-        let raw = r#"{"current_password":"old","new_password":"new"}"#;
+    fn test_change_password_request_camel_case_rejected() {
+        let raw = r#"{"currentPassword":"old","newPassword":"new"}"#;
         let result = serde_json::from_str::<ChangePasswordRequest>(raw);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_qr_login_request_camel_case() {
-        let raw = r#"{"qrToken":"abc123"}"#;
+    fn test_qr_login_request_snake_case() {
+        let raw = r#"{"qr_token":"abc123"}"#;
         let req: QrLoginRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(req.qr_token, "abc123");
     }
 
     #[test]
-    fn test_qr_login_request_snake_case_rejected() {
-        let raw = r#"{"qr_token":"abc"}"#;
+    fn test_qr_login_request_camel_case_rejected() {
+        let raw = r#"{"qrToken":"abc"}"#;
         let result = serde_json::from_str::<QrLoginRequest>(raw);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_auth_status_response_camel_case() {
+    fn test_auth_status_response_snake_case() {
         let resp = AuthStatusResponse {
             success: true,
             needs_setup: true,
@@ -190,22 +186,22 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], true);
-        assert_eq!(json["needsSetup"], true);
-        assert_eq!(json["userCount"], 0);
-        assert_eq!(json["isAuthenticated"], false);
-        // Verify camelCase keys exist, not snake_case
-        assert!(json.get("needs_setup").is_none());
-        assert!(json.get("user_count").is_none());
-        assert!(json.get("is_authenticated").is_none());
+        assert_eq!(json["needs_setup"], true);
+        assert_eq!(json["user_count"], 0);
+        assert_eq!(json["is_authenticated"], false);
+        // Verify snake_case keys exist, not camelCase
+        assert!(json.get("needsSetup").is_none());
+        assert!(json.get("userCount").is_none());
+        assert!(json.get("isAuthenticated").is_none());
     }
 
     #[test]
     fn test_auth_status_response_deserialization() {
         let raw = json!({
             "success": true,
-            "needsSetup": false,
-            "userCount": 3,
-            "isAuthenticated": true
+            "needs_setup": false,
+            "user_count": 3,
+            "is_authenticated": true
         });
         let resp: AuthStatusResponse = serde_json::from_value(raw).unwrap();
         assert!(resp.success);

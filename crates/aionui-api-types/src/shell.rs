@@ -13,13 +13,11 @@ pub enum ToolType {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OpenFileRequest {
     pub file_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ShowItemInFolderRequest {
     pub file_path: String,
 }
@@ -40,7 +38,6 @@ pub struct CheckToolInstalledResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OpenFolderWithRequest {
     pub folder_path: String,
     pub tool: ToolType,
@@ -67,7 +64,6 @@ pub struct SpeechToTextResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OpenAISpeechToTextConfig {
     pub api_key: String,
     #[serde(default)]
@@ -82,7 +78,6 @@ pub struct OpenAISpeechToTextConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DeepgramSpeechToTextConfig {
     pub api_key: String,
     #[serde(default)]
@@ -99,7 +94,6 @@ pub struct DeepgramSpeechToTextConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SpeechToTextConfig {
     pub enabled: bool,
     pub provider: SpeechToTextProvider,
@@ -150,8 +144,8 @@ mod tests {
     // -- Shell request types --
 
     #[test]
-    fn open_file_request_camel_case() {
-        let raw = json!({ "filePath": "/tmp/test.txt" });
+    fn open_file_request_snake_case() {
+        let raw = json!({ "file_path": "/tmp/test.txt" });
         let req: OpenFileRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.file_path, "/tmp/test.txt");
     }
@@ -163,8 +157,8 @@ mod tests {
     }
 
     #[test]
-    fn show_item_in_folder_request_camel_case() {
-        let raw = json!({ "filePath": "/home/user/doc.pdf" });
+    fn show_item_in_folder_request_snake_case() {
+        let raw = json!({ "file_path": "/home/user/doc.pdf" });
         let req: ShowItemInFolderRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.file_path, "/home/user/doc.pdf");
     }
@@ -191,8 +185,8 @@ mod tests {
     }
 
     #[test]
-    fn open_folder_with_request_camel_case() {
-        let raw = json!({ "folderPath": "/tmp", "tool": "terminal" });
+    fn open_folder_with_request_snake_case() {
+        let raw = json!({ "folder_path": "/tmp", "tool": "terminal" });
         let req: OpenFolderWithRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.folder_path, "/tmp");
         assert_eq!(req.tool, ToolType::Terminal);
@@ -262,10 +256,10 @@ mod tests {
         let raw = json!({
             "enabled": true,
             "provider": "openai",
-            "autoSend": true,
+            "auto_send": true,
             "openai": {
-                "apiKey": "sk-test",
-                "baseUrl": "https://api.openai.com",
+                "api_key": "sk-test",
+                "base_url": "https://api.openai.com",
                 "model": "whisper-1",
                 "language": "en",
                 "prompt": "technical terms",
@@ -292,12 +286,12 @@ mod tests {
             "enabled": true,
             "provider": "deepgram",
             "deepgram": {
-                "apiKey": "dg-test",
+                "api_key": "dg-test",
                 "model": "nova-2",
                 "language": "zh",
-                "detectLanguage": true,
+                "detect_language": true,
                 "punctuate": true,
-                "smartFormat": false
+                "smart_format": false
             }
         });
         let config: SpeechToTextConfig = serde_json::from_value(raw).unwrap();
@@ -341,7 +335,7 @@ mod tests {
     #[test]
     fn openai_config_minimal() {
         let raw = json!({
-            "apiKey": "sk-key",
+            "api_key": "sk-key",
             "model": "whisper-1"
         });
         let config: OpenAISpeechToTextConfig = serde_json::from_value(raw).unwrap();
@@ -358,7 +352,7 @@ mod tests {
     #[test]
     fn deepgram_config_minimal() {
         let raw = json!({
-            "apiKey": "dg-key",
+            "api_key": "dg-key",
             "model": "nova-2"
         });
         let config: DeepgramSpeechToTextConfig = serde_json::from_value(raw).unwrap();

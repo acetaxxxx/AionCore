@@ -8,7 +8,6 @@ use serde_json::Value;
 /// Returns all backend system settings with their current values.
 /// When no settings exist in the database, the service layer returns defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct SystemSettingsResponse {
     pub language: String,
     pub notification_enabled: bool,
@@ -34,7 +33,6 @@ impl Default for SystemSettingsResponse {
 /// All fields are optional — only the fields present in the request body
 /// are updated. Unknown fields are silently ignored by serde.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsRequest {
     pub language: Option<String>,
     pub notification_enabled: Option<bool>,
@@ -85,27 +83,27 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_response_serialization_camel_case() {
+    fn test_settings_response_serialization_snake_case() {
         let resp = SystemSettingsResponse::default();
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["language"], "en-US");
-        assert_eq!(json["notificationEnabled"], true);
-        assert_eq!(json["cronNotificationEnabled"], false);
-        assert_eq!(json["commandQueueEnabled"], false);
-        assert_eq!(json["saveUploadToWorkspace"], false);
-        // Verify camelCase, not snake_case
-        assert!(json.get("notification_enabled").is_none());
-        assert!(json.get("cron_notification_enabled").is_none());
+        assert_eq!(json["notification_enabled"], true);
+        assert_eq!(json["cron_notification_enabled"], false);
+        assert_eq!(json["command_queue_enabled"], false);
+        assert_eq!(json["save_upload_to_workspace"], false);
+        // Verify snake_case, not camelCase
+        assert!(json.get("notificationEnabled").is_none());
+        assert!(json.get("cronNotificationEnabled").is_none());
     }
 
     #[test]
-    fn test_settings_response_deserialization_camel_case() {
+    fn test_settings_response_deserialization_snake_case() {
         let raw = json!({
             "language": "zh-CN",
-            "notificationEnabled": false,
-            "cronNotificationEnabled": true,
-            "commandQueueEnabled": true,
-            "saveUploadToWorkspace": true
+            "notification_enabled": false,
+            "cron_notification_enabled": true,
+            "command_queue_enabled": true,
+            "save_upload_to_workspace": true
         });
         let resp: SystemSettingsResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(resp.language, "zh-CN");
@@ -152,8 +150,8 @@ mod tests {
     #[test]
     fn test_update_request_multiple_fields() {
         let raw = json!({
-            "notificationEnabled": false,
-            "commandQueueEnabled": true
+            "notification_enabled": false,
+            "command_queue_enabled": true
         });
         let req: UpdateSettingsRequest = serde_json::from_value(raw).unwrap();
         assert!(req.language.is_none());
@@ -163,9 +161,9 @@ mod tests {
     }
 
     #[test]
-    fn test_update_request_snake_case_ignored() {
-        // snake_case keys are treated as unknown fields and silently ignored
-        let raw = r#"{"notification_enabled":true}"#;
+    fn test_update_request_camel_case_ignored() {
+        // camelCase keys are treated as unknown fields and silently ignored
+        let raw = r#"{"notificationEnabled":true}"#;
         let req: UpdateSettingsRequest = serde_json::from_str(raw).unwrap();
         assert!(req.notification_enabled.is_none());
         assert!(req.is_empty());

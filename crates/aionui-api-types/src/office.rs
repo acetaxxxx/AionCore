@@ -6,13 +6,11 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StartPreviewRequest {
     pub file_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StopPreviewRequest {
     pub file_path: String,
 }
@@ -22,7 +20,6 @@ pub struct StopPreviewRequest {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PreviewUrlResponse {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,7 +27,7 @@ pub struct PreviewUrlResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum PreviewState {
     Starting,
     Installing,
@@ -39,7 +36,6 @@ pub enum PreviewState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PreviewStatusEvent {
     pub state: PreviewState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,7 +47,6 @@ pub struct PreviewStatusEvent {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PreviewHistoryTargetDto {
     pub content_type: PreviewContentType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,7 +64,6 @@ pub struct PreviewHistoryTargetDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PreviewSnapshotInfoDto {
     pub id: String,
     pub label: String,
@@ -87,27 +81,23 @@ pub struct PreviewSnapshotInfoDto {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SaveSnapshotRequest {
     pub target: PreviewHistoryTargetDto,
     pub content: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ListSnapshotsRequest {
     pub target: PreviewHistoryTargetDto,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GetSnapshotContentRequest {
     pub target: PreviewHistoryTargetDto,
     pub snapshot_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct SnapshotContentResponse {
     pub snapshot: PreviewSnapshotInfoDto,
     pub content: String,
@@ -118,7 +108,6 @@ pub struct SnapshotContentResponse {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct DetectStarOfficeRequest {
     #[serde(default)]
     pub preferred_url: Option<String>,
@@ -129,7 +118,6 @@ pub struct DetectStarOfficeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct StarOfficeDetectResponse {
     pub url: Option<String>,
 }
@@ -149,21 +137,18 @@ pub enum ConversionTarget {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DocumentConversionRequest {
     pub file_path: String,
     pub to: ConversionTarget,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct DocumentConversionResponse {
     pub to: String,
     pub result: ConversionResultDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ConversionResultDto {
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,13 +162,11 @@ pub struct ConversionResultDto {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ExcelWorkbookData {
     pub sheets: Vec<ExcelSheetData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ExcelSheetData {
     pub name: String,
     pub data: Vec<Vec<serde_json::Value>>,
@@ -206,7 +189,6 @@ pub struct CellCoord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ExcelSheetImage {
     pub row: usize,
     pub col: usize,
@@ -224,7 +206,6 @@ pub struct ExcelSheetImage {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PptJsonData {
     pub slides: Vec<PptSlideData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,7 +213,6 @@ pub struct PptJsonData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PptSlideData {
     pub slide_number: usize,
     pub content: serde_json::Value,
@@ -251,7 +231,7 @@ mod tests {
 
     #[test]
     fn start_preview_request_deserialize() {
-        let raw = json!({"filePath": "/path/to/doc.docx"});
+        let raw = json!({"file_path": "/path/to/doc.docx"});
         let req: StartPreviewRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.file_path, "/path/to/doc.docx");
     }
@@ -264,7 +244,7 @@ mod tests {
 
     #[test]
     fn stop_preview_request_deserialize() {
-        let raw = json!({"filePath": "/path/to/doc.docx"});
+        let raw = json!({"file_path": "/path/to/doc.docx"});
         let req: StopPreviewRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.file_path, "/path/to/doc.docx");
     }
@@ -377,13 +357,13 @@ mod tests {
     #[test]
     fn target_dto_full_fields() {
         let raw = json!({
-            "contentType": "markdown",
-            "filePath": "/a.md",
+            "content_type": "markdown",
+            "file_path": "/a.md",
             "workspace": "/ws",
-            "fileName": "a.md",
+            "file_name": "a.md",
             "title": "My Doc",
             "language": "rust",
-            "conversationId": "conv_123"
+            "conversation_id": "conv_123"
         });
         let t: PreviewHistoryTargetDto = serde_json::from_value(raw).unwrap();
         assert_eq!(t.content_type, PreviewContentType::Markdown);
@@ -397,7 +377,7 @@ mod tests {
 
     #[test]
     fn target_dto_minimal() {
-        let raw = json!({"contentType": "code"});
+        let raw = json!({"content_type": "code"});
         let t: PreviewHistoryTargetDto = serde_json::from_value(raw).unwrap();
         assert_eq!(t.content_type, PreviewContentType::Code);
         assert!(t.file_path.is_none());
@@ -410,7 +390,7 @@ mod tests {
 
     #[test]
     fn target_dto_missing_content_type() {
-        let raw = json!({"filePath": "/a.md"});
+        let raw = json!({"file_path": "/a.md"});
         assert!(serde_json::from_value::<PreviewHistoryTargetDto>(raw).is_err());
     }
 
@@ -426,13 +406,13 @@ mod tests {
             conversation_id: None,
         };
         let json = serde_json::to_value(&t).unwrap();
-        assert_eq!(json["contentType"], "html");
-        assert_eq!(json["filePath"], "/b.html");
+        assert_eq!(json["content_type"], "html");
+        assert_eq!(json["file_path"], "/b.html");
         assert!(json.get("workspace").is_none());
-        assert!(json.get("fileName").is_none());
+        assert!(json.get("file_name").is_none());
         assert!(json.get("title").is_none());
         assert!(json.get("language").is_none());
-        assert!(json.get("conversationId").is_none());
+        assert!(json.get("conversation_id").is_none());
     }
 
     #[test]
@@ -466,7 +446,7 @@ mod tests {
             ("url", PreviewContentType::Url),
         ];
         for (name, expected) in types {
-            let raw = json!({"contentType": name});
+            let raw = json!({"content_type": name});
             let t: PreviewHistoryTargetDto = serde_json::from_value(raw).unwrap();
             assert_eq!(t.content_type, expected);
         }
@@ -488,11 +468,11 @@ mod tests {
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "1700000000000-abc");
         assert_eq!(json["label"], "2023-11-14 12:00");
-        assert_eq!(json["createdAt"], 1700000000000_i64);
+        assert_eq!(json["created_at"], 1700000000000_i64);
         assert_eq!(json["size"], 1024);
-        assert_eq!(json["contentType"], "markdown");
-        assert_eq!(json["fileName"], "doc.md");
-        assert_eq!(json["filePath"], "/a/doc.md");
+        assert_eq!(json["content_type"], "markdown");
+        assert_eq!(json["file_name"], "doc.md");
+        assert_eq!(json["file_path"], "/a/doc.md");
     }
 
     #[test]
@@ -507,8 +487,8 @@ mod tests {
             file_path: None,
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert!(json.get("fileName").is_none());
-        assert!(json.get("filePath").is_none());
+        assert!(json.get("file_name").is_none());
+        assert!(json.get("file_path").is_none());
     }
 
     #[test]
@@ -532,7 +512,7 @@ mod tests {
     #[test]
     fn save_snapshot_request_deserialize() {
         let raw = json!({
-            "target": {"contentType": "markdown", "filePath": "/a.md"},
+            "target": {"content_type": "markdown", "file_path": "/a.md"},
             "content": "# Hello World"
         });
         let req: SaveSnapshotRequest = serde_json::from_value(raw).unwrap();
@@ -542,7 +522,7 @@ mod tests {
 
     #[test]
     fn save_snapshot_request_missing_content() {
-        let raw = json!({"target": {"contentType": "markdown"}});
+        let raw = json!({"target": {"content_type": "markdown"}});
         assert!(serde_json::from_value::<SaveSnapshotRequest>(raw).is_err());
     }
 
@@ -554,7 +534,7 @@ mod tests {
 
     #[test]
     fn list_snapshots_request_deserialize() {
-        let raw = json!({"target": {"contentType": "html"}});
+        let raw = json!({"target": {"content_type": "html"}});
         let req: ListSnapshotsRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.target.content_type, PreviewContentType::Html);
     }
@@ -562,8 +542,8 @@ mod tests {
     #[test]
     fn get_snapshot_content_request_deserialize() {
         let raw = json!({
-            "target": {"contentType": "code", "language": "rust"},
-            "snapshotId": "snap_abc"
+            "target": {"content_type": "code", "language": "rust"},
+            "snapshot_id": "snap_abc"
         });
         let req: GetSnapshotContentRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.target.language.as_deref(), Some("rust"));
@@ -572,7 +552,7 @@ mod tests {
 
     #[test]
     fn get_snapshot_content_request_missing_snapshot_id() {
-        let raw = json!({"target": {"contentType": "markdown"}});
+        let raw = json!({"target": {"content_type": "markdown"}});
         assert!(serde_json::from_value::<GetSnapshotContentRequest>(raw).is_err());
     }
 
@@ -619,9 +599,9 @@ mod tests {
     #[test]
     fn detect_star_office_request_full() {
         let raw = json!({
-            "preferredUrl": "http://localhost:19000",
+            "preferred_url": "http://localhost:19000",
             "force": true,
-            "timeoutMs": 2000
+            "timeout_ms": 2000
         });
         let req: DetectStarOfficeRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.preferred_url.as_deref(), Some("http://localhost:19000"));
@@ -699,7 +679,7 @@ mod tests {
 
     #[test]
     fn document_conversion_request_deserialize() {
-        let raw = json!({"filePath": "/sheet.xlsx", "to": "excel-json"});
+        let raw = json!({"file_path": "/sheet.xlsx", "to": "excel-json"});
         let req: DocumentConversionRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.file_path, "/sheet.xlsx");
         assert_eq!(req.to, ConversionTarget::ExcelJson);
@@ -707,13 +687,13 @@ mod tests {
 
     #[test]
     fn document_conversion_request_missing_to() {
-        let raw = json!({"filePath": "/a.docx"});
+        let raw = json!({"file_path": "/a.docx"});
         assert!(serde_json::from_value::<DocumentConversionRequest>(raw).is_err());
     }
 
     #[test]
     fn document_conversion_request_invalid_to() {
-        let raw = json!({"filePath": "/a.docx", "to": "pdf"});
+        let raw = json!({"file_path": "/a.docx", "to": "pdf"});
         assert!(serde_json::from_value::<DocumentConversionRequest>(raw).is_err());
     }
 
@@ -904,7 +884,7 @@ mod tests {
             raw: None,
         };
         let json = serde_json::to_value(&ppt).unwrap();
-        assert_eq!(json["slides"][0]["slideNumber"], 1);
+        assert_eq!(json["slides"][0]["slide_number"], 1);
         assert_eq!(json["slides"][0]["content"]["title"], "Intro");
         assert!(json.get("raw").is_none());
     }
@@ -946,6 +926,6 @@ mod tests {
             content: json!({"elements": []}),
         };
         let json = serde_json::to_value(&slide).unwrap();
-        assert_eq!(json["slideNumber"], 3);
+        assert_eq!(json["slide_number"], 3);
     }
 }

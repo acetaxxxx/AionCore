@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 /// Response for `GET /api/system/info`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct SystemInfoResponse {
     pub cache_dir: String,
     pub work_dir: String,
@@ -15,7 +14,6 @@ pub struct SystemInfoResponse {
 
 /// Request body for `POST /api/system/check-update`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateCheckRequest {
     #[serde(default)]
     pub include_prerelease: bool,
@@ -25,7 +23,6 @@ pub struct UpdateCheckRequest {
 
 /// Response for `POST /api/system/check-update`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateCheckResult {
     pub current_version: String,
     pub update_available: bool,
@@ -35,7 +32,6 @@ pub struct UpdateCheckResult {
 
 /// A single GitHub Release entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateReleaseInfo {
     pub tag_name: String,
     pub version: String,
@@ -55,7 +51,6 @@ pub struct UpdateReleaseInfo {
 
 /// A downloadable asset attached to a GitHub Release.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct GitHubReleaseAsset {
     pub name: String,
     pub url: String,
@@ -81,13 +76,13 @@ mod tests {
             arch: "x64".into(),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["cacheDir"], "/home/user/.cache/aionui");
-        assert_eq!(json["workDir"], "/home/user/.local/share/aionui");
-        assert_eq!(json["logDir"], "/home/user/.local/state/aionui/logs");
+        assert_eq!(json["cache_dir"], "/home/user/.cache/aionui");
+        assert_eq!(json["work_dir"], "/home/user/.local/share/aionui");
+        assert_eq!(json["log_dir"], "/home/user/.local/state/aionui/logs");
         assert_eq!(json["platform"], "linux");
         assert_eq!(json["arch"], "x64");
-        // Verify camelCase
-        assert!(json.get("cache_dir").is_none());
+        // Verify snake_case
+        assert!(json.get("cacheDir").is_none());
     }
 
     #[test]
@@ -117,7 +112,7 @@ mod tests {
     #[test]
     fn test_update_check_request_with_options() {
         let raw = json!({
-            "includePrerelease": true,
+            "include_prerelease": true,
             "repo": "iOfficeAI/AionUi"
         });
         let req: UpdateCheckRequest = serde_json::from_value(raw).unwrap();
@@ -135,8 +130,8 @@ mod tests {
             latest: None,
         };
         let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(json["currentVersion"], "1.5.0");
-        assert_eq!(json["updateAvailable"], false);
+        assert_eq!(json["current_version"], "1.5.0");
+        assert_eq!(json["update_available"], false);
         assert!(json.get("latest").is_none());
     }
 
@@ -164,10 +159,10 @@ mod tests {
             }),
         };
         let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(json["updateAvailable"], true);
-        assert_eq!(json["latest"]["tagName"], "v2.0.0");
+        assert_eq!(json["update_available"], true);
+        assert_eq!(json["latest"]["tag_name"], "v2.0.0");
         assert_eq!(json["latest"]["version"], "2.0.0");
-        assert_eq!(json["latest"]["htmlUrl"].as_str().unwrap().len() > 0, true);
+        assert_eq!(json["latest"]["html_url"].as_str().unwrap().len() > 0, true);
         assert_eq!(json["latest"]["assets"].as_array().unwrap().len(), 1);
         assert_eq!(
             json["latest"]["assets"][0]["name"],
@@ -190,7 +185,7 @@ mod tests {
         assert_eq!(json["name"], "app.zip");
         assert_eq!(json["url"], "https://example.com/app.zip");
         assert_eq!(json["size"], 1024);
-        assert!(json.get("contentType").is_none());
+        assert!(json.get("content_type").is_none());
     }
 
     #[test]
@@ -202,7 +197,7 @@ mod tests {
             content_type: Some("application/octet-stream".into()),
         };
         let json = serde_json::to_value(&asset).unwrap();
-        assert_eq!(json["contentType"], "application/octet-stream");
+        assert_eq!(json["content_type"], "application/octet-stream");
     }
 
     // -- UpdateReleaseInfo --
@@ -222,11 +217,11 @@ mod tests {
             recommended_asset: None,
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["tagName"], "v1.0.0");
+        assert_eq!(json["tag_name"], "v1.0.0");
         assert!(json.get("name").is_none());
         assert!(json.get("body").is_none());
-        assert!(json.get("publishedAt").is_none());
-        assert!(json.get("recommendedAsset").is_none());
+        assert!(json.get("published_at").is_none());
+        assert!(json.get("recommended_asset").is_none());
     }
 
     #[test]
