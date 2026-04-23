@@ -772,7 +772,7 @@ async fn read_rule_builtin_returns_manifest_file_contents() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-rule/read",
-        json!({ "assistant_id": "builtin-office", "locale": "en-US" }),
+        json!({ "assistantId": "builtin-office", "locale": "en-US" }),
         &fx.token,
         &fx.csrf,
     );
@@ -788,7 +788,7 @@ async fn read_rule_extension_returns_empty_string() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-rule/read",
-        json!({ "assistant_id": "ext-helper", "locale": "en-US" }),
+        json!({ "assistantId": "ext-helper", "locale": "en-US" }),
         &fx.token,
         &fx.csrf,
     );
@@ -806,7 +806,7 @@ async fn read_rule_user_round_trip_through_write() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-rule/write",
-        json!({ "assistant_id": "u1", "content": "my rule", "locale": "en-US" }),
+        json!({ "assistantId": "u1", "content": "my rule", "locale": "en-US" }),
         &fx.token,
         &fx.csrf,
     );
@@ -816,7 +816,7 @@ async fn read_rule_user_round_trip_through_write() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-rule/read",
-        json!({ "assistant_id": "u1", "locale": "en-US" }),
+        json!({ "assistantId": "u1", "locale": "en-US" }),
         &fx.token,
         &fx.csrf,
     );
@@ -836,7 +836,7 @@ async fn write_rule_user_happy_path() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-rule/write",
-        json!({ "assistant_id": "u1", "content": "rule body" }),
+        json!({ "assistantId": "u1", "content": "rule body" }),
         &fx.token,
         &fx.csrf,
     );
@@ -853,7 +853,7 @@ async fn write_rule_builtin_returns_400() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-rule/write",
-        json!({ "assistant_id": "builtin-office", "content": "nope" }),
+        json!({ "assistantId": "builtin-office", "content": "nope" }),
         &fx.token,
         &fx.csrf,
     );
@@ -867,7 +867,7 @@ async fn write_rule_extension_returns_400() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-rule/write",
-        json!({ "assistant_id": "ext-helper", "content": "nope" }),
+        json!({ "assistantId": "ext-helper", "content": "nope" }),
         &fx.token,
         &fx.csrf,
     );
@@ -943,7 +943,7 @@ async fn read_skill_builtin_returns_manifest_file_contents() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-skill/read",
-        json!({ "assistant_id": "builtin-office", "locale": "en-US" }),
+        json!({ "assistantId": "builtin-office", "locale": "en-US" }),
         &fx.token,
         &fx.csrf,
     );
@@ -959,7 +959,7 @@ async fn read_skill_extension_returns_empty_string() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-skill/read",
-        json!({ "assistant_id": "ext-helper", "locale": "en-US" }),
+        json!({ "assistantId": "ext-helper", "locale": "en-US" }),
         &fx.token,
         &fx.csrf,
     );
@@ -977,7 +977,7 @@ async fn read_skill_user_round_trip_through_write() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-skill/write",
-        json!({ "assistant_id": "u1", "content": "my skill", "locale": "zh-CN" }),
+        json!({ "assistantId": "u1", "content": "my skill", "locale": "zh-CN" }),
         &fx.token,
         &fx.csrf,
     );
@@ -987,7 +987,7 @@ async fn read_skill_user_round_trip_through_write() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-skill/read",
-        json!({ "assistant_id": "u1", "locale": "zh-CN" }),
+        json!({ "assistantId": "u1", "locale": "zh-CN" }),
         &fx.token,
         &fx.csrf,
     );
@@ -1007,7 +1007,7 @@ async fn write_skill_user_happy_path() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-skill/write",
-        json!({ "assistant_id": "u1", "content": "skill body" }),
+        json!({ "assistantId": "u1", "content": "skill body" }),
         &fx.token,
         &fx.csrf,
     );
@@ -1023,7 +1023,7 @@ async fn write_skill_builtin_returns_400() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-skill/write",
-        json!({ "assistant_id": "builtin-office", "content": "nope" }),
+        json!({ "assistantId": "builtin-office", "content": "nope" }),
         &fx.token,
         &fx.csrf,
     );
@@ -1037,7 +1037,7 @@ async fn write_skill_extension_returns_400() {
     let req = json_with_token(
         "POST",
         "/api/skills/assistant-skill/write",
-        json!({ "assistant_id": "ext-helper", "content": "nope" }),
+        json!({ "assistantId": "ext-helper", "content": "nope" }),
         &fx.token,
         &fx.csrf,
     );

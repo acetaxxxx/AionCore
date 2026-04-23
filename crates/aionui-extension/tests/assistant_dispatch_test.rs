@@ -166,8 +166,8 @@ async fn body_json<T: serde::de::DeserializeOwned>(resp: axum::response::Respons
 /// Construct the request body for rule/skill read using the wire field names.
 fn read_body(assistant_id: &str, locale: Option<&str>) -> Vec<u8> {
     let body = match locale {
-        Some(loc) => serde_json::json!({ "assistant_id": assistant_id, "locale": loc }),
-        None => serde_json::json!({ "assistant_id": assistant_id }),
+        Some(loc) => serde_json::json!({ "assistantId": assistant_id, "locale": loc }),
+        None => serde_json::json!({ "assistantId": assistant_id }),
     };
     serde_json::to_vec(&body).unwrap()
 }
@@ -175,12 +175,12 @@ fn read_body(assistant_id: &str, locale: Option<&str>) -> Vec<u8> {
 fn write_body(assistant_id: &str, content: &str, locale: Option<&str>) -> Vec<u8> {
     let body = match locale {
         Some(loc) => serde_json::json!({
-            "assistant_id": assistant_id,
+            "assistantId": assistant_id,
             "content": content,
             "locale": loc,
         }),
         None => serde_json::json!({
-            "assistant_id": assistant_id,
+            "assistantId": assistant_id,
             "content": content,
         }),
     };

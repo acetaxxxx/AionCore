@@ -353,8 +353,8 @@ async fn sm11_get_skill_paths() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let data = &json["data"];
-    assert!(data["user_skills_dir"].is_string());
-    assert!(data["builtin_skills_dir"].is_string());
+    assert!(data["userSkillsDir"].is_string());
+    assert!(data["builtinSkillsDir"].is_string());
 }
 
 #[tokio::test]
@@ -431,7 +431,7 @@ async fn rm1_read_builtin_rule_not_found() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-rule",
-            json!({"file_name": "nonexistent-rule.md"}),
+            json!({"fileName": "nonexistent-rule.md"}),
             &token,
             &csrf,
         ))
@@ -461,7 +461,7 @@ async fn rm2_read_builtin_rule_happy_path_returns_file_content() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-rule",
-            json!({"file_name": "code-review.md"}),
+            json!({"fileName": "code-review.md"}),
             &token,
             &csrf,
         ))
@@ -483,7 +483,7 @@ async fn rm3_read_builtin_rule_rejects_path_traversal() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-rule",
-            json!({"file_name": "../etc/passwd"}),
+            json!({"fileName": "../etc/passwd"}),
             &token,
             &csrf,
         ))
@@ -508,7 +508,7 @@ async fn sk1_read_builtin_skill_not_found() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"file_name": "nonexistent.md"}),
+            json!({"fileName": "nonexistent.md"}),
             &token,
             &csrf,
         ))
@@ -541,7 +541,7 @@ async fn sk2_read_builtin_skill_happy_path_returns_file_content() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"file_name": "cowork-skills.md"}),
+            json!({"fileName": "cowork-skills.md"}),
             &token,
             &csrf,
         ))
@@ -568,7 +568,7 @@ async fn sk3_read_builtin_skill_rejects_path_traversal() {
             .oneshot(json_with_token(
                 "POST",
                 "/api/skills/builtin-skill",
-                json!({"file_name": bad}),
+                json!({"fileName": bad}),
                 &token,
                 &csrf,
             ))
@@ -604,7 +604,7 @@ async fn si1_read_skill_info_from_directory_path() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/info",
-            json!({ "skill_path": skill_dir.to_str().unwrap() }),
+            json!({ "skillPath": skill_dir.to_str().unwrap() }),
             &token,
             &csrf,
         ))
@@ -636,7 +636,7 @@ async fn si2_read_skill_info_falls_back_to_directory_name_when_name_empty() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/info",
-            json!({ "skill_path": skill_dir.to_str().unwrap() }),
+            json!({ "skillPath": skill_dir.to_str().unwrap() }),
             &token,
             &csrf,
         ))
@@ -662,7 +662,7 @@ async fn si3_read_skill_info_returns_not_found_for_missing_path() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/info",
-            json!({ "skill_path": missing.to_str().unwrap() }),
+            json!({ "skillPath": missing.to_str().unwrap() }),
             &token,
             &csrf,
         ))
@@ -717,7 +717,7 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
 
     let review = &by_name["review"];
     assert_eq!(review["source"], "builtin");
-    assert_eq!(review["is_custom"], false);
+    assert_eq!(review["isCustom"], false);
     assert!(
         review["location"].as_str().unwrap().contains("review"),
         "location should point at the skill dir",
@@ -725,7 +725,7 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
 
     let my_skill = &by_name["my-skill"];
     assert_eq!(my_skill["source"], "custom");
-    assert_eq!(my_skill["is_custom"], true);
+    assert_eq!(my_skill["isCustom"], true);
 }
 
 #[tokio::test]
@@ -808,9 +808,10 @@ async fn ba1_auto_skills_lists_underscore_builtin_entries() {
     assert!(names.contains("cron"));
     assert!(names.contains("skill-creator"));
     assert!(!names.contains("review"));
-    // Must be `{ name, description }` — no path / is_custom leak.
+    // Must be `{ name, description, location }` — no path / isCustom leak.
     for item in arr {
         assert!(item.get("path").is_none());
+        assert!(item.get("isCustom").is_none());
         assert!(item.get("is_custom").is_none());
         assert!(item["description"].is_string());
     }
@@ -900,7 +901,7 @@ async fn de1_detect_external_populates_custom_source_slug() {
         custom["source"].as_str().unwrap().starts_with("custom-"),
         "custom source must start with `custom-` for e2e testid contract",
     );
-    assert_eq!(custom["skill_count"], 1);
+    assert_eq!(custom["skillCount"], 1);
 }
 
 #[tokio::test]

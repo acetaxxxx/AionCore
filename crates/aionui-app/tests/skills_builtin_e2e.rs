@@ -144,7 +144,7 @@ async fn builtin_skill_read_auto_inject_returns_frontmatter_content() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"file_name": "auto-inject/cron/SKILL.md"}),
+            json!({"fileName": "auto-inject/cron/SKILL.md"}),
             &fx.token,
             &fx.csrf,
         ))
@@ -169,7 +169,7 @@ async fn builtin_skill_read_opt_in_returns_frontmatter_content() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"file_name": "mermaid/SKILL.md"}),
+            json!({"fileName": "mermaid/SKILL.md"}),
             &fx.token,
             &fx.csrf,
         ))
@@ -191,7 +191,7 @@ async fn builtin_skill_missing_file_returns_empty_string() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"file_name": "unknown/SKILL.md"}),
+            json!({"fileName": "unknown/SKILL.md"}),
             &fx.token,
             &fx.csrf,
         ))
@@ -218,7 +218,7 @@ async fn builtin_skill_rejects_traversal() {
             .oneshot(json_with_token(
                 "POST",
                 "/api/skills/builtin-skill",
-                json!({"file_name": bad}),
+                json!({"fileName": bad}),
                 &fx.token,
                 &fx.csrf,
             ))
@@ -259,7 +259,7 @@ async fn list_skills_builtin_entries_carry_relative_location() {
         match item["source"].as_str().unwrap() {
             "builtin" => {
                 saw_builtin = true;
-                let rel = item["relative_location"].as_str().unwrap();
+                let rel = item["relativeLocation"].as_str().unwrap();
                 assert!(rel.ends_with("/SKILL.md"));
                 let loc = item["location"].as_str().unwrap();
                 assert!(
@@ -274,6 +274,7 @@ async fn list_skills_builtin_entries_carry_relative_location() {
             }
             "custom" => {
                 saw_custom = true;
+                assert!(item.get("relativeLocation").is_none());
                 assert!(item.get("relative_location").is_none());
                 assert_eq!(item["name"], "my-custom");
             }
