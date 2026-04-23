@@ -90,31 +90,23 @@ async fn get_avatar(
     State(state): State<AssistantRouterState>,
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
-    let path = state
+    let asset = state
         .service
-        .avatar_path(&id)
+        .avatar_asset(&id)
         .await
         .ok_or_else(|| AppError::NotFound(format!("avatar '{id}' not found")))?;
 
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|_| AppError::NotFound(format!("avatar '{id}' not found")))?;
-
-    let content_type = content_type_for_path(&path);
+    let content_type = content_type_for_extension(asset.extension.as_deref());
 
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .body(Body::from(bytes))
+        .body(Body::from(asset.bytes))
         .map_err(|e| AppError::Internal(e.to_string()))
 }
 
-fn content_type_for_path(path: &std::path::Path) -> HeaderValue {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase());
-    let mime = match ext.as_deref() {
+fn content_type_for_extension(ext: Option<&str>) -> HeaderValue {
+    let mime = match ext {
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",

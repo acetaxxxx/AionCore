@@ -9,6 +9,6 @@ pub mod routes;
 pub mod service;
 pub mod state;
 
-pub use builtin::{BuiltinAssistant, BuiltinAssistantRegistry};
+pub use builtin::{AvatarAsset, BuiltinAssistant, BuiltinAssistantRegistry};
 pub use routes::{AssistantRouterState, assistant_routes};
 pub use service::AssistantService;

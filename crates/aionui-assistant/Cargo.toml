@@ -12,6 +12,7 @@ aionui-auth = { workspace = true }
 aionui-extension = { workspace = true }
 axum = { workspace = true }
 dirs = { workspace = true }
+include_dir = "0.7"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

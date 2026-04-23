@@ -20,7 +20,7 @@ use aionui_extension::{
 use serde_json;
 use tracing::{debug, warn};
 
-use crate::builtin::{BuiltinAssistant, BuiltinAssistantRegistry};
+use crate::builtin::{AvatarAsset, BuiltinAssistant, BuiltinAssistantRegistry};
 
 /// Aggregated business logic for `/api/assistants/*` and rule/skill dispatch.
 pub struct AssistantService {
@@ -441,10 +441,11 @@ impl AssistantService {
         match self.classify_source(id).await {
             AssistantSource::Builtin => {
                 let locale = locale.unwrap_or("");
-                if let Some(path) = self.builtin.rule_path(id, locale) {
-                    return Ok(read_file_or_empty(&path));
-                }
-                Ok(String::new())
+                Ok(self
+                    .builtin
+                    .rule_bytes(id, locale)
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_default())
             }
             AssistantSource::Extension => {
                 // ResolvedAssistant doesn't expose rule content directly in
@@ -503,10 +504,11 @@ impl AssistantService {
         match self.classify_source(id).await {
             AssistantSource::Builtin => {
                 let locale = locale.unwrap_or("");
-                if let Some(path) = self.builtin.skill_path(id, locale) {
-                    return Ok(read_file_or_empty(&path));
-                }
-                Ok(String::new())
+                Ok(self
+                    .builtin
+                    .skill_bytes(id, locale)
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_default())
             }
             AssistantSource::Extension => Ok(String::new()),
             AssistantSource::User => {
@@ -558,15 +560,25 @@ impl AssistantService {
     // Avatar helpers
     // -----------------------------------------------------------------------
 
-    /// Resolve the on-disk avatar path for an assistant. Extensions return
-    /// `None` here — the frontend serves them via `aion-asset://`.
-    pub async fn avatar_path(&self, id: &str) -> Option<PathBuf> {
+    /// Resolve the avatar bytes for an assistant together with its file
+    /// extension (for `Content-Type` inference).
+    ///
+    /// - Built-in source → read from the embedded bundle (or the disk
+    ///   override when `AIONUI_BUILTIN_ASSISTANTS_PATH` is set).
+    /// - User source → scan the user-writable avatars directory for a file
+    ///   whose stem equals `id`.
+    /// - Extension source → `None`; the frontend serves those via
+    ///   `aion-asset://`.
+    ///
+    /// Built-ins whose manifest `avatar` field is an inline emoji (and thus
+    /// has no on-disk file) also return `None`; clients fall back to the
+    /// text avatar for those.
+    pub async fn avatar_asset(&self, id: &str) -> Option<AvatarAsset> {
         match self.classify_source(id).await {
-            AssistantSource::Builtin => self.builtin.avatar_path(id),
+            AssistantSource::Builtin => self.builtin.avatar_asset(id),
             AssistantSource::Extension => None,
             AssistantSource::User => {
                 let dir = self.user_avatars_dir();
-                // Return whatever file exists with the id prefix.
                 let entries = std::fs::read_dir(&dir).ok()?;
                 for entry in entries.flatten() {
                     let name = entry.file_name();
@@ -574,7 +586,12 @@ impl AssistantService {
                     if let Some(stem) = name.split('.').next()
                         && stem == id
                     {
-                        return Some(entry.path());
+                        let bytes = std::fs::read(entry.path()).ok()?;
+                        let extension = std::path::Path::new(name.as_ref())
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|s| s.to_ascii_lowercase());
+                        return Some(AvatarAsset { bytes, extension });
                     }
                 }
                 None

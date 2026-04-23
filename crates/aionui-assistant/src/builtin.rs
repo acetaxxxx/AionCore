@@ -1,11 +1,33 @@
-//! Built-in assistant registry — loads `assistants.json` manifest + resolves
-//! locale-templated rule/skill/avatar paths.
+//! Built-in assistant registry — embeds the manifest + rule/skill/avatar
+//! assets into the binary via `include_dir`, with an optional filesystem
+//! fallback for E2E tests.
+//!
+//! This kills the "binary must live next to an on-disk assets/ sibling"
+//! assumption, which was fragile in two ways:
+//!
+//! 1. Dev: Electron launches the backend through a symlink
+//!    (`~/.cargo/bin/aionui-backend` → `target/debug/aionui-backend`) and
+//!    `std::env::current_exe().parent()` would resolve to the symlink's
+//!    directory, not the real binary's, missing the `assets/` sibling.
+//! 2. Prod: `AionUi/scripts/prepareAionuiBackend.js` only copies the
+//!    binary from GitHub releases — the `assets/` directory never shipped.
+//!
+//! Embedding avoids both. E2E tests that want to inject a custom fixture
+//! still can, via the `AIONUI_BUILTIN_ASSISTANTS_PATH` env var → disk
+//! fallback path.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 use tracing::{error, warn};
+
+/// Assets compiled into the binary at build time. Paths are relative to
+/// this embedded root, matching the on-disk layout under
+/// `crates/aionui-app/assets/builtin-assistants/`.
+static BUILTIN_ASSETS: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/../aionui-app/assets/builtin-assistants");
 
 /// Single built-in assistant entry, loaded from `assistants.json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -28,10 +50,10 @@ pub struct BuiltinAssistant {
     pub custom_skill_names: Vec<String>,
     #[serde(default)]
     pub disabled_builtin_skills: Vec<String>,
-    /// Relative to assets_dir, may contain `{locale}`.
+    /// Relative to the asset root; may contain `{locale}`.
     #[serde(default)]
     pub rule_file: Option<String>,
-    /// Relative to assets_dir, may contain `{locale}`.
+    /// Parallel to `rule_file`, for `/api/skills/assistant-skill/*` dispatch.
     #[serde(default)]
     pub skill_file: Option<String>,
     #[serde(default)]
@@ -51,29 +73,71 @@ struct BuiltinManifest {
     assistants: Vec<BuiltinAssistant>,
 }
 
+/// An avatar asset loaded from either the embedded bundle or a disk override.
+///
+/// Carries the raw bytes plus the file extension (lower-case, without the
+/// leading dot) so the HTTP layer can set `Content-Type`.
+#[derive(Debug, Clone)]
+pub struct AvatarAsset {
+    pub bytes: Vec<u8>,
+    pub extension: Option<String>,
+}
+
+/// Source of built-in asset content.
+///
+/// The disk branch exists for E2E tests that point
+/// `AIONUI_BUILTIN_ASSISTANTS_PATH` at a fixture directory.
+enum Source {
+    Embedded,
+    Disk(PathBuf),
+}
+
 /// In-memory registry of built-in assistants.
 pub struct BuiltinAssistantRegistry {
     assistants: HashMap<String, BuiltinAssistant>,
-    assets_dir: PathBuf,
+    source: Source,
 }
 
 impl BuiltinAssistantRegistry {
-    /// Load the registry by resolving the assets directory.
+    /// Construct the registry.
     ///
-    /// Graceful degradation:
-    /// - Directory unresolvable → empty registry (warn).
-    /// - Manifest missing → empty registry (warn).
-    /// - Manifest malformed → empty registry (error).
+    /// If `AIONUI_BUILTIN_ASSISTANTS_PATH` is set and points to a readable
+    /// directory, read from disk (test-only override). Otherwise use the
+    /// assets embedded at compile time.
     pub fn load() -> Self {
-        let Some(assets_dir) = resolve_builtin_assets_dir() else {
-            warn!("Built-in assistants directory not resolvable; using empty registry");
-            return Self::empty();
-        };
-        Self::load_from_dir(assets_dir)
+        if let Ok(env) = std::env::var("AIONUI_BUILTIN_ASSISTANTS_PATH") {
+            let p = PathBuf::from(env);
+            if p.exists() {
+                return Self::load_from_dir(p);
+            }
+            warn!(
+                "AIONUI_BUILTIN_ASSISTANTS_PATH points to missing directory; \
+                 falling back to embedded assets"
+            );
+        }
+        Self::load_embedded()
     }
 
-    /// Load from an explicit directory. Used by tests and by [`load`] via the
-    /// default resolver.
+    /// Load the compiled-in assets.
+    pub fn load_embedded() -> Self {
+        let content = match BUILTIN_ASSETS.get_file("assistants.json") {
+            Some(f) => f.contents(),
+            None => {
+                // This can only happen if the embedded bundle itself is
+                // missing the manifest — treat as a build error, but stay
+                // graceful at runtime.
+                error!("Embedded built-in manifest missing (assistants.json)");
+                return Self::with_assistants(HashMap::new(), Source::Embedded);
+            }
+        };
+        let assistants = parse_manifest_bytes(content);
+        Self::with_assistants(assistants, Source::Embedded)
+    }
+
+    /// Load from an explicit on-disk directory. Preserved for
+    /// `AIONUI_BUILTIN_ASSISTANTS_PATH` E2E fixtures — the three
+    /// graceful-degradation branches below mirror the original filesystem
+    /// behaviour.
     pub fn load_from_dir(assets_dir: PathBuf) -> Self {
         let manifest_path = assets_dir.join("assistants.json");
         let content = match std::fs::read_to_string(&manifest_path) {
@@ -84,39 +148,22 @@ impl BuiltinAssistantRegistry {
                     manifest_path.display(),
                     e
                 );
-                return Self {
-                    assistants: HashMap::new(),
-                    assets_dir,
-                };
+                return Self::with_assistants(HashMap::new(), Source::Disk(assets_dir));
             }
         };
-        let manifest: BuiltinManifest = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                error!("Built-in manifest parse failed: {}", e);
-                return Self {
-                    assistants: HashMap::new(),
-                    assets_dir,
-                };
-            }
-        };
-        let assistants = manifest
-            .assistants
-            .into_iter()
-            .map(|a| (a.id.clone(), a))
-            .collect();
-        Self {
-            assistants,
-            assets_dir,
-        }
+        let assistants = parse_manifest_str(&content);
+        Self::with_assistants(assistants, Source::Disk(assets_dir))
     }
 
-    /// Construct an empty registry (safe fallback + test helper).
+    fn with_assistants(assistants: HashMap<String, BuiltinAssistant>, source: Source) -> Self {
+        Self { assistants, source }
+    }
+
+    /// Construct an empty registry (safe fallback + test helper). Treated
+    /// as embedded-source with zero entries; callers should prefer
+    /// [`load`](Self::load) in production.
     pub fn empty() -> Self {
-        Self {
-            assistants: HashMap::new(),
-            assets_dir: PathBuf::new(),
-        }
+        Self::with_assistants(HashMap::new(), Source::Embedded)
     }
 
     pub fn has(&self, id: &str) -> bool {
@@ -131,10 +178,6 @@ impl BuiltinAssistantRegistry {
         self.assistants.values()
     }
 
-    pub fn assets_dir(&self) -> &Path {
-        &self.assets_dir
-    }
-
     pub fn is_empty(&self) -> bool {
         self.assistants.is_empty()
     }
@@ -143,28 +186,49 @@ impl BuiltinAssistantRegistry {
         self.assistants.len()
     }
 
-    /// Resolve the on-disk path for a built-in assistant's rule file.
-    /// Substitutes `{locale}` in `rule_file`.
-    pub fn rule_path(&self, id: &str, locale: &str) -> Option<PathBuf> {
-        let a = self.assistants.get(id)?;
-        let rel = a.rule_file.as_ref()?;
-        let resolved = rel.replace("{locale}", locale);
-        Some(self.assets_dir.join(resolved))
+    /// Read the rule file bytes for a built-in assistant. Substitutes
+    /// `{locale}` in the manifest-declared `rule_file` path. Returns `None`
+    /// when the assistant has no declared rule or the file is missing.
+    pub fn rule_bytes(&self, id: &str, locale: &str) -> Option<Vec<u8>> {
+        let rel = self.assistants.get(id)?.rule_file.as_ref()?;
+        self.read_asset(&rel.replace("{locale}", locale))
     }
 
-    /// Resolve the on-disk path for a built-in assistant's skill file.
-    pub fn skill_path(&self, id: &str, locale: &str) -> Option<PathBuf> {
-        let a = self.assistants.get(id)?;
-        let rel = a.skill_file.as_ref()?;
-        let resolved = rel.replace("{locale}", locale);
-        Some(self.assets_dir.join(resolved))
+    /// Read the skill file bytes for a built-in assistant.
+    pub fn skill_bytes(&self, id: &str, locale: &str) -> Option<Vec<u8>> {
+        let rel = self.assistants.get(id)?.skill_file.as_ref()?;
+        self.read_asset(&rel.replace("{locale}", locale))
     }
 
-    /// Resolve the on-disk path for a built-in assistant's avatar asset.
-    pub fn avatar_path(&self, id: &str) -> Option<PathBuf> {
+    /// Read the avatar asset for a built-in assistant along with its
+    /// extension (for Content-Type inference). Returns `None` when the
+    /// manifest does not declare an avatar or the file is missing.
+    ///
+    /// Note: when the manifest `avatar` field is an emoji string
+    /// (like `"📝"`) rather than a relative path, no file is resolved and
+    /// this method returns `None`. Callers treating an assistant without a
+    /// shipped avatar should fall back to the text avatar on the client.
+    pub fn avatar_asset(&self, id: &str) -> Option<AvatarAsset> {
         let a = self.assistants.get(id)?;
         let rel = a.avatar.as_ref()?;
-        Some(self.assets_dir.join(rel))
+        // Emoji / text avatars have no path separator and no extension.
+        if !looks_like_relative_path(rel) {
+            return None;
+        }
+        let bytes = self.read_asset(rel)?;
+        let extension = Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        Some(AvatarAsset { bytes, extension })
+    }
+
+    /// Dispatch read to embedded bundle or disk, depending on source.
+    fn read_asset(&self, rel: &str) -> Option<Vec<u8>> {
+        match &self.source {
+            Source::Embedded => BUILTIN_ASSETS.get_file(rel).map(|f| f.contents().to_vec()),
+            Source::Disk(root) => std::fs::read(root.join(rel)).ok(),
+        }
     }
 }
 
@@ -174,47 +238,39 @@ impl Default for BuiltinAssistantRegistry {
     }
 }
 
-fn resolve_builtin_assets_dir() -> Option<PathBuf> {
-    if let Ok(env) = std::env::var("AIONUI_BUILTIN_ASSISTANTS_PATH") {
-        let p = PathBuf::from(env);
-        if p.exists() {
-            return Some(p);
+fn parse_manifest_bytes(bytes: &[u8]) -> HashMap<String, BuiltinAssistant> {
+    match serde_json::from_slice::<BuiltinManifest>(bytes) {
+        Ok(m) => m
+            .assistants
+            .into_iter()
+            .map(|a| (a.id.clone(), a))
+            .collect(),
+        Err(e) => {
+            error!("Embedded built-in manifest parse failed: {e}");
+            HashMap::new()
         }
     }
-    let exe = std::env::current_exe().ok()?;
-    if let Some(dir) = resolve_assets_dir_from_exe(&exe) {
-        return Some(dir);
-    }
-    // Dev fallback: cargo run from workspace root
-    let cargo_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
-    let dev = PathBuf::from(cargo_dir)
-        .parent()?
-        .join("aionui-app")
-        .join("assets")
-        .join("builtin-assistants");
-    if dev.exists() {
-        return Some(dev);
-    }
-    None
 }
 
-/// Locate `{real_exe_parent}/assets/builtin-assistants/` given an executable
-/// path.
-///
-/// On macOS (and some other platforms) `std::env::current_exe()` returns the
-/// symlink path as-is rather than following it; when Electron spawns the
-/// backend via `~/.cargo/bin/aionui-backend` (a symlink to
-/// `target/debug/aionui-backend` per workflow docs), `exe.parent()` would
-/// resolve to `~/.cargo/bin/` instead of `target/debug/`, so the assets dir
-/// would be missed and the registry would silently fall back to empty.
-/// Canonicalizing the exe path before taking its parent fixes that.
-///
-/// Split out as a pure function so it can be unit-tested with a synthesized
-/// symlink fixture.
-fn resolve_assets_dir_from_exe(exe: &Path) -> Option<PathBuf> {
-    let real_exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
-    let dir = real_exe.parent()?.join("assets").join("builtin-assistants");
-    if dir.exists() { Some(dir) } else { None }
+fn parse_manifest_str(content: &str) -> HashMap<String, BuiltinAssistant> {
+    match serde_json::from_str::<BuiltinManifest>(content) {
+        Ok(m) => m
+            .assistants
+            .into_iter()
+            .map(|a| (a.id.clone(), a))
+            .collect(),
+        Err(e) => {
+            error!("Built-in manifest parse failed: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+/// Heuristic for distinguishing a relative-path avatar (`"rules/x.svg"`)
+/// from an inline emoji/text avatar (`"📝"`). Path-like strings contain a
+/// `/` or at least one `.` extension separator.
+fn looks_like_relative_path(s: &str) -> bool {
+    s.contains('/') || (Path::new(s).extension().is_some() && !s.starts_with('.'))
 }
 
 #[cfg(test)]
@@ -226,8 +282,62 @@ mod tests {
         std::fs::write(dir.join("assistants.json"), body).unwrap();
     }
 
+    // -----------------------------------------------------------------------
+    // Embedded-source sanity: the bundle shipped with the crate must be
+    // well-formed and non-empty. Acts as a compile-time → runtime bridge
+    // guard (if the manifest is ever broken or the include_dir path is
+    // wrong, this test fails immediately rather than at user-hit-404 time).
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn load_missing_dir_returns_empty_with_warn() {
+    fn load_embedded_has_expected_builtins() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        assert!(
+            !reg.is_empty(),
+            "embedded registry should contain the shipped presets"
+        );
+        // Sanity-check a couple of known ids from the committed manifest.
+        assert!(reg.has("word-creator"));
+        assert!(reg.has("cowork"));
+    }
+
+    #[test]
+    fn load_embedded_rule_bytes_available_for_shipped_preset() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let bytes = reg
+            .rule_bytes("word-creator", "en-US")
+            .expect("shipped word-creator en-US rule should resolve from the embedded bundle");
+        assert!(!bytes.is_empty());
+        let text = std::str::from_utf8(&bytes).expect("rule file should be valid utf-8");
+        assert!(text.len() > 100, "rule file should have real content");
+    }
+
+    #[test]
+    fn load_embedded_skill_bytes_available_for_cowork() {
+        // cowork is one of the three presets that ships a skill_file too.
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let bytes = reg
+            .skill_bytes("cowork", "en-US")
+            .expect("cowork en-US skill should resolve from the embedded bundle");
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn embedded_rule_missing_locale_returns_none() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        // The manifest declares rule_file as "rules/{id}.{locale}.md"; a
+        // made-up locale can't resolve.
+        assert!(reg.rule_bytes("word-creator", "xx-YY").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Disk-source fallback (used by E2E fixtures via
+    // AIONUI_BUILTIN_ASSISTANTS_PATH). Graceful-degradation semantics must
+    // stay intact.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_from_dir_missing_dir_returns_empty() {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("nope");
         let reg = BuiltinAssistantRegistry::load_from_dir(missing);
@@ -235,14 +345,14 @@ mod tests {
     }
 
     #[test]
-    fn load_missing_manifest_returns_empty() {
+    fn load_from_dir_missing_manifest_returns_empty() {
         let tmp = TempDir::new().unwrap();
         let reg = BuiltinAssistantRegistry::load_from_dir(tmp.path().to_path_buf());
         assert!(reg.is_empty());
     }
 
     #[test]
-    fn load_malformed_manifest_returns_empty() {
+    fn load_from_dir_malformed_manifest_returns_empty() {
         let tmp = TempDir::new().unwrap();
         write_manifest(tmp.path(), "{not valid json");
         let reg = BuiltinAssistantRegistry::load_from_dir(tmp.path().to_path_buf());
@@ -250,157 +360,112 @@ mod tests {
     }
 
     #[test]
-    fn load_empty_list_is_ok() {
+    fn load_from_dir_reads_bytes_from_disk() {
         let tmp = TempDir::new().unwrap();
-        write_manifest(tmp.path(), r#"{"version":"1.0.0","assistants":[]}"#);
-        let reg = BuiltinAssistantRegistry::load_from_dir(tmp.path().to_path_buf());
-        assert!(reg.is_empty());
-        assert!(!reg.has("anything"));
-    }
-
-    #[test]
-    fn load_happy_path_resolves_ids_and_paths() {
-        let tmp = TempDir::new().unwrap();
+        let rules_dir = tmp.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("office.en-US.md"), "office rule body").unwrap();
         write_manifest(
             tmp.path(),
             r#"{
                 "version": "1.0.0",
-                "assistants": [
-                    {
-                        "id": "builtin-office",
-                        "name": "Office",
-                        "presetAgentType": "gemini",
-                        "ruleFile": "rules/office.{locale}.md",
-                        "skillFile": "skills/office.{locale}.md",
-                        "avatar": "assets/office.svg"
-                    }
-                ]
+                "assistants": [{
+                    "id": "builtin-office",
+                    "name": "Office",
+                    "presetAgentType": "gemini",
+                    "ruleFile": "rules/office.{locale}.md"
+                }]
             }"#,
         );
+
         let reg = BuiltinAssistantRegistry::load_from_dir(tmp.path().to_path_buf());
         assert_eq!(reg.len(), 1);
         assert!(reg.has("builtin-office"));
-        assert!(!reg.has("missing"));
 
-        let rule = reg.rule_path("builtin-office", "en-US").unwrap();
-        assert!(rule.ends_with("rules/office.en-US.md"));
-
-        let skill = reg.skill_path("builtin-office", "zh-CN").unwrap();
-        assert!(skill.ends_with("skills/office.zh-CN.md"));
-
-        let avatar = reg.avatar_path("builtin-office").unwrap();
-        assert!(avatar.ends_with("assets/office.svg"));
+        let bytes = reg
+            .rule_bytes("builtin-office", "en-US")
+            .expect("disk-source rule_bytes should read the fixture");
+        assert_eq!(bytes, b"office rule body");
     }
 
     #[test]
-    fn rule_path_returns_none_when_missing() {
+    fn load_from_dir_missing_asset_returns_none() {
         let tmp = TempDir::new().unwrap();
         write_manifest(
             tmp.path(),
             r#"{
-                "assistants": [
-                    { "id": "no-rule", "name": "x", "presetAgentType": "gemini" }
-                ]
+                "assistants": [{
+                    "id": "x",
+                    "name": "X",
+                    "presetAgentType": "gemini",
+                    "ruleFile": "rules/x.{locale}.md"
+                }]
             }"#,
         );
         let reg = BuiltinAssistantRegistry::load_from_dir(tmp.path().to_path_buf());
-        assert!(reg.rule_path("no-rule", "en-US").is_none());
-        assert!(reg.skill_path("no-rule", "en-US").is_none());
-        assert!(reg.avatar_path("no-rule").is_none());
+        assert!(reg.rule_bytes("x", "en-US").is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // load() env-var routing
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn all_and_get_expose_entries() {
+    fn load_respects_env_var_disk_override() {
         let tmp = TempDir::new().unwrap();
         write_manifest(
             tmp.path(),
-            r#"{
-                "assistants": [
-                    { "id": "a1", "name": "A", "presetAgentType": "gemini" },
-                    { "id": "a2", "name": "B", "presetAgentType": "claude" }
-                ]
-            }"#,
+            r#"{"assistants":[{"id":"env-only","name":"E","presetAgentType":"gemini"}]}"#,
+        );
+        // SAFETY: env-var mutation is only unsafe if another thread reads
+        // environment concurrently. This test is self-contained.
+        // SAFETY: cargo test runs tests in parallel by default, so guard
+        // against interference from other tests by using a unique env-var
+        // value and checking via a dedicated loader call.
+        let key = "AIONUI_BUILTIN_ASSISTANTS_PATH";
+        let prev = std::env::var(key).ok();
+        // SAFETY: set_var is sound when no other thread is concurrently
+        // reading env. Tests within this module do not share mutation, and
+        // the env key is not observed by other tests.
+        unsafe {
+            std::env::set_var(key, tmp.path());
+        }
+        let reg = BuiltinAssistantRegistry::load();
+        assert!(reg.has("env-only"));
+        assert!(!reg.has("word-creator"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Avatar asset — emoji vs file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn avatar_asset_is_none_for_emoji_avatar() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        // word-creator ships with avatar: "📝" in the manifest.
+        assert!(reg.avatar_asset("word-creator").is_none());
+    }
+
+    #[test]
+    fn avatar_asset_returns_bytes_and_extension_for_file_avatar() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("duck.svg"), b"<svg/>").unwrap();
+        write_manifest(
+            tmp.path(),
+            r#"{"assistants":[{
+                "id": "with-file-avatar",
+                "name": "F",
+                "presetAgentType": "gemini",
+                "avatar": "duck.svg"
+            }]}"#,
         );
         let reg = BuiltinAssistantRegistry::load_from_dir(tmp.path().to_path_buf());
-        let ids: Vec<String> = reg.all().map(|a| a.id.clone()).collect();
-        assert_eq!(ids.len(), 2);
-        assert_eq!(reg.get("a1").unwrap().name, "A");
-        assert_eq!(reg.get("a2").unwrap().preset_agent_type, "claude");
-    }
-
-    // -----------------------------------------------------------------------
-    // resolve_assets_dir_from_exe — symlink regression guard (H1 hotfix)
-    // -----------------------------------------------------------------------
-
-    /// Regression test for the production bug where Electron spawning the
-    /// backend through a symlink (`~/.cargo/bin/aionui-backend` → real
-    /// `target/debug/aionui-backend`) caused `exe.parent()` to resolve to
-    /// the symlink directory, missing the sibling `assets/builtin-assistants`
-    /// shipped next to the real binary. The fix canonicalizes the exe path
-    /// before taking its parent.
-    #[cfg(unix)]
-    #[test]
-    fn resolve_assets_dir_follows_symlinked_exe() {
-        let tmp = TempDir::new().unwrap();
-        let real_dir = tmp.path().join("real");
-        let assets = real_dir.join("assets").join("builtin-assistants");
-        std::fs::create_dir_all(&assets).unwrap();
-
-        // Real binary sitting next to the assets.
-        let real_exe = real_dir.join("aionui-backend");
-        std::fs::write(&real_exe, b"#!/bin/sh\necho stub\n").unwrap();
-
-        // Symlink in a sibling directory that does NOT contain the assets —
-        // mirrors the ~/.cargo/bin/aionui-backend → target/debug/ layout.
-        let link_dir = tmp.path().join("bin");
-        std::fs::create_dir_all(&link_dir).unwrap();
-        let linked_exe = link_dir.join("aionui-backend");
-        std::os::unix::fs::symlink(&real_exe, &linked_exe).unwrap();
-
-        // Prove the bug precondition: resolving via the symlink's parent
-        // without canonicalization would miss the assets dir.
-        let naive = linked_exe
-            .parent()
-            .unwrap()
-            .join("assets")
-            .join("builtin-assistants");
-        assert!(
-            !naive.exists(),
-            "test fixture invalid: assets should not exist at symlink parent"
-        );
-
-        // With canonicalization, the helper resolves to the real directory.
-        let resolved = resolve_assets_dir_from_exe(&linked_exe)
-            .expect("canonicalized exe parent should locate assets dir");
-        assert_eq!(
-            resolved.canonicalize().unwrap(),
-            assets.canonicalize().unwrap()
-        );
-    }
-
-    #[test]
-    fn resolve_assets_dir_happy_path_no_symlink() {
-        let tmp = TempDir::new().unwrap();
-        let assets = tmp.path().join("assets").join("builtin-assistants");
-        std::fs::create_dir_all(&assets).unwrap();
-
-        let exe = tmp.path().join("aionui-backend");
-        std::fs::write(&exe, b"stub").unwrap();
-
-        let resolved = resolve_assets_dir_from_exe(&exe)
-            .expect("assets dir sitting next to the exe should be found");
-        assert_eq!(
-            resolved.canonicalize().unwrap(),
-            assets.canonicalize().unwrap()
-        );
-    }
-
-    #[test]
-    fn resolve_assets_dir_missing_returns_none() {
-        let tmp = TempDir::new().unwrap();
-        let exe = tmp.path().join("aionui-backend");
-        std::fs::write(&exe, b"stub").unwrap();
-        // No assets/builtin-assistants/ sibling — should return None.
-        assert!(resolve_assets_dir_from_exe(&exe).is_none());
+        let asset = reg.avatar_asset("with-file-avatar").unwrap();
+        assert_eq!(asset.bytes, b"<svg/>");
+        assert_eq!(asset.extension.as_deref(), Some("svg"));
     }
 }
