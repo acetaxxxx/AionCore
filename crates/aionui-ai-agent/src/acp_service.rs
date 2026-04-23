@@ -28,15 +28,10 @@ fn cli_binary_name(backend: AcpBackend) -> Option<&'static str> {
         AcpBackend::Kimi => Some("kimi"),
         AcpBackend::Qoder => Some("qoder"),
         AcpBackend::Vibe => Some("vibe"),
-        AcpBackend::Nanobot => Some("nanobot"),
         AcpBackend::Hermes => Some("hermes"),
         AcpBackend::Snow => Some("snow"),
         // These backends don't have a direct CLI to detect
         AcpBackend::IFlow => None,
-        AcpBackend::Gemini => None,
-        AcpBackend::OpenclawGateway => None,
-        AcpBackend::Remote => None,
-        AcpBackend::Aionrs => None,
         AcpBackend::Custom => None,
     }
 }
@@ -196,10 +191,7 @@ mod tests {
     #[test]
     fn cli_binary_name_returns_none_for_non_cli_backends() {
         assert_eq!(cli_binary_name(AcpBackend::IFlow), None);
-        assert_eq!(cli_binary_name(AcpBackend::Gemini), None);
         assert_eq!(cli_binary_name(AcpBackend::Custom), None);
-        assert_eq!(cli_binary_name(AcpBackend::Remote), None);
-        assert_eq!(cli_binary_name(AcpBackend::Aionrs), None);
     }
 
     #[test]

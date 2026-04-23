@@ -14,11 +14,15 @@ pub enum AgentType {
 }
 
 /// ACP sub-backend identifier.
+///
+/// Only ACP-protocol products belong here. Non-ACP execution engines
+/// (Gemini, OpenClaw, Nanobot, Remote, Aionrs) have their own Manager
+/// implementations and are dispatched via [`AgentType`] in the agent
+/// factory — not through this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AcpBackend {
     Claude,
-    Gemini,
     Qwen,
     #[serde(rename = "iFlow")]
     IFlow,
@@ -31,16 +35,11 @@ pub enum AcpBackend {
     Opencode,
     Copilot,
     Qoder,
-    #[serde(rename = "openclaw-gateway")]
-    OpenclawGateway,
     Vibe,
-    Nanobot,
     Cursor,
     Kiro,
     Hermes,
     Snow,
-    Remote,
-    Aionrs,
     Custom,
 }
 
@@ -248,7 +247,6 @@ mod tests {
             (AcpBackend::Claude, "claude"),
             (AcpBackend::Codebuddy, "codebuddy"),
             (AcpBackend::Opencode, "opencode"),
-            (AcpBackend::OpenclawGateway, "openclaw-gateway"),
             (AcpBackend::Hermes, "hermes"),
             (AcpBackend::Snow, "snow"),
         ];
@@ -257,6 +255,18 @@ mod tests {
             assert_eq!(json, format!("\"{expected}\""), "serialize {variant:?}");
             let parsed: AcpBackend = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, variant, "deserialize {expected}");
+        }
+    }
+
+    #[test]
+    fn acp_backend_rejects_non_acp_engine_names() {
+        // Non-ACP execution engines are dispatched via AgentType, not AcpBackend.
+        // Rejecting them at the HTTP deserialization boundary prevents accidental
+        // regression where a future change re-adds one of these variants.
+        for name in ["gemini", "nanobot", "remote", "aionrs", "openclaw-gateway"] {
+            let json = format!("\"{name}\"");
+            let result: Result<AcpBackend, _> = serde_json::from_str(&json);
+            assert!(result.is_err(), "AcpBackend should not accept {name:?}");
         }
     }
 
