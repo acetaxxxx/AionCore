@@ -245,6 +245,7 @@ dependencies = [
  "aion-agent",
  "aion-config",
  "aion-protocol",
+ "aion-tools",
  "aion-types",
  "aionui-api-types",
  "aionui-auth",

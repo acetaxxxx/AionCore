@@ -33,6 +33,7 @@ aion-agent.workspace = true
 aion-types.workspace = true
 aion-protocol.workspace = true
 aion-config.workspace = true
+aion-tools.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

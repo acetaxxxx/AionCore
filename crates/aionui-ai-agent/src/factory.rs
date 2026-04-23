@@ -9,7 +9,8 @@ use crate::remote_agent::RemoteAgentConfig;
 use crate::skill_manager::AcpSkillManager;
 use crate::task_manager::AgentFactory;
 use crate::types::{
-    AcpBuildExtra, BuildTaskOptions, GeminiBuildExtra, OpenClawBuildExtra, RemoteBuildExtra,
+    AcpBuildExtra, AionrsBuildExtra, BuildTaskOptions, GeminiBuildExtra, OpenClawBuildExtra,
+    RemoteBuildExtra,
 };
 use crate::{
     AcpAgentManager, AionrsAgentManager, GeminiAgentManager, NanobotAgentManager,
@@ -127,7 +128,9 @@ async fn build_agent(
             Ok(Arc::new(agent))
         }
         AgentType::Aionrs => {
-            let agent = AionrsAgentManager::new(conversation_id, workspace);
+            let config: AionrsBuildExtra = serde_json::from_value(options.extra)
+                .map_err(|e| AppError::BadRequest(format!("Invalid Aionrs build options: {e}")))?;
+            let agent = AionrsAgentManager::new(conversation_id, workspace, config);
             Ok(Arc::new(agent))
         }
     }

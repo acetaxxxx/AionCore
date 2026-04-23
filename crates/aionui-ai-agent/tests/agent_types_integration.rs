@@ -104,45 +104,45 @@ impl IAgentManager for TypedMockAgent {
 }
 
 // ---------------------------------------------------------------------------
-// Aionrs stub tests
+// Aionrs agent tests (real implementation with AgentEngine)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn aionrs_stub_send_message_returns_error() {
-    let agent = AionrsAgentManager::new("conv-aionrs".into(), "/project".into());
-    let data = SendMessageData {
-        content: "hello".into(),
-        msg_id: "m1".into(),
-        files: vec![],
-        inject_skills: vec![],
-    };
-    let result = agent.send_message(data).await;
-    assert!(result.is_err());
-    let err_msg = format!("{}", result.unwrap_err());
-    assert!(err_msg.contains("not yet implemented"));
+fn make_aionrs_config() -> AionrsBuildExtra {
+    AionrsBuildExtra {
+        provider: "anthropic".into(),
+        api_key: "sk-test-key".into(),
+        model: "claude-sonnet-4-20250514".into(),
+        base_url: None,
+        system_prompt: None,
+        max_tokens: 4096,
+        max_turns: None,
+    }
 }
 
 #[test]
-fn aionrs_stub_kill_succeeds() {
-    let agent = AionrsAgentManager::new("conv-1".into(), "/proj".into());
+fn aionrs_agent_kill_succeeds() {
+    let agent =
+        AionrsAgentManager::new("conv-1".into(), "/proj".into(), make_aionrs_config());
     assert!(agent.kill(None).is_ok());
     assert!(agent.kill(Some(AgentKillReason::IdleTimeout)).is_ok());
 }
 
 #[test]
-fn aionrs_stub_confirm_returns_error() {
-    let agent = AionrsAgentManager::new("conv-1".into(), "/proj".into());
+fn aionrs_agent_confirm_succeeds() {
+    let agent =
+        AionrsAgentManager::new("conv-1".into(), "/proj".into(), make_aionrs_config());
     let result = agent.confirm("msg", "call", json!({}), false);
-    assert!(result.is_err());
+    assert!(result.is_ok());
 }
 
 #[test]
-fn aionrs_stub_metadata() {
-    let agent = AionrsAgentManager::new("conv-abc".into(), "/work".into());
+fn aionrs_agent_metadata() {
+    let agent =
+        AionrsAgentManager::new("conv-abc".into(), "/work".into(), make_aionrs_config());
     assert_eq!(agent.agent_type(), AgentType::Aionrs);
     assert_eq!(agent.workspace(), "/work");
     assert_eq!(agent.conversation_id(), "conv-abc");
-    assert!(agent.status().is_none());
+    assert_eq!(agent.status(), Some(ConversationStatus::Pending));
     assert!(agent.get_confirmations().is_empty());
     assert!(!agent.check_approval("any", None));
 }
