@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 /// Universal paginated result for list APIs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PaginatedResult<T> {
     pub items: Vec<T>,
     pub total: u64,
@@ -14,7 +13,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_serialize_camel_case() {
+    fn test_serialize_snake_case() {
         let result = PaginatedResult {
             items: vec![1, 2, 3],
             total: 10,
@@ -23,7 +22,7 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["items"], serde_json::json!([1, 2, 3]));
         assert_eq!(json["total"], 10);
-        assert_eq!(json["hasMore"], true);
+        assert_eq!(json["has_more"], true);
     }
 
     #[test]
@@ -36,12 +35,12 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["items"], serde_json::json!([]));
         assert_eq!(json["total"], 0);
-        assert_eq!(json["hasMore"], false);
+        assert_eq!(json["has_more"], false);
     }
 
     #[test]
     fn test_deserialize() {
-        let json = r#"{"items":[1,2],"total":5,"hasMore":true}"#;
+        let json = r#"{"items":[1,2],"total":5,"has_more":true}"#;
         let result: PaginatedResult<i32> = serde_json::from_str(json).unwrap();
         assert_eq!(result.items, vec![1, 2]);
         assert_eq!(result.total, 5);

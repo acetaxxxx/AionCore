@@ -54,8 +54,9 @@ pub struct ModelHealthStatus {
 
 /// AWS Bedrock authentication method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum BedrockAuthMethod {
+    #[serde(rename = "accessKey")]
     AccessKey,
     Profile,
 }

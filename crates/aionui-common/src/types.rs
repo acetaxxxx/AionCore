@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Type of available update based on semver comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum UpdateType {
     Major,
     Minor,
@@ -13,7 +13,6 @@ pub enum UpdateType {
 
 /// Model selection config — references a provider and a specific model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProviderWithModel {
     pub provider_id: String,
     pub model: String,
@@ -22,7 +21,6 @@ pub struct ProviderWithModel {
 
 /// A pending tool-call confirmation item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Confirmation {
     pub id: String,
     pub call_id: String,
@@ -35,7 +33,6 @@ pub struct Confirmation {
 
 /// A single option within a confirmation dialog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ConfirmationOption {
     pub label: String,
     pub value: serde_json::Value,
@@ -44,7 +41,6 @@ pub struct ConfirmationOption {
 
 /// Semantic version info with comparison and update detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct VersionInfo {
     pub current: String,
     pub latest: String,
@@ -104,9 +100,9 @@ mod tests {
             use_model: Some("gpt-4-turbo".into()),
         };
         let json = serde_json::to_value(&p).unwrap();
-        assert_eq!(json["providerId"], "openai-1");
+        assert_eq!(json["provider_id"], "openai-1");
         assert_eq!(json["model"], "gpt-4");
-        assert_eq!(json["useModel"], "gpt-4-turbo");
+        assert_eq!(json["use_model"], "gpt-4-turbo");
     }
 
     #[test]
@@ -125,8 +121,8 @@ mod tests {
             }],
         };
         let json = serde_json::to_value(&c).unwrap();
-        assert_eq!(json["callId"], "call1");
-        assert_eq!(json["commandType"], "bash");
+        assert_eq!(json["call_id"], "call1");
+        assert_eq!(json["command_type"], "bash");
     }
 
     #[test]
