@@ -35,11 +35,7 @@ pub struct AionrsAgentManager {
 }
 
 impl AionrsAgentManager {
-    pub fn new(
-        conversation_id: String,
-        workspace: String,
-        config_extra: AionrsBuildExtra,
-    ) -> Self {
+    pub fn new(conversation_id: String, workspace: String, config_extra: AionrsBuildExtra) -> Self {
         let (event_tx, _) = broadcast::channel(128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(event_tx.clone()));
 
@@ -208,8 +204,7 @@ mod tests {
 
     #[test]
     fn aionrs_agent_returns_correct_type() {
-        let agent =
-            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
+        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
         assert_eq!(agent.agent_type(), AgentType::Aionrs);
         assert_eq!(agent.workspace(), "/project");
         assert_eq!(agent.conversation_id(), "conv-1");
@@ -217,44 +212,38 @@ mod tests {
 
     #[test]
     fn aionrs_agent_initial_status_is_pending() {
-        let agent =
-            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
+        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
         assert_eq!(agent.status(), Some(ConversationStatus::Pending));
     }
 
     #[test]
     fn aionrs_agent_subscribe_returns_receiver() {
-        let agent =
-            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
+        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
         let _rx = agent.subscribe();
     }
 
     #[test]
     fn aionrs_agent_kill_succeeds() {
-        let agent =
-            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
+        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
         assert!(agent.kill(None).is_ok());
         assert_eq!(agent.status(), None);
     }
 
     #[test]
     fn aionrs_agent_kill_with_reason_succeeds() {
-        let agent =
-            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
+        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
         assert!(agent.kill(Some(AgentKillReason::IdleTimeout)).is_ok());
     }
 
     #[test]
     fn aionrs_agent_confirmations_initially_empty() {
-        let agent =
-            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
+        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
         assert!(agent.get_confirmations().is_empty());
     }
 
     #[test]
     fn aionrs_agent_check_approval_returns_false_by_default() {
-        let agent =
-            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
+        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
         assert!(!agent.check_approval("any_action", None));
     }
 }

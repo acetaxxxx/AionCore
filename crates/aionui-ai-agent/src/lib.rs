@@ -4,9 +4,9 @@ pub mod acp_routes;
 pub mod acp_service;
 pub mod agent_manager;
 pub mod aionrs_agent;
-pub mod backend_output_sink;
 pub mod api_client;
 pub mod auxiliary_routes;
+pub mod backend_output_sink;
 pub mod cli_process;
 pub mod connection_test_routes;
 pub mod connection_test_service;
@@ -28,13 +28,13 @@ pub use acp_agent::AcpAgentManager;
 pub use acp_routes::{AcpRouterState, acp_routes};
 pub use agent_manager::{AgentManagerHandle, IAgentManager, approval_key};
 pub use aionrs_agent::AionrsAgentManager;
-pub use backend_output_sink::BackendOutputSink;
 pub use api_client::{
     AnthropicRotatingClient, ApiClientError, ApiKeyManager, ApiKeyStatus, ClientOptions,
     GeminiRotatingClient, LlmClient, OpenAIRotatingClient, RotatingClient, clean_function_name,
     create_rotating_client, is_retryable_status, normalize_base_url,
 };
 pub use auxiliary_routes::{AuxiliaryRouterState, auxiliary_routes};
+pub use backend_output_sink::BackendOutputSink;
 pub use cli_process::{CliAgentProcess, CliSpawnConfig};
 pub use connection_test_routes::{ConnectionTestRouterState, connection_test_routes};
 pub use connection_test_service::ConnectionTestService;

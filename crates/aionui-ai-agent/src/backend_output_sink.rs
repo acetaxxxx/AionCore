@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::stream_event::{
     AgentStreamEvent, ErrorEventData, FinishEventData, StartEventData, TextEventData,
-    ThinkingEventData, TipsEventData, TipType, ToolCallEventData, ToolCallStatus,
+    ThinkingEventData, TipType, TipsEventData, ToolCallEventData, ToolCallStatus,
 };
 
 pub struct BackendOutputSink {
@@ -68,9 +68,7 @@ impl OutputSink for BackendOutputSink {
     fn emit_stream_start(&self, _msg_id: &str) {
         let _ = self
             .event_tx
-            .send(AgentStreamEvent::Start(StartEventData {
-                session_id: None,
-            }));
+            .send(AgentStreamEvent::Start(StartEventData { session_id: None }));
     }
 
     fn emit_stream_end(
@@ -90,21 +88,17 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_error(&self, msg: &str) {
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Error(ErrorEventData {
-                message: msg.to_owned(),
-                code: None,
-            }));
+        let _ = self.event_tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: msg.to_owned(),
+            code: None,
+        }));
     }
 
     fn emit_info(&self, msg: &str) {
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Tips(TipsEventData {
-                content: msg.to_owned(),
-                tip_type: TipType::Success,
-            }));
+        let _ = self.event_tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: msg.to_owned(),
+            tip_type: TipType::Success,
+        }));
     }
 }
 
