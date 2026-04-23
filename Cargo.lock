@@ -490,6 +490,7 @@ dependencies = [
  "axum",
  "dirs",
  "http-body-util",
+ "include_dir",
  "notify",
  "semver",
  "serde",

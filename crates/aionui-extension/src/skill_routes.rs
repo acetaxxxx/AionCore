@@ -8,11 +8,11 @@ use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
     AddExternalPathRequest, ApiResponse, BuiltinAutoSkillResponse, ExportSkillRequest,
-    ExternalSkillSourceResponse, ImportSkillRequest, ImportSkillResponse, NamedPathResponse,
-    ReadAssistantRuleRequest, ReadBuiltinResourceRequest, ReadSkillInfoRequest,
-    ReadSkillInfoResponse, RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse,
-    ScannedSkillResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse,
-    WriteAssistantRuleRequest,
+    ExternalSkillSourceResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
+    MaterializeSkillsResponse, NamedPathResponse, ReadAssistantRuleRequest,
+    ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse,
+    RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
+    SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
 use aionui_common::AppError;
 
@@ -70,6 +70,15 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         // Built-in resources
         .route("/api/skills/builtin-rule", post(read_builtin_rule))
         .route("/api/skills/builtin-skill", post(read_builtin_skill))
+        // Per-agent skill materialization (for gemini CLI)
+        .route(
+            "/api/skills/materialize-for-agent",
+            post(materialize_for_agent),
+        )
+        .route(
+            "/api/skills/materialize-for-agent/{conversation_id}",
+            delete(cleanup_for_agent),
+        )
         // Assistant rules CRUD
         .route("/api/skills/assistant-rule/read", post(read_assistant_rule))
         .route(
@@ -121,6 +130,7 @@ async fn list_skills(
             name: s.name,
             description: s.description,
             location: s.location,
+            relative_location: s.relative_location,
             is_custom: s.is_custom,
             source: to_source_response(s.source),
         })
@@ -138,6 +148,7 @@ async fn list_builtin_auto_skills(
         .map(|s| BuiltinAutoSkillResponse {
             name: s.name,
             description: s.description,
+            location: s.location,
         })
         .collect();
     Ok(Json(ApiResponse::ok(resp)))
@@ -306,6 +317,45 @@ async fn read_builtin_skill(
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let content = skill_service::read_builtin_skill(&state.skill_paths, &req.file_name).await?;
     Ok(Json(ApiResponse::ok(content)))
+}
+
+/// `POST /api/skills/materialize-for-agent` — flatten auto-inject + opt-in
+/// skills into `{data_dir}/agent-skills/{conversationId}/` and hand the
+/// frontend an absolute path for gemini CLI `--extensions` loading.
+async fn materialize_for_agent(
+    State(state): State<SkillRouterState>,
+    body: Result<Json<MaterializeSkillsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<MaterializeSkillsResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if req.conversation_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "conversationId must not be empty".into(),
+        ));
+    }
+    let dir = skill_service::materialize_skills_for_agent(
+        &state.skill_paths,
+        &req.conversation_id,
+        &req.enabled_skills,
+    )
+    .await?;
+    Ok(Json(ApiResponse::ok(MaterializeSkillsResponse {
+        dir_path: dir.to_string_lossy().into_owned(),
+    })))
+}
+
+/// `DELETE /api/skills/materialize-for-agent/:conversation_id` — remove the
+/// per-conversation agent-skills directory. Idempotent.
+async fn cleanup_for_agent(
+    State(state): State<SkillRouterState>,
+    AxumPath(conversation_id): AxumPath<String>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    if conversation_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "conversationId must not be empty".into(),
+        ));
+    }
+    skill_service::cleanup_agent_skills(&state.skill_paths, &conversation_id).await?;
+    Ok(Json(ApiResponse::success()))
 }
 
 // ---------------------------------------------------------------------------
@@ -518,7 +568,7 @@ mod tests {
         let paths = SkillPaths {
             data_dir: tmp.path().to_path_buf(),
             user_skills_dir: tmp.path().join("skills"),
-            builtin_skills_dir: tmp.path().join("builtin-skills"),
+            builtin_skills_dir: Some(tmp.path().join("builtin-skills")),
             builtin_rules_dir: tmp.path().join("builtin-rules"),
             assistant_rules_dir: tmp.path().join("assistant-rules"),
             assistant_skills_dir: tmp.path().join("assistant-skills"),

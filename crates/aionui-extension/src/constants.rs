@@ -61,10 +61,22 @@ pub const BUILTIN_SKILLS_DIR_NAME: &str = "builtin-skills";
 /// Default subdirectory name for built-in rules.
 pub const BUILTIN_RULES_DIR_NAME: &str = "builtin-rules";
 
-/// Subdirectory inside `BUILTIN_SKILLS_DIR_NAME` whose children are
-/// auto-injected into every assistant. Matches
-/// `getBuiltinAutoSkillsDir` in AionUi (`src/process/utils/initStorage.ts`).
-pub const BUILTIN_AUTO_SKILLS_SUBDIR: &str = "_builtin";
+/// Subdirectory inside the built-in skills corpus whose children are
+/// auto-injected into every assistant. Historical name was `_builtin`;
+/// renamed to `auto-inject` as part of the 2026-04-23 built-in skill
+/// migration (skills are now embedded in the backend binary via
+/// `include_dir!`).
+pub const BUILTIN_AUTO_SKILLS_SUBDIR: &str = "auto-inject";
+
+/// Subdirectory under `data_dir` where the lazily materialized built-in
+/// skills "view" lives. Consumers (e.g. SkillsHubSettings export-symlink
+/// flow) need a real on-disk source path, even though the canonical
+/// corpus is embedded in the binary. See `skill_service::list_skills`.
+pub const BUILTIN_SKILLS_VIEW_SUBDIR: &str = "builtin-skills-view";
+
+/// Subdirectory under `data_dir` where per-conversation materialized
+/// skill directories are written for the gemini agent.
+pub const AGENT_SKILLS_SUBDIR: &str = "agent-skills";
 
 /// Default subdirectory name for assistant-level rules.
 pub const ASSISTANT_RULES_DIR_NAME: &str = "assistant-rules";

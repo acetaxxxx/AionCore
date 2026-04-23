@@ -17,21 +17,34 @@ pub enum SkillSourceResponse {
 }
 
 /// Single item in the available skills list (`GET /api/skills`).
+///
+/// For `source=builtin` entries, `location` is a synthesized absolute path
+/// under `{data_dir}/builtin-skills-view/{name}/SKILL.md` (lazily
+/// materialized from the embedded corpus so the export-symlink flow can
+/// resolve it), and `relative_location` carries the path the frontend
+/// passes back into `POST /api/skills/builtin-skill` (e.g.
+/// `"auto-inject/cron/SKILL.md"` or `"{name}/SKILL.md"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillListItemResponse {
     pub name: String,
     pub description: String,
     pub location: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_location: Option<String>,
     pub is_custom: bool,
     pub source: SkillSourceResponse,
 }
 
 /// An auto-injected built-in skill (`GET /api/skills/builtin-auto`).
+///
+/// `location` is the relative path the frontend passes back into
+/// `POST /api/skills/builtin-skill` (e.g. `"auto-inject/cron/SKILL.md"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BuiltinAutoSkillResponse {
     pub name: String,
     pub description: String,
+    pub location: String,
 }
 
 /// Request body for `POST /api/skills/info`.
@@ -159,6 +172,22 @@ pub struct ReadBuiltinResourceRequest {
     pub file_name: String,
 }
 
+/// Request body for `POST /api/skills/materialize-for-agent`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterializeSkillsRequest {
+    pub conversation_id: String,
+    #[serde(default)]
+    pub enabled_skills: Vec<String>,
+}
+
+/// Response for `POST /api/skills/materialize-for-agent`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterializeSkillsResponse {
+    pub dir_path: String,
+}
+
 // ---------------------------------------------------------------------------
 // E. External path management
 // ---------------------------------------------------------------------------
@@ -189,6 +218,7 @@ mod tests {
             name: "my-skill".into(),
             description: "Does things".into(),
             location: "/home/user/.aionui/skills/my-skill".into(),
+            relative_location: None,
             is_custom: true,
             source: SkillSourceResponse::Custom,
         };
@@ -197,6 +227,50 @@ mod tests {
         assert_eq!(json["is_custom"], true);
         assert_eq!(json["source"], "custom");
         assert!(json.get("isCustom").is_none());
+        // Absent for custom source — Option<String>::None is skipped.
+        assert!(json.get("relative_location").is_none());
+    }
+
+    #[test]
+    fn test_skill_list_item_builtin_with_relative_location() {
+        let item = SkillListItemResponse {
+            name: "cron".into(),
+            description: "Schedule recurring tasks".into(),
+            location: "/home/user/.aionui/builtin-skills-view/cron/SKILL.md".into(),
+            relative_location: Some("auto-inject/cron/SKILL.md".into()),
+            is_custom: false,
+            source: SkillSourceResponse::Builtin,
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["relative_location"], "auto-inject/cron/SKILL.md");
+        assert_eq!(json["source"], "builtin");
+    }
+
+    #[test]
+    fn test_materialize_request_roundtrip() {
+        let raw = json!({
+            "conversationId": "conv-abc",
+            "enabledSkills": ["mermaid", "pdf"],
+        });
+        let req: MaterializeSkillsRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.conversation_id, "conv-abc");
+        assert_eq!(req.enabled_skills, vec!["mermaid", "pdf"]);
+    }
+
+    #[test]
+    fn test_materialize_request_default_enabled() {
+        let raw = json!({"conversationId": "conv-abc"});
+        let req: MaterializeSkillsRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.enabled_skills.is_empty());
+    }
+
+    #[test]
+    fn test_materialize_response_serializes_camel() {
+        let resp = MaterializeSkillsResponse {
+            dir_path: "/tmp/agent-skills/conv-abc".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["dirPath"], "/tmp/agent-skills/conv-abc");
     }
 
     #[test]

@@ -528,7 +528,11 @@ async fn sk2_read_builtin_skill_happy_path_returns_file_content() {
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
     std::fs::write(
-        paths.builtin_skills_dir.join("cowork-skills.md"),
+        paths
+            .builtin_skills_dir
+            .as_ref()
+            .expect("disk override set in build_app_with_skill_paths")
+            .join("cowork-skills.md"),
         "## Cowork skills\n\n- git\n- bash\n",
     )
     .unwrap();
@@ -555,7 +559,10 @@ async fn sk3_read_builtin_skill_rejects_path_traversal() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    for bad in ["../escape.md", "/etc/passwd", "nested/file.md", ""] {
+    // Path traversal / absolute-path attempts must be rejected. Relative
+    // paths with `/` are now legitimate (e.g. `auto-inject/cron/SKILL.md`)
+    // and handled by the valid-path code path further below.
+    for bad in ["../escape.md", "/etc/passwd", "foo/../etc/passwd", ""] {
         let resp = app
             .clone()
             .oneshot(json_with_token(
@@ -684,7 +691,12 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    write_skill(&paths.builtin_skills_dir, "review", "Built-in review skill");
+    let builtin_dir = paths
+        .builtin_skills_dir
+        .as_ref()
+        .expect("disk override set by helper")
+        .clone();
+    write_skill(&builtin_dir, "review", "Built-in review skill");
     write_skill(&paths.user_skills_dir, "my-skill", "A user-imported skill");
 
     let resp = app
@@ -722,7 +734,12 @@ async fn sl2_list_skills_user_custom_overrides_builtin() {
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    write_skill(&paths.builtin_skills_dir, "review", "Built-in review");
+    let builtin_dir = paths
+        .builtin_skills_dir
+        .as_ref()
+        .expect("disk override set by helper")
+        .clone();
+    write_skill(&builtin_dir, "review", "Built-in review");
     write_skill(&paths.user_skills_dir, "review", "Custom review override");
 
     let resp = app
@@ -765,11 +782,16 @@ async fn ba1_auto_skills_lists_underscore_builtin_entries() {
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    let auto_dir = paths.builtin_skills_dir.join("_builtin");
+    let builtin_dir = paths
+        .builtin_skills_dir
+        .as_ref()
+        .expect("disk override set by helper")
+        .clone();
+    let auto_dir = builtin_dir.join("auto-inject");
     write_skill(&auto_dir, "cron", "Schedule recurring tasks");
     write_skill(&auto_dir, "skill-creator", "Scaffold a new skill");
     // A top-level builtin that must NOT appear in the auto list.
-    write_skill(&paths.builtin_skills_dir, "review", "Top-level");
+    write_skill(&builtin_dir, "review", "Top-level");
 
     let resp = app
         .oneshot(get_with_token("/api/skills/builtin-auto", &token))

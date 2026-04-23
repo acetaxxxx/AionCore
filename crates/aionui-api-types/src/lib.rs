@@ -113,11 +113,11 @@ pub use shell::{
 };
 pub use skill::{
     AddExternalPathRequest, BuiltinAutoSkillResponse, DeleteSkillRequest, ExportSkillRequest,
-    ExternalSkillSourceResponse, ImportSkillRequest, ImportSkillResponse, NamedPathResponse,
-    ReadAssistantRuleRequest, ReadBuiltinResourceRequest, ReadSkillInfoRequest,
-    ReadSkillInfoResponse, RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse,
-    ScannedSkillResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse,
-    WriteAssistantRuleRequest,
+    ExternalSkillSourceResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
+    MaterializeSkillsResponse, NamedPathResponse, ReadAssistantRuleRequest,
+    ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse,
+    RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
+    SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
 pub use system::{
     ClientPreferencesResponse, SystemSettingsResponse, UpdateClientPreferencesRequest,
