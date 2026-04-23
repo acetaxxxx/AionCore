@@ -31,17 +31,18 @@ pub async fn build_app_with_skill_paths(
     let services = AppServices::from_database(db).await.unwrap();
     let mut states = build_module_states(&services).await;
 
+    let builtin_dir = root.join("builtin-skills");
     let paths = SkillPaths {
         data_dir: root.to_path_buf(),
         user_skills_dir: root.join("skills"),
-        builtin_skills_dir: root.join("builtin-skills"),
+        builtin_skills_dir: Some(builtin_dir.clone()),
         builtin_rules_dir: root.join("builtin-rules"),
         assistant_rules_dir: root.join("assistant-rules"),
         assistant_skills_dir: root.join("assistant-skills"),
     };
     for dir in [
         &paths.user_skills_dir,
-        &paths.builtin_skills_dir,
+        &builtin_dir,
         &paths.builtin_rules_dir,
         &paths.assistant_rules_dir,
         &paths.assistant_skills_dir,

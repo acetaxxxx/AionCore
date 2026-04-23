@@ -26,11 +26,18 @@ fn make_paths(base: &Path) -> SkillPaths {
     SkillPaths {
         data_dir: base.to_path_buf(),
         user_skills_dir: base.join("skills"),
-        builtin_skills_dir: base.join("builtin-skills"),
+        builtin_skills_dir: Some(base.join("builtin-skills")),
         builtin_rules_dir: base.join("builtin-rules"),
         assistant_rules_dir: base.join("assistant-rules"),
         assistant_skills_dir: base.join("assistant-skills"),
     }
+}
+
+fn builtin_dir(paths: &SkillPaths) -> &Path {
+    paths
+        .builtin_skills_dir
+        .as_deref()
+        .expect("disk override must be set for integration tests")
 }
 
 fn create_skill(base: &Path, name: &str, desc: &str) {
@@ -64,9 +71,9 @@ async fn sm1_list_available_skills_deduplication() {
     let paths = make_paths(tmp.path());
 
     // 3 built-in, 2 custom (1 overlaps)
-    create_skill(&paths.builtin_skills_dir, "review", "Built-in review");
-    create_skill(&paths.builtin_skills_dir, "debug", "Built-in debug");
-    create_skill(&paths.builtin_skills_dir, "test", "Built-in test");
+    create_skill(builtin_dir(&paths), "review", "Built-in review");
+    create_skill(builtin_dir(&paths), "debug", "Built-in debug");
+    create_skill(builtin_dir(&paths), "test", "Built-in test");
     create_skill(&paths.user_skills_dir, "review", "Custom review override");
     create_skill(&paths.user_skills_dir, "my-tool", "My custom tool");
 
@@ -202,13 +209,13 @@ async fn sm7_delete_builtin_skill_rejected() {
     let tmp = TempDir::new().unwrap();
     let paths = make_paths(tmp.path());
 
-    create_skill(&paths.builtin_skills_dir, "protected", "Cannot delete");
+    create_skill(builtin_dir(&paths), "protected", "Cannot delete");
 
     let result = delete_skill(&paths, "protected").await;
     assert!(result.is_err());
 
     // Verify it still exists
-    assert!(paths.builtin_skills_dir.join("protected").exists());
+    assert!(builtin_dir(&paths).join("protected").exists());
 }
 
 /// SM-8: Scan for skills in a directory.
@@ -229,17 +236,28 @@ async fn sm8_scan_for_skills() {
 }
 
 /// SM-11: Get skill directory paths.
+///
+/// Production mode: no `AIONUI_BUILTIN_SKILLS_PATH` set — the built-in
+/// corpus is embedded and `builtin_skills_dir` is `None`. The user
+/// skills directory is derived from `data_dir`, not `resource_dir`.
 #[tokio::test]
 async fn sm11_get_skill_paths() {
+    // Ensure the env var is unset for a deterministic assertion.
+    // Safe: the test runs single-threaded w.r.t. this env var.
+    // (SAFETY: `remove_var` is unsafe in 2024 edition due to process-wide
+    // side-effects.)
+    unsafe {
+        std::env::remove_var("AIONUI_BUILTIN_SKILLS_PATH");
+    }
+
     let resource_dir = Path::new("/app/resources");
-    let paths = resolve_skill_paths(resource_dir);
+    let data_dir = Path::new("/home/user/.aionui");
+    let paths = resolve_skill_paths(resource_dir, data_dir);
 
     assert!(paths.user_skills_dir.to_string_lossy().contains("skills"));
     assert!(
-        paths
-            .builtin_skills_dir
-            .to_string_lossy()
-            .contains("builtin-skills")
+        paths.builtin_skills_dir.is_none(),
+        "production mode must yield None (embedded corpus)"
     );
 }
 
@@ -275,7 +293,7 @@ async fn rm1_read_builtin_skill() {
     let tmp = TempDir::new().unwrap();
     let paths = make_paths(tmp.path());
 
-    create_builtin_skill(&paths.builtin_skills_dir, "tdd.md", "# TDD Workflow");
+    create_builtin_skill(builtin_dir(&paths), "tdd.md", "# TDD Workflow");
 
     let content = read_builtin_skill(&paths, "tdd.md").await.unwrap();
     assert_eq!(content, "# TDD Workflow");

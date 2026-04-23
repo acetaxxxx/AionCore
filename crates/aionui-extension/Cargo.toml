@@ -11,6 +11,7 @@ aionui-realtime.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 dirs.workspace = true
+include_dir.workspace = true
 semver.workspace = true
 notify.workspace = true
 tokio.workspace = true

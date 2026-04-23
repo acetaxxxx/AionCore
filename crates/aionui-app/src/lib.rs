@@ -237,6 +237,13 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
     let dispatcher: Arc<dyn AssistantRuleDispatcher> = assistant.service.clone();
     skill_state.assistant_dispatcher = Some(dispatcher);
 
+    // Best-effort cleanup of orphaned per-agent skills directories from
+    // conversations that no longer exist. The predicate closure bridges
+    // the extension crate (which does not depend on aionui-conversation)
+    // and the conversation repository. Failures are logged and ignored
+    // — agent-skills sweeping is not critical to startup.
+    run_orphan_agent_skills_cleanup(services, &skill_state.skill_paths).await;
+
     ModuleStates {
         system: build_system_state(services),
         conversation: build_conversation_state(services),
@@ -255,6 +262,47 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
         office: build_office_state(services),
         shell: build_shell_state(services),
         assistant,
+    }
+}
+
+/// Best-effort orphan sweep of `{data_dir}/agent-skills/`.
+///
+/// Scans the directory and deletes subdirectories whose name does not
+/// correspond to a live conversation (per the conversation repository).
+/// Runs synchronously during startup — the count is small in practice
+/// (one entry per open conversation at shutdown) and the operation is
+/// strictly local filesystem I/O.
+///
+/// `aionui-extension` accepts a `Fn(&str) -> bool` predicate so it does
+/// not need to depend on `aionui-conversation`. We perform the blocking
+/// repository check via `tokio::task::block_in_place` + the current
+/// runtime's `block_on`, which is safe on multi-thread runtimes (the
+/// only runtime flavor this binary uses).
+async fn run_orphan_agent_skills_cleanup(
+    services: &AppServices,
+    skill_paths: &aionui_extension::SkillPaths,
+) {
+    let pool = services.database.pool().clone();
+    let repo: Arc<dyn aionui_db::IConversationRepository> =
+        Arc::new(SqliteConversationRepository::new(pool));
+    let handle = tokio::runtime::Handle::current();
+    let is_live = {
+        let repo = repo.clone();
+        move |id: &str| -> bool {
+            let id = id.to_string();
+            let repo = repo.clone();
+            // Block on the async repo call. Multi-thread runtime required.
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move { repo.get(&id).await.ok().flatten().is_some() })
+            })
+        }
+    };
+    match aionui_extension::cleanup_orphan_agent_skills(skill_paths, is_live).await {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "swept orphan agent-skills dirs on startup")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "orphan agent-skills sweep failed (non-fatal)"),
     }
 }
 
@@ -569,29 +617,39 @@ struct CronServiceTickRef(std::sync::Mutex<Option<Arc<aionui_cron::service::Cron
 pub async fn build_extension_states(
     services: &AppServices,
 ) -> (ExtensionRouterState, HubRouterState, SkillRouterState) {
-    let data_dir = dirs::home_dir()
+    // Extension state, hub index, and external skill paths continue to live
+    // under `~/.aionui/` (carried over from the pre-migration layout).
+    let legacy_home_dir = dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(".aionui");
 
-    let state_store = ExtensionStateStore::new(data_dir.join("extension-states.json"));
+    // Skill paths honor the `--data-dir` CLI flag so the new
+    // `{data_dir}/agent-skills/` and `{data_dir}/builtin-skills-view/`
+    // directories land inside whatever root the operator picked.
+    let skill_data_dir = std::path::PathBuf::from(&services.data_dir);
+
+    let state_store = ExtensionStateStore::new(legacy_home_dir.join("extension-states.json"));
     let registry = ExtensionRegistry::new(
         state_store,
         services.event_bus.clone(),
         env!("CARGO_PKG_VERSION").to_string(),
     );
 
-    let hub_dir = data_dir.join("extensions");
+    let hub_dir = legacy_home_dir.join("extensions");
     let index_manager = HubIndexManager::new(hub_dir, registry.clone());
     let installer = HubInstaller::new(index_manager.clone(), registry.clone());
 
-    // Skill paths: use app resource dir (binary's parent) for built-in resources.
+    // Skill paths: use app resource dir (binary's parent) for built-in
+    // rules. Canonicalize current_exe so a cargo-install symlink doesn't
+    // point the resource root at `~/.cargo/bin/` (assistant H1 lesson).
     let app_resource_dir = std::env::current_exe()
         .ok()
+        .and_then(|p| p.canonicalize().ok())
         .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let skill_paths = aionui_extension::resolve_skill_paths(&app_resource_dir);
+    let skill_paths = aionui_extension::resolve_skill_paths(&app_resource_dir, &skill_data_dir);
 
-    let ext_paths_mgr = Arc::new(ExternalPathsManager::new(&data_dir).await);
+    let ext_paths_mgr = Arc::new(ExternalPathsManager::new(&legacy_home_dir).await);
 
     let ext_state = ExtensionRouterState {
         registry: registry.clone(),
