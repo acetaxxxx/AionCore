@@ -17,7 +17,7 @@ fn create_conv_body(name: &str, agent_type: &str) -> serde_json::Value {
     json!({
         "type": agent_type,
         "name": name,
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/project" }
     })
 }
@@ -260,7 +260,7 @@ async fn confirm_call_no_task() {
     let req = json_with_token(
         "POST",
         &format!("/api/conversations/{conv_id}/confirmations/call-1/confirm"),
-        json!({ "msgId": "msg-1", "data": { "value": "allow" }, "alwaysAllow": false }),
+        json!({ "msg_id": "msg-1", "data": { "value": "allow" }, "always_allow": false }),
         &token,
         &csrf,
     );

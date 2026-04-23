@@ -349,8 +349,8 @@ async fn sm11_get_skill_paths() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let data = &json["data"];
-    assert!(data["userSkillsDir"].is_string());
-    assert!(data["builtinSkillsDir"].is_string());
+    assert!(data["user_skills_dir"].is_string());
+    assert!(data["builtin_skills_dir"].is_string());
 }
 
 #[tokio::test]
@@ -427,7 +427,7 @@ async fn rm1_read_builtin_rule_not_found() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-rule",
-            json!({"fileName": "nonexistent-rule.md"}),
+            json!({"file_name": "nonexistent-rule.md"}),
             &token,
             &csrf,
         ))

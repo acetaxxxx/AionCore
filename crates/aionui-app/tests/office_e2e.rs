@@ -98,7 +98,7 @@ fn build_test_office_state(data_dir: &std::path::Path) -> OfficeRouterState {
 }
 
 fn snapshot_target() -> serde_json::Value {
-    json!({"contentType": "markdown", "filePath": "/a.md"})
+    json!({"content_type": "markdown", "file_path": "/a.md"})
 }
 
 // ── AU-1/AU-2: Unauthenticated requests ─────────────────────────────
@@ -152,7 +152,7 @@ async fn wp4_word_preview_officecli_not_available() {
     let (mut app, services, _tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let body = json!({"filePath": "/tmp/test.docx"});
+    let body = json!({"file_path": "/tmp/test.docx"});
     let req = json_with_token("POST", "/api/word-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
@@ -191,9 +191,9 @@ async fn sh1_save_snapshot() {
     let data = &json["data"];
     assert!(data["id"].is_string());
     assert!(!data["id"].as_str().unwrap().is_empty());
-    assert!(data["createdAt"].is_number());
+    assert!(data["created_at"].is_number());
     assert_eq!(data["size"], 13); // "# Hello World".len()
-    assert_eq!(data["contentType"], "markdown");
+    assert_eq!(data["content_type"], "markdown");
 }
 
 // ── SH-2: List snapshots ────────────────────────────────────────────
@@ -249,7 +249,7 @@ async fn sh3_get_snapshot_content() {
 
     let get_body = json!({
         "target": snapshot_target(),
-        "snapshotId": snapshot_id
+        "snapshot_id": snapshot_id
     });
     let req = json_with_token(
         "POST",
@@ -276,7 +276,7 @@ async fn sh4_get_nonexistent_snapshot() {
 
     let body = json!({
         "target": snapshot_target(),
-        "snapshotId": "nonexistent"
+        "snapshot_id": "nonexistent"
     });
     let req = json_with_token(
         "POST",
@@ -330,8 +330,8 @@ async fn sh6_different_targets_isolated() {
     let (mut app, services, _tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let target_a = json!({"contentType": "markdown", "filePath": "/a.md"});
-    let target_b = json!({"contentType": "code", "filePath": "/b.rs"});
+    let target_a = json!({"content_type": "markdown", "file_path": "/a.md"});
+    let target_b = json!({"content_type": "code", "file_path": "/b.rs"});
 
     let body_a = json!({"target": target_a, "content": "AAA"});
     let req = json_with_token("POST", "/api/preview-history/save", body_a, &token, &csrf);
@@ -361,12 +361,12 @@ async fn sh7_target_field_combination_different_hash() {
     let (mut app, services, _tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let target_simple = json!({"contentType": "markdown", "filePath": "/a.md"});
+    let target_simple = json!({"content_type": "markdown", "file_path": "/a.md"});
     let target_complex = json!({
-        "contentType": "markdown",
-        "filePath": "/a.md",
+        "content_type": "markdown",
+        "file_path": "/a.md",
         "workspace": "/ws",
-        "conversationId": "conv_1"
+        "conversation_id": "conv_1"
     });
 
     let body = json!({"target": target_simple, "content": "simple"});
@@ -422,7 +422,7 @@ async fn so2_detect_with_preferred_url() {
     let (mut app, services, _tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let body = json!({"preferredUrl": "http://localhost:19000"});
+    let body = json!({"preferred_url": "http://localhost:19000"});
     let req = json_with_token("POST", "/api/star-office/detect", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
@@ -443,7 +443,7 @@ async fn dc1_excel_to_json() {
     create_test_xlsx(&xlsx_path);
 
     let body = json!({
-        "filePath": xlsx_path.to_str().unwrap(),
+        "file_path": xlsx_path.to_str().unwrap(),
         "to": "excel-json"
     });
     let req = json_with_token("POST", "/api/document/convert", body, &token, &csrf);
@@ -469,7 +469,7 @@ async fn dc4_excel_file_not_found() {
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
     let body = json!({
-        "filePath": "/nonexistent/file.xlsx",
+        "file_path": "/nonexistent/file.xlsx",
         "to": "excel-json"
     });
     let req = json_with_token("POST", "/api/document/convert", body, &token, &csrf);
@@ -490,7 +490,7 @@ async fn dc9_invalid_conversion_target() {
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
     let body = json!({
-        "filePath": "/path/to/file.txt",
+        "file_path": "/path/to/file.txt",
         "to": "invalid"
     });
     let req = json_with_token("POST", "/api/document/convert", body, &token, &csrf);

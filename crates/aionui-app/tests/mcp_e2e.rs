@@ -132,7 +132,7 @@ async fn remove_unknown_names_from_agents() {
     let req = json_with_token(
         "POST",
         "/api/mcp/remove-from-agents",
-        json!({ "serverNames": ["nonexistent-server"] }),
+        json!({ "server_names": ["nonexistent-server"] }),
         &token,
         &csrf,
     );
@@ -155,7 +155,7 @@ async fn oauth_check_status_unauthenticated_server() {
     let req = json_with_token(
         "POST",
         "/api/mcp/oauth/check-status",
-        json!({ "serverUrl": "https://unknown-server.example.com" }),
+        json!({ "server_url": "https://unknown-server.example.com" }),
         &token,
         &csrf,
     );
@@ -200,7 +200,7 @@ async fn oauth_logout_idempotent() {
     let req = json_with_token(
         "POST",
         "/api/mcp/oauth/logout",
-        json!({ "serverUrl": "https://never-authed.example.com" }),
+        json!({ "server_url": "https://never-authed.example.com" }),
         &token,
         &csrf,
     );

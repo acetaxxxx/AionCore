@@ -33,7 +33,7 @@ fn write_manifest_full(
         manifest["engine"] = serde_json::json!({ "aionui": eng });
     }
     if let Some(api) = api_version {
-        manifest["apiVersion"] = serde_json::json!(api);
+        manifest["api_version"] = serde_json::json!(api);
     }
     fs::write(
         dir.join("aion-extension.json"),

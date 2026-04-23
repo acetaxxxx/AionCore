@@ -110,7 +110,7 @@ async fn sh2_open_file_not_found() {
     let req = json_with_token(
         "POST",
         "/api/shell/open-file",
-        json!({ "filePath": "/nonexistent/file.txt" }),
+        json!({ "file_path": "/nonexistent/file.txt" }),
         &token,
         &csrf,
     );
@@ -129,7 +129,7 @@ async fn sh4_show_item_in_folder_not_found() {
     let req = json_with_token(
         "POST",
         "/api/shell/show-item-in-folder",
-        json!({ "filePath": "/nonexistent/path" }),
+        json!({ "file_path": "/nonexistent/path" }),
         &token,
         &csrf,
     );
@@ -242,7 +242,7 @@ async fn sh12_open_folder_with_nonexistent() {
     let req = json_with_token(
         "POST",
         "/api/shell/open-folder-with",
-        json!({ "folderPath": "/nonexistent/dir", "tool": "explorer" }),
+        json!({ "folder_path": "/nonexistent/dir", "tool": "explorer" }),
         &token,
         &csrf,
     );
@@ -341,7 +341,7 @@ async fn st5_openai_not_configured() {
         json!({
             "enabled": true,
             "provider": "openai",
-            "openai": { "apiKey": "", "model": "whisper-1" }
+            "openai": { "api_key": "", "model": "whisper-1" }
         }),
     )
     .await;
@@ -372,7 +372,7 @@ async fn st6_deepgram_not_configured() {
         json!({
             "enabled": true,
             "provider": "deepgram",
-            "deepgram": { "apiKey": "", "model": "nova-2" }
+            "deepgram": { "api_key": "", "model": "nova-2" }
         }),
     )
     .await;
@@ -411,8 +411,8 @@ async fn st7_stt_api_failure() {
             "enabled": true,
             "provider": "openai",
             "openai": {
-                "apiKey": "sk-fake-key",
-                "baseUrl": mock_server.uri(),
+                "api_key": "sk-fake-key",
+                "base_url": mock_server.uri(),
                 "model": "whisper-1"
             }
         }),
@@ -442,7 +442,7 @@ async fn st8_multipart_missing_filename() {
         &mut app,
         &token,
         &csrf,
-        json!({ "enabled": true, "provider": "openai", "openai": { "apiKey": "sk-test", "model": "whisper-1" } }),
+        json!({ "enabled": true, "provider": "openai", "openai": { "api_key": "sk-test", "model": "whisper-1" } }),
     )
     .await;
 
@@ -468,7 +468,7 @@ async fn st9_multipart_missing_file() {
         &mut app,
         &token,
         &csrf,
-        json!({ "enabled": true, "provider": "openai", "openai": { "apiKey": "sk-test", "model": "whisper-1" } }),
+        json!({ "enabled": true, "provider": "openai", "openai": { "api_key": "sk-test", "model": "whisper-1" } }),
     )
     .await;
 
@@ -505,8 +505,8 @@ async fn st1_openai_transcription_success() {
             "enabled": true,
             "provider": "openai",
             "openai": {
-                "apiKey": "sk-test-key",
-                "baseUrl": mock_server.uri(),
+                "api_key": "sk-test-key",
+                "base_url": mock_server.uri(),
                 "model": "whisper-1"
             }
         }),
@@ -562,8 +562,8 @@ async fn st2_deepgram_transcription_success() {
             "enabled": true,
             "provider": "deepgram",
             "deepgram": {
-                "apiKey": "dg-test-key",
-                "baseUrl": mock_server.uri(),
+                "api_key": "dg-test-key",
+                "base_url": mock_server.uri(),
                 "model": "nova-2"
             }
         }),
@@ -606,8 +606,8 @@ async fn st10_language_hint_passed() {
             "enabled": true,
             "provider": "openai",
             "openai": {
-                "apiKey": "sk-test-key",
-                "baseUrl": mock_server.uri(),
+                "api_key": "sk-test-key",
+                "base_url": mock_server.uri(),
                 "model": "whisper-1"
             }
         }),
@@ -642,7 +642,7 @@ async fn au1_shell_unauthenticated() {
         .method("POST")
         .uri("/api/shell/open-file")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"filePath":"/tmp/test.txt"}"#))
+        .body(Body::from(r#"{"file_path":"/tmp/test.txt"}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -696,7 +696,7 @@ async fn st_multipart_missing_mimetype() {
         &mut app,
         &token,
         &csrf,
-        json!({ "enabled": true, "provider": "openai", "openai": { "apiKey": "sk-test", "model": "whisper-1" } }),
+        json!({ "enabled": true, "provider": "openai", "openai": { "api_key": "sk-test", "model": "whisper-1" } }),
     )
     .await;
 

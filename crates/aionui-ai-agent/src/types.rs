@@ -4,7 +4,6 @@ use aionui_common::{AcpBackend, AgentType, ProviderWithModel};
 
 /// Data payload for sending a user message to an Agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SendMessageData {
     /// User message content.
     pub content: String,
@@ -20,7 +19,6 @@ pub struct SendMessageData {
 
 /// Options for building (creating or resuming) an Agent task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BuildTaskOptions {
     /// Type of agent to create.
     pub agent_type: AgentType,
@@ -37,7 +35,6 @@ pub struct BuildTaskOptions {
 
 /// ACP-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpBuildExtra {
     /// ACP sub-backend identifier.
     pub backend: AcpBackend,
@@ -71,7 +68,6 @@ pub struct AcpBuildExtra {
 
 /// Gemini-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GeminiBuildExtra {
     /// Whether the user picked a custom workspace path.
     #[serde(default)]
@@ -110,7 +106,6 @@ pub struct GeminiBuildExtra {
 
 /// OpenClaw gateway configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OpenClawGatewayConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
@@ -123,7 +118,6 @@ pub struct OpenClawGatewayConfig {
 
 /// OpenClaw-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OpenClawBuildExtra {
     /// ACP sub-backend identifier.
     pub backend: AcpBackend,
@@ -148,7 +142,6 @@ pub struct OpenClawBuildExtra {
 
 /// Remote agent-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RemoteBuildExtra {
     /// Remote agent configuration ID.
     pub remote_agent_id: String,
@@ -156,7 +149,6 @@ pub struct RemoteBuildExtra {
 
 /// ACP model information returned by the ACP backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpModelInfo {
     pub model_id: String,
     pub model_name: Option<String>,
@@ -165,7 +157,6 @@ pub struct AcpModelInfo {
 
 /// ACP session configuration option.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AcpSessionConfigOption {
     pub config_id: String,
     pub label: String,
@@ -176,7 +167,6 @@ pub struct AcpSessionConfigOption {
 
 /// A slash command item available in a conversation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SlashCommandItem {
     pub command: String,
     pub description: String,
@@ -197,9 +187,9 @@ mod tests {
         };
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["content"], "Hello");
-        assert_eq!(json["msgId"], "msg-001");
+        assert_eq!(json["msg_id"], "msg-001");
         assert_eq!(json["files"], json!(["/tmp/a.txt"]));
-        assert_eq!(json["injectSkills"], json!(["review"]));
+        assert_eq!(json["inject_skills"], json!(["review"]));
 
         let parsed: SendMessageData = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.content, "Hello");
@@ -208,7 +198,7 @@ mod tests {
 
     #[test]
     fn send_message_data_defaults_optional_fields() {
-        let json = json!({ "content": "Hi", "msgId": "m1" });
+        let json = json!({ "content": "Hi", "msg_id": "m1" });
         let data: SendMessageData = serde_json::from_value(json).unwrap();
         assert!(data.files.is_empty());
         assert!(data.inject_skills.is_empty());
@@ -228,9 +218,9 @@ mod tests {
             extra: json!({ "backend": "claude" }),
         };
         let json = serde_json::to_value(&opts).unwrap();
-        assert_eq!(json["agentType"], "acp");
+        assert_eq!(json["agent_type"], "acp");
         assert_eq!(json["workspace"], "/project");
-        assert_eq!(json["conversationId"], "conv-1");
+        assert_eq!(json["conversation_id"], "conv-1");
     }
 
     #[test]
@@ -241,8 +231,8 @@ mod tests {
             provider: Some("anthropic".into()),
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["modelId"], "claude-sonnet-4");
-        assert_eq!(json["modelName"], "Claude Sonnet 4");
+        assert_eq!(json["model_id"], "claude-sonnet-4");
+        assert_eq!(json["model_name"], "Claude Sonnet 4");
     }
 
     #[test]
@@ -254,7 +244,7 @@ mod tests {
             options: Some(vec!["light".into(), "dark".into()]),
         };
         let json = serde_json::to_value(&opt).unwrap();
-        assert_eq!(json["configId"], "theme");
+        assert_eq!(json["config_id"], "theme");
         assert_eq!(json["options"], json!(["light", "dark"]));
     }
 

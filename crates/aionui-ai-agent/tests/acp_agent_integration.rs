@@ -152,7 +152,7 @@ async fn acp_agent_type_is_acp() {
 async fn acp_agent_receives_stream_events() {
     let _guard = serial();
     let (_agent, mut rx) = make_mock_agent(
-        r#"echo '{"type":"start","data":{"sessionId":"sess-1"}}' && echo '{"type":"text","data":{"content":"Hello"}}' && echo '{"type":"finish","data":{"sessionId":"sess-1"}}'"#,
+        r#"echo '{"type":"start","data":{"session_id":"sess-1"}}' && echo '{"type":"text","data":{"content":"Hello"}}' && echo '{"type":"finish","data":{"session_id":"sess-1"}}'"#,
         AcpBackend::Claude,
     )
     .await;
@@ -181,7 +181,7 @@ async fn acp_agent_receives_stream_events() {
 async fn acp_agent_session_id_captured_from_start() {
     let _guard = serial();
     let (agent, mut rx) = make_mock_agent(
-        r#"echo '{"type":"start","data":{"sessionId":"sess-abc"}}' && sleep 1"#,
+        r#"echo '{"type":"start","data":{"session_id":"sess-abc"}}' && sleep 1"#,
         AcpBackend::Claude,
     )
     .await;
@@ -232,7 +232,7 @@ async fn acp_agent_error_event_sets_finished() {
 async fn acp_agent_model_info_captured() {
     let _guard = serial();
     let (agent, mut rx) = make_mock_agent(
-        r#"echo '{"type":"acpModelInfo","data":{"modelId":"claude-sonnet-4","modelName":"Claude Sonnet 4","provider":"anthropic"}}' && sleep 0.5"#,
+        r#"echo '{"type":"acp_model_info","data":{"model_id":"claude-sonnet-4","model_name":"Claude Sonnet 4","provider":"anthropic"}}' && sleep 0.5"#,
         AcpBackend::Claude,
     )
     .await;
@@ -369,7 +369,7 @@ async fn acp_agent_text_content_received() {
 async fn acp_agent_agent_status_event_captures_session() {
     let _guard = serial();
     let (agent, mut rx) = make_mock_agent(
-        r#"echo '{"type":"agentStatus","data":{"backend":"claude","status":"running","sessionId":"sess-xyz"}}' && sleep 1"#,
+        r#"echo '{"type":"agent_status","data":{"backend":"claude","status":"running","session_id":"sess-xyz"}}' && sleep 1"#,
         AcpBackend::Claude,
     )
     .await;
@@ -386,7 +386,7 @@ async fn acp_agent_agent_status_event_captures_session() {
 async fn acp_agent_multiple_event_types() {
     let _guard = serial();
     let (_agent, mut rx) = make_mock_agent(
-        r#"echo '{"type":"start","data":{"sessionId":"sess-multi"}}' && echo '{"type":"thinking","data":{"content":"Analyzing...","subject":"code","duration":100,"status":"in_progress"}}' && echo '{"type":"text","data":{"content":"Result"}}' && echo '{"type":"finish","data":{"sessionId":"sess-multi"}}'"#,
+        r#"echo '{"type":"start","data":{"session_id":"sess-multi"}}' && echo '{"type":"thinking","data":{"content":"Analyzing...","subject":"code","duration":100,"status":"in_progress"}}' && echo '{"type":"text","data":{"content":"Result"}}' && echo '{"type":"finish","data":{"session_id":"sess-multi"}}'"#,
         AcpBackend::Claude,
     )
     .await;

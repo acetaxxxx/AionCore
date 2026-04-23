@@ -421,8 +421,8 @@ mod tests {
 
     #[test]
     fn enum_to_str_protocol() {
-        assert_eq!(enum_to_str(&RemoteAgentProtocol::OpenClaw), "openClaw");
-        assert_eq!(enum_to_str(&RemoteAgentProtocol::ZeroClaw), "zeroClaw");
+        assert_eq!(enum_to_str(&RemoteAgentProtocol::OpenClaw), "openclaw");
+        assert_eq!(enum_to_str(&RemoteAgentProtocol::ZeroClaw), "zeroclaw");
         assert_eq!(enum_to_str(&RemoteAgentProtocol::Acp), "acp");
     }
 
@@ -435,8 +435,8 @@ mod tests {
 
     #[test]
     fn parse_protocol_known_values() {
-        assert_eq!(parse_protocol("openClaw"), RemoteAgentProtocol::OpenClaw);
-        assert_eq!(parse_protocol("zeroClaw"), RemoteAgentProtocol::ZeroClaw);
+        assert_eq!(parse_protocol("openclaw"), RemoteAgentProtocol::OpenClaw);
+        assert_eq!(parse_protocol("zeroclaw"), RemoteAgentProtocol::ZeroClaw);
         assert_eq!(parse_protocol("acp"), RemoteAgentProtocol::Acp);
     }
 

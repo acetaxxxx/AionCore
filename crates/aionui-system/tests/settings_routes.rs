@@ -88,10 +88,10 @@ async fn get_settings_default_values() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["language"], "en-US");
-    assert_eq!(json["data"]["notificationEnabled"], true);
-    assert_eq!(json["data"]["cronNotificationEnabled"], false);
-    assert_eq!(json["data"]["commandQueueEnabled"], false);
-    assert_eq!(json["data"]["saveUploadToWorkspace"], false);
+    assert_eq!(json["data"]["notification_enabled"], true);
+    assert_eq!(json["data"]["cron_notification_enabled"], false);
+    assert_eq!(json["data"]["command_queue_enabled"], false);
+    assert_eq!(json["data"]["save_upload_to_workspace"], false);
 }
 
 #[tokio::test]
@@ -109,8 +109,8 @@ async fn patch_settings_single_field() {
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["language"], "zh-CN");
     // Others remain default
-    assert_eq!(json["data"]["notificationEnabled"], true);
-    assert_eq!(json["data"]["cronNotificationEnabled"], false);
+    assert_eq!(json["data"]["notification_enabled"], true);
+    assert_eq!(json["data"]["cron_notification_enabled"], false);
 }
 
 #[tokio::test]
@@ -120,16 +120,16 @@ async fn patch_settings_multiple_fields() {
         "PATCH",
         "/api/settings",
         serde_json::json!({
-            "notificationEnabled": false,
-            "commandQueueEnabled": true
+            "notification_enabled": false,
+            "command_queue_enabled": true
         }),
     );
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["notificationEnabled"], false);
-    assert_eq!(json["data"]["commandQueueEnabled"], true);
+    assert_eq!(json["data"]["notification_enabled"], false);
+    assert_eq!(json["data"]["command_queue_enabled"], true);
     assert_eq!(json["data"]["language"], "en-US");
 }
 
@@ -162,7 +162,7 @@ async fn patch_settings_type_error_rejected() {
     let req = json_request(
         "PATCH",
         "/api/settings",
-        serde_json::json!({"notificationEnabled": "yes"}),
+        serde_json::json!({"notification_enabled": "yes"}),
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -174,7 +174,7 @@ async fn patch_settings_unknown_field_ignored() {
     let req = json_request(
         "PATCH",
         "/api/settings",
-        serde_json::json!({"unknownField": 123}),
+        serde_json::json!({"unknown_field": 123}),
     );
     let resp = app.oneshot(req).await.unwrap();
 
@@ -191,7 +191,7 @@ async fn patch_then_get_reflects_changes() {
     let req = json_request(
         "PATCH",
         "/api/settings",
-        serde_json::json!({"language": "ja-JP", "saveUploadToWorkspace": true}),
+        serde_json::json!({"language": "ja-JP", "save_upload_to_workspace": true}),
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -202,7 +202,7 @@ async fn patch_then_get_reflects_changes() {
     let resp = app2.oneshot(get_request("/api/settings")).await.unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["language"], "ja-JP");
-    assert_eq!(json["data"]["saveUploadToWorkspace"], true);
+    assert_eq!(json["data"]["save_upload_to_workspace"], true);
 }
 
 // ===========================================================================

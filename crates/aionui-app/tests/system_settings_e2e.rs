@@ -25,7 +25,7 @@ async fn settings_get_default_values_with_auth() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["language"], "en-US");
-    assert_eq!(json["data"]["notificationEnabled"], true);
+    assert_eq!(json["data"]["notification_enabled"], true);
 }
 
 #[tokio::test]
@@ -36,7 +36,7 @@ async fn settings_patch_and_get_with_auth() {
     let req = json_with_token(
         "PATCH",
         "/api/settings",
-        json!({"language": "zh-CN", "notificationEnabled": false}),
+        json!({"language": "zh-CN", "notification_enabled": false}),
         &token,
         &csrf,
     );
@@ -44,7 +44,7 @@ async fn settings_patch_and_get_with_auth() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["language"], "zh-CN");
-    assert_eq!(json["data"]["notificationEnabled"], false);
+    assert_eq!(json["data"]["notification_enabled"], false);
 
     let resp = app
         .oneshot(get_with_token("/api/settings", &token))
@@ -52,7 +52,7 @@ async fn settings_patch_and_get_with_auth() {
         .unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["language"], "zh-CN");
-    assert_eq!(json["data"]["notificationEnabled"], false);
+    assert_eq!(json["data"]["notification_enabled"], false);
 }
 
 #[tokio::test]

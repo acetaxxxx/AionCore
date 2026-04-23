@@ -140,10 +140,10 @@ fn test_ext_acp_adapter_minimal() {
     };
     let json = serde_json::to_value(&adapter).unwrap();
     assert_eq!(json["id"], "claude-adapter");
-    assert_eq!(json["cliCommand"], "claude");
-    assert_eq!(json["supportsStreaming"], true);
+    assert_eq!(json["cli_command"], "claude");
+    assert_eq!(json["supports_streaming"], true);
     // Empty vecs should be omitted
-    assert!(json.get("acpArgs").is_none());
+    assert!(json.get("acp_args").is_none());
 }
 
 #[test]
@@ -156,8 +156,8 @@ fn test_ext_theme_serde() {
         cover_image: Some("images/dark-preview.png".into()),
     };
     let json = serde_json::to_value(&theme).unwrap();
-    assert_eq!(json["cssFile"], "themes/dark.css");
-    assert_eq!(json["coverImage"], "images/dark-preview.png");
+    assert_eq!(json["css_file"], "themes/dark.css");
+    assert_eq!(json["cover_image"], "images/dark-preview.png");
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn test_ext_settings_tab_with_position() {
         }),
     };
     let json = serde_json::to_value(&tab).unwrap();
-    assert_eq!(json["position"]["relativeTo"], "general");
+    assert_eq!(json["position"]["relative_to"], "general");
     assert_eq!(json["position"]["placement"], "after");
 }
 
@@ -284,7 +284,7 @@ fn test_manifest_full_roundtrip() {
 }
 
 #[test]
-fn test_manifest_camel_case_keys() {
+fn test_manifest_snake_case_keys() {
     let manifest = ExtensionManifest {
         name: "x".into(),
         version: "1.0.0".into(),
@@ -304,12 +304,12 @@ fn test_manifest_camel_case_keys() {
         i18n: None,
     };
     let json = serde_json::to_value(&manifest).unwrap();
-    assert!(json.get("displayName").is_some());
-    assert!(json.get("apiVersion").is_some());
-    assert!(json.get("entryPoint").is_some());
-    // snake_case keys should not exist
-    assert!(json.get("display_name").is_none());
-    assert!(json.get("api_version").is_none());
+    assert!(json.get("display_name").is_some());
+    assert!(json.get("api_version").is_some());
+    assert!(json.get("entry_point").is_some());
+    // camelCase keys should not exist
+    assert!(json.get("displayName").is_none());
+    assert!(json.get("apiVersion").is_none());
 }
 
 // -- Extension state & source --
@@ -539,7 +539,7 @@ fn test_lifecycle_hooks_empty() {
 
 #[test]
 fn test_lifecycle_hooks_partial() {
-    let raw = json!({"onInstall": "scripts/install.sh"});
+    let raw = json!({"on_install": "scripts/install.sh"});
     let hooks: LifecycleHooks = serde_json::from_value(raw).unwrap();
     assert_eq!(hooks.on_install.as_deref(), Some("scripts/install.sh"));
     assert!(hooks.on_activate.is_none());

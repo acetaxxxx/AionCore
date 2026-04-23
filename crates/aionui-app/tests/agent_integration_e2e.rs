@@ -220,7 +220,7 @@ async fn create_conversation(
     let body = json!({
         "type": "acp",
         "name": name,
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/project" }
     });
     let req = common::json_with_token("POST", "/api/conversations", body, token, csrf);
@@ -240,7 +240,7 @@ async fn send_message_with_mock_agent_returns_202() {
     let req = json_with_token(
         "POST",
         &format!("/api/conversations/{conv_id}/messages"),
-        json!({ "content": "Hello mock agent", "msgId": "msg-001" }),
+        json!({ "content": "Hello mock agent", "msg_id": "msg-001" }),
         &token,
         &csrf,
     );
@@ -332,7 +332,7 @@ async fn confirm_and_check_approval() {
     let req = json_with_token(
         "POST",
         &format!("/api/conversations/{conv_id}/confirmations/call-42/confirm"),
-        json!({ "msgId": "msg-1", "data": { "value": "allow" }, "alwaysAllow": true }),
+        json!({ "msg_id": "msg-1", "data": { "value": "allow" }, "always_allow": true }),
         &token,
         &csrf,
     );

@@ -103,7 +103,7 @@ async fn fetch_models_nonexistent_provider() {
     let (router, _db) = setup().await;
     let req = post_request(
         "/api/providers/nonexistent/models",
-        json!({"tryFix": false}),
+        json!({"try_fix": false}),
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -115,7 +115,7 @@ async fn fetch_models_vertex_ai_hardcoded() {
     let id = create_provider(&db, "vertex-ai", "https://unused", "fake-key").await;
     let req = post_request(
         &format!("/api/providers/{id}/models"),
-        json!({"tryFix": false}),
+        json!({"try_fix": false}),
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -126,7 +126,7 @@ async fn fetch_models_vertex_ai_hardcoded() {
     assert_eq!(models.len(), 2);
     assert_eq!(models[0], "gemini-2.5-pro");
     assert_eq!(models[1], "gemini-2.5-flash");
-    assert!(json["data"].get("fixedBaseUrl").is_none());
+    assert!(json["data"].get("fixed_base_url").is_none());
 }
 
 #[tokio::test]
@@ -165,7 +165,7 @@ async fn fetch_models_openai_compatible_success() {
 
     let req = post_request(
         &format!("/api/providers/{id}/models"),
-        json!({"tryFix": false}),
+        json!({"try_fix": false}),
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -191,7 +191,7 @@ async fn fetch_models_openai_remote_error() {
 
     let req = post_request(
         &format!("/api/providers/{id}/models"),
-        json!({"tryFix": false}),
+        json!({"try_fix": false}),
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -364,7 +364,7 @@ async fn fetch_models_url_auto_fix_success() {
 
     let req = post_request(
         &format!("/api/providers/{id}/models"),
-        json!({"tryFix": true}),
+        json!({"try_fix": true}),
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -375,7 +375,7 @@ async fn fetch_models_url_auto_fix_success() {
     assert_eq!(models[0], "fixed-model");
     // fixedBaseUrl should be present
     assert!(
-        json["data"]["fixedBaseUrl"]
+        json["data"]["fixed_base_url"]
             .as_str()
             .unwrap()
             .contains("/v1")
@@ -398,7 +398,7 @@ async fn fetch_models_url_auto_fix_not_triggered_when_success() {
 
     let req = post_request(
         &format!("/api/providers/{id}/models"),
-        json!({"tryFix": true}),
+        json!({"try_fix": true}),
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -407,7 +407,7 @@ async fn fetch_models_url_auto_fix_not_triggered_when_success() {
     let models = json["data"]["models"].as_array().unwrap();
     assert_eq!(models[0], "original-model");
     // fixedBaseUrl should NOT be present since original URL worked
-    assert!(json["data"].get("fixedBaseUrl").is_none());
+    assert!(json["data"].get("fixed_base_url").is_none());
 }
 
 #[tokio::test]
@@ -426,12 +426,12 @@ async fn fetch_models_url_auto_fix_not_for_anthropic() {
     // Even with tryFix=true, Anthropic should use fallback, not URL fix
     let req = post_request(
         &format!("/api/providers/{id}/models"),
-        json!({"tryFix": true}),
+        json!({"try_fix": true}),
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
     // Should be fallback models, no fixedBaseUrl
-    assert!(json["data"].get("fixedBaseUrl").is_none());
+    assert!(json["data"].get("fixed_base_url").is_none());
 }

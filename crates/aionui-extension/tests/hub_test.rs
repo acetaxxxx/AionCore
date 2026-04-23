@@ -44,7 +44,7 @@ fn setup() -> TestHarness {
 
 fn write_hub_index(hub_dir: &std::path::Path, extensions: &[serde_json::Value]) {
     let index = json!({
-        "schemaVersion": 1,
+        "schema_version": 1,
         "extensions": extensions,
     });
     std::fs::write(
@@ -88,7 +88,7 @@ async fn hm1_load_index_with_entries() {
             json!({
                 "name": "ext-alpha",
                 "version": "1.0.0",
-                "displayName": "Alpha Extension",
+                "display_name": "Alpha Extension",
                 "tags": ["tools"],
                 "bundled": false,
             }),

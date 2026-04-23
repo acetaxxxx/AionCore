@@ -49,7 +49,7 @@ const USER_ID: &str = "system_default_user";
 fn make_create_req() -> CreateConversationRequest {
     serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "claude-sonnet-4-20250514" },
+        "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
         "extra": { "workspace": "/home/user/project" }
     }))
     .unwrap()
@@ -79,7 +79,7 @@ async fn t6_1_clone_from_source() {
     let source_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
         "name": "Source",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/src", "contextFileName": "ctx.md" }
     }))
     .unwrap();
@@ -87,11 +87,11 @@ async fn t6_1_clone_from_source() {
 
     // Clone with overrides
     let clone_req: CloneConversationRequest = serde_json::from_value(json!({
-        "sourceConversationId": source.id,
+        "source_conversation_id": source.id,
         "conversation": {
             "type": "gemini",
             "name": "Cloned",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": { "workspace": "/cloned" }
         }
     }))
@@ -114,7 +114,7 @@ async fn t6_2_clone_without_source() {
         "conversation": {
             "type": "acp",
             "name": "Direct",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         }
     }))
@@ -128,10 +128,10 @@ async fn t6_3_clone_source_not_found() {
     let (svc, _repo, _b) = setup().await;
 
     let req: CloneConversationRequest = serde_json::from_value(json!({
-        "sourceConversationId": "nonexistent",
+        "source_conversation_id": "nonexistent",
         "conversation": {
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         }
     }))
@@ -151,10 +151,10 @@ async fn t6_4_clone_messages_not_copied() {
         .unwrap();
 
     let clone_req: CloneConversationRequest = serde_json::from_value(json!({
-        "sourceConversationId": source.id,
+        "source_conversation_id": source.id,
         "conversation": {
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         }
     }))
@@ -381,7 +381,7 @@ async fn t10_1_same_workspace() {
     let req1: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
         "name": "Conv A",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/shared/path" }
     }))
     .unwrap();
@@ -390,7 +390,7 @@ async fn t10_1_same_workspace() {
     let req2: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Conv B",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/shared/path" }
     }))
     .unwrap();
@@ -400,7 +400,7 @@ async fn t10_1_same_workspace() {
     let req3: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
         "name": "Conv C",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/other/path" }
     }))
     .unwrap();
@@ -417,7 +417,7 @@ async fn t10_2_no_associated() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/unique/path" }
     }))
     .unwrap();

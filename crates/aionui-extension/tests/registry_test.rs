@@ -68,7 +68,7 @@ fn write_fixtures(
         let manifest = serde_json::json!({
             "name": ext.manifest.name,
             "version": ext.manifest.version,
-            "displayName": ext.manifest.display_name,
+            "display_name": ext.manifest.display_name,
             "description": ext.manifest.description,
         });
         std::fs::write(

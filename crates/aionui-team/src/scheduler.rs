@@ -631,7 +631,7 @@ mod tests {
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "team.agent.status");
-        assert_eq!(events[0].data["slotId"], "worker-1");
+        assert_eq!(events[0].data["slot_id"], "worker-1");
         assert_eq!(events[0].data["status"], "working");
     }
 
@@ -813,7 +813,7 @@ mod tests {
             .filter(|e| e.name == "team.agent.removed")
             .collect();
         assert_eq!(removed_events.len(), 1);
-        assert_eq!(removed_events[0].data["slotId"], "worker-2");
+        assert_eq!(removed_events[0].data["slot_id"], "worker-2");
     }
 
     #[tokio::test]

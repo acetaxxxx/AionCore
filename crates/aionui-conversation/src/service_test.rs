@@ -242,7 +242,7 @@ fn make_service() -> (ConversationService, Arc<MockBroadcaster>, Arc<MockRepo>) 
 fn make_create_req() -> CreateConversationRequest {
     serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/project" }
     }))
     .unwrap()
@@ -271,7 +271,7 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "conversation.listChanged");
     assert_eq!(events[0].data["action"], "created");
-    assert_eq!(events[0].data["conversationId"], resp.id);
+    assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
 }
 
@@ -282,9 +282,9 @@ async fn create_with_custom_name_and_source() {
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Custom Name",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "source": "telegram",
-        "channelChatId": "chat:123",
+        "channel_chat_id": "chat:123",
         "extra": {}
     }))
     .unwrap();
@@ -375,7 +375,7 @@ async fn list_with_source_filter() {
 
     let telegram_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "source": "telegram",
         "extra": {}
     }))
@@ -469,7 +469,7 @@ async fn update_extra_merge() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/old", "contextFileName": "ctx.md" }
     }))
     .unwrap();
@@ -490,7 +490,7 @@ async fn update_model() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({
-        "model": { "providerId": "p2", "model": "new-model" }
+        "model": { "provider_id": "p2", "model": "new-model" }
     }))
     .unwrap();
     let updated = svc.update("user_1", &conv.id, req).await.unwrap();
@@ -526,7 +526,7 @@ async fn delete_conversation() {
     let events = broadcaster.take_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["action"], "deleted");
-    assert_eq!(events[0].data["conversationId"], conv.id);
+    assert_eq!(events[0].data["conversation_id"], conv.id);
 }
 
 #[tokio::test]
@@ -544,7 +544,7 @@ async fn broadcast_includes_source_on_delete() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "source": "telegram",
         "extra": {}
     }))
@@ -627,7 +627,7 @@ async fn clone_without_source_creates_new() {
         "conversation": {
             "type": "gemini",
             "name": "Cloned",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": { "workspace": "/new" }
         }
     }))
@@ -650,7 +650,7 @@ async fn clone_from_source_inherits_config() {
     let source_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
         "name": "Source Conv",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/source", "contextFileName": "ctx.md" }
     }))
     .unwrap();
@@ -658,10 +658,10 @@ async fn clone_from_source_inherits_config() {
 
     // Clone with override on workspace only
     let clone_req: CloneConversationRequest = serde_json::from_value(json!({
-        "sourceConversationId": source.id,
+        "source_conversation_id": source.id,
         "conversation": {
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": { "workspace": "/cloned" }
         }
     }))
@@ -682,10 +682,10 @@ async fn clone_source_not_found() {
     let (svc, _broadcaster, _repo) = make_service();
 
     let req: CloneConversationRequest = serde_json::from_value(json!({
-        "sourceConversationId": "no-such-id",
+        "source_conversation_id": "no-such-id",
         "conversation": {
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         }
     }))
@@ -702,10 +702,10 @@ async fn clone_source_wrong_user() {
     let source = svc.create("user_1", make_create_req()).await.unwrap();
 
     let req: CloneConversationRequest = serde_json::from_value(json!({
-        "sourceConversationId": source.id,
+        "source_conversation_id": source.id,
         "conversation": {
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         }
     }))
@@ -721,17 +721,17 @@ async fn clone_strips_cron_job_id_by_default() {
 
     let source_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/p", "cronJobId": "cron_1" }
     }))
     .unwrap();
     let source = svc.create("user_1", source_req).await.unwrap();
 
     let clone_req: CloneConversationRequest = serde_json::from_value(json!({
-        "sourceConversationId": source.id,
+        "source_conversation_id": source.id,
         "conversation": {
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         }
     }))
@@ -748,20 +748,20 @@ async fn clone_with_migrate_cron_preserves_cron_job_id() {
 
     let source_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/p", "cronJobId": "cron_1" }
     }))
     .unwrap();
     let source = svc.create("user_1", source_req).await.unwrap();
 
     let clone_req: CloneConversationRequest = serde_json::from_value(json!({
-        "sourceConversationId": source.id,
+        "source_conversation_id": source.id,
         "conversation": {
             "type": "gemini",
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         },
-        "migrateCron": true
+        "migrate_cron": true
     }))
     .unwrap();
     let cloned = svc.clone_create("user_1", clone_req).await.unwrap();
@@ -1002,7 +1002,7 @@ impl IWorkerTaskManager for MockTaskManager {
 fn make_send_req() -> SendMessageRequest {
     serde_json::from_value(json!({
         "content": "Hello",
-        "msgId": "msg-1"
+        "msg_id": "msg-1"
     }))
     .unwrap()
 }
@@ -1028,7 +1028,7 @@ async fn send_message_empty_content_returns_bad_request() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let req: SendMessageRequest = serde_json::from_value(json!({
         "content": "",
-        "msgId": "msg-1"
+        "msg_id": "msg-1"
     }))
     .unwrap();
 
@@ -1047,7 +1047,7 @@ async fn send_message_whitespace_content_returns_bad_request() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let req: SendMessageRequest = serde_json::from_value(json!({
         "content": "   ",
-        "msgId": "msg-1"
+        "msg_id": "msg-1"
     }))
     .unwrap();
 
@@ -1344,7 +1344,7 @@ async fn confirm_removes_confirmation_and_broadcasts() {
     let events = broadcaster.take_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "confirmation.remove");
-    assert_eq!(events[0].data["conversationId"], conv.id);
+    assert_eq!(events[0].data["conversation_id"], conv.id);
     assert_eq!(events[0].data["id"], "c1");
 }
 

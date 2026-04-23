@@ -23,7 +23,6 @@ impl ApiKeyEntry {
 
 /// Status snapshot of the key manager for diagnostic queries.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ApiKeyStatus {
     pub auth_type: String,
     pub env_key: Option<String>,

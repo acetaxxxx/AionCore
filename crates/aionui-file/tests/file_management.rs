@@ -269,9 +269,9 @@ async fn remove_entry_emits_delete_event() {
     assert_eq!(event.name, "fileStream.contentUpdate");
     assert_eq!(event.data["operation"], "delete");
     assert!(event.data.get("content").is_none());
-    assert_eq!(event.data["relativePath"], "event_del.txt");
+    assert_eq!(event.data["relative_path"], "event_del.txt");
     assert!(
-        event.data["filePath"]
+        event.data["file_path"]
             .as_str()
             .unwrap()
             .contains("event_del.txt")

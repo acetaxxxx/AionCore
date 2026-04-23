@@ -162,7 +162,6 @@ impl PairingStatus {
 /// Remaining fields are captured in `extra` for extensibility
 /// (API Spec `[key: string]: unknown`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PluginCredentials {
     // Telegram
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,7 +199,6 @@ pub struct PluginCredentials {
 /// Configures the connection mode, webhook URL, rate limiting,
 /// and group-chat mention requirement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PluginConfigOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<ConnectionMode>,
@@ -229,7 +227,6 @@ pub enum ConnectionMode {
 ///
 /// Stored as JSON in the `assistant_plugins.config` column (encrypted).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PluginConfig {
     pub credentials: PluginCredentials,
     #[serde(default)]
@@ -242,7 +239,6 @@ pub struct PluginConfig {
 
 /// Information about the bot identity on a platform.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct BotInfo {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,7 +252,6 @@ pub struct BotInfo {
 
 /// Message received from an IM platform, normalized to a common format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct UnifiedIncomingMessage {
     pub id: String,
     pub platform: PluginType,
@@ -274,7 +269,6 @@ pub struct UnifiedIncomingMessage {
 
 /// Sender identity from an IM platform.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct UnifiedUser {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -286,7 +280,6 @@ pub struct UnifiedUser {
 
 /// Content of an incoming message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct UnifiedMessageContent {
     #[serde(rename = "type")]
     pub content_type: MessageContentType,
@@ -312,7 +305,6 @@ pub enum MessageContentType {
 
 /// File attachment in a unified message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct UnifiedAttachment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
@@ -332,7 +324,6 @@ pub struct UnifiedAttachment {
 
 /// Message to be sent to an IM platform.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct UnifiedOutgoingMessage {
     #[serde(rename = "type")]
     pub message_type: OutgoingMessageType,
@@ -380,7 +371,6 @@ pub enum ParseMode {
 
 /// An interactive button in an outgoing message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ActionButton {
     pub label: String,
     pub action: String,
@@ -390,7 +380,6 @@ pub struct ActionButton {
 
 /// Media action attached to an outgoing message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ChannelMediaAction {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -403,7 +392,6 @@ pub struct ChannelMediaAction {
 
 /// A routable action parsed from a button callback or command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct UnifiedAction {
     /// Action identifier, e.g. "session.new", "chat.send".
     pub action: String,
@@ -424,7 +412,6 @@ pub enum ActionCategory {
 
 /// Context provided with every action for routing and state lookup.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ActionContext {
     pub platform: PluginType,
     pub user_id: String,
@@ -437,7 +424,6 @@ pub struct ActionContext {
 
 /// Response produced by an action handler.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ActionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -611,7 +597,7 @@ mod tests {
         let json = serde_json::to_value(&creds).unwrap();
         assert_eq!(json["token"], "bot123:ABC");
         // Optional fields should be absent
-        assert!(json.get("appId").is_none());
+        assert!(json.get("app_id").is_none());
     }
 
     #[test]
@@ -629,10 +615,10 @@ mod tests {
             extra: HashMap::new(),
         };
         let json = serde_json::to_value(&creds).unwrap();
-        assert_eq!(json["appId"], "cli_abc");
-        assert_eq!(json["appSecret"], "secret");
-        assert_eq!(json["encryptKey"], "ek");
-        assert_eq!(json["verificationToken"], "vt");
+        assert_eq!(json["app_id"], "cli_abc");
+        assert_eq!(json["app_secret"], "secret");
+        assert_eq!(json["encrypt_key"], "ek");
+        assert_eq!(json["verification_token"], "vt");
     }
 
     #[test]
@@ -652,8 +638,8 @@ mod tests {
             "credentials": { "token": "bot:123" },
             "config": {
                 "mode": "polling",
-                "rateLimit": 10,
-                "requireMention": true
+                "rate_limit": 10,
+                "require_mention": true
             }
         });
         let cfg: PluginConfig = serde_json::from_value(raw).unwrap();
@@ -700,7 +686,7 @@ mod tests {
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "bot_1");
         assert_eq!(json["username"], "my_bot");
-        assert_eq!(json["displayName"], "My Bot");
+        assert_eq!(json["display_name"], "My Bot");
     }
 
     #[test]
@@ -743,7 +729,7 @@ mod tests {
         assert_eq!(json["platform"], "telegram");
         assert_eq!(json["content"]["type"], "text");
         assert_eq!(json["content"]["text"], "Hello");
-        assert_eq!(json["user"]["displayName"], "Alice");
+        assert_eq!(json["user"]["display_name"], "Alice");
     }
 
     #[test]
@@ -775,10 +761,10 @@ mod tests {
             url: None,
         };
         let json = serde_json::to_value(&att).unwrap();
-        assert_eq!(json["fileId"], "file_1");
-        assert_eq!(json["fileName"], "photo.jpg");
-        assert_eq!(json["mimeType"], "image/jpeg");
-        assert_eq!(json["fileSize"], 12345);
+        assert_eq!(json["file_id"], "file_1");
+        assert_eq!(json["file_name"], "photo.jpg");
+        assert_eq!(json["mime_type"], "image/jpeg");
+        assert_eq!(json["file_size"], 12345);
         assert!(json.get("url").is_none());
     }
 
@@ -900,7 +886,7 @@ mod tests {
         assert_eq!(json["action"], "session.new");
         assert_eq!(json["category"], "system");
         assert_eq!(json["context"]["platform"], "telegram");
-        assert_eq!(json["context"]["userId"], "tg_42");
+        assert_eq!(json["context"]["user_id"], "tg_42");
     }
 
     #[test]
@@ -933,7 +919,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["text"], "Session created");
-        assert_eq!(json["parseMode"], "HTML");
+        assert_eq!(json["parse_mode"], "HTML");
         assert_eq!(json["behavior"], "send");
         assert_eq!(json["buttons"][0][0]["label"], "Help");
     }
@@ -951,7 +937,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["behavior"], "edit");
-        assert_eq!(json["editMessageId"], "msg_42");
+        assert_eq!(json["edit_message_id"], "msg_42");
     }
 
     #[test]

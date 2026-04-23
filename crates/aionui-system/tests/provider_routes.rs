@@ -88,8 +88,8 @@ fn sample_create_body() -> serde_json::Value {
     json!({
         "platform": "anthropic",
         "name": "Anthropic",
-        "baseUrl": "https://api.anthropic.com",
-        "apiKey": "sk-ant-api03-test1234"
+        "base_url": "https://api.anthropic.com",
+        "api_key": "sk-ant-api03-test1234"
     })
 }
 
@@ -134,7 +134,7 @@ async fn list_providers_returns_masked_api_key() {
     let providers = json["data"].as_array().unwrap();
     assert_eq!(providers.len(), 1);
 
-    let api_key = providers[0]["apiKey"].as_str().unwrap();
+    let api_key = providers[0]["api_key"].as_str().unwrap();
     assert!(api_key.contains("***"));
     assert!(api_key.ends_with("1234"));
     // Must NOT contain the full key
@@ -161,12 +161,12 @@ async fn create_provider_success() {
     assert!(data["id"].as_str().unwrap().starts_with("prov_"));
     assert_eq!(data["platform"], "anthropic");
     assert_eq!(data["name"], "Anthropic");
-    assert_eq!(data["baseUrl"], "https://api.anthropic.com");
-    assert!(data["apiKey"].as_str().unwrap().contains("***"));
+    assert_eq!(data["base_url"], "https://api.anthropic.com");
+    assert!(data["api_key"].as_str().unwrap().contains("***"));
     assert!(data["enabled"].as_bool().unwrap());
     assert!(data["models"].as_array().unwrap().is_empty());
-    assert!(data["createdAt"].as_i64().unwrap() > 0);
-    assert!(data["updatedAt"].as_i64().unwrap() > 0);
+    assert!(data["created_at"].as_i64().unwrap() > 0);
+    assert!(data["updated_at"].as_i64().unwrap() > 0);
 }
 
 #[tokio::test]
@@ -175,17 +175,17 @@ async fn create_provider_with_optional_fields() {
     let body = json!({
         "platform": "bedrock",
         "name": "AWS Bedrock",
-        "baseUrl": "https://bedrock.us-east-1.amazonaws.com",
-        "apiKey": "test-key-abcd",
+        "base_url": "https://bedrock.us-east-1.amazonaws.com",
+        "api_key": "test-key-abcd",
         "models": ["anthropic.claude-3-sonnet"],
         "enabled": false,
-        "capabilities": [{"type": "text"}, {"type": "vision", "isUserSelected": true}],
-        "contextLimit": 200000,
-        "bedrockConfig": {
-            "authMethod": "accessKey",
+        "capabilities": [{"type": "text"}, {"type": "vision", "is_user_selected": true}],
+        "context_limit": 200000,
+        "bedrock_config": {
+            "auth_method": "accessKey",
             "region": "us-east-1",
-            "accessKeyId": "AKIA...",
-            "secretAccessKey": "secret"
+            "access_key_id": "AKIA...",
+            "secret_access_key": "secret"
         }
     });
 
@@ -200,9 +200,9 @@ async fn create_provider_with_optional_fields() {
     assert!(!data["enabled"].as_bool().unwrap());
     assert_eq!(data["models"].as_array().unwrap().len(), 1);
     assert_eq!(data["capabilities"].as_array().unwrap().len(), 2);
-    assert_eq!(data["contextLimit"], 200000);
-    assert_eq!(data["bedrockConfig"]["authMethod"], "accessKey");
-    assert_eq!(data["bedrockConfig"]["region"], "us-east-1");
+    assert_eq!(data["context_limit"], 200000);
+    assert_eq!(data["bedrock_config"]["auth_method"], "accessKey");
+    assert_eq!(data["bedrock_config"]["region"], "us-east-1");
 }
 
 #[tokio::test]
@@ -210,8 +210,8 @@ async fn create_provider_missing_platform() {
     let (app, _db) = setup().await;
     let body = json!({
         "name": "Test",
-        "baseUrl": "https://api.example.com",
-        "apiKey": "sk-test"
+        "base_url": "https://api.example.com",
+        "api_key": "sk-test"
     });
     let resp = app
         .oneshot(json_request("POST", "/api/providers", body))
@@ -225,8 +225,8 @@ async fn create_provider_missing_name() {
     let (app, _db) = setup().await;
     let body = json!({
         "platform": "openai",
-        "baseUrl": "https://api.example.com",
-        "apiKey": "sk-test"
+        "base_url": "https://api.example.com",
+        "api_key": "sk-test"
     });
     let resp = app
         .oneshot(json_request("POST", "/api/providers", body))
@@ -241,7 +241,7 @@ async fn create_provider_missing_base_url() {
     let body = json!({
         "platform": "openai",
         "name": "Test",
-        "apiKey": "sk-test"
+        "api_key": "sk-test"
     });
     let resp = app
         .oneshot(json_request("POST", "/api/providers", body))
@@ -256,7 +256,7 @@ async fn create_provider_missing_api_key() {
     let body = json!({
         "platform": "openai",
         "name": "Test",
-        "baseUrl": "https://api.example.com"
+        "base_url": "https://api.example.com"
     });
     let resp = app
         .oneshot(json_request("POST", "/api/providers", body))
@@ -271,8 +271,8 @@ async fn create_provider_invalid_url() {
     let body = json!({
         "platform": "openai",
         "name": "Test",
-        "baseUrl": "not-a-url",
-        "apiKey": "sk-test"
+        "base_url": "not-a-url",
+        "api_key": "sk-test"
     });
     let resp = app
         .oneshot(json_request("POST", "/api/providers", body))
@@ -316,14 +316,14 @@ async fn update_provider_api_key_mask_changes() {
         .oneshot(json_request(
             "PUT",
             &format!("/api/providers/{id}"),
-            json!({"apiKey": "new-key-abcdefgh"}),
+            json!({"api_key": "new-key-abcdefgh"}),
         ))
         .await
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    let api_key = json["data"]["apiKey"].as_str().unwrap();
+    let api_key = json["data"]["api_key"].as_str().unwrap();
     assert!(api_key.ends_with("efgh"));
 }
 

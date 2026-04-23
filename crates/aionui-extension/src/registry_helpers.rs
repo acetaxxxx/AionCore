@@ -14,7 +14,6 @@ use crate::types::{ExtensionSource, ExtensionState, LoadedExtension};
 
 /// Lightweight summary of a loaded extension.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ExtensionSummary {
     pub name: String,
     pub version: String,

@@ -362,11 +362,11 @@ async fn ws1_pairing_request_broadcasts_event() {
     let events = bc.take_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "channel.pairing-requested");
-    assert_eq!(events[0].data["platformUserId"], "tg_42");
-    assert_eq!(events[0].data["platformType"], "telegram");
-    assert_eq!(events[0].data["displayName"], "Alice");
+    assert_eq!(events[0].data["platform_user_id"], "tg_42");
+    assert_eq!(events[0].data["platform_type"], "telegram");
+    assert_eq!(events[0].data["display_name"], "Alice");
     assert!(events[0].data["code"].is_string());
-    assert!(events[0].data["expiresAt"].is_number());
+    assert!(events[0].data["expires_at"].is_number());
 }
 
 // ── WS-3: Approve broadcasts user-authorized event ─────────────────
@@ -385,9 +385,9 @@ async fn ws3_approve_broadcasts_user_authorized() {
     let events = bc.take_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "channel.user-authorized");
-    assert_eq!(events[0].data["platformUserId"], "tg_42");
-    assert_eq!(events[0].data["platformType"], "telegram");
-    assert_eq!(events[0].data["displayName"], "Alice");
+    assert_eq!(events[0].data["platform_user_id"], "tg_42");
+    assert_eq!(events[0].data["platform_type"], "telegram");
+    assert_eq!(events[0].data["display_name"], "Alice");
     assert!(events[0].data["id"].is_string());
 }
 

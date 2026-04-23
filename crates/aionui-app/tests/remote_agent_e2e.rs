@@ -17,8 +17,8 @@ fn bearer_agent_body() -> serde_json::Value {
         "name": "Test Remote Server",
         "protocol": "acp",
         "url": "wss://remote.example.com",
-        "authType": "bearer",
-        "authToken": "my-secret-token-1234",
+        "auth_type": "bearer",
+        "auth_token": "my-secret-token-1234",
         "description": "Production agent"
     })
 }
@@ -26,9 +26,9 @@ fn bearer_agent_body() -> serde_json::Value {
 fn openclaw_agent_body() -> serde_json::Value {
     json!({
         "name": "OpenClaw Agent",
-        "protocol": "openClaw",
+        "protocol": "openclaw",
         "url": "wss://openclaw.example.com",
-        "authType": "none"
+        "auth_type": "none"
     })
 }
 
@@ -60,13 +60,13 @@ async fn t1_1_create_bearer_agent() {
     assert_eq!(data["name"], "Test Remote Server");
     assert_eq!(data["protocol"], "acp");
     assert_eq!(data["url"], "wss://remote.example.com");
-    assert_eq!(data["authType"], "bearer");
+    assert_eq!(data["auth_type"], "bearer");
     // Auth token should be masked
-    assert_eq!(data["authToken"], "***1234");
+    assert_eq!(data["auth_token"], "***1234");
     assert_eq!(data["status"], "unknown");
     assert_eq!(data["description"], "Production agent");
-    assert!(data["createdAt"].as_i64().is_some());
-    assert!(data["updatedAt"].as_i64().is_some());
+    assert!(data["created_at"].as_i64().is_some());
+    assert!(data["updated_at"].as_i64().is_some());
 }
 
 #[tokio::test]
@@ -77,12 +77,12 @@ async fn t1_2_create_openclaw_agent_generates_device_keys() {
     let json = create_agent(&mut app, &token, &csrf, openclaw_agent_body()).await;
 
     let data = &json["data"];
-    assert_eq!(data["protocol"], "openClaw");
+    assert_eq!(data["protocol"], "openclaw");
     // Device ID and public key should be generated
-    assert!(data["deviceId"].as_str().unwrap().starts_with("dev_"));
-    assert!(data["devicePublicKey"].as_str().is_some());
+    assert!(data["device_id"].as_str().unwrap().starts_with("dev_"));
+    assert!(data["device_public_key"].as_str().is_some());
     // Private key should NOT be in the response
-    assert!(data.get("devicePrivateKey").is_none());
+    assert!(data.get("device_private_key").is_none());
 }
 
 #[tokio::test]
@@ -129,7 +129,7 @@ async fn t2_1_list_returns_agents_without_auth_token() {
     assert_eq!(data.len(), 1);
 
     // auth_token should NOT appear in list response
-    assert!(data[0].get("authToken").is_none());
+    assert!(data[0].get("auth_token").is_none());
     assert_eq!(data[0]["name"], "Test Remote Server");
 }
 
@@ -164,7 +164,7 @@ async fn t3_1_get_single_agent_with_masked_token() {
     let json = body_json(resp).await;
     let data = &json["data"];
     assert_eq!(data["id"], id);
-    assert_eq!(data["authToken"], "***1234");
+    assert_eq!(data["auth_token"], "***1234");
     assert_eq!(data["description"], "Production agent");
 }
 
@@ -217,7 +217,7 @@ async fn t4_2_update_multiple_fields() {
     let body = json!({
         "name": "Updated",
         "url": "wss://new-url.example.com",
-        "authToken": "new-super-secret-token"
+        "auth_token": "new-super-secret-token"
     });
     let req = json_with_token(
         "PUT",
@@ -232,7 +232,7 @@ async fn t4_2_update_multiple_fields() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["name"], "Updated");
     assert_eq!(json["data"]["url"], "wss://new-url.example.com");
-    assert_eq!(json["data"]["authToken"], "***oken");
+    assert_eq!(json["data"]["auth_token"], "***oken");
 }
 
 #[tokio::test]
@@ -291,7 +291,7 @@ async fn t6_1_test_connection_invalid_protocol() {
 
     let body = json!({
         "url": "http://example.com",
-        "authType": "bearer"
+        "auth_type": "bearer"
     });
     let req = json_with_token(
         "POST",

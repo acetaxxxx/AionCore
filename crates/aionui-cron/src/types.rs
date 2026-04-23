@@ -124,7 +124,6 @@ impl FromStr for JobStatus {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CronAgentConfig {
     pub backend: String,
     pub name: String,

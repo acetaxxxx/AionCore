@@ -47,7 +47,7 @@ const USER_ID: &str = "system_default_user";
 fn make_create_req() -> CreateConversationRequest {
     serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "claude-sonnet-4-20250514" },
+        "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
         "extra": { "workspace": "/home/user/project" }
     }))
     .unwrap()
@@ -81,7 +81,7 @@ async fn t1_1_create_with_defaults() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "conversation.listChanged");
     assert_eq!(events[0].data["action"], "created");
-    assert_eq!(events[0].data["conversationId"], resp.id);
+    assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
 }
 
@@ -101,7 +101,7 @@ async fn t1_2_create_each_agent_type() {
     for (type_str, expected_type) in types {
         let req: CreateConversationRequest = serde_json::from_value(json!({
             "type": type_str,
-            "model": { "providerId": "p1", "model": "m1" },
+            "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         }))
         .unwrap();
@@ -117,9 +117,9 @@ async fn t1_3_create_with_optional_fields() {
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
         "name": "Custom Name",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "source": "telegram",
-        "channelChatId": "user:123",
+        "channel_chat_id": "user:123",
         "extra": { "workspace": "/path" }
     }))
     .unwrap();
@@ -220,7 +220,7 @@ async fn t2_4_source_filter() {
 
     let telegram_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "source": "telegram",
         "extra": {}
     }))
@@ -334,7 +334,7 @@ async fn t4_4_extra_merge_preserves_existing_keys() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/old", "contextFileName": "ctx.md" }
     }))
     .unwrap();
@@ -355,7 +355,7 @@ async fn t4_5_update_model() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({
-        "model": { "providerId": "p2", "model": "new-model" }
+        "model": { "provider_id": "p2", "model": "new-model" }
     }))
     .unwrap();
     let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
@@ -391,7 +391,7 @@ async fn t5_1_delete_conversation() {
     let events = broadcaster.take_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["action"], "deleted");
-    assert_eq!(events[0].data["conversationId"], conv.id);
+    assert_eq!(events[0].data["conversation_id"], conv.id);
 }
 
 #[tokio::test]
@@ -422,7 +422,7 @@ async fn t11_1_create_broadcasts_created() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "conversation.listChanged");
     assert_eq!(events[0].data["action"], "created");
-    assert_eq!(events[0].data["conversationId"], resp.id);
+    assert_eq!(events[0].data["conversation_id"], resp.id);
 }
 
 #[tokio::test]
@@ -460,7 +460,7 @@ async fn t12_1_long_name() {
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
         "name": long_name,
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": {}
     }))
     .unwrap();
@@ -485,7 +485,7 @@ async fn t12_2_large_extra_json() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
-        "model": { "providerId": "p1", "model": "m1" },
+        "model": { "provider_id": "p1", "model": "m1" },
         "extra": large_extra
     }))
     .unwrap();

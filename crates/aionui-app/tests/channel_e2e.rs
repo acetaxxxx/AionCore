@@ -71,7 +71,7 @@ async fn enable_plugin_missing_config() {
     let req = json_with_token(
         "POST",
         "/api/channel/plugins/enable",
-        json!({ "pluginId": "telegram" }),
+        json!({ "plugin_id": "telegram" }),
         &token,
         &csrf,
     );
@@ -89,7 +89,7 @@ async fn enable_plugin_invalid_type() {
         "POST",
         "/api/channel/plugins/enable",
         json!({
-            "pluginId": "nonexistent",
+            "plugin_id": "nonexistent",
             "config": { "credentials": { "token": "x" } }
         }),
         &token,
@@ -135,7 +135,7 @@ async fn disable_plugin_not_registered() {
     let req = json_with_token(
         "POST",
         "/api/channel/plugins/disable",
-        json!({ "pluginId": "telegram" }),
+        json!({ "plugin_id": "telegram" }),
         &token,
         &csrf,
     );
@@ -174,7 +174,7 @@ async fn test_plugin_missing_token() {
     let req = json_with_token(
         "POST",
         "/api/channel/plugins/test",
-        json!({ "pluginId": "telegram" }),
+        json!({ "plugin_id": "telegram" }),
         &token,
         &csrf,
     );
@@ -297,7 +297,7 @@ async fn revoke_user_not_found() {
     let req = json_with_token(
         "POST",
         "/api/channel/users/revoke",
-        json!({ "userId": "nonexistent" }),
+        json!({ "user_id": "nonexistent" }),
         &token,
         &csrf,
     );
@@ -423,7 +423,7 @@ async fn sync_settings_with_model() {
             "agent": { "backend": "gemini" },
             "model": {
                 "id": "gemini-pro",
-                "useModel": true
+                "use_model": true
             }
         }),
         &token,
@@ -467,9 +467,9 @@ async fn pairing_approve_creates_user() {
     let pairings = json["data"].as_array().unwrap();
     assert_eq!(pairings.len(), 1);
     assert_eq!(pairings[0]["code"], code);
-    assert_eq!(pairings[0]["platformUserId"], "tg_user_42");
-    assert_eq!(pairings[0]["platformType"], "telegram");
-    assert_eq!(pairings[0]["displayName"], "Alice");
+    assert_eq!(pairings[0]["platform_user_id"], "tg_user_42");
+    assert_eq!(pairings[0]["platform_type"], "telegram");
+    assert_eq!(pairings[0]["display_name"], "Alice");
 
     // Approve the pairing
     let req = json_with_token(
@@ -491,9 +491,9 @@ async fn pairing_approve_creates_user() {
     let json = body_json(resp).await;
     let users = json["data"].as_array().unwrap();
     assert_eq!(users.len(), 1);
-    assert_eq!(users[0]["platformUserId"], "tg_user_42");
-    assert_eq!(users[0]["platformType"], "telegram");
-    assert_eq!(users[0]["displayName"], "Alice");
+    assert_eq!(users[0]["platform_user_id"], "tg_user_42");
+    assert_eq!(users[0]["platform_type"], "telegram");
+    assert_eq!(users[0]["display_name"], "Alice");
     let user_id = users[0]["id"].as_str().unwrap().to_owned();
 
     // Verify double-approve fails
@@ -517,7 +517,7 @@ async fn pairing_approve_creates_user() {
     let req = json_with_token(
         "POST",
         "/api/channel/users/revoke",
-        json!({ "userId": user_id }),
+        json!({ "user_id": user_id }),
         &token,
         &csrf,
     );
@@ -605,7 +605,7 @@ async fn enable_disable_plugin_lifecycle() {
         "POST",
         "/api/channel/plugins/enable",
         json!({
-            "pluginId": "telegram",
+            "plugin_id": "telegram",
             "config": {
                 "credentials": { "token": "000000000:FAKE_TOKEN" },
                 "config": { "mode": "polling" }
@@ -625,7 +625,7 @@ async fn enable_disable_plugin_lifecycle() {
     let json = body_json(resp).await;
     let plugins = json["data"].as_array().unwrap();
     assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0]["pluginId"], "telegram");
+    assert_eq!(plugins[0]["plugin_id"], "telegram");
     assert_eq!(plugins[0]["type"], "telegram");
     assert_eq!(plugins[0]["name"], "Telegram Bot");
 
@@ -633,7 +633,7 @@ async fn enable_disable_plugin_lifecycle() {
     let req = json_with_token(
         "POST",
         "/api/channel/plugins/disable",
-        json!({ "pluginId": "telegram" }),
+        json!({ "plugin_id": "telegram" }),
         &token,
         &csrf,
     );

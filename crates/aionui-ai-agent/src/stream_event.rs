@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// These are parsed from Agent stdout (line-delimited JSON) and forwarded
 /// to the WebSocket layer as `message.stream` events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "camelCase")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentStreamEvent {
     /// Start of a new response turn.
     Start(StartEventData),
@@ -55,7 +55,6 @@ pub enum AgentStreamEvent {
 
 /// Data for the `Start` event.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StartEventData {
     /// Session ID for this turn (if available).
     #[serde(default)]
@@ -64,7 +63,6 @@ pub struct StartEventData {
 
 /// Data for the `Text` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TextEventData {
     /// Incremental text content.
     pub content: String,
@@ -72,7 +70,6 @@ pub struct TextEventData {
 
 /// Data for the `Tips` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TipsEventData {
     /// Tip message content.
     pub content: String,
@@ -83,7 +80,7 @@ pub struct TipsEventData {
 
 /// Severity level for a tip event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum TipType {
     Error,
     Success,
@@ -92,7 +89,6 @@ pub enum TipType {
 
 /// Data for the `ToolCall` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ToolCallEventData {
     pub call_id: String,
     pub name: String,
@@ -103,7 +99,7 @@ pub struct ToolCallEventData {
 
 /// Status of a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
     Running,
     Completed,
@@ -112,7 +108,6 @@ pub enum ToolCallStatus {
 
 /// A single entry in a `ToolGroup` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ToolGroupEntry {
     pub call_id: String,
     pub name: String,
@@ -123,7 +118,6 @@ pub struct ToolGroupEntry {
 
 /// Data for the `AgentStatus` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AgentStatusEventData {
     pub backend: String,
     pub status: String,
@@ -135,7 +129,6 @@ pub struct AgentStatusEventData {
 
 /// Data for the `Thinking` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ThinkingEventData {
     pub content: String,
     #[serde(default)]
@@ -148,7 +141,6 @@ pub struct ThinkingEventData {
 
 /// Data for the `Plan` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PlanEventData {
     #[serde(default)]
     pub session_id: Option<String>,
@@ -158,14 +150,12 @@ pub struct PlanEventData {
 
 /// Data for the `AvailableCommands` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AvailableCommandsEventData {
     pub commands: Vec<serde_json::Value>,
 }
 
 /// Data for the `SkillSuggest` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SkillSuggestEventData {
     #[serde(default)]
     pub cron_job_id: Option<String>,
@@ -177,7 +167,6 @@ pub struct SkillSuggestEventData {
 
 /// Data for the `CronTrigger` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CronTriggerEventData {
     pub cron_job_id: String,
     pub cron_job_name: String,
@@ -186,7 +175,6 @@ pub struct CronTriggerEventData {
 
 /// Data for the `Finish` event.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct FinishEventData {
     #[serde(default)]
     pub session_id: Option<String>,
@@ -194,7 +182,6 @@ pub struct FinishEventData {
 
 /// Data for the `Error` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ErrorEventData {
     pub message: String,
     #[serde(default)]
@@ -243,8 +230,8 @@ mod tests {
             status: ToolCallStatus::Running,
         });
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "toolCall");
-        assert_eq!(json["data"]["callId"], "call-1");
+        assert_eq!(json["type"], "tool_call");
+        assert_eq!(json["data"]["call_id"], "call-1");
         assert_eq!(json["data"]["status"], "running");
     }
 
@@ -255,7 +242,7 @@ mod tests {
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "finish");
-        assert_eq!(json["data"]["sessionId"], "sess-abc");
+        assert_eq!(json["data"]["session_id"], "sess-abc");
     }
 
     #[test]
@@ -274,7 +261,7 @@ mod tests {
         let event = AgentStreamEvent::Start(StartEventData::default());
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "start");
-        assert_eq!(json["data"]["sessionId"], serde_json::Value::Null);
+        assert_eq!(json["data"]["session_id"], serde_json::Value::Null);
     }
 
     #[test]
@@ -295,10 +282,10 @@ mod tests {
         ];
         let event = AgentStreamEvent::ToolGroup(entries);
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "toolGroup");
+        assert_eq!(json["type"], "tool_group");
         let data = json["data"].as_array().unwrap();
         assert_eq!(data.len(), 2);
-        assert_eq!(data[0]["callId"], "c1");
+        assert_eq!(data[0]["call_id"], "c1");
     }
 
     #[test]
@@ -310,7 +297,7 @@ mod tests {
             session_id: None,
         });
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "agentStatus");
+        assert_eq!(json["type"], "agent_status");
         assert_eq!(json["data"]["backend"], "claude");
     }
 

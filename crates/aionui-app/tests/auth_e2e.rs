@@ -226,7 +226,7 @@ async fn t12_2_csrf_exempt_paths() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // POST /api/auth/qr-login is exempt from CSRF
-    let req = post_json_login("/api/auth/qr-login", r#"{"qrToken":"fake"}"#);
+    let req = post_json_login("/api/auth/qr-login", r#"{"qr_token":"fake"}"#);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -322,7 +322,7 @@ async fn t14_1_fresh_system_needs_setup() {
 
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
-    assert_eq!(json["needsSetup"], true);
+    assert_eq!(json["needs_setup"], true);
 }
 
 #[tokio::test]
@@ -336,7 +336,7 @@ async fn t14_2_setup_then_login() {
         .await
         .unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["needsSetup"], true);
+    assert_eq!(json["needs_setup"], true);
 
     // Set system user credentials (simulating initial setup)
     let hash = aionui_auth::hash_password("Admin@Pass1").unwrap();
@@ -353,7 +353,7 @@ async fn t14_2_setup_then_login() {
         .await
         .unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["needsSetup"], false);
+    assert_eq!(json["needs_setup"], false);
 
     // Login with new credentials
     let req = post_json_login("/login", r#"{"username":"admin","password":"Admin@Pass1"}"#);
@@ -369,8 +369,8 @@ async fn t14_2_setup_then_login() {
     let req = get_with_token("/api/auth/status", token);
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["isAuthenticated"], true);
-    assert_eq!(json["needsSetup"], false);
+    assert_eq!(json["is_authenticated"], true);
+    assert_eq!(json["needs_setup"], false);
 }
 
 // ===========================================================================
@@ -389,7 +389,7 @@ async fn full_auth_flow_e2e() {
         .unwrap();
     let csrf = extract_csrf_token(&resp).expect("CSRF cookie on first request");
     let json = body_json(resp).await;
-    assert_eq!(json["needsSetup"], true);
+    assert_eq!(json["needs_setup"], true);
 
     // 2. Setup user
     let hash = aionui_auth::hash_password("Initial@Pass1").unwrap();
@@ -423,7 +423,7 @@ async fn full_auth_flow_e2e() {
     // 5. Change password (needs CSRF)
     let req = post_json_with_csrf(
         "/api/auth/change-password",
-        r#"{"currentPassword":"Initial@Pass1","newPassword":"Updated@Pass2"}"#,
+        r#"{"current_password":"Initial@Pass1","new_password":"Updated@Pass2"}"#,
         &token,
         &csrf,
     );
