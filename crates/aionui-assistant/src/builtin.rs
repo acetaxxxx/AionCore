@@ -182,8 +182,7 @@ fn resolve_builtin_assets_dir() -> Option<PathBuf> {
         }
     }
     let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.join("assets").join("builtin-assistants");
-    if dir.exists() {
+    if let Some(dir) = resolve_assets_dir_from_exe(&exe) {
         return Some(dir);
     }
     // Dev fallback: cargo run from workspace root
@@ -197,6 +196,25 @@ fn resolve_builtin_assets_dir() -> Option<PathBuf> {
         return Some(dev);
     }
     None
+}
+
+/// Locate `{real_exe_parent}/assets/builtin-assistants/` given an executable
+/// path.
+///
+/// On macOS (and some other platforms) `std::env::current_exe()` returns the
+/// symlink path as-is rather than following it; when Electron spawns the
+/// backend via `~/.cargo/bin/aionui-backend` (a symlink to
+/// `target/debug/aionui-backend` per workflow docs), `exe.parent()` would
+/// resolve to `~/.cargo/bin/` instead of `target/debug/`, so the assets dir
+/// would be missed and the registry would silently fall back to empty.
+/// Canonicalizing the exe path before taking its parent fixes that.
+///
+/// Split out as a pure function so it can be unit-tested with a synthesized
+/// symlink fixture.
+fn resolve_assets_dir_from_exe(exe: &Path) -> Option<PathBuf> {
+    let real_exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let dir = real_exe.parent()?.join("assets").join("builtin-assistants");
+    if dir.exists() { Some(dir) } else { None }
 }
 
 #[cfg(test)]
@@ -308,5 +326,81 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(reg.get("a1").unwrap().name, "A");
         assert_eq!(reg.get("a2").unwrap().preset_agent_type, "claude");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_assets_dir_from_exe — symlink regression guard (H1 hotfix)
+    // -----------------------------------------------------------------------
+
+    /// Regression test for the production bug where Electron spawning the
+    /// backend through a symlink (`~/.cargo/bin/aionui-backend` → real
+    /// `target/debug/aionui-backend`) caused `exe.parent()` to resolve to
+    /// the symlink directory, missing the sibling `assets/builtin-assistants`
+    /// shipped next to the real binary. The fix canonicalizes the exe path
+    /// before taking its parent.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_assets_dir_follows_symlinked_exe() {
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real");
+        let assets = real_dir.join("assets").join("builtin-assistants");
+        std::fs::create_dir_all(&assets).unwrap();
+
+        // Real binary sitting next to the assets.
+        let real_exe = real_dir.join("aionui-backend");
+        std::fs::write(&real_exe, b"#!/bin/sh\necho stub\n").unwrap();
+
+        // Symlink in a sibling directory that does NOT contain the assets —
+        // mirrors the ~/.cargo/bin/aionui-backend → target/debug/ layout.
+        let link_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let linked_exe = link_dir.join("aionui-backend");
+        std::os::unix::fs::symlink(&real_exe, &linked_exe).unwrap();
+
+        // Prove the bug precondition: resolving via the symlink's parent
+        // without canonicalization would miss the assets dir.
+        let naive = linked_exe
+            .parent()
+            .unwrap()
+            .join("assets")
+            .join("builtin-assistants");
+        assert!(
+            !naive.exists(),
+            "test fixture invalid: assets should not exist at symlink parent"
+        );
+
+        // With canonicalization, the helper resolves to the real directory.
+        let resolved = resolve_assets_dir_from_exe(&linked_exe)
+            .expect("canonicalized exe parent should locate assets dir");
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            assets.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_assets_dir_happy_path_no_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let assets = tmp.path().join("assets").join("builtin-assistants");
+        std::fs::create_dir_all(&assets).unwrap();
+
+        let exe = tmp.path().join("aionui-backend");
+        std::fs::write(&exe, b"stub").unwrap();
+
+        let resolved = resolve_assets_dir_from_exe(&exe)
+            .expect("assets dir sitting next to the exe should be found");
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            assets.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_assets_dir_missing_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let exe = tmp.path().join("aionui-backend");
+        std::fs::write(&exe, b"stub").unwrap();
+        // No assets/builtin-assistants/ sibling — should return None.
+        assert!(resolve_assets_dir_from_exe(&exe).is_none());
     }
 }
