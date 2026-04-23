@@ -45,6 +45,12 @@ aionui-team = { path = "crates/aionui-team" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-app = { path = "crates/aionui-app" }
 
+# Aionrs agent engine (external git dependency)
+aion-agent = { git = "ssh://git@github.com/iOfficeAI/aionrs.git", tag = "v0.1.14" }
+aion-types = { git = "ssh://git@github.com/iOfficeAI/aionrs.git", tag = "v0.1.14" }
+aion-protocol = { git = "ssh://git@github.com/iOfficeAI/aionrs.git", tag = "v0.1.14" }
+aion-config = { git = "ssh://git@github.com/iOfficeAI/aionrs.git", tag = "v0.1.14" }
+
 # Core framework
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["multipart", "ws"] }
