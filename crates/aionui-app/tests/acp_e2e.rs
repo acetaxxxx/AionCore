@@ -89,7 +89,7 @@ async fn list_agents_returns_array() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let req = get_with_token("/api/acp/agents", &token);
+    let req = get_with_token("/api/agents", &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -105,7 +105,7 @@ async fn refresh_agents_returns_array() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let req = json_with_token("POST", "/api/acp/agents/refresh", json!({}), &token, &csrf);
+    let req = json_with_token("POST", "/api/agents/refresh", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -121,7 +121,7 @@ async fn test_custom_agent_nonexistent_command() {
 
     let req = json_with_token(
         "POST",
-        "/api/acp/agents/test",
+        "/api/agents/test",
         json!({ "command": "/nonexistent/path/to/agent" }),
         &token,
         &csrf,

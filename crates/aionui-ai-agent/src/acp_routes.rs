@@ -6,9 +6,9 @@ use axum::extract::{Extension, Json, Path, State};
 use axum::routing::{get, post, put};
 
 use aionui_api_types::{
-    AcpAgentInfo, AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AcpModeResponse,
-    ApiResponse, DetectCliRequest, DetectCliResponse, ProbeModelRequest, SetConfigOptionRequest,
-    SetModeRequest, SetModelRequest, TestCustomAgentRequest, TestCustomAgentResponse,
+    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AcpModeResponse, ApiResponse,
+    DetectCliRequest, DetectCliResponse, ProbeModelRequest, SetConfigOptionRequest, SetModeRequest,
+    SetModelRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{AgentType, AppError};
@@ -16,7 +16,6 @@ use aionui_common::{AgentType, AppError};
 use crate::acp_agent::AcpAgentManager;
 use crate::acp_service;
 use crate::agent_manager::AgentManagerHandle;
-use crate::agent_registry::AgentRegistry;
 use crate::task_manager::IWorkerTaskManager;
 use crate::types::{AcpModelInfo, AcpSessionConfigOption};
 
@@ -24,7 +23,6 @@ use crate::types::{AcpModelInfo, AcpSessionConfigOption};
 #[derive(Clone)]
 pub struct AcpRouterState {
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
-    pub agent_registry: Arc<AgentRegistry>,
 }
 
 /// Build the ACP management router.
@@ -35,9 +33,6 @@ pub fn acp_routes(state: AcpRouterState) -> Router {
     Router::new()
         // Global ACP management routes
         .route("/api/acp/detect-cli", post(detect_cli))
-        .route("/api/acp/agents", get(list_agents))
-        .route("/api/acp/agents/refresh", post(refresh_agents))
-        .route("/api/acp/agents/test", post(test_custom_agent))
         .route("/api/acp/health-check", post(health_check))
         .route("/api/acp/env", get(get_env))
         .route("/api/acp/probe-model", post(probe_model))
@@ -101,35 +96,6 @@ async fn detect_cli(
 ) -> Result<Json<ApiResponse<DetectCliResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let result = acp_service::detect_cli(req.backend);
-    Ok(Json(ApiResponse::ok(result)))
-}
-
-async fn list_agents(
-    State(state): State<AcpRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-) -> Result<Json<ApiResponse<Vec<AcpAgentInfo>>>, AppError> {
-    let agents = state.agent_registry.get_all().await;
-    let infos: Vec<AcpAgentInfo> = agents.into_iter().map(Into::into).collect();
-    Ok(Json(ApiResponse::ok(infos)))
-}
-
-async fn refresh_agents(
-    State(state): State<AcpRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-) -> Result<Json<ApiResponse<Vec<AcpAgentInfo>>>, AppError> {
-    state.agent_registry.refresh_builtins().await;
-    let agents = state.agent_registry.get_all().await;
-    let infos: Vec<AcpAgentInfo> = agents.into_iter().map(Into::into).collect();
-    Ok(Json(ApiResponse::ok(infos)))
-}
-
-async fn test_custom_agent(
-    State(_state): State<AcpRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-    body: Result<Json<TestCustomAgentRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<TestCustomAgentResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let result = acp_service::test_custom_agent(&req.command, &req.acp_args, &req.env)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
