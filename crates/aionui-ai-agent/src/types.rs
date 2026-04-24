@@ -48,9 +48,6 @@ pub struct AcpBuildExtra {
     /// Path to the CLI executable (resolved from registry when `agent_id` is set).
     #[serde(default)]
     pub cli_path: Option<String>,
-    /// Whether the user picked a custom workspace path.
-    #[serde(default)]
-    pub custom_workspace: bool,
     /// Agent name within the ACP backend.
     #[serde(default)]
     pub agent_name: Option<String>,
@@ -94,9 +91,6 @@ pub struct OpenClawBuildExtra {
     /// Agent name.
     #[serde(default)]
     pub agent_name: Option<String>,
-    /// Whether the user picked a custom workspace path.
-    #[serde(default)]
-    pub custom_workspace: bool,
     /// OpenClaw gateway configuration.
     pub gateway: OpenClawGatewayConfig,
     /// Skills to enable.

@@ -435,7 +435,11 @@ pub fn build_conversation_state(services: &AppServices) -> ConversationRouterSta
     let pool = services.database.pool().clone();
     let repo = Arc::new(SqliteConversationRepository::new(pool));
     ConversationRouterState {
-        conversation_service: ConversationService::new(repo, services.event_bus.clone()),
+        conversation_service: ConversationService::new_with_workspace_root(
+            repo,
+            services.event_bus.clone(),
+            std::path::PathBuf::from(&services.data_dir),
+        ),
         worker_task_manager: services.worker_task_manager.clone(),
     }
 }
@@ -563,7 +567,11 @@ pub fn build_team_state(services: &AppServices) -> TeamRouterState {
         Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
     let conv_repo: Arc<dyn aionui_db::IConversationRepository> =
         Arc::new(SqliteConversationRepository::new(pool));
-    let conv_service = ConversationService::new(conv_repo, services.event_bus.clone());
+    let conv_service = ConversationService::new_with_workspace_root(
+        conv_repo,
+        services.event_bus.clone(),
+        std::path::PathBuf::from(&services.data_dir),
+    );
     let service = Arc::new(TeamSessionService::new(
         team_repo,
         conv_service,
@@ -580,7 +588,11 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
 
     let conv_repo: Arc<dyn aionui_db::IConversationRepository> =
         Arc::new(SqliteConversationRepository::new(pool));
-    let conv_service = ConversationService::new(conv_repo.clone(), services.event_bus.clone());
+    let conv_service = ConversationService::new_with_workspace_root(
+        conv_repo.clone(),
+        services.event_bus.clone(),
+        std::path::PathBuf::from(&services.data_dir),
+    );
 
     let busy_guard = Arc::new(aionui_cron::busy_guard::CronBusyGuard::new());
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
