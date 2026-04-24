@@ -84,7 +84,7 @@ async fn build_agent(
             if let Some(ref detected) = detected
                 && config.backend.is_none()
             {
-                config.backend = Some(detected.backend);
+                config.backend = detected.backend;
             }
 
             let (spawn_command, spawn_args) = match detected {
