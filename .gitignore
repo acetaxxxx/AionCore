@@ -45,3 +45,6 @@ worktrees/
 perf.data
 perf.data.old
 flamegraph.svg
+
+# Runtime data (never commit DBs)
+data/
