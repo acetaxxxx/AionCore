@@ -23,7 +23,6 @@ pub enum AssistantSource {
 /// Wire shape returned by `GET /api/assistants` (single element) and
 /// by the single-resource CRUD handlers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AssistantResponse {
     pub id: String,
     pub source: AssistantSource,
@@ -65,7 +64,6 @@ pub struct AssistantResponse {
 
 /// `POST /api/assistants`. Server generates `id` when absent.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateAssistantRequest {
     #[serde(default)]
     pub id: Option<String>,
@@ -96,7 +94,6 @@ pub struct CreateAssistantRequest {
 
 /// `PUT /api/assistants/{id}`. All fields optional; partial update semantics.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateAssistantRequest {
     #[serde(default)]
     pub name: Option<String>,
@@ -126,7 +123,6 @@ pub struct UpdateAssistantRequest {
 
 /// `PATCH /api/assistants/{id}/state`. Upserts `assistant_overrides`.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct SetAssistantStateRequest {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -139,14 +135,12 @@ pub struct SetAssistantStateRequest {
 /// `POST /api/assistants/import`. Bulk insert-only from legacy Electron
 /// config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ImportAssistantsRequest {
     pub assistants: Vec<CreateAssistantRequest>,
 }
 
 /// Aggregate result of `POST /api/assistants/import`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct ImportAssistantsResult {
     pub imported: usize,
     pub skipped: usize,
@@ -157,7 +151,6 @@ pub struct ImportAssistantsResult {
 
 /// Per-row error within [`ImportAssistantsResult::errors`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ImportError {
     pub id: String,
     pub error: String,
@@ -168,7 +161,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assistant_source_camel_case_serializes_lowercase() {
+    fn assistant_source_serializes_lowercase() {
         let json = serde_json::to_string(&AssistantSource::Builtin).unwrap();
         assert_eq!(json, "\"builtin\"");
         let json = serde_json::to_string(&AssistantSource::User).unwrap();
@@ -178,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_response_round_trip_camel_case() {
+    fn assistant_response_round_trip_snake_case() {
         let resp = AssistantResponse {
             id: "a1".into(),
             source: AssistantSource::User,
@@ -202,9 +195,9 @@ mod tests {
         };
 
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["presetAgentType"], "gemini");
-        assert_eq!(json["sortOrder"], 5);
-        assert_eq!(json["lastUsedAt"], 1234);
+        assert_eq!(json["preset_agent_type"], "gemini");
+        assert_eq!(json["sort_order"], 5);
+        assert_eq!(json["last_used_at"], 1234);
     }
 
     #[test]
@@ -239,5 +232,33 @@ mod tests {
         assert_eq!(r.skipped, 0);
         assert_eq!(r.failed, 0);
         assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn assistant_response_rejects_camel_case() {
+        // Body has BOTH snake_case (valid required values) AND camelCase aliases.
+        // Prove: snake is consumed; camel is silently ignored (NOT aliased over snake).
+        let json = serde_json::json!({
+            "id": "a1",
+            "source": "user",
+            "name": "X",
+            "enabled": true,
+            "sort_order": 7,                   // snake required field
+            "preset_agent_type": "gemini",     // snake required field
+            "presetAgentType": "claude",       // legacy camel — must be ignored
+            "sortOrder": 99,                   // legacy camel — must be ignored
+            "lastUsedAt": 111_222,             // legacy camel for optional field — must be ignored
+        });
+        let resp: AssistantResponse = serde_json::from_value(json).unwrap();
+        // If camel were aliased, these would be the camel values.
+        assert_eq!(
+            resp.preset_agent_type, "gemini",
+            "snake_case preset_agent_type must win"
+        );
+        assert_eq!(resp.sort_order, 7, "snake_case sort_order must win");
+        assert!(
+            resp.last_used_at.is_none(),
+            "camelCase lastUsedAt must NOT alias into last_used_at"
+        );
     }
 }

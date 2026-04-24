@@ -144,20 +144,36 @@ Add one new regression test:
 ```rust
 #[test]
 fn assistant_response_rejects_camel_case() {
+    // Body has BOTH snake_case (valid required values) AND camelCase aliases.
+    // Prove: snake is consumed; camel is silently ignored (NOT aliased over snake).
     let json = serde_json::json!({
         "id": "a1",
         "source": "user",
         "name": "X",
-        "presetAgentType": "gemini",  // ← legacy camelCase
         "enabled": true,
-        "sortOrder": 0,
+        "sort_order": 7,                   // ← snake required field
+        "preset_agent_type": "gemini",     // ← snake required field
+        "presetAgentType": "claude",       // ← legacy camel — must be ignored
+        "sortOrder": 99,                   // ← legacy camel — must be ignored
+        "lastUsedAt": 111_222,             // ← legacy camel for optional field — must be ignored
     });
     let resp: AssistantResponse = serde_json::from_value(json).unwrap();
-    // `presetAgentType` silently drops; field stays default (empty string).
-    assert_eq!(resp.preset_agent_type, "");
-    assert_eq!(resp.sort_order, 0);
+    // If camel were aliased, these would be the camel values.
+    assert_eq!(resp.preset_agent_type, "gemini", "snake_case preset_agent_type must win");
+    assert_eq!(resp.sort_order, 7, "snake_case sort_order must win");
+    assert!(resp.last_used_at.is_none(), "camelCase lastUsedAt must NOT alias into last_used_at");
 }
 ```
+
+Note: earlier drafts of this spec had a body providing ONLY camelCase
+keys and relied on `unwrap()` + default-field fallback, but
+`AssistantResponse.sort_order` / `preset_agent_type` / `enabled` are
+required (no `#[serde(default)]`) so the camel-only body fails
+deserialization before the assertions run. The revised form above
+keeps required-field values in snake_case (so deser succeeds) while
+piggybacking camelCase aliases whose presence must not displace the
+snake values — giving a true regression signal without widening the
+production contract.
 
 This pins down the "camel is silently ignored now, not aliased"
 behavior so future refactors don't reintroduce dual-accept.

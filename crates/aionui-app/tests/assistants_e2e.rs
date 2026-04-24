@@ -94,15 +94,15 @@ async fn fixture() -> Fixture {
             {
                 "id": "builtin-office",
                 "name": "Office",
-                "presetAgentType": "gemini",
-                "ruleFile": "rules/office.{locale}.md",
-                "skillFile": "skills/office.{locale}.md",
+                "preset_agent_type": "gemini",
+                "rule_file": "rules/office.{locale}.md",
+                "skill_file": "skills/office.{locale}.md",
                 "avatar": "office.png",
             },
             {
                 "id": "builtin-bare",
                 "name": "Bare",
-                "presetAgentType": "gemini",
+                "preset_agent_type": "gemini",
             }
         ]
     });
@@ -514,7 +514,7 @@ async fn set_state_inserts_override_for_builtin() {
     let req = json_with_token(
         "PATCH",
         "/api/assistants/builtin-office/state",
-        json!({ "enabled": false, "sortOrder": 9 }),
+        json!({ "enabled": false, "sort_order": 9 }),
         &fx.token,
         &fx.csrf,
     );
@@ -522,7 +522,7 @@ async fn set_state_inserts_override_for_builtin() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["enabled"], false);
-    assert_eq!(json["data"]["sortOrder"], 9);
+    assert_eq!(json["data"]["sort_order"], 9);
     assert_eq!(json["data"]["source"], "builtin");
 }
 
@@ -534,7 +534,7 @@ async fn set_state_updates_existing_override_for_user() {
     let req = json_with_token(
         "PATCH",
         "/api/assistants/u1/state",
-        json!({ "enabled": false, "sortOrder": 3 }),
+        json!({ "enabled": false, "sort_order": 3 }),
         &fx.token,
         &fx.csrf,
     );
@@ -544,7 +544,7 @@ async fn set_state_updates_existing_override_for_user() {
     let req = json_with_token(
         "PATCH",
         "/api/assistants/u1/state",
-        json!({ "sortOrder": 7 }),
+        json!({ "sort_order": 7 }),
         &fx.token,
         &fx.csrf,
     );
@@ -552,7 +552,7 @@ async fn set_state_updates_existing_override_for_user() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["enabled"], false);
-    assert_eq!(json["data"]["sortOrder"], 7);
+    assert_eq!(json["data"]["sort_order"], 7);
 }
 
 #[tokio::test]
