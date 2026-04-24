@@ -31,7 +31,6 @@ static BUILTIN_ASSETS: Dir<'_> =
 
 /// Single built-in assistant entry, loaded from `assistants.json`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BuiltinAssistant {
     pub id: String,
     pub name: String,
@@ -372,8 +371,8 @@ mod tests {
                 "assistants": [{
                     "id": "builtin-office",
                     "name": "Office",
-                    "presetAgentType": "gemini",
-                    "ruleFile": "rules/office.{locale}.md"
+                    "preset_agent_type": "gemini",
+                    "rule_file": "rules/office.{locale}.md"
                 }]
             }"#,
         );
@@ -397,8 +396,8 @@ mod tests {
                 "assistants": [{
                     "id": "x",
                     "name": "X",
-                    "presetAgentType": "gemini",
-                    "ruleFile": "rules/x.{locale}.md"
+                    "preset_agent_type": "gemini",
+                    "rule_file": "rules/x.{locale}.md"
                 }]
             }"#,
         );
@@ -415,7 +414,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_manifest(
             tmp.path(),
-            r#"{"assistants":[{"id":"env-only","name":"E","presetAgentType":"gemini"}]}"#,
+            r#"{"assistants":[{"id":"env-only","name":"E","preset_agent_type":"gemini"}]}"#,
         );
         // SAFETY: env-var mutation is only unsafe if another thread reads
         // environment concurrently. This test is self-contained.
@@ -459,7 +458,7 @@ mod tests {
             r#"{"assistants":[{
                 "id": "with-file-avatar",
                 "name": "F",
-                "presetAgentType": "gemini",
+                "preset_agent_type": "gemini",
                 "avatar": "duck.svg"
             }]}"#,
         );

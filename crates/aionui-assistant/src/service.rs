@@ -989,9 +989,9 @@ mod tests {
                     serde_json::json!({
                         "id": b.id,
                         "name": b.name,
-                        "presetAgentType": b.preset_agent_type,
-                        "ruleFile": b.rule_file,
-                        "skillFile": b.skill_file,
+                        "preset_agent_type": b.preset_agent_type,
+                        "rule_file": b.rule_file,
+                        "skill_file": b.skill_file,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1387,8 +1387,8 @@ mod tests {
             "assistants": [{
                 "id": "builtin-office",
                 "name": "Office",
-                "presetAgentType": "gemini",
-                "ruleFile": "rules/office.{locale}.md",
+                "preset_agent_type": "gemini",
+                "rule_file": "rules/office.{locale}.md",
             }]
         });
         std::fs::write(
