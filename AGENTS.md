@@ -177,14 +177,15 @@ cargo clippy -p aionui-<crate> -- -D warnings         # Lint the crate you chang
 ### Before Commit (affected crates)
 
 ```bash
-cargo test -p aionui-<crate1> -p aionui-<crate2>     # Test all affected crates
-cargo fmt --all -- --check                             # Format check
+cargo fmt --all -- --check                                                      # Format gate (instant)
+cargo clippy -p aionui-<crate1> -p aionui-<crate2> -- -D warnings              # Lint affected crates
+cargo test -p aionui-<crate1> -p aionui-<crate2>                               # Test affected crates
 ```
 
 ### Final Verification (run in background, 10+ min)
 
 ```bash
-cargo test --workspace                                 # Full test suite
+cargo fmt --all -- --check                             # Format gate (instant)
 cargo clippy --workspace -- -D warnings                # Full lint
-cargo fmt --all                                        # Format
+cargo test --workspace                                 # Full test suite
 ```
