@@ -50,8 +50,15 @@ pub struct CreateProviderRequest {
 
 Service change in `crates/aionui-system/src/provider.rs::create()`:
 
-- If `req.id` is `Some`, use it; else `Uuid::new_v4().to_string()`.
-  Validate it's a valid UUID string before trusting it.
+- If `req.id` is `Some`, trim + validate it; else `Uuid::new_v4().to_string()`.
+- **Validation is lenient, not strict UUID.** Frontend's `uuid()` util
+  returns an 8-char hex string by default (see `src/common/utils/utils.ts:7`
+  in AionUi), not a UUID. Historical provider ids are short hex strings.
+  Spec §1 "validate UUID" was a wording error — the real requirement is
+  "non-empty, safe-shaped string id":
+  - `1..=128` chars after trim
+  - charset `[A-Za-z0-9_-]` only (blocks SQL/path/injection footguns)
+  - reject if already taken at the repo layer
 - Persist `model_protocols / model_enabled / model_health` on create
   (serialize to JSON, pass through `CreateProviderParams` — those fields
   already exist on the params struct, they're just hardcoded to `None`
@@ -114,8 +121,15 @@ assertion that expected `***` in `api_key`.
 - [ ] `cargo clippy --workspace -- -D warnings` baseline unchanged
 - [ ] Live probe:
   ```
-  POST /api/providers {"id":"my-uuid-1","platform":"openai","name":"test","base_url":"https://a","api_key":"sk-xxx","models":["gpt-4"],"model_enabled":{"gpt-4":true}}
-  → 201, response.id == "my-uuid-1", response.api_key == "sk-xxx" (not masked), response.model_enabled == {"gpt-4": true}
+  # Accepts frontend-style 8-char hex id:
+  POST /api/providers {"id":"a1b2c3d4","platform":"openai","name":"test","base_url":"https://a","api_key":"sk-xxx","models":["gpt-4"],"model_enabled":{"gpt-4":true}}
+  → 201, response.id == "a1b2c3d4", response.api_key == "sk-xxx" (not masked), response.model_enabled == {"gpt-4": true}
+  # Also accepts real UUID:
+  POST /api/providers {"id":"11111111-1111-4111-8111-111111111111", ...} → 201, id preserved
+  # Rejects unsafe:
+  POST /api/providers {"id":"../etc/passwd", ...} → 400
+  POST /api/providers {"id":"", ...} → 400
+  POST /api/providers {"id":"x".repeat(200), ...} → 400
   GET /api/providers → includes the above, api_key == "sk-xxx"
   ```
 
