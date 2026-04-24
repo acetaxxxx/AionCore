@@ -36,55 +36,83 @@ fn cli_binary_name(backend: AcpBackend) -> Option<&'static str> {
     }
 }
 
-/// Predefined list of known ACP agents.
+/// Known agents surfaced by `GET /api/acp/agents`.
+///
+/// Includes two classes:
+///
+/// * **ACP CLI agents** — detected via `which(<binary>)`; `available` flips to
+///   `true` only when the binary is on `PATH`.
+/// * **Non-ACP execution engines** — Gemini, Aionrs, nanobot, openclaw-gateway.
+///   These do not have a dedicated CLI (they are built-in or detected via
+///   other means upstream), so they are emitted with `available = true` by
+///   default. The frontend references them by the `backend` string tag (e.g.
+///   `AionrsSettings.tsx` looks up `backend === "aionrs"`).
+///
+/// Mirrors the historical TS `AgentRegistry` behaviour from
+/// `AionUi/src/process/agent/AgentRegistry.ts`, which always emitted Gemini
+/// and Aionrs alongside ACP agents.
 fn known_agents() -> Vec<AcpAgentInfo> {
     vec![
+        // Non-ACP engines — always available.
+        AcpAgentInfo {
+            id: "aionrs".into(),
+            name: "Aion CLI".into(),
+            backend: "aionrs".into(),
+            available: true,
+        },
+        AcpAgentInfo {
+            id: "gemini".into(),
+            name: "Gemini CLI".into(),
+            backend: "gemini".into(),
+            available: true,
+        },
+        // ACP CLI agents — availability resolved by `get_available_agents`.
         AcpAgentInfo {
             id: "claude".into(),
             name: "Claude".into(),
-            backend: AcpBackend::Claude,
+            backend: "claude".into(),
             available: false,
         },
         AcpAgentInfo {
             id: "codex".into(),
             name: "Codex".into(),
-            backend: AcpBackend::Codex,
+            backend: "codex".into(),
             available: false,
         },
         AcpAgentInfo {
             id: "codebuddy".into(),
             name: "CodeBuddy".into(),
-            backend: AcpBackend::Codebuddy,
+            backend: "codebuddy".into(),
             available: false,
         },
         AcpAgentInfo {
             id: "qwen".into(),
             name: "Qwen".into(),
-            backend: AcpBackend::Qwen,
+            backend: "qwen".into(),
             available: false,
         },
         AcpAgentInfo {
             id: "kiro".into(),
             name: "Kiro".into(),
-            backend: AcpBackend::Kiro,
+            backend: "kiro".into(),
             available: false,
         },
         AcpAgentInfo {
             id: "opencode".into(),
             name: "OpenCode".into(),
-            backend: AcpBackend::Opencode,
+            backend: "opencode".into(),
             available: false,
         },
         AcpAgentInfo {
             id: "copilot".into(),
             name: "Copilot".into(),
-            backend: AcpBackend::Copilot,
+            backend: "copilot".into(),
             available: false,
         },
         AcpAgentInfo {
             id: "goose".into(),
             name: "Goose".into(),
-            backend: AcpBackend::Goose,
+            backend: "goose".into(),
             available: false,
         },
     ]
@@ -106,16 +134,29 @@ pub fn detect_cli(backend: AcpBackend) -> DetectCliResponse {
 }
 
 /// Get the list of available ACP agents, checking CLI availability.
+///
+/// Non-ACP engines (Gemini, Aionrs, …) keep the default `available` value
+/// from [`known_agents`]. ACP backends get their `available` flag recomputed
+/// via `which` against the binary name for the matching [`AcpBackend`] variant.
 pub fn get_available_agents() -> Vec<AcpAgentInfo> {
     known_agents()
         .into_iter()
         .map(|mut agent| {
-            if let Some(binary) = cli_binary_name(agent.backend) {
+            if let Some(backend) = parse_acp_backend(&agent.backend)
+                && let Some(binary) = cli_binary_name(backend)
+            {
                 agent.available = which::which(binary).is_ok();
             }
             agent
         })
         .collect()
+}
+
+/// Parse a `backend` string tag back into [`AcpBackend`] when the tag
+/// corresponds to a known ACP CLI. Returns `None` for non-ACP engines
+/// (gemini, aionrs, nanobot, openclaw-gateway) and for unknown tags.
+fn parse_acp_backend(tag: &str) -> Option<AcpBackend> {
+    serde_json::from_value::<AcpBackend>(serde_json::Value::String(tag.to_string())).ok()
 }
 
 /// Perform a health check for an ACP backend.
@@ -231,6 +272,42 @@ mod tests {
         assert!(ids.contains(&"codebuddy"));
         assert!(ids.contains(&"qwen"));
         assert!(ids.contains(&"kiro"));
+    }
+
+    #[test]
+    fn known_agents_includes_non_acp_engines() {
+        let agents = known_agents();
+        let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert!(
+            ids.contains(&"gemini"),
+            "gemini must appear in getAvailableAgents for the frontend"
+        );
+        assert!(
+            ids.contains(&"aionrs"),
+            "aionrs must appear in getAvailableAgents for AionrsSettings"
+        );
+    }
+
+    #[test]
+    fn non_acp_engines_are_available_by_default() {
+        let agents = known_agents();
+        let gemini = agents.iter().find(|a| a.id == "gemini").unwrap();
+        let aionrs = agents.iter().find(|a| a.id == "aionrs").unwrap();
+        assert!(gemini.available);
+        assert!(aionrs.available);
+    }
+
+    #[test]
+    fn parse_acp_backend_recognises_cli_backends() {
+        assert_eq!(parse_acp_backend("claude"), Some(AcpBackend::Claude));
+        assert_eq!(parse_acp_backend("codex"), Some(AcpBackend::Codex));
+    }
+
+    #[test]
+    fn parse_acp_backend_returns_none_for_non_acp_tags() {
+        assert_eq!(parse_acp_backend("gemini"), None);
+        assert_eq!(parse_acp_backend("aionrs"), None);
+        assert_eq!(parse_acp_backend("nonsense"), None);
     }
 
     #[test]
