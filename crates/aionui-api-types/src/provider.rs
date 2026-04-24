@@ -163,6 +163,23 @@ pub struct FetchModelsRequest {
     pub try_fix: bool,
 }
 
+/// Request body for `POST /api/providers/fetch-models` (anonymous, pre-create).
+///
+/// Used by the frontend's Add-Platform form to preview a provider's model
+/// list before the provider row is persisted — credentials are passed in
+/// the request body instead of looked up by id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchModelsAnonymousRequest {
+    pub platform: String,
+    pub base_url: String,
+    /// Plain-text API key (supports multi-key).
+    pub api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedrock_config: Option<BedrockConfig>,
+    #[serde(default)]
+    pub try_fix: bool,
+}
+
 /// A model entry that can be either a bare ID string or an object with
 /// id and name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -611,6 +628,51 @@ mod tests {
         let raw = json!({"try_fix": true});
         let req: FetchModelsRequest = serde_json::from_value(raw).unwrap();
         assert!(req.try_fix);
+    }
+
+    // -- FetchModelsAnonymousRequest --
+
+    #[test]
+    fn test_fetch_models_anonymous_request_required_fields() {
+        let raw = json!({
+            "platform": "openai",
+            "base_url": "https://api.openai.com",
+            "api_key": "sk-test"
+        });
+        let req: FetchModelsAnonymousRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.platform, "openai");
+        assert_eq!(req.base_url, "https://api.openai.com");
+        assert_eq!(req.api_key, "sk-test");
+        assert!(req.bedrock_config.is_none());
+        assert!(!req.try_fix);
+    }
+
+    #[test]
+    fn test_fetch_models_anonymous_request_with_bedrock() {
+        let raw = json!({
+            "platform": "bedrock",
+            "base_url": "https://bedrock.us-east-1.amazonaws.com",
+            "api_key": "",
+            "bedrock_config": {
+                "auth_method": "accessKey",
+                "region": "us-east-1",
+                "access_key_id": "AKIA...",
+                "secret_access_key": "secret"
+            },
+            "try_fix": true
+        });
+        let req: FetchModelsAnonymousRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.platform, "bedrock");
+        assert!(req.try_fix);
+        let cfg = req.bedrock_config.unwrap();
+        assert_eq!(cfg.region, "us-east-1");
+        assert_eq!(cfg.auth_method, BedrockAuthMethod::AccessKey);
+    }
+
+    #[test]
+    fn test_fetch_models_anonymous_request_missing_required_field() {
+        let raw = json!({"platform": "openai", "api_key": "sk"});
+        assert!(serde_json::from_value::<FetchModelsAnonymousRequest>(raw).is_err());
     }
 
     // -- ModelInfo --

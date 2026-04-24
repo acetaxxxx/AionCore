@@ -98,9 +98,10 @@ pub use office::{
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest,
-    DetectionSuggestion, FetchModelsRequest, FetchModelsResponse, HealthStatus, KeyTestResult,
-    ModelCapability, ModelHealthStatus, ModelInfo, ModelType, MultiKeyResult,
-    ProtocolDetectionResponse, ProviderResponse, SuggestionType, UpdateProviderRequest,
+    DetectionSuggestion, FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse,
+    HealthStatus, KeyTestResult, ModelCapability, ModelHealthStatus, ModelInfo, ModelType,
+    MultiKeyResult, ProtocolDetectionResponse, ProviderResponse, SuggestionType,
+    UpdateProviderRequest,
 };
 pub use remote_agent::{
     CreateRemoteAgentRequest, HandshakeResponse, RemoteAgentListItem, RemoteAgentResponse,
