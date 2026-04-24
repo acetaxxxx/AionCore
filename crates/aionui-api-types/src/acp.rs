@@ -17,28 +17,6 @@ pub struct DetectCliResponse {
     pub path: Option<String>,
 }
 
-/// Information about an available ACP agent (public API shape).
-#[derive(Debug, Clone, Serialize)]
-pub struct AcpAgentInfo {
-    pub id: String,
-    pub name: String,
-    pub backend: AcpBackend,
-    pub available: bool,
-    pub source: crate::AgentSource,
-}
-
-impl From<crate::DetectedAgent> for AcpAgentInfo {
-    fn from(a: crate::DetectedAgent) -> Self {
-        Self {
-            id: a.id,
-            name: a.name,
-            backend: a.backend,
-            available: a.available,
-            source: a.source,
-        }
-    }
-}
-
 /// Request body for ACP health check.
 #[derive(Debug, Deserialize)]
 pub struct AcpHealthCheckRequest {
@@ -134,22 +112,6 @@ mod tests {
         let resp = DetectCliResponse { path: None };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("path").is_none());
-    }
-
-    #[test]
-    fn acp_agent_info_serde() {
-        let info = AcpAgentInfo {
-            id: "claude".into(),
-            name: "Claude".into(),
-            backend: AcpBackend::Claude,
-            available: true,
-            source: crate::AgentSource::Builtin,
-        };
-        let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["id"], "claude");
-        assert_eq!(json["backend"], "claude");
-        assert_eq!(json["available"], true);
-        assert_eq!(json["source"], "builtin");
     }
 
     #[test]
