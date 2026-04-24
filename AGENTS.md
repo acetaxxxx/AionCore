@@ -163,9 +163,9 @@ Prohibited:
 > - Do NOT run `cargo test --workspace` at the start of a task.
 >
 > ⚠️ **Performance:**
+> - `cargo clippy --workspace` takes several minutes — use `run_in_background: true`.
 > - `cargo test --workspace` takes 10+ minutes. MUST use `run_in_background: true` when calling via Bash tool, otherwise it will timeout.
-> - `cargo clippy --workspace` also takes several minutes — use `run_in_background: true`.
-> - `cargo test -p aionui-<crate>` and `cargo clippy -p aionui-<crate>` typically complete in under 1 minute.
+> - `cargo clippy -p aionui-<crate>` and `cargo test -p aionui-<crate>` typically complete in under 1 minute.
 
 ### During Development (fast feedback loop)
 
