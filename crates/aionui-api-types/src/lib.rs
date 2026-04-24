@@ -1,5 +1,6 @@
 //! All HTTP request/response DTOs shared across the API surface.
 mod acp;
+mod agent;
 mod agent_discovery;
 mod assistant;
 mod auth;
@@ -23,10 +24,11 @@ mod team;
 mod websocket;
 
 pub use acp::{
-    AcpAgentInfo, AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AcpModeResponse,
+    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AcpModeResponse,
     DetectCliRequest, DetectCliResponse, ProbeModelRequest, SetConfigOptionRequest, SetModeRequest,
     SetModelRequest, TestCustomAgentRequest, TestCustomAgentResponse,
 };
+pub use agent::AgentInfo;
 pub use agent_discovery::{AgentSource, DetectedAgent, EnvVar};
 pub use assistant::{
     AssistantResponse, AssistantSource, CreateAssistantRequest, ImportAssistantsRequest,

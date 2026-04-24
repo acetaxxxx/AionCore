@@ -10,10 +10,10 @@ use sha2::{Digest, Sha256};
 use tower_http::cors::{Any, CorsLayer};
 
 use aionui_ai_agent::{
-    AcpRouterState, AcpSkillManager, AgentFactoryDeps, AgentRegistry, AuxiliaryRouterState,
-    ConnectionTestRouterState, ConnectionTestService, IWorkerTaskManager, RemoteAgentRouterState,
-    RemoteAgentService, WorkerTaskManagerImpl, acp_routes, auxiliary_routes, build_agent_factory,
-    connection_test_routes, remote_agent_routes,
+    AcpRouterState, AcpSkillManager, AgentFactoryDeps, AgentRegistry, AgentRouterState,
+    AuxiliaryRouterState, ConnectionTestRouterState, ConnectionTestService, IWorkerTaskManager,
+    RemoteAgentRouterState, RemoteAgentService, WorkerTaskManagerImpl, acp_routes, agent_routes,
+    auxiliary_routes, build_agent_factory, connection_test_routes, remote_agent_routes,
 };
 use aionui_api_types::{AgentSource, DetectedAgent, EnvVar};
 use aionui_assistant::{
@@ -229,6 +229,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub agent: AgentRouterState,
 }
 
 /// Convert extension-contributed ACP adapters into `DetectedAgent` values.
@@ -300,6 +301,9 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
         office: build_office_state(services),
         shell: build_shell_state(services),
         assistant,
+        agent: AgentRouterState {
+            agent_registry: services.agent_registry.clone(),
+        },
     }
 }
 
@@ -444,7 +448,6 @@ pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterStat
 pub fn build_acp_state(services: &AppServices) -> AcpRouterState {
     AcpRouterState {
         worker_task_manager: services.worker_task_manager.clone(),
-        agent_registry: services.agent_registry.clone(),
     }
 }
 
@@ -797,6 +800,10 @@ pub fn create_router_with_all_state(
     let acp_authenticated = acp_routes(states.acp)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // Unified agent listing/refresh/test routes protected by auth middleware
+    let agent_authenticated = agent_routes(states.agent)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Connection test routes (Bedrock, Gemini) protected by auth middleware
     let connection_test_authenticated = connection_test_routes(states.connection_test)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -869,6 +876,7 @@ pub fn create_router_with_all_state(
         .merge(conversation_authenticated)
         .merge(remote_agent_authenticated)
         .merge(acp_authenticated)
+        .merge(agent_authenticated)
         .merge(connection_test_authenticated)
         .merge(auxiliary_authenticated)
         .merge(file_authenticated)
