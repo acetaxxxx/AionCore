@@ -337,9 +337,7 @@ mod tests {
         let registry = AgentRegistry::new();
         registry.initialize(vec![], vec![]).await;
         let agents = registry.get_all().await;
-        assert!(agents
-            .iter()
-            .any(|a| a.agent_type == AgentType::Aionrs));
+        assert!(agents.iter().any(|a| a.agent_type == AgentType::Aionrs));
     }
 
     #[tokio::test]

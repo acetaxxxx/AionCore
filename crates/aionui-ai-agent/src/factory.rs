@@ -54,11 +54,10 @@ async fn build_agent(
 ) -> Result<AgentManagerHandle, AppError> {
     let conversation_id = options.conversation_id.clone();
     let workspace = if options.workspace.is_empty() {
-        let dir = deps.data_dir.join("tmp").join(format!(
-            "{:?}-temp-{}",
-            options.agent_type,
-            now_ms()
-        ));
+        let dir =
+            deps.data_dir
+                .join("tmp")
+                .join(format!("{:?}-temp-{}", options.agent_type, now_ms()));
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Internal(format!("Failed to create temp workspace: {e}")))?;
         dir.to_string_lossy().into_owned()

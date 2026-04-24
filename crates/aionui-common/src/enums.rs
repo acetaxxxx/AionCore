@@ -359,7 +359,10 @@ mod tests {
 
     #[test]
     fn test_agent_type_display_names() {
-        assert_eq!(AgentType::OpenclawGateway.display_name(), "OpenClaw Gateway");
+        assert_eq!(
+            AgentType::OpenclawGateway.display_name(),
+            "OpenClaw Gateway"
+        );
         assert_eq!(AgentType::Aionrs.display_name(), "Aion CLI");
         assert_eq!(AgentType::Nanobot.display_name(), "Nanobot");
         assert_eq!(AgentType::Gemini.display_name(), "Gemini");
