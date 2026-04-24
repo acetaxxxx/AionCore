@@ -17,19 +17,26 @@ pub struct DetectCliResponse {
     pub path: Option<String>,
 }
 
-/// Information about an available agent (ACP or non-ACP execution engine).
-///
-/// The `backend` field is a free-form string rather than `AcpBackend` because
-/// the frontend consumer (`getAvailableAgents`) lists both ACP CLIs and
-/// execution engines that live outside the `AcpBackend` enum — Gemini,
-/// Aionrs, nanobot, openclaw-gateway — which the renderer references by
-/// string tag (see AionUi `src/renderer/pages/settings/AionrsSettings.tsx`).
+/// Information about an available ACP agent (public API shape).
 #[derive(Debug, Clone, Serialize)]
 pub struct AcpAgentInfo {
     pub id: String,
     pub name: String,
-    pub backend: String,
+    pub backend: AcpBackend,
     pub available: bool,
+    pub source: crate::AgentSource,
+}
+
+impl From<crate::DetectedAgent> for AcpAgentInfo {
+    fn from(a: crate::DetectedAgent) -> Self {
+        Self {
+            id: a.id,
+            name: a.name,
+            backend: a.backend,
+            available: a.available,
+            source: a.source,
+        }
+    }
 }
 
 /// Request body for ACP health check.
@@ -134,13 +141,15 @@ mod tests {
         let info = AcpAgentInfo {
             id: "claude".into(),
             name: "Claude".into(),
-            backend: "claude".into(),
+            backend: AcpBackend::Claude,
             available: true,
+            source: crate::AgentSource::Builtin,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "claude");
         assert_eq!(json["backend"], "claude");
         assert_eq!(json["available"], true);
+        assert_eq!(json["source"], "builtin");
     }
 
     #[test]
