@@ -2,6 +2,7 @@
 mod acp;
 mod agent;
 mod agent_discovery;
+mod assistant;
 mod auth;
 mod channel;
 mod confirmation;
@@ -29,6 +30,10 @@ pub use acp::{
 };
 pub use agent::AgentInfo;
 pub use agent_discovery::{AgentSource, DetectedAgent, EnvVar};
+pub use assistant::{
+    AssistantResponse, AssistantSource, CreateAssistantRequest, ImportAssistantsRequest,
+    ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
+};
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser,
     QrLoginRequest, RefreshResponse, RefreshTokenRequest, UserInfoResponse, WsTokenResponse,
@@ -95,9 +100,10 @@ pub use office::{
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest,
-    DetectionSuggestion, FetchModelsRequest, FetchModelsResponse, HealthStatus, KeyTestResult,
-    ModelCapability, ModelHealthStatus, ModelInfo, ModelType, MultiKeyResult,
-    ProtocolDetectionResponse, ProviderResponse, SuggestionType, UpdateProviderRequest,
+    DetectionSuggestion, FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse,
+    HealthStatus, KeyTestResult, ModelCapability, ModelHealthStatus, ModelInfo, ModelType,
+    MultiKeyResult, ProtocolDetectionResponse, ProviderResponse, SuggestionType,
+    UpdateProviderRequest,
 };
 pub use remote_agent::{
     CreateRemoteAgentRequest, HandshakeResponse, RemoteAgentListItem, RemoteAgentResponse,
@@ -111,11 +117,12 @@ pub use shell::{
     ToolType,
 };
 pub use skill::{
-    AddExternalPathRequest, DeleteSkillRequest, ExportSkillRequest, ExternalSkillSourceResponse,
-    ImportSkillRequest, ImportSkillResponse, NamedPathResponse, ReadAssistantRuleRequest,
+    AddExternalPathRequest, BuiltinAutoSkillResponse, DeleteSkillRequest, ExportSkillRequest,
+    ExternalSkillSourceResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
+    MaterializeSkillsResponse, NamedPathResponse, ReadAssistantRuleRequest,
     ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse,
     RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
-    SkillListItemResponse, SkillPathsResponse, WriteAssistantRuleRequest,
+    SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
 pub use system::{
     ClientPreferencesResponse, SystemSettingsResponse, UpdateClientPreferencesRequest,

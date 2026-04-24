@@ -1,3 +1,4 @@
+pub mod assistant;
 pub mod channel;
 mod client_preference;
 pub mod conversation;
@@ -7,6 +8,7 @@ pub mod oauth_token;
 pub mod provider;
 pub mod remote_agent;
 mod settings;
+mod sqlite_assistant;
 mod sqlite_channel;
 mod sqlite_client_preference;
 mod sqlite_conversation;
@@ -21,6 +23,7 @@ mod sqlite_user;
 pub mod team;
 mod user;
 
+pub use assistant::{IAssistantOverrideRepository, IAssistantRepository};
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
 pub use conversation::IConversationRepository;
@@ -30,6 +33,7 @@ pub use oauth_token::IOAuthTokenRepository;
 pub use provider::IProviderRepository;
 pub use remote_agent::IRemoteAgentRepository;
 pub use settings::ISettingsRepository;
+pub use sqlite_assistant::{SqliteAssistantOverrideRepository, SqliteAssistantRepository};
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;
 pub use sqlite_conversation::SqliteConversationRepository;

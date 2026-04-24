@@ -1,4 +1,6 @@
 //! Extension registry: manifest parsing, hub installer, skill scanning, and lifecycle hooks.
+
+pub mod classifier;
 pub mod constants;
 pub mod dependency;
 pub mod error;
@@ -20,6 +22,7 @@ pub mod template;
 pub mod types;
 pub mod watcher;
 
+pub use classifier::{AssistantClassifier, AssistantRuleDispatcher, DefaultUserClassifier};
 pub use constants::*;
 pub use dependency::{
     DependencyIssue, DependencyValidationResult, topological_sort, validate_dependencies,
@@ -44,9 +47,11 @@ pub use hub_routes::{HubRouterState, hub_routes};
 pub use routes::{ExtensionRouterState, extension_routes};
 pub use skill_routes::{SkillRouterState, skill_routes};
 pub use skill_service::{
-    ExternalSkillSource, NamedPath, ScannedSkill, SkillListItem, SkillPaths, delete_skill,
-    detect_and_count_external_skills, detect_common_skill_paths, export_skill_with_symlink,
-    get_skill_paths, import_skill, import_skill_with_symlink, list_available_skills,
+    BUILTIN_SKILLS_ENV_VAR, BuiltinAutoSkillItem, ExternalSkillSource, NamedPath, ScannedSkill,
+    SkillListItem, SkillPaths, SkillSource, cleanup_agent_skills, cleanup_orphan_agent_skills,
+    delete_skill, detect_and_count_external_skills, detect_common_skill_paths,
+    export_skill_with_symlink, get_skill_paths, import_skill, import_skill_with_symlink,
+    list_available_skills, list_builtin_auto_skills, materialize_skills_for_agent,
     read_builtin_rule, read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills,
 };
 pub use skill_service::{

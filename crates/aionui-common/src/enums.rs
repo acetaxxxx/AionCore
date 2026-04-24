@@ -447,6 +447,18 @@ mod tests {
     }
 
     #[test]
+    fn acp_backend_rejects_non_acp_engine_names() {
+        // Non-ACP execution engines are dispatched via AgentType, not AcpBackend.
+        // Rejecting them at the HTTP deserialization boundary prevents accidental
+        // regression where a future change re-adds one of these variants.
+        for name in ["gemini", "nanobot", "remote", "aionrs", "openclaw-gateway"] {
+            let json = format!("\"{name}\"");
+            let result: Result<AcpBackend, _> = serde_json::from_str(&json);
+            assert!(result.is_err(), "AcpBackend should not accept {name:?}");
+        }
+    }
+
+    #[test]
     fn test_protocol_type_openai() {
         let val = ProtocolType::OpenAI;
         let json = serde_json::to_string(&val).unwrap();

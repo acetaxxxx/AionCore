@@ -61,6 +61,23 @@ pub const BUILTIN_SKILLS_DIR_NAME: &str = "builtin-skills";
 /// Default subdirectory name for built-in rules.
 pub const BUILTIN_RULES_DIR_NAME: &str = "builtin-rules";
 
+/// Subdirectory inside the built-in skills corpus whose children are
+/// auto-injected into every assistant. Historical name was `_builtin`;
+/// renamed to `auto-inject` as part of the 2026-04-23 built-in skill
+/// migration (skills are now embedded in the backend binary via
+/// `include_dir!`).
+pub const BUILTIN_AUTO_SKILLS_SUBDIR: &str = "auto-inject";
+
+/// Subdirectory under `data_dir` where the lazily materialized built-in
+/// skills "view" lives. Consumers (e.g. SkillsHubSettings export-symlink
+/// flow) need a real on-disk source path, even though the canonical
+/// corpus is embedded in the binary. See `skill_service::list_skills`.
+pub const BUILTIN_SKILLS_VIEW_SUBDIR: &str = "builtin-skills-view";
+
+/// Subdirectory under `data_dir` where per-conversation materialized
+/// skill directories are written for the gemini agent.
+pub const AGENT_SKILLS_SUBDIR: &str = "agent-skills";
+
 /// Default subdirectory name for assistant-level rules.
 pub const ASSISTANT_RULES_DIR_NAME: &str = "assistant-rules";
 
@@ -85,10 +102,17 @@ pub const SKILLS_MARKET_NAME: &str = "aionui-skills";
 pub const SKILLS_MARKET_PATH: &str = "https://github.com/AionUI/aionui-skills";
 
 /// Common skill directory names to detect on the filesystem.
-pub const COMMON_SKILL_DIRS: &[(&str, &str)] = &[
-    ("Claude Skills", ".claude/skills"),
-    ("Gemini Skills", ".gemini/skills"),
-    ("Agents", ".agents"),
+///
+/// Each tuple is `(display_name, relative_path, source_slug)`:
+/// - `display_name` — user-facing label (e.g. the tab title).
+/// - `relative_path` — path under the user's home directory.
+/// - `source_slug` — stable machine-readable identifier mirrored to
+///   the renderer as `ExternalSkillSourceResponse.source`. Used as a
+///   React key and `data-testid` suffix in `SkillsHubSettings.tsx`.
+pub const COMMON_SKILL_DIRS: &[(&str, &str, &str)] = &[
+    ("Claude Skills", ".claude/skills", "claude"),
+    ("Gemini Skills", ".gemini/skills", "gemini"),
+    ("Agents", ".agents", "agents"),
 ];
 
 #[cfg(test)]
