@@ -144,7 +144,7 @@ async fn builtin_skill_read_auto_inject_returns_frontmatter_content() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"fileName": "auto-inject/cron/SKILL.md"}),
+            json!({"file_name": "auto-inject/cron/SKILL.md"}),
             &fx.token,
             &fx.csrf,
         ))
@@ -169,7 +169,7 @@ async fn builtin_skill_read_opt_in_returns_frontmatter_content() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"fileName": "mermaid/SKILL.md"}),
+            json!({"file_name": "mermaid/SKILL.md"}),
             &fx.token,
             &fx.csrf,
         ))
@@ -191,7 +191,7 @@ async fn builtin_skill_missing_file_returns_empty_string() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"fileName": "unknown/SKILL.md"}),
+            json!({"file_name": "unknown/SKILL.md"}),
             &fx.token,
             &fx.csrf,
         ))
@@ -218,7 +218,7 @@ async fn builtin_skill_rejects_traversal() {
             .oneshot(json_with_token(
                 "POST",
                 "/api/skills/builtin-skill",
-                json!({"fileName": bad}),
+                json!({"file_name": bad}),
                 &fx.token,
                 &fx.csrf,
             ))
@@ -227,7 +227,7 @@ async fn builtin_skill_rejects_traversal() {
         assert_eq!(
             resp.status(),
             StatusCode::BAD_REQUEST,
-            "fileName={bad:?} should be rejected",
+            "file_name={bad:?} should be rejected",
         );
     }
 }
@@ -259,7 +259,7 @@ async fn list_skills_builtin_entries_carry_relative_location() {
         match item["source"].as_str().unwrap() {
             "builtin" => {
                 saw_builtin = true;
-                let rel = item["relativeLocation"].as_str().unwrap();
+                let rel = item["relative_location"].as_str().unwrap();
                 assert!(rel.ends_with("/SKILL.md"));
                 let loc = item["location"].as_str().unwrap();
                 assert!(
@@ -274,7 +274,7 @@ async fn list_skills_builtin_entries_carry_relative_location() {
             }
             "custom" => {
                 saw_custom = true;
-                assert!(item.get("relativeLocation").is_none());
+                assert!(item.get("relative_location").is_none());
                 assert!(item.get("relative_location").is_none());
                 assert_eq!(item["name"], "my-custom");
             }
@@ -300,8 +300,8 @@ async fn materialize_for_agent_writes_auto_inject_flat() {
             "POST",
             "/api/skills/materialize-for-agent",
             json!({
-                "conversationId": "conv-happy",
-                "enabledSkills": [],
+                "conversation_id": "conv-happy",
+                "enabled_skills": [],
             }),
             &fx.token,
             &fx.csrf,
@@ -310,9 +310,9 @@ async fn materialize_for_agent_writes_auto_inject_flat() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json: Value = body_json(resp).await;
-    let dir_path = json["data"]["dirPath"].as_str().unwrap().to_owned();
+    let dir_path = json["data"]["dir_path"].as_str().unwrap().to_owned();
     let dir = std::path::Path::new(&dir_path);
-    assert!(dir.is_absolute(), "dirPath must be absolute: {dir_path}");
+    assert!(dir.is_absolute(), "dir_path must be absolute: {dir_path}");
     assert!(dir.is_dir(), "agent-skills dir must exist: {dir_path}");
     assert!(
         dir.join("cron").join("SKILL.md").exists(),
@@ -336,8 +336,8 @@ async fn materialize_for_agent_includes_opt_in_skill() {
             "POST",
             "/api/skills/materialize-for-agent",
             json!({
-                "conversationId": "conv-opt",
-                "enabledSkills": ["mermaid"],
+                "conversation_id": "conv-opt",
+                "enabled_skills": ["mermaid"],
             }),
             &fx.token,
             &fx.csrf,
@@ -346,7 +346,7 @@ async fn materialize_for_agent_includes_opt_in_skill() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json: Value = body_json(resp).await;
-    let dir_path = json["data"]["dirPath"].as_str().unwrap().to_owned();
+    let dir_path = json["data"]["dir_path"].as_str().unwrap().to_owned();
     assert!(
         std::path::Path::new(&dir_path)
             .join("mermaid")
@@ -367,8 +367,8 @@ async fn materialize_for_agent_silently_skips_unknown_skill() {
             "POST",
             "/api/skills/materialize-for-agent",
             json!({
-                "conversationId": "conv-bogus",
-                "enabledSkills": ["this-does-not-exist"],
+                "conversation_id": "conv-bogus",
+                "enabled_skills": ["this-does-not-exist"],
             }),
             &fx.token,
             &fx.csrf,
@@ -377,7 +377,7 @@ async fn materialize_for_agent_silently_skips_unknown_skill() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json: Value = body_json(resp).await;
-    let dir_path = json["data"]["dirPath"].as_str().unwrap().to_owned();
+    let dir_path = json["data"]["dir_path"].as_str().unwrap().to_owned();
     assert!(std::path::Path::new(&dir_path).is_dir());
     // Unknown skill does not materialize into a subdir.
     assert!(
@@ -399,14 +399,14 @@ async fn materialize_for_agent_fresh_on_each_call() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/materialize-for-agent",
-            json!({"conversationId": "conv-fresh", "enabledSkills": []}),
+            json!({"conversation_id": "conv-fresh", "enabled_skills": []}),
             &fx.token,
             &fx.csrf,
         ))
         .await
         .unwrap();
     let json1 = body_json(resp1).await;
-    let dir = json1["data"]["dirPath"].as_str().unwrap().to_owned();
+    let dir = json1["data"]["dir_path"].as_str().unwrap().to_owned();
 
     // Sentinel file under the materialized dir.
     std::fs::write(
@@ -422,14 +422,14 @@ async fn materialize_for_agent_fresh_on_each_call() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/materialize-for-agent",
-            json!({"conversationId": "conv-fresh", "enabledSkills": []}),
+            json!({"conversation_id": "conv-fresh", "enabled_skills": []}),
             &fx.token,
             &fx.csrf,
         ))
         .await
         .unwrap();
     let json2 = body_json(resp2).await;
-    let dir2 = json2["data"]["dirPath"].as_str().unwrap().to_owned();
+    let dir2 = json2["data"]["dir_path"].as_str().unwrap().to_owned();
     assert_eq!(dir, dir2);
     assert!(
         !std::path::Path::new(&dir2).join("sentinel.txt").exists(),
@@ -447,7 +447,7 @@ async fn materialize_for_agent_rejects_empty_conversation_id() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/materialize-for-agent",
-            json!({"conversationId": "", "enabledSkills": []}),
+            json!({"conversation_id": "", "enabled_skills": []}),
             &fx.token,
             &fx.csrf,
         ))
@@ -466,7 +466,7 @@ async fn materialize_for_agent_rejects_traversal_in_conversation_id() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/materialize-for-agent",
-            json!({"conversationId": "../evil", "enabledSkills": []}),
+            json!({"conversation_id": "../evil", "enabled_skills": []}),
             &fx.token,
             &fx.csrf,
         ))
@@ -489,7 +489,7 @@ async fn cleanup_for_agent_is_idempotent() {
         .oneshot(json_with_token(
             "POST",
             "/api/skills/materialize-for-agent",
-            json!({"conversationId": "conv-del", "enabledSkills": []}),
+            json!({"conversation_id": "conv-del", "enabled_skills": []}),
             &fx.token,
             &fx.csrf,
         ))
