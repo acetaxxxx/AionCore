@@ -52,6 +52,7 @@ Never introduce circular dependencies or upward references.
 | `POST /login`, `/api/auth/*` | aionui-auth | Public (rate-limited) |
 | `POST /logout`, `/api/auth/user`, `/api/auth/change-password`, `/api/ws-token` | aionui-auth | Yes |
 | `/api/conversations/*`, `/api/messages/*` | aionui-conversation | Yes |
+| `/api/agents`, `/api/agents/refresh`, `/api/agents/test` | aionui-ai-agent | Yes |
 | `/api/acp/*`, `/api/conversations/{id}/acp/*` | aionui-ai-agent | Yes |
 | `/api/bedrock/*`, `/api/gemini/*` | aionui-ai-agent | Yes |
 | `/api/conversations/{id}/workspace`, `/api/conversations/{id}/side-question`, `/api/conversations/{id}/slash-commands`, `/api/conversations/{id}/reload-context` | aionui-ai-agent | Yes |
