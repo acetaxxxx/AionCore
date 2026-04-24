@@ -63,17 +63,11 @@ pub enum AcpBackend {
     Opencode,
     Copilot,
     Qoder,
-    #[serde(rename = "openclaw-gateway")]
-    OpenclawGateway,
     Vibe,
-    Nanobot,
     Cursor,
     Kiro,
     Hermes,
     Snow,
-    Remote,
-    Aionrs,
-    Custom,
 }
 
 impl AcpBackend {
@@ -93,7 +87,6 @@ impl AcpBackend {
         AcpBackend::Kimi,
         AcpBackend::Qoder,
         AcpBackend::Vibe,
-        AcpBackend::Nanobot,
         AcpBackend::Hermes,
         AcpBackend::Snow,
     ];
@@ -114,15 +107,9 @@ impl AcpBackend {
             AcpBackend::Kimi => Some("kimi"),
             AcpBackend::Qoder => Some("qoder"),
             AcpBackend::Vibe => Some("vibe"),
-            AcpBackend::Nanobot => Some("nanobot"),
             AcpBackend::Hermes => Some("hermes"),
             AcpBackend::Snow => Some("snow"),
-            AcpBackend::IFlow
-            | AcpBackend::Gemini
-            | AcpBackend::OpenclawGateway
-            | AcpBackend::Remote
-            | AcpBackend::Aionrs
-            | AcpBackend::Custom => None,
+            AcpBackend::IFlow | AcpBackend::Gemini => None,
         }
     }
 
@@ -147,16 +134,11 @@ impl AcpBackend {
             AcpBackend::Opencode => "OpenCode",
             AcpBackend::Copilot => "Copilot",
             AcpBackend::Qoder => "Qoder",
-            AcpBackend::OpenclawGateway => "OpenClaw Gateway",
             AcpBackend::Vibe => "Vibe",
-            AcpBackend::Nanobot => "Nanobot",
             AcpBackend::Cursor => "Cursor",
             AcpBackend::Kiro => "Kiro",
             AcpBackend::Hermes => "Hermes",
             AcpBackend::Snow => "Snow",
-            AcpBackend::Remote => "Remote",
-            AcpBackend::Aionrs => "Aionrs",
-            AcpBackend::Custom => "Custom",
         }
     }
 
@@ -205,9 +187,8 @@ impl AcpBackend {
             AcpBackend::Hermes => Some(&["acp"]),
             AcpBackend::Snow => Some(&["--acp"]),
             AcpBackend::Qwen => Some(&["--acp"]),
-            AcpBackend::Nanobot => Some(&["--experimental-acp"]),
             // Non-CLI backends
-            _ => None,
+            AcpBackend::IFlow | AcpBackend::Gemini => None,
         }
     }
 }
@@ -451,7 +432,6 @@ mod tests {
             (AcpBackend::Claude, "claude"),
             (AcpBackend::Codebuddy, "codebuddy"),
             (AcpBackend::Opencode, "opencode"),
-            (AcpBackend::OpenclawGateway, "openclaw-gateway"),
             (AcpBackend::Hermes, "hermes"),
             (AcpBackend::Snow, "snow"),
         ];
@@ -560,10 +540,6 @@ mod tests {
     fn test_acp_backend_cli_binary_name_none() {
         assert_eq!(AcpBackend::IFlow.cli_binary_name(), None);
         assert_eq!(AcpBackend::Gemini.cli_binary_name(), None);
-        assert_eq!(AcpBackend::OpenclawGateway.cli_binary_name(), None);
-        assert_eq!(AcpBackend::Remote.cli_binary_name(), None);
-        assert_eq!(AcpBackend::Aionrs.cli_binary_name(), None);
-        assert_eq!(AcpBackend::Custom.cli_binary_name(), None);
     }
 
     #[test]
@@ -572,10 +548,6 @@ mod tests {
         assert_eq!(AcpBackend::IFlow.display_name(), "iFlow");
         assert_eq!(AcpBackend::Codebuddy.display_name(), "CodeBuddy");
         assert_eq!(AcpBackend::Opencode.display_name(), "OpenCode");
-        assert_eq!(
-            AcpBackend::OpenclawGateway.display_name(),
-            "OpenClaw Gateway"
-        );
     }
 
     #[test]
