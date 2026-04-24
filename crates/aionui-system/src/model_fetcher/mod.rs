@@ -127,6 +127,7 @@ mod tests {
         let encrypted = encrypt_string(api_key, &TEST_KEY).unwrap();
         let row = repo
             .create(CreateProviderParams {
+                id: None,
                 platform,
                 name: "Test",
                 base_url,

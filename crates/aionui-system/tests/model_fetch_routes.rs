@@ -62,6 +62,7 @@ async fn create_provider(
     let encrypted = encrypt_string(api_key, &TEST_KEY).unwrap();
     let row = repo
         .create(CreateProviderParams {
+            id: None,
             platform,
             name: "Test Provider",
             base_url,
