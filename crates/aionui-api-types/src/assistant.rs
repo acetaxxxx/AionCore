@@ -236,32 +236,29 @@ mod tests {
 
     #[test]
     fn assistant_response_rejects_camel_case() {
-        // Regression: after T1 this pilot removes rename_all = "camelCase".
-        // Ensure a camelCase body does NOT get aliased into snake fields —
-        // a payload carrying both keys must always bind the snake value.
+        // Body has BOTH snake_case (valid required values) AND camelCase aliases.
+        // Prove: snake is consumed; camel is silently ignored (NOT aliased over snake).
         let json = serde_json::json!({
             "id": "a1",
             "source": "user",
             "name": "X",
             "enabled": true,
-            "sort_order": 5,
-            "preset_agent_type": "gemini",
-            "presetAgentType": "should-be-ignored",
-            "sortOrder": 999,
-            "lastUsedAt": 42,
+            "sort_order": 7,                   // snake required field
+            "preset_agent_type": "gemini",     // snake required field
+            "presetAgentType": "claude",       // legacy camel — must be ignored
+            "sortOrder": 99,                   // legacy camel — must be ignored
+            "lastUsedAt": 111_222,             // legacy camel for optional field — must be ignored
         });
         let resp: AssistantResponse = serde_json::from_value(json).unwrap();
+        // If camel were aliased, these would be the camel values.
         assert_eq!(
             resp.preset_agent_type, "gemini",
-            "presetAgentType must NOT alias into preset_agent_type"
+            "snake_case preset_agent_type must win"
         );
-        assert_eq!(
-            resp.sort_order, 5,
-            "sortOrder must NOT alias into sort_order"
-        );
-        assert_eq!(
-            resp.last_used_at, None,
-            "lastUsedAt must NOT alias into last_used_at"
+        assert_eq!(resp.sort_order, 7, "snake_case sort_order must win");
+        assert!(
+            resp.last_used_at.is_none(),
+            "camelCase lastUsedAt must NOT alias into last_used_at"
         );
     }
 }
