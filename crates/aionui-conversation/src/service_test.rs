@@ -240,7 +240,11 @@ fn make_service() -> (
 ) {
     let repo = Arc::new(MockRepo::new());
     let broadcaster = Arc::new(MockBroadcaster::new());
-    let svc = ConversationService::new(repo.clone(), broadcaster.clone());
+    let svc = ConversationService::new_with_workspace_root(
+        repo.clone(),
+        broadcaster.clone(),
+        std::path::PathBuf::from(std::env::temp_dir()),
+    );
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
     (svc, broadcaster, repo, task_mgr)
 }

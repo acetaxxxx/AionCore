@@ -31,6 +31,7 @@ pub struct ConversationService {
     repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     delete_hooks: Vec<Arc<dyn OnConversationDelete>>,
+    workspace_root: std::path::PathBuf,
 }
 
 impl ConversationService {
@@ -42,6 +43,20 @@ impl ConversationService {
             repo,
             broadcaster,
             delete_hooks: Vec::new(),
+            workspace_root: std::path::PathBuf::from("data"),
+        }
+    }
+
+    pub fn new_with_workspace_root(
+        repo: Arc<dyn IConversationRepository>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        workspace_root: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            repo,
+            broadcaster,
+            delete_hooks: Vec::new(),
+            workspace_root,
         }
     }
 
@@ -54,6 +69,7 @@ impl ConversationService {
             repo,
             broadcaster,
             delete_hooks,
+            workspace_root: std::path::PathBuf::from("data"),
         }
     }
 
@@ -70,12 +86,20 @@ impl ConversationService {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
+        let mut extra = req.extra;
+        if extra.get("workspace").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+            let ws_path = self.workspace_root.join("workspaces").join(&id);
+            std::fs::create_dir_all(&ws_path)
+                .map_err(|e| AppError::Internal(format!("Failed to create workspace: {e}")))?;
+            extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
+        }
+
         let row = aionui_db::models::ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.unwrap_or_default(),
             r#type: enum_to_db(&req.r#type)?,
-            extra: serde_json::to_string(&req.extra)
+            extra: serde_json::to_string(&extra)
                 .map_err(|e| AppError::Internal(format!("Failed to serialize extra: {e}")))?,
             model: req
                 .model
