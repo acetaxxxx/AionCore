@@ -4,13 +4,46 @@ use serde::{Deserialize, Serialize};
 // A. Skill list & info
 // ---------------------------------------------------------------------------
 
+/// Origin of a listed skill — `builtin`, `custom`, or `extension`.
+///
+/// Matches the renderer contract in
+/// `src/common/adapter/ipcBridge.ts::listAvailableSkills`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillSourceResponse {
+    Builtin,
+    Custom,
+    Extension,
+}
+
 /// Single item in the available skills list (`GET /api/skills`).
+///
+/// For `source=builtin` entries, `location` is a synthesized absolute path
+/// under `{data_dir}/builtin-skills-view/{name}/SKILL.md` (lazily
+/// materialized from the embedded corpus so the export-symlink flow can
+/// resolve it), and `relative_location` carries the path the frontend
+/// passes back into `POST /api/skills/builtin-skill` (e.g.
+/// `"auto-inject/cron/SKILL.md"` or `"{name}/SKILL.md"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillListItemResponse {
     pub name: String,
     pub description: String,
     pub location: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_location: Option<String>,
     pub is_custom: bool,
+    pub source: SkillSourceResponse,
+}
+
+/// An auto-injected built-in skill (`GET /api/skills/builtin-auto`).
+///
+/// `location` is the relative path the frontend passes back into
+/// `POST /api/skills/builtin-skill` (e.g. `"auto-inject/cron/SKILL.md"`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BuiltinAutoSkillResponse {
+    pub name: String,
+    pub description: String,
+    pub location: String,
 }
 
 /// Request body for `POST /api/skills/info`.
@@ -80,10 +113,16 @@ pub struct ScanForSkillsResponse {
 }
 
 /// An external skill source with count (`GET /api/skills/detect-external`).
+///
+/// `source` is a stable slug identifying the origin (e.g. `"claude"`,
+/// `"gemini"`, `"agents"`, or `"custom-<abs-path>"` for user-added paths).
+/// The renderer uses it as a React key and `data-testid` suffix in
+/// `SkillsHubSettings.tsx`, so it must be unique across the returned list.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExternalSkillSourceResponse {
     pub name: String,
     pub path: String,
+    pub source: String,
     pub skill_count: usize,
     pub skills: Vec<ScannedSkillResponse>,
 }
@@ -132,6 +171,20 @@ pub struct ReadBuiltinResourceRequest {
     pub file_name: String,
 }
 
+/// Request body for `POST /api/skills/materialize-for-agent`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MaterializeSkillsRequest {
+    pub conversation_id: String,
+    #[serde(default)]
+    pub enabled_skills: Vec<String>,
+}
+
+/// Response for `POST /api/skills/materialize-for-agent`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MaterializeSkillsResponse {
+    pub dir_path: String,
+}
+
 // ---------------------------------------------------------------------------
 // E. External path management
 // ---------------------------------------------------------------------------
@@ -162,19 +215,111 @@ mod tests {
             name: "my-skill".into(),
             description: "Does things".into(),
             location: "/home/user/.aionui/skills/my-skill".into(),
+            relative_location: None,
             is_custom: true,
+            source: SkillSourceResponse::Custom,
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["name"], "my-skill");
+        // Project-wide wire contract: field names are snake_case.
         assert_eq!(json["is_custom"], true);
         assert!(json.get("isCustom").is_none());
+        assert_eq!(json["source"], "custom");
+        // Absent for custom source — Option<String>::None is skipped.
+        assert!(json.get("relative_location").is_none());
+        assert!(json.get("relativeLocation").is_none());
+    }
+
+    #[test]
+    fn test_skill_list_item_builtin_with_relative_location() {
+        let item = SkillListItemResponse {
+            name: "cron".into(),
+            description: "Schedule recurring tasks".into(),
+            location: "/home/user/.aionui/builtin-skills-view/cron/SKILL.md".into(),
+            relative_location: Some("auto-inject/cron/SKILL.md".into()),
+            is_custom: false,
+            source: SkillSourceResponse::Builtin,
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        // Project-wide wire contract: relative_location stays snake_case.
+        assert_eq!(json["relative_location"], "auto-inject/cron/SKILL.md");
+        assert!(json.get("relativeLocation").is_none());
+        assert_eq!(json["source"], "builtin");
+    }
+
+    #[test]
+    fn test_skill_list_item_deserializes_snake_case() {
+        // Frontend wire format → backend deserialization round-trip.
+        let raw = json!({
+            "name": "cron",
+            "description": "Schedule",
+            "location": "/tmp/view/cron/SKILL.md",
+            "relative_location": "auto-inject/cron/SKILL.md",
+            "is_custom": false,
+            "source": "builtin",
+        });
+        let item: SkillListItemResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(item.name, "cron");
+        assert!(!item.is_custom);
+        assert_eq!(
+            item.relative_location.as_deref(),
+            Some("auto-inject/cron/SKILL.md")
+        );
+    }
+
+    #[test]
+    fn test_materialize_request_roundtrip() {
+        let raw = json!({
+            "conversation_id": "conv-abc",
+            "enabled_skills": ["mermaid", "pdf"],
+        });
+        let req: MaterializeSkillsRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.conversation_id, "conv-abc");
+        assert_eq!(req.enabled_skills, vec!["mermaid", "pdf"]);
+    }
+
+    #[test]
+    fn test_materialize_request_default_enabled() {
+        let raw = json!({"conversation_id": "conv-abc"});
+        let req: MaterializeSkillsRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.enabled_skills.is_empty());
+    }
+
+    #[test]
+    fn test_materialize_response_serializes_snake() {
+        let resp = MaterializeSkillsResponse {
+            dir_path: "/tmp/agent-skills/conv-abc".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["dir_path"], "/tmp/agent-skills/conv-abc");
+        assert!(json.get("dirPath").is_none());
+    }
+
+    #[test]
+    fn test_skill_source_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(SkillSourceResponse::Builtin).unwrap(),
+            serde_json::json!("builtin")
+        );
+        assert_eq!(
+            serde_json::to_value(SkillSourceResponse::Custom).unwrap(),
+            serde_json::json!("custom")
+        );
+        assert_eq!(
+            serde_json::to_value(SkillSourceResponse::Extension).unwrap(),
+            serde_json::json!("extension")
+        );
     }
 
     #[test]
     fn test_read_skill_info_request() {
+        // Project-wide wire contract: skill_path on the wire.
         let raw = json!({"skill_path": "/path/to/skill"});
         let req: ReadSkillInfoRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.skill_path, "/path/to/skill");
+        // Legacy camelCase must now fail.
+        let legacy = json!({"skillPath": "/path/to/skill"});
+        assert!(serde_json::from_value::<ReadSkillInfoRequest>(legacy).is_err());
     }
 
     #[test]
@@ -204,6 +349,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["skill_name"], "imported-skill");
+        assert!(json.get("skillName").is_none());
     }
 
     #[test]
@@ -240,6 +386,7 @@ mod tests {
         let source = ExternalSkillSourceResponse {
             name: "Claude Skills".into(),
             path: "/home/user/.claude/skills".into(),
+            source: "claude".into(),
             skill_count: 2,
             skills: vec![
                 ScannedSkillResponse {
@@ -255,8 +402,42 @@ mod tests {
             ],
         };
         let json = serde_json::to_value(&source).unwrap();
+        // Project-wide wire contract: skill_count stays snake_case.
         assert_eq!(json["skill_count"], 2);
+        assert!(json.get("skillCount").is_none());
         assert_eq!(json["skills"].as_array().unwrap().len(), 2);
+        assert_eq!(json["source"], "claude");
+    }
+
+    #[test]
+    fn test_external_skill_source_response_custom_source() {
+        let source = ExternalSkillSourceResponse {
+            name: "My Extras".into(),
+            path: "/opt/extras".into(),
+            source: "custom-/opt/extras".into(),
+            skill_count: 0,
+            skills: vec![],
+        };
+        let json = serde_json::to_value(&source).unwrap();
+        assert_eq!(json["source"], "custom-/opt/extras");
+        assert_eq!(json["name"], "My Extras");
+    }
+
+    #[test]
+    fn test_external_skill_source_response_roundtrip() {
+        let raw = json!({
+            "name": "Gemini Skills",
+            "path": "/home/user/.gemini/skills",
+            "source": "gemini",
+            "skill_count": 0,
+            "skills": []
+        });
+        let parsed: ExternalSkillSourceResponse = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(parsed.source, "gemini");
+        assert_eq!(parsed.name, "Gemini Skills");
+        assert_eq!(parsed.skill_count, 0);
+        let round = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(round, raw);
     }
 
     #[test]
@@ -277,8 +458,11 @@ mod tests {
             builtin_skills_dir: "/app/resources/skills".into(),
         };
         let json = serde_json::to_value(&resp).unwrap();
+        // Project-wide wire contract: snake_case fields on the wire.
         assert_eq!(json["user_skills_dir"], "/home/user/.aionui/skills");
         assert_eq!(json["builtin_skills_dir"], "/app/resources/skills");
+        assert!(json.get("userSkillsDir").is_none());
+        assert!(json.get("builtinSkillsDir").is_none());
     }
 
     // -- Assistant rules --
@@ -313,9 +497,14 @@ mod tests {
 
     #[test]
     fn test_read_builtin_resource_request() {
+        // Project-wide wire contract: the frontend sends `file_name`.
         let raw = json!({"file_name": "code-review.md"});
         let req: ReadBuiltinResourceRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.file_name, "code-review.md");
+
+        // Legacy camelCase now fails — matches project-wide wire contract.
+        let legacy = json!({"fileName": "code-review.md"});
+        assert!(serde_json::from_value::<ReadBuiltinResourceRequest>(legacy).is_err());
     }
 
     // -- External paths --

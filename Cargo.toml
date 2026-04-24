@@ -17,6 +17,7 @@ members = [
     "crates/aionui-channel",
     "crates/aionui-team",
     "crates/aionui-cron",
+    "crates/aionui-assistant",
     "crates/aionui-app",
 ]
 
@@ -43,6 +44,7 @@ aionui-extension = { path = "crates/aionui-extension" }
 aionui-channel = { path = "crates/aionui-channel" }
 aionui-team = { path = "crates/aionui-team" }
 aionui-cron = { path = "crates/aionui-cron" }
+aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
 # Aionrs agent engine (external git dependency)
@@ -109,6 +111,7 @@ dirs = "6"
 regex = "1"
 
 # File system
+include_dir = "0.7"
 notify = "8"
 walkdir = "2"
 ignore = "0.4"
@@ -155,3 +158,14 @@ wiremock = "0.6"
 
 # Random
 getrandom = "0.2"
+
+# Shrink target/debug: minimal debuginfo, sidecar files, no incremental cache.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+incremental = false

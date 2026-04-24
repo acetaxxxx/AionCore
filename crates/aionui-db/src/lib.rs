@@ -6,6 +6,10 @@ mod repository;
 
 pub use database::{Database, init_database, init_database_memory};
 pub use error::DbError;
+pub use models::{
+    AssistantOverrideRow, AssistantRow, CreateAssistantParams, UpdateAssistantParams,
+    UpsertOverrideParams,
+};
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, MessageRowUpdate, MessageSearchRow, SortOrder,
@@ -17,13 +21,14 @@ pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
-    IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
-    IMcpServerRepository, IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository,
-    ISettingsRepository, ITeamRepository, IUserRepository, SqliteChannelRepository,
-    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
-    SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteTeamRepository,
-    SqliteUserRepository,
+    IAssistantOverrideRepository, IAssistantRepository, IChannelRepository,
+    IClientPreferenceRepository, IConversationRepository, ICronRepository, IMcpServerRepository,
+    IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository, ISettingsRepository,
+    ITeamRepository, IUserRepository, SqliteAssistantOverrideRepository, SqliteAssistantRepository,
+    SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
+    SqliteCronRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository,
+    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteTeamRepository, SqliteUserRepository,
 };
 
 // Re-export sqlx pool type for downstream crates

@@ -16,6 +16,9 @@ use aionui_ai_agent::{
     auxiliary_routes, build_agent_factory, connection_test_routes, remote_agent_routes,
 };
 use aionui_api_types::{AgentSource, DetectedAgent, EnvVar};
+use aionui_assistant::{
+    AssistantRouterState, AssistantService, BuiltinAssistantRegistry, assistant_routes,
+};
 use aionui_auth::{
     AuthRouterState, AuthState, CookieConfig, JwtService, QrTokenStore, auth_middleware,
     auth_routes, csrf_middleware, extract_token_from_ws_headers, resolve_jwt_secret,
@@ -28,14 +31,16 @@ use aionui_common::AgentType;
 use aionui_conversation::{ConversationRouterState, ConversationService, conversation_routes};
 use aionui_cron::{CronEventEmitter, CronRouterState, cron_routes};
 use aionui_db::{
-    Database, IUserRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
+    Database, IAssistantOverrideRepository, IAssistantRepository, IClientPreferenceRepository,
+    IProviderRepository, IUserRepository, SqliteAssistantOverrideRepository,
+    SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
     SqliteUserRepository,
 };
 use aionui_extension::{
-    ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
-    HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, extension_routes, hub_routes,
-    skill_routes,
+    AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore,
+    ExternalPathsManager, HubIndexManager, HubInstaller, HubRouterState, SkillRouterState,
+    extension_routes, hub_routes, skill_routes,
 };
 use aionui_file::{FileRouterState, FileService, FileWatchService, SnapshotService, file_routes};
 use aionui_mcp::{
@@ -54,7 +59,8 @@ use aionui_realtime::{
 use aionui_shell::{ShellRouterState, shell_routes};
 use aionui_system::{
     ClientPrefService, ModelFetchService, ProtocolDetectionService, ProviderService,
-    SettingsService, SystemRouterState, VersionCheckService, system_routes,
+    SettingsService, SystemRouterState, VersionCheckService, migrate_legacy_providers,
+    system_routes,
 };
 use aionui_team::{TeamRouterState, TeamSessionService, team_routes};
 
@@ -158,6 +164,30 @@ impl AppServices {
         }
 
         let encryption_key = derive_encryption_key(&secret);
+
+        // One-shot startup migration: lift legacy `client_preferences.model.config`
+        // rows (camelCase IProvider[] from the pre-backend frontend) into the
+        // canonical `providers` table. No-op after the first successful run or
+        // when the providers table is already populated. Non-fatal on failure:
+        // startup continues so the rest of the app remains usable and the legacy
+        // data stays in place for a retry.
+        {
+            let provider_repo: Arc<dyn IProviderRepository> =
+                Arc::new(SqliteProviderRepository::new(database.pool().clone()));
+            let client_pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(
+                SqliteClientPreferenceRepository::new(database.pool().clone()),
+            );
+            if let Err(e) = migrate_legacy_providers(
+                provider_repo.as_ref(),
+                client_pref_repo.as_ref(),
+                &encryption_key,
+            )
+            .await
+            {
+                tracing::warn!("Legacy provider migration failed (continuing startup): {e}");
+            }
+        }
+
         let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
         let agent_registry = Arc::new(AgentRegistry::new());
         let factory = build_agent_factory(AgentFactoryDeps {
@@ -225,6 +255,7 @@ pub struct ModuleStates {
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
+    pub assistant: AssistantRouterState,
     pub agent: AgentRouterState,
 }
 
@@ -259,11 +290,26 @@ async fn resolve_extension_agents(registry: &ExtensionRegistry) -> Vec<DetectedA
 
 /// Build all default `ModuleStates` from application services.
 pub async fn build_module_states(services: &AppServices) -> ModuleStates {
-    let (ext_state, hub_state, skill_state) = build_extension_states(services).await;
+    let (ext_state, hub_state, mut skill_state) = build_extension_states(services).await;
+    let assistant = build_assistant_state(services, ext_state.registry.clone());
 
     let extensions = resolve_extension_agents(&ext_state.registry).await;
     // TODO: load custom agent configs from settings/DB and convert to DetectedAgent
     services.agent_registry.initialize(extensions, vec![]).await;
+
+    // Wire the AssistantService as the source-dispatch implementation for
+    // the existing assistant-rule / assistant-skill endpoints in
+    // aionui-extension. This replaces the legacy user-directory-only paths
+    // with builtin / extension / user routing.
+    let dispatcher: Arc<dyn AssistantRuleDispatcher> = assistant.service.clone();
+    skill_state.assistant_dispatcher = Some(dispatcher);
+
+    // Best-effort cleanup of orphaned per-agent skills directories from
+    // conversations that no longer exist. The predicate closure bridges
+    // the extension crate (which does not depend on aionui-conversation)
+    // and the conversation repository. Failures are logged and ignored
+    // — agent-skills sweeping is not critical to startup.
+    run_orphan_agent_skills_cleanup(services, &skill_state.skill_paths).await;
 
     ModuleStates {
         system: build_system_state(services),
@@ -282,10 +328,76 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
         cron: build_cron_state(services),
         office: build_office_state(services),
         shell: build_shell_state(services),
+        assistant,
         agent: AgentRouterState {
             agent_registry: services.agent_registry.clone(),
         },
     }
+}
+
+/// Best-effort orphan sweep of `{data_dir}/agent-skills/`.
+///
+/// Scans the directory and deletes subdirectories whose name does not
+/// correspond to a live conversation (per the conversation repository).
+/// Runs synchronously during startup — the count is small in practice
+/// (one entry per open conversation at shutdown) and the operation is
+/// strictly local filesystem I/O.
+///
+/// `aionui-extension` accepts a `Fn(&str) -> bool` predicate so it does
+/// not need to depend on `aionui-conversation`. We perform the blocking
+/// repository check via `tokio::task::block_in_place` + the current
+/// runtime's `block_on`, which is safe on multi-thread runtimes (the
+/// only runtime flavor this binary uses).
+async fn run_orphan_agent_skills_cleanup(
+    services: &AppServices,
+    skill_paths: &aionui_extension::SkillPaths,
+) {
+    let pool = services.database.pool().clone();
+    let repo: Arc<dyn aionui_db::IConversationRepository> =
+        Arc::new(SqliteConversationRepository::new(pool));
+    let handle = tokio::runtime::Handle::current();
+    let is_live = {
+        let repo = repo.clone();
+        move |id: &str| -> bool {
+            let id = id.to_string();
+            let repo = repo.clone();
+            // Block on the async repo call. Multi-thread runtime required.
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move { repo.get(&id).await.ok().flatten().is_some() })
+            })
+        }
+    };
+    match aionui_extension::cleanup_orphan_agent_skills(skill_paths, is_live).await {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "swept orphan agent-skills dirs on startup")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "orphan agent-skills sweep failed (non-fatal)"),
+    }
+}
+
+/// Build the default `AssistantRouterState` from application services.
+///
+/// Loads the built-in assistant manifest from
+/// `{exe_dir}/assets/builtin-assistants/` (or dev fallback), constructs
+/// the user-data repositories, and assembles the full `AssistantService`.
+pub fn build_assistant_state(
+    services: &AppServices,
+    extension_registry: ExtensionRegistry,
+) -> AssistantRouterState {
+    let pool = services.database.pool().clone();
+    let repo: Arc<dyn IAssistantRepository> =
+        Arc::new(SqliteAssistantRepository::new(pool.clone()));
+    let override_repo: Arc<dyn IAssistantOverrideRepository> =
+        Arc::new(SqliteAssistantOverrideRepository::new(pool));
+    let builtin = Arc::new(BuiltinAssistantRegistry::load());
+    let service = Arc::new(AssistantService::new(
+        repo,
+        override_repo,
+        builtin,
+        extension_registry,
+    ));
+    AssistantRouterState { service }
 }
 
 /// Build the default `SystemRouterState` from application services.
@@ -585,29 +697,39 @@ struct CronServiceTickRef(std::sync::Mutex<Option<Arc<aionui_cron::service::Cron
 pub async fn build_extension_states(
     services: &AppServices,
 ) -> (ExtensionRouterState, HubRouterState, SkillRouterState) {
-    let data_dir = dirs::home_dir()
+    // Extension state, hub index, and external skill paths continue to live
+    // under `~/.aionui/` (carried over from the pre-migration layout).
+    let legacy_home_dir = dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(".aionui");
 
-    let state_store = ExtensionStateStore::new(data_dir.join("extension-states.json"));
+    // Skill paths honor the `--data-dir` CLI flag so the new
+    // `{data_dir}/agent-skills/` and `{data_dir}/builtin-skills-view/`
+    // directories land inside whatever root the operator picked.
+    let skill_data_dir = std::path::PathBuf::from(&services.data_dir);
+
+    let state_store = ExtensionStateStore::new(legacy_home_dir.join("extension-states.json"));
     let registry = ExtensionRegistry::new(
         state_store,
         services.event_bus.clone(),
         env!("CARGO_PKG_VERSION").to_string(),
     );
 
-    let hub_dir = data_dir.join("extensions");
+    let hub_dir = legacy_home_dir.join("extensions");
     let index_manager = HubIndexManager::new(hub_dir, registry.clone());
     let installer = HubInstaller::new(index_manager.clone(), registry.clone());
 
-    // Skill paths: use app resource dir (binary's parent) for built-in resources.
+    // Skill paths: use app resource dir (binary's parent) for built-in
+    // rules. Canonicalize current_exe so a cargo-install symlink doesn't
+    // point the resource root at `~/.cargo/bin/` (assistant H1 lesson).
     let app_resource_dir = std::env::current_exe()
         .ok()
+        .and_then(|p| p.canonicalize().ok())
         .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let skill_paths = aionui_extension::resolve_skill_paths(&app_resource_dir);
+    let skill_paths = aionui_extension::resolve_skill_paths(&app_resource_dir, &skill_data_dir);
 
-    let ext_paths_mgr = Arc::new(ExternalPathsManager::new(&data_dir).await);
+    let ext_paths_mgr = Arc::new(ExternalPathsManager::new(&legacy_home_dir).await);
 
     let ext_state = ExtensionRouterState {
         registry: registry.clone(),
@@ -621,6 +743,9 @@ pub async fn build_extension_states(
     let skill_state = SkillRouterState {
         skill_paths,
         external_paths_manager: ext_paths_mgr,
+        // Wired in `build_module_states` once the AssistantService is built
+        // (the service implements `AssistantRuleDispatcher`).
+        assistant_dispatcher: None,
     };
 
     (ext_state, hub_state, skill_state)
@@ -755,8 +880,13 @@ pub fn create_router_with_all_state(
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Shell + STT routes protected by auth middleware
-    let shell_authenticated =
-        shell_routes(states.shell).route_layer(from_fn_with_state(auth_mw_state, auth_middleware));
+    let shell_authenticated = shell_routes(states.shell)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    // Assistant routes protected by auth middleware (T1a skeleton: all
+    // handlers return 500 "not implemented"; T1b wires real service)
+    let assistant_authenticated = assistant_routes(states.assistant)
+        .route_layer(from_fn_with_state(auth_mw_state, auth_middleware));
 
     // Office proxy routes — exempt from auth (serve iframe content)
     let office_proxy = office_proxy_routes(states.office);
@@ -786,7 +916,8 @@ pub fn create_router_with_all_state(
         .merge(team_authenticated)
         .merge(cron_authenticated)
         .merge(office_authenticated)
-        .merge(shell_authenticated);
+        .merge(shell_authenticated)
+        .merge(assistant_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]

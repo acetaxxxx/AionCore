@@ -344,6 +344,7 @@ version = "0.1.0"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
+ "aionui-assistant",
  "aionui-auth",
  "aionui-channel",
  "aionui-common",
@@ -380,6 +381,32 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+]
+
+[[package]]
+name = "aionui-assistant"
+version = "0.1.0"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-extension",
+ "aionui-realtime",
+ "async-trait",
+ "axum",
+ "chrono",
+ "dirs",
+ "http-body-util",
+ "include_dir",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -512,8 +539,11 @@ dependencies = [
  "aionui-common",
  "aionui-db",
  "aionui-realtime",
+ "async-trait",
  "axum",
  "dirs",
+ "http-body-util",
+ "include_dir",
  "notify",
  "semver",
  "serde",
@@ -521,6 +551,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -3023,6 +3054,25 @@ dependencies = [
  "same-file",
  "walkdir",
  "winapi-util",
+]
+
+[[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
 ]
 
 [[package]]

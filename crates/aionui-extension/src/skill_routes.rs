@@ -7,16 +7,26 @@ use axum::extract::{Json, Path as AxumPath, State};
 use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
-    AddExternalPathRequest, ApiResponse, ExportSkillRequest, ExternalSkillSourceResponse,
-    ImportSkillRequest, ImportSkillResponse, NamedPathResponse, ReadAssistantRuleRequest,
+    AddExternalPathRequest, ApiResponse, BuiltinAutoSkillResponse, ExportSkillRequest,
+    ExternalSkillSourceResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
+    MaterializeSkillsResponse, NamedPathResponse, ReadAssistantRuleRequest,
     ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse,
     RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
-    SkillListItemResponse, SkillPathsResponse, WriteAssistantRuleRequest,
+    SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
 use aionui_common::AppError;
 
+use crate::classifier::AssistantRuleDispatcher;
 use crate::external_paths::ExternalPathsManager;
-use crate::skill_service::{self, SkillPaths};
+use crate::skill_service::{self, SkillPaths, SkillSource};
+
+fn to_source_response(source: SkillSource) -> SkillSourceResponse {
+    match source {
+        SkillSource::Builtin => SkillSourceResponse::Builtin,
+        SkillSource::Custom => SkillSourceResponse::Custom,
+        SkillSource::Extension => SkillSourceResponse::Extension,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Router state
@@ -27,6 +37,11 @@ use crate::skill_service::{self, SkillPaths};
 pub struct SkillRouterState {
     pub skill_paths: SkillPaths,
     pub external_paths_manager: Arc<ExternalPathsManager>,
+    /// Optional dispatcher that routes assistant-rule / assistant-skill
+    /// read/write/delete by source (builtin / extension / user). When
+    /// `None`, the legacy user-directory-only behavior is preserved.
+    #[allow(clippy::type_complexity)]
+    pub assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +55,7 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
     Router::new()
         // Skill listing & info
         .route("/api/skills", get(list_skills))
+        .route("/api/skills/builtin-auto", get(list_builtin_auto_skills))
         .route("/api/skills/info", post(read_skill_info))
         .route("/api/skills/paths", get(get_skill_paths))
         // Import / export / delete
@@ -54,6 +70,15 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         // Built-in resources
         .route("/api/skills/builtin-rule", post(read_builtin_rule))
         .route("/api/skills/builtin-skill", post(read_builtin_skill))
+        // Per-agent skill materialization (for gemini CLI)
+        .route(
+            "/api/skills/materialize-for-agent",
+            post(materialize_for_agent),
+        )
+        .route(
+            "/api/skills/materialize-for-agent/{conversation_id}",
+            delete(cleanup_for_agent),
+        )
         // Assistant rules CRUD
         .route("/api/skills/assistant-rule/read", post(read_assistant_rule))
         .route(
@@ -105,7 +130,25 @@ async fn list_skills(
             name: s.name,
             description: s.description,
             location: s.location,
+            relative_location: s.relative_location,
             is_custom: s.is_custom,
+            source: to_source_response(s.source),
+        })
+        .collect();
+    Ok(Json(ApiResponse::ok(resp)))
+}
+
+/// `GET /api/skills/builtin-auto` — list auto-injected built-in skills.
+async fn list_builtin_auto_skills(
+    State(state): State<SkillRouterState>,
+) -> Result<Json<ApiResponse<Vec<BuiltinAutoSkillResponse>>>, AppError> {
+    let items = skill_service::list_builtin_auto_skills(&state.skill_paths).await?;
+    let resp: Vec<BuiltinAutoSkillResponse> = items
+        .into_iter()
+        .map(|s| BuiltinAutoSkillResponse {
+            name: s.name,
+            description: s.description,
+            location: s.location,
         })
         .collect();
     Ok(Json(ApiResponse::ok(resp)))
@@ -236,6 +279,7 @@ async fn detect_external(
         .map(|s| ExternalSkillSourceResponse {
             name: s.name,
             path: s.path,
+            source: s.source,
             skill_count: s.skill_count,
             skills: s
                 .skills
@@ -275,16 +319,64 @@ async fn read_builtin_skill(
     Ok(Json(ApiResponse::ok(content)))
 }
 
+/// `POST /api/skills/materialize-for-agent` — flatten auto-inject + opt-in
+/// skills into `{data_dir}/agent-skills/{conversationId}/` and hand the
+/// frontend an absolute path for gemini CLI `--extensions` loading.
+async fn materialize_for_agent(
+    State(state): State<SkillRouterState>,
+    body: Result<Json<MaterializeSkillsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<MaterializeSkillsResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if req.conversation_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "conversationId must not be empty".into(),
+        ));
+    }
+    let dir = skill_service::materialize_skills_for_agent(
+        &state.skill_paths,
+        &req.conversation_id,
+        &req.enabled_skills,
+    )
+    .await?;
+    Ok(Json(ApiResponse::ok(MaterializeSkillsResponse {
+        dir_path: dir.to_string_lossy().into_owned(),
+    })))
+}
+
+/// `DELETE /api/skills/materialize-for-agent/:conversation_id` — remove the
+/// per-conversation agent-skills directory. Idempotent.
+async fn cleanup_for_agent(
+    State(state): State<SkillRouterState>,
+    AxumPath(conversation_id): AxumPath<String>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    if conversation_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "conversationId must not be empty".into(),
+        ));
+    }
+    skill_service::cleanup_agent_skills(&state.skill_paths, &conversation_id).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
 // ---------------------------------------------------------------------------
 // Assistant rules CRUD
 // ---------------------------------------------------------------------------
 
 /// `POST /api/skills/assistant-rule/read` — read an assistant rule.
+///
+/// Dispatches by source via [`AssistantRuleDispatcher`] when wired; falls
+/// back to user-directory-only legacy behavior otherwise.
 async fn read_assistant_rule(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if let Some(dispatcher) = &state.assistant_dispatcher {
+        let content = dispatcher
+            .read_rule(&req.assistant_id, req.locale.as_deref())
+            .await?;
+        return Ok(Json(ApiResponse::ok(content)));
+    }
     let content = skill_service::read_assistant_rule(
         &state.skill_paths,
         &req.assistant_id,
@@ -295,11 +387,19 @@ async fn read_assistant_rule(
 }
 
 /// `POST /api/skills/assistant-rule/write` — write an assistant rule.
+///
+/// Dispatches by source: builtin / extension ids reject with 400.
 async fn write_assistant_rule(
     State(state): State<SkillRouterState>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if let Some(dispatcher) = &state.assistant_dispatcher {
+        dispatcher
+            .write_rule(&req.assistant_id, req.locale.as_deref(), &req.content)
+            .await?;
+        return Ok(Json(ApiResponse::ok(true)));
+    }
     let ok = skill_service::write_assistant_rule(
         &state.skill_paths,
         &req.assistant_id,
@@ -315,6 +415,10 @@ async fn delete_assistant_rule(
     State(state): State<SkillRouterState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<bool>>, AppError> {
+    if let Some(dispatcher) = &state.assistant_dispatcher {
+        let ok = dispatcher.delete_rule(&id).await?;
+        return Ok(Json(ApiResponse::ok(ok)));
+    }
     let ok = skill_service::delete_assistant_rule(&state.skill_paths, &id).await?;
     Ok(Json(ApiResponse::ok(ok)))
 }
@@ -324,11 +428,19 @@ async fn delete_assistant_rule(
 // ---------------------------------------------------------------------------
 
 /// `POST /api/skills/assistant-skill/read` — read an assistant skill.
+///
+/// Dispatches by source via [`AssistantRuleDispatcher`] when wired.
 async fn read_assistant_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if let Some(dispatcher) = &state.assistant_dispatcher {
+        let content = dispatcher
+            .read_skill(&req.assistant_id, req.locale.as_deref())
+            .await?;
+        return Ok(Json(ApiResponse::ok(content)));
+    }
     let content = skill_service::read_assistant_skill(
         &state.skill_paths,
         &req.assistant_id,
@@ -339,11 +451,19 @@ async fn read_assistant_skill(
 }
 
 /// `POST /api/skills/assistant-skill/write` — write an assistant skill.
+///
+/// Dispatches by source: builtin / extension ids reject with 400.
 async fn write_assistant_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if let Some(dispatcher) = &state.assistant_dispatcher {
+        dispatcher
+            .write_skill(&req.assistant_id, req.locale.as_deref(), &req.content)
+            .await?;
+        return Ok(Json(ApiResponse::ok(true)));
+    }
     let ok = skill_service::write_assistant_skill(
         &state.skill_paths,
         &req.assistant_id,
@@ -359,6 +479,10 @@ async fn delete_assistant_skill(
     State(state): State<SkillRouterState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<bool>>, AppError> {
+    if let Some(dispatcher) = &state.assistant_dispatcher {
+        let ok = dispatcher.delete_skill(&id).await?;
+        return Ok(Json(ApiResponse::ok(ok)));
+    }
     let ok = skill_service::delete_assistant_skill(&state.skill_paths, &id).await?;
     Ok(Json(ApiResponse::ok(ok)))
 }
@@ -444,7 +568,7 @@ mod tests {
         let paths = SkillPaths {
             data_dir: tmp.path().to_path_buf(),
             user_skills_dir: tmp.path().join("skills"),
-            builtin_skills_dir: tmp.path().join("builtin-skills"),
+            builtin_skills_dir: Some(tmp.path().join("builtin-skills")),
             builtin_rules_dir: tmp.path().join("builtin-rules"),
             assistant_rules_dir: tmp.path().join("assistant-rules"),
             assistant_skills_dir: tmp.path().join("assistant-skills"),
@@ -455,6 +579,7 @@ mod tests {
         SkillRouterState {
             skill_paths: paths,
             external_paths_manager: ext_mgr,
+            assistant_dispatcher: None,
         }
     }
 
