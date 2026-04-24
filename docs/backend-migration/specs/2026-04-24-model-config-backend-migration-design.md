@@ -91,6 +91,49 @@ Existing `POST /api/providers` handler (`routes.rs::create_provider`)
 already passes the request straight to `provider_service.create`. Only
 the request schema and the service `create()` body need editing.
 
+### 5. Anonymous fetch-models endpoint (T1b)
+
+Pre-create form preview: user fills platform/base_url/api_key in
+AddPlatformModal, clicks "Fetch Models" to populate the dropdown
+BEFORE the provider row exists. The by-id `POST /api/providers/:id/models`
+can't serve this — need an anonymous variant that takes the
+credentials in the request body, no DB lookup.
+
+Files:
+
+- `crates/aionui-api-types/src/provider.rs`: add
+  ```rust
+  pub struct FetchModelsAnonymousRequest {
+      pub platform: String,
+      pub base_url: String,
+      pub api_key: String,
+      #[serde(default, skip_serializing_if = "Option::is_none")]
+      pub bedrock_config: Option<BedrockConfig>,
+      #[serde(default)]
+      pub try_fix: bool,
+  }
+  ```
+  Response reuses existing `FetchModelsResponse`.
+
+- `crates/aionui-system/src/model_fetcher/mod.rs`: add
+  `fetch_models_anonymous(&self, req: &FetchModelsAnonymousRequest)`
+  that constructs `FetchConfig` directly from the request (skip
+  `load_provider_config`) and calls the same `fetchers::fetch_for_platform`
+  path with same `try_fix` semantics.
+
+- `crates/aionui-system/src/routes.rs`: register
+  `.route("/api/providers/fetch-models", post(fetch_models_anonymous))`
+  **before** `/api/providers/{id}/models` so axum doesn't interpret
+  "fetch-models" as an id.
+
+Tests:
+- api-types: `test_fetch_models_anonymous_request_required_fields`,
+  `test_fetch_models_anonymous_request_with_bedrock`.
+- integration: `fetch_models_anonymous_returns_models_for_valid_input`,
+  `fetch_models_anonymous_rejects_empty_api_key`.
+
+Live probe: `curl POST /api/providers/fetch-models {"platform":"minimax",...}` → 200 with model list.
+
 ## Tests to add / flip
 
 `crates/aionui-api-types/src/provider.rs`:
