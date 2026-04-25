@@ -202,9 +202,7 @@ async fn build_agent(
                 .provider_repo
                 .find_by_id(provider_id)
                 .await
-                .map_err(|e| {
-                    AppError::Internal(format!("Failed to load provider config: {e}"))
-                })?
+                .map_err(|e| AppError::Internal(format!("Failed to load provider config: {e}")))?
                 .ok_or_else(|| {
                     AppError::BadRequest(format!("Provider '{provider_id}' not found"))
                 })?;
