@@ -154,17 +154,12 @@ pub struct RemoteBuildExtra {
 }
 
 /// Aionrs-specific fields extracted from `extra` in [`BuildTaskOptions`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Provider credentials (provider name, api_key, model) are resolved from
+/// the providers table in the factory — they are NOT expected in `extra`.
+/// This struct only carries optional overrides the caller may supply.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AionrsBuildExtra {
-    /// LLM provider name (anthropic, openai, bedrock, vertex).
-    pub provider: String,
-    /// API key for the provider.
-    pub api_key: String,
-    /// Model identifier.
-    pub model: String,
-    /// Provider base URL override.
-    #[serde(default)]
-    pub base_url: Option<String>,
     /// System prompt override.
     #[serde(default)]
     pub system_prompt: Option<String>,
@@ -173,6 +168,28 @@ pub struct AionrsBuildExtra {
     pub max_tokens: u32,
     /// Max agentic turns.
     #[serde(default)]
+    pub max_turns: Option<usize>,
+}
+
+/// Fully resolved Aionrs configuration passed to the agent manager.
+///
+/// Constructed in the factory by combining provider DB data with
+/// optional overrides from [`AionrsBuildExtra`].
+#[derive(Debug, Clone)]
+pub struct AionrsResolvedConfig {
+    /// LLM provider name (anthropic, openai, bedrock, vertex).
+    pub provider: String,
+    /// Decrypted API key.
+    pub api_key: String,
+    /// Model identifier.
+    pub model: String,
+    /// Provider base URL.
+    pub base_url: Option<String>,
+    /// System prompt override.
+    pub system_prompt: Option<String>,
+    /// Max tokens per response.
+    pub max_tokens: u32,
+    /// Max agentic turns.
     pub max_turns: Option<usize>,
 }
 
@@ -301,36 +318,23 @@ mod tests {
     }
 
     #[test]
-    fn aionrs_build_extra_serde_minimal() {
-        let json = json!({
-            "provider": "anthropic",
-            "api_key": "sk-test",
-            "model": "claude-sonnet-4-20250514"
-        });
+    fn aionrs_build_extra_serde_defaults() {
+        let json = json!({});
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
-        assert_eq!(extra.provider, "anthropic");
-        assert_eq!(extra.api_key, "sk-test");
-        assert_eq!(extra.model, "claude-sonnet-4-20250514");
-        assert!(extra.base_url.is_none());
         assert!(extra.system_prompt.is_none());
         assert_eq!(extra.max_tokens, 8192);
         assert!(extra.max_turns.is_none());
     }
 
     #[test]
-    fn aionrs_build_extra_serde_full() {
+    fn aionrs_build_extra_serde_with_overrides() {
         let json = json!({
-            "provider": "openai",
-            "api_key": "sk-openai",
-            "model": "gpt-4o",
-            "base_url": "https://api.openai.com/v1",
             "system_prompt": "You are a helpful assistant.",
             "max_tokens": 4096,
             "max_turns": 10
         });
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
-        assert_eq!(extra.provider, "openai");
-        assert_eq!(extra.base_url.unwrap(), "https://api.openai.com/v1");
+        assert_eq!(extra.system_prompt.unwrap(), "You are a helpful assistant.");
         assert_eq!(extra.max_tokens, 4096);
         assert_eq!(extra.max_turns.unwrap(), 10);
     }
