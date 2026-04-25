@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
+use aion_config::compat::ProviderCompat;
 use aion_config::config::{Config, ProviderType};
 use aion_protocol::ToolApprovalManager;
 use aion_tools::bash::BashTool;
@@ -22,7 +23,7 @@ use tracing::info;
 use crate::agent_manager::IAgentManager;
 use crate::backend_output_sink::BackendOutputSink;
 use crate::stream_event::AgentStreamEvent;
-use crate::types::{AionrsBuildExtra, SendMessageData};
+use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 pub struct AionrsAgentManager {
     conversation_id: String,
@@ -35,7 +36,11 @@ pub struct AionrsAgentManager {
 }
 
 impl AionrsAgentManager {
-    pub fn new(conversation_id: String, workspace: String, config_extra: AionrsBuildExtra) -> Self {
+    pub fn new(
+        conversation_id: String,
+        workspace: String,
+        config_extra: AionrsResolvedConfig,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(event_tx.clone()));
 
@@ -45,6 +50,17 @@ impl AionrsAgentManager {
             "vertex" => ProviderType::Vertex,
             _ => ProviderType::Anthropic,
         };
+
+        let compat = match provider_type {
+            ProviderType::OpenAI => ProviderCompat::openai_defaults(),
+            ProviderType::Bedrock => ProviderCompat::bedrock_defaults(),
+            ProviderType::Anthropic | ProviderType::Vertex => ProviderCompat::anthropic_defaults(),
+        };
+
+        let prompt_caching = matches!(
+            provider_type,
+            ProviderType::Anthropic | ProviderType::Bedrock | ProviderType::Vertex
+        );
 
         let config = Config {
             provider_label: config_extra.provider.clone(),
@@ -56,8 +72,8 @@ impl AionrsAgentManager {
             max_turns: config_extra.max_turns,
             system_prompt: config_extra.system_prompt,
             thinking: None,
-            prompt_caching: true,
-            compat: Default::default(),
+            prompt_caching,
+            compat,
             tools: Default::default(),
             session: Default::default(),
             compact: Default::default(),
@@ -190,8 +206,8 @@ impl IAgentManager for AionrsAgentManager {
 mod tests {
     use super::*;
 
-    fn make_test_config() -> AionrsBuildExtra {
-        AionrsBuildExtra {
+    fn make_test_config() -> AionrsResolvedConfig {
+        AionrsResolvedConfig {
             provider: "anthropic".into(),
             api_key: "sk-test-key".into(),
             model: "claude-sonnet-4-20250514".into(),

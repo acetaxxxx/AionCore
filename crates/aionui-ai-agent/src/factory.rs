@@ -1,5 +1,5 @@
 use aionui_common::{AcpBackend, AgentType, AppError, CommandSpec, now_ms};
-use aionui_db::IRemoteAgentRepository;
+use aionui_db::{IProviderRepository, IRemoteAgentRepository};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::warn;
@@ -10,8 +10,8 @@ use crate::remote_agent::RemoteAgentConfig;
 use crate::skill_manager::AcpSkillManager;
 use crate::task_manager::AgentFactory;
 use crate::types::{
-    AcpBuildExtra, AionrsBuildExtra, BuildTaskOptions, GeminiBuildExtra, OpenClawBuildExtra,
-    RemoteBuildExtra,
+    AcpBuildExtra, AionrsBuildExtra, AionrsResolvedConfig, BuildTaskOptions, GeminiBuildExtra,
+    OpenClawBuildExtra, RemoteBuildExtra,
 };
 use crate::{
     AcpAgentManager, AionrsAgentManager, GeminiAgentManager, NanobotAgentManager,
@@ -22,6 +22,7 @@ use crate::{
 pub struct AgentFactoryDeps {
     pub skill_manager: Arc<AcpSkillManager>,
     pub remote_agent_repo: Arc<dyn IRemoteAgentRepository>,
+    pub provider_repo: Arc<dyn IProviderRepository>,
     pub encryption_key: [u8; 32],
     pub agent_registry: Arc<AgentRegistry>,
     pub data_dir: PathBuf,
@@ -212,12 +213,56 @@ async fn build_agent(
             Ok(Arc::new(agent) as AgentManagerHandle)
         }
         AgentType::Aionrs => {
-            let config: AionrsBuildExtra = serde_json::from_value(options.extra)
-                .map_err(|e| AppError::BadRequest(format!("Invalid Aionrs build options: {e}")))?;
+            let overrides: AionrsBuildExtra =
+                serde_json::from_value(options.extra).unwrap_or_default();
+
+            let provider_id = &options.model.provider_id;
+            let row = deps
+                .provider_repo
+                .find_by_id(provider_id)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to load provider config: {e}")))?
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!("Provider '{provider_id}' not found"))
+                })?;
+
+            let api_key =
+                aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)?;
+
+            let model_id = options
+                .model
+                .use_model
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&options.model.model)
+                .to_owned();
+
+            // Aionrs expects base_url without path suffix — it appends
+            // /v1/messages (Anthropic) or /v1/chat/completions (OpenAI) itself.
+            // DB stores URLs like "https://api.openai.com/v1", so strip the tail.
+            let base_url = Some(normalize_aionrs_base_url(&row.base_url)).filter(|u| !u.is_empty());
+
+            let config = AionrsResolvedConfig {
+                provider: row.platform,
+                api_key,
+                model: model_id,
+                base_url,
+                system_prompt: overrides.system_prompt,
+                max_tokens: overrides.max_tokens,
+                max_turns: overrides.max_turns,
+            };
+
             let agent = AionrsAgentManager::new(conversation_id, workspace, config);
             Ok(Arc::new(agent) as AgentManagerHandle)
         }
     }
+}
+
+/// Strip trailing `/v1`, `/v1/`, or lone `/` from a base URL so that
+/// aionrs can append its own path suffix (`/v1/messages`, `/v1/chat/completions`).
+fn normalize_aionrs_base_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned()
 }
 
 #[cfg(test)]
@@ -230,5 +275,30 @@ mod tests {
         let _: fn() -> AgentFactoryDeps = || {
             panic!("compile-time check only");
         };
+    }
+
+    #[test]
+    fn normalize_aionrs_base_url_strips_v1() {
+        assert_eq!(
+            normalize_aionrs_base_url("https://api.openai.com/v1"),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            normalize_aionrs_base_url("https://api.openai.com/v1/"),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            normalize_aionrs_base_url("https://api.anthropic.com"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            normalize_aionrs_base_url("https://api.deepseek.com/"),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            normalize_aionrs_base_url("http://localhost:11434"),
+            "http://localhost:11434"
+        );
+        assert_eq!(normalize_aionrs_base_url(""), "");
     }
 }
