@@ -32,32 +32,23 @@ struct Cli {
     log_dir: Option<PathBuf>,
 
     /// Log level filter (e.g. "info", "debug", "info,aionui_mcp=trace").
-    /// Overridden by RUST_LOG env var when set.
     #[arg(long)]
     log_level: Option<String>,
 }
 
 fn init_tracing(
     log_dir: &Path,
-    log_level: Option<String>,
+    log_level: Option<&str>,
 ) -> tracing_appender::non_blocking::WorkerGuard {
     let default_filter =
         "info,aionui_ai_agent=debug,aionui_conversation=debug,aionui_realtime=debug";
 
-    let make_filter = |fallback: &str| {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            log_level
-                .as_deref()
-                .map(EnvFilter::new)
-                .unwrap_or_else(|| fallback.into())
-        })
-    };
-
     std::fs::create_dir_all(log_dir).expect("failed to create log directory");
 
+    let console_filter = EnvFilter::new(log_level.unwrap_or("info"));
     let console_layer = fmt::layer()
         .with_target(true)
-        .with_filter(make_filter("info"));
+        .with_filter(console_filter);
 
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -67,12 +58,13 @@ fn init_tracing(
         .expect("failed to create log file appender");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
+    let file_filter = EnvFilter::new(log_level.unwrap_or(default_filter));
     let file_layer = fmt::layer()
         .json()
         .with_writer(non_blocking)
         .with_ansi(false)
         .with_target(true)
-        .with_filter(make_filter(default_filter));
+        .with_filter(file_filter);
 
     tracing_subscriber::registry()
         .with(console_layer)
@@ -89,7 +81,7 @@ async fn main() -> Result<()> {
     let log_dir = cli
         .log_dir
         .unwrap_or_else(|| Path::new(&cli.data_dir).join("logs"));
-    let _log_guard = init_tracing(&log_dir, cli.log_level);
+    let _log_guard = init_tracing(&log_dir, cli.log_level.as_deref());
 
     let config = AppConfig {
         host: cli.host,
