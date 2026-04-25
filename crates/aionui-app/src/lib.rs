@@ -32,10 +32,9 @@ use aionui_conversation::{ConversationRouterState, ConversationService, conversa
 use aionui_cron::{CronEventEmitter, CronRouterState, cron_routes};
 use aionui_db::{
     Database, IAssistantOverrideRepository, IAssistantRepository, IUserRepository,
-    SqliteAssistantOverrideRepository,
-    SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
-    SqliteUserRepository,
+    SqliteAssistantOverrideRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteSettingsRepository, SqliteUserRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore,

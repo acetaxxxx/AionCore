@@ -35,7 +35,11 @@ pub struct AionrsAgentManager {
 }
 
 impl AionrsAgentManager {
-    pub fn new(conversation_id: String, workspace: String, config_extra: AionrsResolvedConfig) -> Self {
+    pub fn new(
+        conversation_id: String,
+        workspace: String,
+        config_extra: AionrsResolvedConfig,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(event_tx.clone()));
 
