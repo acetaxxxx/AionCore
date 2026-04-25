@@ -36,8 +36,10 @@ tmp/
 .superpowers/
 docs/superpowers/
 
-# Worktrees
+# Git worktrees
+.worktree/
 .worktrees/
+worktree/
 worktrees/
 
 # Profiling & debugging
