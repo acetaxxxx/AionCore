@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
+use aion_config::compat::ProviderCompat;
 use aion_config::config::{Config, ProviderType};
 use aion_protocol::ToolApprovalManager;
 use aion_tools::bash::BashTool;
@@ -50,6 +51,17 @@ impl AionrsAgentManager {
             _ => ProviderType::Anthropic,
         };
 
+        let compat = match provider_type {
+            ProviderType::OpenAI => ProviderCompat::openai_defaults(),
+            ProviderType::Bedrock => ProviderCompat::bedrock_defaults(),
+            ProviderType::Anthropic | ProviderType::Vertex => ProviderCompat::anthropic_defaults(),
+        };
+
+        let prompt_caching = matches!(
+            provider_type,
+            ProviderType::Anthropic | ProviderType::Bedrock | ProviderType::Vertex
+        );
+
         let config = Config {
             provider_label: config_extra.provider.clone(),
             provider: provider_type,
@@ -60,8 +72,8 @@ impl AionrsAgentManager {
             max_turns: config_extra.max_turns,
             system_prompt: config_extra.system_prompt,
             thinking: None,
-            prompt_caching: true,
-            compat: Default::default(),
+            prompt_caching,
+            compat,
             tools: Default::default(),
             session: Default::default(),
             compact: Default::default(),
