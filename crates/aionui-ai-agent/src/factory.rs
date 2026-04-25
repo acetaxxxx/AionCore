@@ -218,7 +218,10 @@ async fn build_agent(
                 .unwrap_or(&options.model.model)
                 .to_owned();
 
-            let base_url = Some(row.base_url).filter(|u| !u.is_empty());
+            // Aionrs expects base_url without path suffix — it appends
+            // /v1/messages (Anthropic) or /v1/chat/completions (OpenAI) itself.
+            // DB stores URLs like "https://api.openai.com/v1", so strip the tail.
+            let base_url = Some(normalize_aionrs_base_url(&row.base_url)).filter(|u| !u.is_empty());
 
             let config = AionrsResolvedConfig {
                 provider: row.platform,
@@ -236,6 +239,13 @@ async fn build_agent(
     }
 }
 
+/// Strip trailing `/v1`, `/v1/`, or lone `/` from a base URL so that
+/// aionrs can append its own path suffix (`/v1/messages`, `/v1/chat/completions`).
+fn normalize_aionrs_base_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +256,30 @@ mod tests {
         let _: fn() -> AgentFactoryDeps = || {
             panic!("compile-time check only");
         };
+    }
+
+    #[test]
+    fn normalize_aionrs_base_url_strips_v1() {
+        assert_eq!(
+            normalize_aionrs_base_url("https://api.openai.com/v1"),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            normalize_aionrs_base_url("https://api.openai.com/v1/"),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            normalize_aionrs_base_url("https://api.anthropic.com"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            normalize_aionrs_base_url("https://api.deepseek.com/"),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            normalize_aionrs_base_url("http://localhost:11434"),
+            "http://localhost:11434"
+        );
+        assert_eq!(normalize_aionrs_base_url(""), "");
     }
 }
