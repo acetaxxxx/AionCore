@@ -1,0 +1,138 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use aionui_ai_agent::agent_registry::AgentRegistry;
+use aionui_ai_agent::factory::{AgentFactoryDeps, build_agent_factory};
+use aionui_ai_agent::skill_manager::AcpSkillManager;
+use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_common::{AgentType, ProviderWithModel, encrypt_string};
+use aionui_db::{
+    CreateProviderParams, IProviderRepository, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, init_database_memory,
+};
+
+fn test_encryption_key() -> [u8; 32] {
+    [0xABu8; 32]
+}
+
+async fn setup() -> (
+    Arc<dyn IProviderRepository>,
+    Arc<SqliteRemoteAgentRepository>,
+) {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
+    let provider_repo: Arc<dyn IProviderRepository> =
+        Arc::new(SqliteProviderRepository::new(pool.clone()));
+    let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(pool));
+    (provider_repo, remote_agent_repo)
+}
+
+async fn insert_test_provider(repo: &dyn IProviderRepository, id: &str, platform: &str) {
+    let key = test_encryption_key();
+    let encrypted_api_key = encrypt_string("sk-test-key-12345", &key).unwrap();
+    repo.create(CreateProviderParams {
+        id: Some(id),
+        platform,
+        name: "Test Provider",
+        base_url: "https://api.example.com/v1",
+        api_key_encrypted: &encrypted_api_key,
+        models: r#"["gpt-4o","gpt-5.4"]"#,
+        enabled: true,
+        capabilities: "[]",
+        context_limit: None,
+        model_protocols: None,
+        model_enabled: None,
+        model_health: None,
+        bedrock_config: None,
+    })
+    .await
+    .unwrap();
+}
+
+fn make_factory(
+    provider_repo: Arc<dyn IProviderRepository>,
+    remote_agent_repo: Arc<SqliteRemoteAgentRepository>,
+) -> aionui_ai_agent::AgentFactory {
+    build_agent_factory(AgentFactoryDeps {
+        skill_manager: AcpSkillManager::new(),
+        remote_agent_repo,
+        provider_repo,
+        encryption_key: test_encryption_key(),
+        agent_registry: Arc::new(AgentRegistry::new()),
+        data_dir: PathBuf::from("/tmp/aionrs-test"),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aionrs_factory_returns_error_for_missing_provider() {
+    let (provider_repo, remote_agent_repo) = setup().await;
+    let factory = make_factory(provider_repo, remote_agent_repo);
+
+    let options = BuildTaskOptions {
+        agent_type: AgentType::Aionrs,
+        workspace: String::new(),
+        model: ProviderWithModel {
+            provider_id: "nonexistent-provider".into(),
+            model: "gpt-4o".into(),
+            use_model: None,
+        },
+        conversation_id: "conv-test-1".into(),
+        extra: serde_json::json!({}),
+    };
+
+    let result = factory(options);
+    match result {
+        Ok(_) => panic!("Expected error for missing provider, got Ok"),
+        Err(e) => {
+            let err_msg = e.to_string();
+            assert!(
+                err_msg.contains("not found"),
+                "Expected 'not found' error, got: {err_msg}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aionrs_factory_resolves_provider_from_db() {
+    let (provider_repo, remote_agent_repo) = setup().await;
+    insert_test_provider(&*provider_repo, "prov-001", "openai").await;
+    let factory = make_factory(provider_repo, remote_agent_repo);
+
+    let options = BuildTaskOptions {
+        agent_type: AgentType::Aionrs,
+        workspace: "/tmp/test-workspace".into(),
+        model: ProviderWithModel {
+            provider_id: "prov-001".into(),
+            model: "gpt-4o".into(),
+            use_model: None,
+        },
+        conversation_id: "conv-test-2".into(),
+        extra: serde_json::json!({ "max_tokens": 2048 }),
+    };
+
+    let result = factory(options);
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aionrs_factory_respects_use_model_override() {
+    let (provider_repo, remote_agent_repo) = setup().await;
+    insert_test_provider(&*provider_repo, "prov-002", "openai").await;
+    let factory = make_factory(provider_repo, remote_agent_repo);
+
+    let options = BuildTaskOptions {
+        agent_type: AgentType::Aionrs,
+        workspace: "/tmp/test-workspace".into(),
+        model: ProviderWithModel {
+            provider_id: "prov-002".into(),
+            model: "gpt-4o".into(),
+            use_model: Some("gpt-5.4".into()),
+        },
+        conversation_id: "conv-test-3".into(),
+        extra: serde_json::json!({}),
+    };
+
+    let result = factory(options);
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+}
