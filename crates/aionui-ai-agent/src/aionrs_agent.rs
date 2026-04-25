@@ -22,7 +22,7 @@ use tracing::info;
 use crate::agent_manager::IAgentManager;
 use crate::backend_output_sink::BackendOutputSink;
 use crate::stream_event::AgentStreamEvent;
-use crate::types::{AionrsBuildExtra, SendMessageData};
+use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 pub struct AionrsAgentManager {
     conversation_id: String,
@@ -35,7 +35,7 @@ pub struct AionrsAgentManager {
 }
 
 impl AionrsAgentManager {
-    pub fn new(conversation_id: String, workspace: String, config_extra: AionrsBuildExtra) -> Self {
+    pub fn new(conversation_id: String, workspace: String, config_extra: AionrsResolvedConfig) -> Self {
         let (event_tx, _) = broadcast::channel(128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(event_tx.clone()));
 
@@ -190,8 +190,8 @@ impl IAgentManager for AionrsAgentManager {
 mod tests {
     use super::*;
 
-    fn make_test_config() -> AionrsBuildExtra {
-        AionrsBuildExtra {
+    fn make_test_config() -> AionrsResolvedConfig {
+        AionrsResolvedConfig {
             provider: "anthropic".into(),
             api_key: "sk-test-key".into(),
             model: "claude-sonnet-4-20250514".into(),
