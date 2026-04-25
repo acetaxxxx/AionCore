@@ -100,15 +100,27 @@ impl OpenClawAgentManager {
         let port = gateway.port.unwrap_or(DEFAULT_GATEWAY_PORT);
 
         let mut env = vec![
-            EnvVar { name: "OPENCLAW_GATEWAY_HOST".into(), value: host.to_owned() },
-            EnvVar { name: "OPENCLAW_GATEWAY_PORT".into(), value: port.to_string() },
+            EnvVar {
+                name: "OPENCLAW_GATEWAY_HOST".into(),
+                value: host.to_owned(),
+            },
+            EnvVar {
+                name: "OPENCLAW_GATEWAY_PORT".into(),
+                value: port.to_string(),
+            },
         ];
 
         if let Some(ref token) = gateway.token {
-            env.push(EnvVar { name: "OPENCLAW_GATEWAY_TOKEN".into(), value: token.clone() });
+            env.push(EnvVar {
+                name: "OPENCLAW_GATEWAY_TOKEN".into(),
+                value: token.clone(),
+            });
         }
         if let Some(ref password) = gateway.password {
-            env.push(EnvVar { name: "OPENCLAW_GATEWAY_PASSWORD".into(), value: password.clone() });
+            env.push(EnvVar {
+                name: "OPENCLAW_GATEWAY_PASSWORD".into(),
+                value: password.clone(),
+            });
         }
 
         CommandSpec {
@@ -398,7 +410,11 @@ mod tests {
     }
 
     fn env_val<'a>(config: &'a CommandSpec, name: &str) -> Option<&'a str> {
-        config.env.iter().find(|e| e.name == name).map(|e| e.value.as_str())
+        config
+            .env
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.value.as_str())
     }
 
     #[test]
@@ -414,7 +430,10 @@ mod tests {
         let config =
             OpenClawAgentManager::build_spawn_config("/usr/bin/openclaw", "/proj", &gateway);
         assert_eq!(config.command.to_str().unwrap(), "/usr/bin/openclaw");
-        assert_eq!(env_val(&config, "OPENCLAW_GATEWAY_HOST").unwrap(), "127.0.0.1");
+        assert_eq!(
+            env_val(&config, "OPENCLAW_GATEWAY_HOST").unwrap(),
+            "127.0.0.1"
+        );
         assert_eq!(env_val(&config, "OPENCLAW_GATEWAY_PORT").unwrap(), "18789");
         assert!(env_val(&config, "OPENCLAW_GATEWAY_TOKEN").is_none());
     }
@@ -431,10 +450,19 @@ mod tests {
         };
         let config =
             OpenClawAgentManager::build_spawn_config("/usr/bin/openclaw", "/proj", &gateway);
-        assert_eq!(env_val(&config, "OPENCLAW_GATEWAY_HOST").unwrap(), "remote.host");
+        assert_eq!(
+            env_val(&config, "OPENCLAW_GATEWAY_HOST").unwrap(),
+            "remote.host"
+        );
         assert_eq!(env_val(&config, "OPENCLAW_GATEWAY_PORT").unwrap(), "9999");
-        assert_eq!(env_val(&config, "OPENCLAW_GATEWAY_TOKEN").unwrap(), "secret");
-        assert_eq!(env_val(&config, "OPENCLAW_GATEWAY_PASSWORD").unwrap(), "pass");
+        assert_eq!(
+            env_val(&config, "OPENCLAW_GATEWAY_TOKEN").unwrap(),
+            "secret"
+        );
+        assert_eq!(
+            env_val(&config, "OPENCLAW_GATEWAY_PASSWORD").unwrap(),
+            "pass"
+        );
     }
 
     #[test]

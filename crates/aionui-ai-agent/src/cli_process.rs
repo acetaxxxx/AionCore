@@ -81,7 +81,8 @@ impl CliAgentProcess {
             error!(command = %config.command.display(), error = %e, "Failed to spawn CLI process");
             AppError::Internal(format!(
                 "Failed to spawn CLI process '{}': {}",
-                config.command.display(), e
+                config.command.display(),
+                e
             ))
         })?;
 
@@ -210,7 +211,8 @@ impl CliAgentProcess {
             error!(command = %config.command.display(), error = %e, "Failed to spawn CLI process");
             AppError::Internal(format!(
                 "Failed to spawn CLI process '{}': {}",
-                config.command.display(), e
+                config.command.display(),
+                e
             ))
         })?;
 
@@ -635,7 +637,10 @@ mod tests {
                 "-c".into(),
                 "echo \"{\\\"val\\\":\\\"$MY_TEST_VAR\\\"}\"".into(),
             ],
-            env: vec![EnvVar { name: "MY_TEST_VAR".into(), value: "hello_env".into() }],
+            env: vec![EnvVar {
+                name: "MY_TEST_VAR".into(),
+                value: "hello_env".into(),
+            }],
             cwd: Some("/tmp".into()),
         };
         let proc = CliAgentProcess::spawn(config).await.unwrap();
