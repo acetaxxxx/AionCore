@@ -165,10 +165,12 @@ impl AppServices {
         let encryption_key = derive_encryption_key(&secret);
 
         let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
+        let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let agent_registry = Arc::new(AgentRegistry::new());
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new(),
             remote_agent_repo,
+            provider_repo,
             encryption_key,
             agent_registry: agent_registry.clone(),
             data_dir: std::path::PathBuf::from(&data_dir),
