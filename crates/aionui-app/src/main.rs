@@ -46,9 +46,7 @@ fn init_tracing(
     std::fs::create_dir_all(log_dir).expect("failed to create log directory");
 
     let console_filter = EnvFilter::new(log_level.unwrap_or("info"));
-    let console_layer = fmt::layer()
-        .with_target(true)
-        .with_filter(console_filter);
+    let console_layer = fmt::layer().with_target(true).with_filter(console_filter);
 
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
