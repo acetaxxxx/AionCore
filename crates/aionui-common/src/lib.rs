@@ -22,5 +22,6 @@ pub use id::{
 pub use pagination::PaginatedResult;
 pub use timestamp::{TimestampMs, now_ms};
 pub use types::{
-    CommandSpec, Confirmation, ConfirmationOption, EnvVar, ProviderWithModel, UpdateType, VersionInfo,
+    CommandSpec, Confirmation, ConfirmationOption, EnvVar, ProviderWithModel, UpdateType,
+    VersionInfo,
 };
