@@ -28,7 +28,7 @@ use crate::types::{AionrsResolvedConfig, SendMessageData};
 pub struct AionrsAgentManager {
     conversation_id: String,
     workspace: String,
-    event_tx: broadcast::Sender<AgentStreamEvent>,
+    pub(crate) event_tx: broadcast::Sender<AgentStreamEvent>,
     last_activity: AtomicI64,
     engine: Mutex<AgentEngine>,
     status: RwLock<Option<ConversationStatus>>,
@@ -159,7 +159,19 @@ impl IAgentManager for AionrsAgentManager {
 
         match result {
             Ok(_) => Ok(()),
-            Err(e) => Err(AppError::Internal(format!("Aionrs agent error: {e}"))),
+            Err(e) => {
+                let error_msg = format!("Aionrs agent error: {e}");
+                let _ = self.event_tx.send(AgentStreamEvent::Error(
+                    crate::stream_event::ErrorEventData {
+                        message: error_msg.clone(),
+                        code: None,
+                    },
+                ));
+                let _ = self.event_tx.send(AgentStreamEvent::Finish(
+                    crate::stream_event::FinishEventData { session_id: None },
+                ));
+                Err(AppError::Internal(error_msg))
+            }
         }
     }
 
@@ -268,5 +280,31 @@ mod tests {
     fn aionrs_agent_check_approval_returns_false_by_default() {
         let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config());
         assert!(!agent.check_approval("any_action", None));
+    }
+
+    #[test]
+    fn event_tx_can_send_error_and_finish() {
+        let agent =
+            AionrsAgentManager::new("conv-err".into(), "/project".into(), make_test_config());
+        let mut rx = agent.subscribe();
+
+        let _ = agent.event_tx.send(AgentStreamEvent::Error(
+            crate::stream_event::ErrorEventData {
+                message: "test error".into(),
+                code: None,
+            },
+        ));
+        let _ = agent.event_tx.send(AgentStreamEvent::Finish(
+            crate::stream_event::FinishEventData { session_id: None },
+        ));
+
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::Error(data) => assert_eq!(data.message, "test error"),
+            other => panic!("Expected Error, got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::Finish(_) => {}
+            other => panic!("Expected Finish, got {:?}", other),
+        }
     }
 }
