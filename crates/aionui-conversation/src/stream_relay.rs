@@ -9,7 +9,7 @@ use aionui_db::models::MessageRow;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
@@ -42,6 +42,13 @@ impl StreamRelay {
 
     /// Run the relay loop. Consumes `self` and runs until the agent stream ends.
     pub async fn run(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
+        let started_at = now_ms();
+        info!(
+            conversation_id = %self.conversation_id,
+            assistant_msg_id = %self.assistant_msg_id,
+            "StreamRelay started"
+        );
+
         let mut text_buffer = String::new();
         let mut thinking_buffer = String::new();
         let mut thinking_started_at: Option<i64> = None;
@@ -76,6 +83,19 @@ impl StreamRelay {
                     }
 
                     if self.is_terminal(&event) {
+                        let elapsed_ms = now_ms() - started_at;
+                        let event_type = match &event {
+                            AgentStreamEvent::Finish(_) => "Finish",
+                            AgentStreamEvent::Error(_) => "Error",
+                            _ => "Unknown",
+                        };
+                        info!(
+                            conversation_id = %self.conversation_id,
+                            event_type,
+                            elapsed_ms,
+                            text_len = text_buffer.len(),
+                            "StreamRelay received terminal event"
+                        );
                         if has_thinking {
                             self.send_thinking_done();
                         }
@@ -87,6 +107,13 @@ impl StreamRelay {
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
+                    let elapsed_ms = now_ms() - started_at;
+                    warn!(
+                        conversation_id = %self.conversation_id,
+                        elapsed_ms,
+                        text_len = text_buffer.len(),
+                        "StreamRelay channel closed without terminal event"
+                    );
                     if has_thinking {
                         self.send_thinking_done();
                     }
@@ -197,7 +224,7 @@ impl StreamRelay {
                 .update_message(&self.assistant_msg_id, &update)
                 .await
             {
-                warn!(error = %e, "Failed to update streaming message");
+                error!(error = %e, "Failed to update streaming message");
             }
         } else {
             let row = MessageRow {
@@ -212,7 +239,7 @@ impl StreamRelay {
                 created_at: now_ms(),
             };
             if let Err(e) = self.repo.insert_message(&row).await {
-                warn!(error = %e, "Failed to create streaming message");
+                error!(error = %e, "Failed to create streaming message");
             }
             *record_created = true;
         }
@@ -238,7 +265,7 @@ impl StreamRelay {
                     .update_message(&self.assistant_msg_id, &update)
                     .await
                 {
-                    warn!(error = %e, "Failed to finalize streaming message");
+                    error!(error = %e, "Failed to finalize streaming message");
                 }
             } else {
                 let row = MessageRow {
@@ -253,7 +280,7 @@ impl StreamRelay {
                     created_at: now_ms(),
                 };
                 if let Err(e) = self.repo.insert_message(&row).await {
-                    warn!(error = %e, "Failed to create final message");
+                    error!(error = %e, "Failed to create final message");
                 }
             }
         } else if let AgentStreamEvent::Error(data) = event {
@@ -271,7 +298,7 @@ impl StreamRelay {
                 created_at: now_ms(),
             };
             if let Err(e) = self.repo.insert_message(&row).await {
-                warn!(error = %e, "Failed to store error message");
+                error!(error = %e, "Failed to store error message");
             }
         }
 
@@ -303,7 +330,7 @@ impl StreamRelay {
             created_at: started_at.unwrap_or_else(now_ms),
         };
         if let Err(e) = self.repo.insert_message(&row).await {
-            warn!(error = %e, "Failed to persist thinking message");
+            error!(error = %e, "Failed to persist thinking message");
         }
     }
 
@@ -356,7 +383,7 @@ impl StreamRelay {
                 ..Default::default()
             };
             if let Err(e) = self.repo.update(&self.conversation_id, &update).await {
-                warn!(error = %e, "Failed to update conversation status");
+                error!(error = %e, "Failed to update conversation status");
             }
         }
     }
