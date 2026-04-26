@@ -14,7 +14,7 @@ use aionui_common::{
 };
 use aionui_db::{ConversationFilters, ConversationRowUpdate, IConversationRepository, SortOrder};
 use aionui_realtime::EventBroadcaster;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::convert::{
     row_to_message_response, row_to_response, search_row_to_item, string_to_enum,
@@ -583,6 +583,7 @@ impl ConversationService {
         // Send message to the agent in a background task.
         // prompt() blocks until the PromptResponse arrives (turn completed),
         // but the HTTP handler should return 202 immediately.
+        let msg_id_log = req.msg_id.clone();
         let send_data = SendMessageData {
             content: req.content,
             msg_id: req.msg_id,
@@ -596,7 +597,7 @@ impl ConversationService {
             }
         });
 
-        debug!(conversation_id, "Message dispatched, stream relay started");
+        info!(conversation_id, msg_id = %msg_id_log, "Message dispatched, stream relay started");
         Ok(())
     }
 
@@ -622,7 +623,7 @@ impl ConversationService {
 
         agent.stop().await?;
 
-        debug!(conversation_id, "Stream stopped");
+        info!(conversation_id, "Stream stopped");
         Ok(())
     }
 

@@ -18,7 +18,7 @@ use aionui_common::{
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast};
-use tracing::info;
+use tracing::{debug, info, error};
 
 use crate::agent_manager::IAgentManager;
 use crate::backend_output_sink::BackendOutputSink;
@@ -142,7 +142,13 @@ impl IAgentManager for AionrsAgentManager {
     }
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AppError> {
-        self.last_activity.store(now_ms(), Ordering::Relaxed);
+        let started_at = now_ms();
+        info!(
+            conversation_id = %self.conversation_id,
+            msg_id = %data.msg_id,
+            "Aionrs send_message started"
+        );
+        self.last_activity.store(started_at, Ordering::Relaxed);
 
         if let Ok(mut s) = self.status.write() {
             *s = Some(ConversationStatus::Running);
@@ -150,6 +156,8 @@ impl IAgentManager for AionrsAgentManager {
 
         let mut engine = self.engine.lock().await;
         let result = engine.run(&data.content, &data.msg_id).await;
+
+        let elapsed_ms = now_ms() - started_at;
 
         if let Ok(mut s) = self.status.write() {
             *s = Some(ConversationStatus::Finished);
@@ -159,6 +167,11 @@ impl IAgentManager for AionrsAgentManager {
 
         match result {
             Ok(_) => {
+                info!(
+                    conversation_id = %self.conversation_id,
+                    elapsed_ms,
+                    "Aionrs engine.run() completed, emitting Finish"
+                );
                 // AgentEngine.run() does not call emit_stream_end(), so we must
                 // send the Finish event ourselves to unblock StreamRelay.
                 let _ = self.event_tx.send(AgentStreamEvent::Finish(
@@ -168,6 +181,12 @@ impl IAgentManager for AionrsAgentManager {
             }
             Err(e) => {
                 let error_msg = format!("Aionrs agent error: {e}");
+                error!(
+                    conversation_id = %self.conversation_id,
+                    elapsed_ms,
+                    error = %e,
+                    "Aionrs engine.run() failed, emitting Error+Finish"
+                );
                 let _ = self.event_tx.send(AgentStreamEvent::Error(
                     crate::stream_event::ErrorEventData {
                         message: error_msg.clone(),
@@ -183,6 +202,10 @@ impl IAgentManager for AionrsAgentManager {
     }
 
     async fn stop(&self) -> Result<(), AppError> {
+        info!(
+            conversation_id = %self.conversation_id,
+            "Aionrs stop requested"
+        );
         let _ = self.event_tx.send(AgentStreamEvent::Error(
             crate::stream_event::ErrorEventData {
                 message: "Stopped by user".into(),
@@ -210,6 +233,12 @@ impl IAgentManager for AionrsAgentManager {
         } else {
             aion_protocol::commands::ApprovalScope::Once
         };
+        debug!(
+            conversation_id = %self.conversation_id,
+            call_id,
+            always_allow,
+            "Aionrs confirm"
+        );
         self.approval_manager.approve(call_id, scope);
         Ok(())
     }
