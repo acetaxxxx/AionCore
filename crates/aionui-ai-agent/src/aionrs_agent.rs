@@ -158,7 +158,14 @@ impl IAgentManager for AionrsAgentManager {
         self.last_activity.store(now_ms(), Ordering::Relaxed);
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // AgentEngine.run() does not call emit_stream_end(), so we must
+                // send the Finish event ourselves to unblock StreamRelay.
+                let _ = self.event_tx.send(AgentStreamEvent::Finish(
+                    crate::stream_event::FinishEventData { session_id: None },
+                ));
+                Ok(())
+            }
             Err(e) => {
                 let error_msg = format!("Aionrs agent error: {e}");
                 let _ = self.event_tx.send(AgentStreamEvent::Error(
