@@ -24,27 +24,34 @@ static BUILTIN_SKILLS: Dir<'static> =
 /// [`resolve_skill_paths`] when building [`SkillPaths`].
 pub const BUILTIN_SKILLS_ENV_VAR: &str = "AIONUI_BUILTIN_SKILLS_PATH";
 
+/// Expose the embedded builtin skills corpus for startup
+/// materialization. Consumers outside this crate should not depend on
+/// `include_dir` directly.
+pub fn builtin_skills_corpus() -> &'static Dir<'static> {
+    &BUILTIN_SKILLS
+}
+
 // ---------------------------------------------------------------------------
 // Skill paths resolution
 // ---------------------------------------------------------------------------
 
 /// Resolved base directories for skill and rule management.
 ///
-/// `builtin_skills_dir` is `Some(path)` only when the
-/// `AIONUI_BUILTIN_SKILLS_PATH` env var points at an on-disk corpus, or
-/// when tests construct the struct directly. In normal production use it
-/// is `None` and the embedded [`BUILTIN_SKILLS`] corpus is consulted
-/// instead.
+/// `builtin_skills_dir` always points at a real on-disk directory.
+/// In production it resolves to `{data_dir}/builtin-skills/`, populated
+/// at startup by [`crate::startup_materialize::materialize_if_needed`].
+/// In dev/test it can be redirected via [`BUILTIN_SKILLS_ENV_VAR`].
 #[derive(Debug, Clone)]
 pub struct SkillPaths {
     /// Root data directory (~/.aionui/).
     pub data_dir: PathBuf,
     /// User-created skills directory (~/.aionui/skills/).
     pub user_skills_dir: PathBuf,
-    /// Built-in skills directory on disk. `None` means "use the embedded
-    /// corpus"; `Some(path)` means "read from disk" (env override or
-    /// test fixture).
-    pub builtin_skills_dir: Option<PathBuf>,
+    /// Built-in skills directory on disk. Always set.
+    /// Points to `{data_dir}/builtin-skills/` in production (populated at
+    /// startup by `startup_materialize::materialize_if_needed`) or
+    /// wherever [`BUILTIN_SKILLS_ENV_VAR`] points in dev mode.
+    pub builtin_skills_dir: PathBuf,
     /// Built-in rules directory (app bundle resource).
     pub builtin_rules_dir: PathBuf,
     /// Assistant-level rules directory (~/.aionui/assistant-rules/).
@@ -58,18 +65,19 @@ pub struct SkillPaths {
 /// `app_resource_dir` is the application's bundled resource directory
 /// (e.g. the binary's parent or a configured resource path); only
 /// `builtin_rules_dir` is still derived from it — built-in skills live
-/// embedded in the binary unless overridden via
-/// [`BUILTIN_SKILLS_ENV_VAR`].
+/// under `data_dir` (materialized at startup from the embedded corpus)
+/// unless redirected via [`BUILTIN_SKILLS_ENV_VAR`].
 ///
 /// `data_dir` is the user-level data root (e.g. `~/.aionui/`) and
 /// determines where user skills, assistant resources, the built-in
-/// skills "view" (`{data_dir}/builtin-skills-view/`), and per-agent
+/// skills tree (`{data_dir}/builtin-skills/`), and per-agent
 /// materialized skill dirs (`{data_dir}/agent-skills/`) live.
 pub fn resolve_skill_paths(app_resource_dir: &Path, data_dir: &Path) -> SkillPaths {
     let builtin_skills_dir = std::env::var(BUILTIN_SKILLS_ENV_VAR)
         .ok()
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join(crate::constants::BUILTIN_SKILLS_DIR_NAME));
 
     SkillPaths {
         data_dir: data_dir.to_path_buf(),
@@ -106,25 +114,16 @@ pub async fn read_builtin_rule(
 /// exist (preserves the legacy graceful-degradation contract consumed by
 /// the renderer).
 ///
-/// When `paths.builtin_skills_dir` is `Some`, reads from that on-disk
-/// directory; otherwise consults the embedded corpus. Rejects
-/// `..`-style traversal regardless of source.
+/// Reads from `paths.builtin_skills_dir`, which is always populated at
+/// startup by [`crate::startup_materialize::materialize_if_needed`].
+/// Rejects `..`-style traversal.
 pub async fn read_builtin_skill(
     paths: &SkillPaths,
     file_name: &str,
 ) -> Result<String, ExtensionError> {
     validate_builtin_skill_path(file_name)?;
-
-    if let Some(dir) = &paths.builtin_skills_dir {
-        let file_path = dir.join(file_name);
-        return read_file_or_empty(&file_path).await;
-    }
-
-    Ok(BUILTIN_SKILLS
-        .get_file(file_name)
-        .and_then(|f| f.contents_utf8())
-        .map(|s| s.to_string())
-        .unwrap_or_default())
+    let file_path = paths.builtin_skills_dir.join(file_name);
+    read_file_or_empty(&file_path).await
 }
 
 // ---------------------------------------------------------------------------
@@ -273,10 +272,8 @@ pub async fn list_available_skills(
 /// Emit a [`SkillListItem`] for every built-in skill (both auto-inject
 /// and opt-in), materializing the on-disk view lazily.
 async fn list_builtin_skills(paths: &SkillPaths) -> Vec<SkillListItem> {
-    if let Some(dir) = &paths.builtin_skills_dir {
-        return list_builtin_skills_from_disk(paths, dir).await;
-    }
-    list_builtin_skills_from_embedded(paths).await
+    let dir = paths.builtin_skills_dir.clone();
+    list_builtin_skills_from_disk(paths, &dir).await
 }
 
 async fn list_builtin_skills_from_disk(paths: &SkillPaths, dir: &Path) -> Vec<SkillListItem> {
@@ -288,8 +285,16 @@ async fn list_builtin_skills_from_disk(paths: &SkillPaths, dir: &Path) -> Vec<Sk
             if s.name == BUILTIN_AUTO_SKILLS_SUBDIR {
                 continue;
             }
-            let rel = format!("{}/{SKILL_MANIFEST_FILE}", s.name);
-            let location = materialize_builtin_view_from_disk(paths, dir, &s.name).await;
+            // Use the on-disk directory name (basename of scanned path)
+            // rather than the frontmatter name, so the view lookup hits
+            // the real filesystem layout when the two disagree.
+            let dir_name = Path::new(&s.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&s.name)
+                .to_string();
+            let rel = format!("{dir_name}/{SKILL_MANIFEST_FILE}");
+            let location = materialize_builtin_view_from_disk(paths, dir, &dir_name).await;
             items.push(SkillListItem {
                 name: s.name,
                 description: s.description,
@@ -305,11 +310,13 @@ async fn list_builtin_skills_from_disk(paths: &SkillPaths, dir: &Path) -> Vec<Sk
     let auto_dir = dir.join(BUILTIN_AUTO_SKILLS_SUBDIR);
     if let Ok(auto) = scan_skill_dirs(&auto_dir).await {
         for s in auto {
-            let rel = format!(
-                "{BUILTIN_AUTO_SKILLS_SUBDIR}/{}/{SKILL_MANIFEST_FILE}",
-                s.name
-            );
-            let location = materialize_builtin_view_from_disk(paths, dir, &s.name).await;
+            let dir_name = Path::new(&s.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&s.name)
+                .to_string();
+            let rel = format!("{BUILTIN_AUTO_SKILLS_SUBDIR}/{dir_name}/{SKILL_MANIFEST_FILE}");
+            let location = materialize_builtin_view_from_disk(paths, dir, &dir_name).await;
             items.push(SkillListItem {
                 name: s.name,
                 description: s.description,
@@ -324,6 +331,7 @@ async fn list_builtin_skills_from_disk(paths: &SkillPaths, dir: &Path) -> Vec<Sk
     items
 }
 
+#[allow(dead_code)]
 async fn list_builtin_skills_from_embedded(paths: &SkillPaths) -> Vec<SkillListItem> {
     let mut items = Vec::new();
 
@@ -396,6 +404,7 @@ async fn list_builtin_skills_from_embedded(paths: &SkillPaths) -> Vec<SkillListI
     items
 }
 
+#[allow(dead_code)]
 fn read_embedded_skill_meta(skill_rel: &str) -> Option<(String, String)> {
     let file = BUILTIN_SKILLS.get_file(skill_rel)?;
     let content = file.contents_utf8()?;
@@ -515,20 +524,14 @@ pub struct BuiltinAutoSkillItem {
 
 /// List built-in skills that are auto-injected into every assistant.
 ///
-/// Reads from the embedded corpus under `auto-inject/`, or from
-/// `{builtin_skills_dir}/auto-inject/` when a disk override is in
-/// effect. A missing `auto-inject/` directory yields an empty list,
-/// matching the graceful-degradation semantics used elsewhere in this
-/// module.
+/// Reads from `{paths.builtin_skills_dir}/auto-inject/`. A missing
+/// `auto-inject/` directory yields an empty list, matching the
+/// graceful-degradation semantics used elsewhere in this module.
 pub async fn list_builtin_auto_skills(
     paths: &SkillPaths,
 ) -> Result<Vec<BuiltinAutoSkillItem>, ExtensionError> {
-    let items = if let Some(dir) = &paths.builtin_skills_dir {
-        list_auto_skills_from_disk(&dir.join(BUILTIN_AUTO_SKILLS_SUBDIR)).await
-    } else {
-        list_auto_skills_from_embedded()
-    };
-    let mut items = items;
+    let auto_dir = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR);
+    let mut items = list_auto_skills_from_disk(&auto_dir).await;
     items.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(items)
 }
@@ -554,6 +557,7 @@ async fn list_auto_skills_from_disk(auto_dir: &Path) -> Vec<BuiltinAutoSkillItem
         .collect()
 }
 
+#[allow(dead_code)]
 fn list_auto_skills_from_embedded() -> Vec<BuiltinAutoSkillItem> {
     let Some(auto_dir) = BUILTIN_SKILLS.get_dir(BUILTIN_AUTO_SKILLS_SUBDIR) else {
         return Vec::new();
@@ -734,20 +738,15 @@ pub async fn delete_skill(paths: &SkillPaths, skill_name: &str) -> Result<(), Ex
 }
 
 /// Check whether a skill name exists in the built-in corpus — either as
-/// a top-level opt-in skill or under `auto-inject/`. Consults the disk
-/// override when present; otherwise the embedded corpus.
+/// a top-level opt-in skill or under `auto-inject/`. Consults the
+/// on-disk tree at `paths.builtin_skills_dir`.
 fn builtin_skill_exists(paths: &SkillPaths, skill_name: &str) -> bool {
-    if let Some(dir) = &paths.builtin_skills_dir {
-        return dir.join(skill_name).is_dir()
-            || dir
-                .join(BUILTIN_AUTO_SKILLS_SUBDIR)
-                .join(skill_name)
-                .is_dir();
-    }
-    BUILTIN_SKILLS.get_dir(skill_name).is_some()
-        || BUILTIN_SKILLS
-            .get_dir(format!("{BUILTIN_AUTO_SKILLS_SUBDIR}/{skill_name}"))
-            .is_some()
+    paths.builtin_skills_dir.join(skill_name).is_dir()
+        || paths
+            .builtin_skills_dir
+            .join(BUILTIN_AUTO_SKILLS_SUBDIR)
+            .join(skill_name)
+            .is_dir()
 }
 
 // ---------------------------------------------------------------------------
@@ -818,46 +817,32 @@ pub async fn materialize_skills_for_agent(
 }
 
 async fn write_auto_inject_skills(paths: &SkillPaths, target: &Path) -> Result<(), ExtensionError> {
-    if let Some(dir) = &paths.builtin_skills_dir {
-        let auto_dir = dir.join(BUILTIN_AUTO_SKILLS_SUBDIR);
-        if !auto_dir.is_dir() {
-            return Ok(());
-        }
-        let mut entries = match tokio::fs::read_dir(&auto_dir).await {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(ExtensionError::Io(e)),
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let dest = target.join(name);
-            copy_dir_recursive(&path, &dest).await?;
-        }
+    let auto_dir = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR);
+    if !auto_dir.is_dir() {
         return Ok(());
     }
-
-    let Some(auto_dir) = BUILTIN_SKILLS.get_dir(BUILTIN_AUTO_SKILLS_SUBDIR) else {
-        return Ok(());
+    let mut entries = match tokio::fs::read_dir(&auto_dir).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ExtensionError::Io(e)),
     };
-    for subdir in auto_dir.dirs() {
-        let Some(name) = subdir.path().file_name().and_then(|n| n.to_str()) else {
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         let dest = target.join(name);
-        extract_embedded_dir(subdir, &dest).await?;
+        copy_dir_recursive(&path, &dest).await?;
     }
     Ok(())
 }
 
 /// Write a single opt-in skill into `{target}/{name}/`. Resolves in
-/// order: embedded/disk builtin (top-level + auto-inject) → user
-/// skills dir. Returns `true` if the skill was found and written.
+/// order: builtin top-level → builtin auto-inject → user skills dir.
+/// Returns `true` if the skill was found and written.
 async fn write_opt_in_skill(
     paths: &SkillPaths,
     name: &str,
@@ -865,40 +850,24 @@ async fn write_opt_in_skill(
 ) -> Result<bool, ExtensionError> {
     let dest = target.join(name);
 
-    // Disk corpus override.
-    if let Some(dir) = &paths.builtin_skills_dir {
-        let top = dir.join(name);
-        if top.is_dir() {
-            if dest.exists() {
-                tokio::fs::remove_dir_all(&dest).await?;
-            }
-            copy_dir_recursive(&top, &dest).await?;
-            return Ok(true);
+    let top = paths.builtin_skills_dir.join(name);
+    if top.is_dir() {
+        if dest.exists() {
+            tokio::fs::remove_dir_all(&dest).await?;
         }
-        let auto = dir.join(BUILTIN_AUTO_SKILLS_SUBDIR).join(name);
-        if auto.is_dir() {
-            if dest.exists() {
-                tokio::fs::remove_dir_all(&dest).await?;
-            }
-            copy_dir_recursive(&auto, &dest).await?;
-            return Ok(true);
+        copy_dir_recursive(&top, &dest).await?;
+        return Ok(true);
+    }
+    let auto = paths
+        .builtin_skills_dir
+        .join(BUILTIN_AUTO_SKILLS_SUBDIR)
+        .join(name);
+    if auto.is_dir() {
+        if dest.exists() {
+            tokio::fs::remove_dir_all(&dest).await?;
         }
-    } else {
-        // Embedded corpus.
-        if let Some(top) = BUILTIN_SKILLS.get_dir(name) {
-            if dest.exists() {
-                tokio::fs::remove_dir_all(&dest).await?;
-            }
-            extract_embedded_dir(top, &dest).await?;
-            return Ok(true);
-        }
-        if let Some(auto) = BUILTIN_SKILLS.get_dir(format!("{BUILTIN_AUTO_SKILLS_SUBDIR}/{name}")) {
-            if dest.exists() {
-                tokio::fs::remove_dir_all(&dest).await?;
-            }
-            extract_embedded_dir(auto, &dest).await?;
-            return Ok(true);
-        }
+        copy_dir_recursive(&auto, &dest).await?;
+        return Ok(true);
     }
 
     // User skill.
@@ -1092,20 +1061,14 @@ pub async fn detect_and_count_external_skills(
 
 /// Get the user and built-in skill directory paths.
 ///
-/// When the built-in corpus is embedded (the production case), the
-/// returned built-in path is a placeholder URL (`embedded://builtin-skills`)
-/// — consumers (`SkillsHubSettings`) only use it for display, never to
-/// resolve on-disk files. When a disk override is active, the override
-/// path is returned verbatim.
+/// Both values are real on-disk paths. The built-in path points at the
+/// tree populated at startup by
+/// [`crate::startup_materialize::materialize_if_needed`], or at the
+/// [`BUILTIN_SKILLS_ENV_VAR`] override when set.
 pub fn get_skill_paths(paths: &SkillPaths) -> (String, String) {
-    let builtin = paths
-        .builtin_skills_dir
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "embedded://builtin-skills".to_string());
     (
         paths.user_skills_dir.to_string_lossy().into_owned(),
-        builtin,
+        paths.builtin_skills_dir.to_string_lossy().into_owned(),
     )
 }
 
@@ -1440,7 +1403,7 @@ mod tests {
         let paths = SkillPaths {
             data_dir: tmp.path().to_path_buf(),
             user_skills_dir: tmp.path().join(SKILLS_DIR_NAME),
-            builtin_skills_dir: Some(tmp.path().join(crate::constants::BUILTIN_SKILLS_DIR_NAME)),
+            builtin_skills_dir: tmp.path().join(crate::constants::BUILTIN_SKILLS_DIR_NAME),
             builtin_rules_dir: rules_dir,
             assistant_rules_dir: tmp.path().join(ASSISTANT_RULES_DIR_NAME),
             assistant_skills_dir: tmp.path().join(ASSISTANT_SKILLS_DIR_NAME),
@@ -1942,44 +1905,41 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_test_paths(base: &Path) -> SkillPaths {
-        // Tests historically seed `builtin_skills_dir` with on-disk
-        // content, so we always hand out a disk override here. Tests
-        // exercising the embedded corpus use `make_embedded_paths`.
+        // Hand out an empty on-disk builtin-skills dir. Tests that need
+        // specific fixtures seed it via `create_skill_in_dir`; tests
+        // that want the full real corpus use `make_embedded_paths`.
         SkillPaths {
             data_dir: base.to_path_buf(),
             user_skills_dir: base.join(SKILLS_DIR_NAME),
-            builtin_skills_dir: Some(base.join(crate::constants::BUILTIN_SKILLS_DIR_NAME)),
+            builtin_skills_dir: base.join(crate::constants::BUILTIN_SKILLS_DIR_NAME),
             builtin_rules_dir: base.join(BUILTIN_RULES_DIR_NAME),
             assistant_rules_dir: base.join(ASSISTANT_RULES_DIR_NAME),
             assistant_skills_dir: base.join(ASSISTANT_SKILLS_DIR_NAME),
         }
     }
 
-    fn make_embedded_paths(base: &Path) -> SkillPaths {
-        // For tests that want to exercise the embedded-corpus code
-        // paths without a disk override.
-        SkillPaths {
-            data_dir: base.to_path_buf(),
-            user_skills_dir: base.join(SKILLS_DIR_NAME),
-            builtin_skills_dir: None,
-            builtin_rules_dir: base.join(BUILTIN_RULES_DIR_NAME),
-            assistant_rules_dir: base.join(ASSISTANT_RULES_DIR_NAME),
-            assistant_skills_dir: base.join(ASSISTANT_SKILLS_DIR_NAME),
-        }
+    /// Return `SkillPaths` pre-populated with the real embedded builtin
+    /// skills corpus materialized to disk. Use this for tests that
+    /// previously relied on the embedded-corpus fallback.
+    async fn make_embedded_paths(base: &Path) -> SkillPaths {
+        crate::startup_materialize::materialize_embedded_builtin_skills(
+            base,
+            &BUILTIN_SKILLS,
+            "test-version",
+        )
+        .await
+        .expect("failed to materialize embedded corpus for test");
+        make_test_paths(base)
     }
 
-    /// Return a `SkillPaths` rooted at `base` but whose
-    /// `builtin_skills_dir` is `Some(path)`, so tests can seed
-    /// on-disk fixtures.
+    /// Return a `SkillPaths` rooted at `base` with an on-disk
+    /// `builtin_skills_dir`, so tests can seed fixtures in that dir.
     fn make_disk_builtin_paths(base: &Path) -> SkillPaths {
         make_test_paths(base)
     }
 
     fn disk_builtin_dir(paths: &SkillPaths) -> &Path {
-        paths
-            .builtin_skills_dir
-            .as_deref()
-            .expect("disk override must be set for test")
+        &paths.builtin_skills_dir
     }
 
     fn create_skill_in_dir(base: &Path, name: &str, description: &str) {
@@ -1999,7 +1959,7 @@ mod tests {
     #[tokio::test]
     async fn embedded_lists_auto_inject_from_corpus() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let autos = list_builtin_auto_skills(&paths).await.unwrap();
         assert!(
@@ -2021,7 +1981,7 @@ mod tests {
     #[tokio::test]
     async fn embedded_reads_builtin_skill_content() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let content = read_builtin_skill(&paths, "auto-inject/cron/SKILL.md")
             .await
@@ -2037,7 +1997,7 @@ mod tests {
     #[tokio::test]
     async fn embedded_rejects_path_traversal() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let result = read_builtin_skill(&paths, "../etc/passwd").await;
         assert!(matches!(result, Err(ExtensionError::PathTraversal(_))));
@@ -2049,7 +2009,7 @@ mod tests {
     #[tokio::test]
     async fn embedded_handles_missing_file() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let content = read_builtin_skill(&paths, "nonexistent/SKILL.md")
             .await
@@ -2081,7 +2041,7 @@ mod tests {
     #[tokio::test]
     async fn list_skills_builtin_has_relative_location_from_embedded() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let skills = list_available_skills(&paths).await.unwrap();
         let builtins: Vec<_> = skills
@@ -2119,7 +2079,7 @@ mod tests {
     #[tokio::test]
     async fn materialize_creates_fresh_dir_each_call() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let dir = materialize_skills_for_agent(&paths, "conv-1", &[])
             .await
@@ -2140,7 +2100,7 @@ mod tests {
     #[tokio::test]
     async fn materialize_includes_auto_inject() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let dir = materialize_skills_for_agent(&paths, "conv-auto", &[])
             .await
@@ -2159,7 +2119,7 @@ mod tests {
     #[tokio::test]
     async fn materialize_includes_opt_in() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let dir = materialize_skills_for_agent(&paths, "conv-opt", &["mermaid".to_string()])
             .await
@@ -2177,7 +2137,7 @@ mod tests {
     #[tokio::test]
     async fn materialize_handles_nonexistent_skill_name() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let dir =
             materialize_skills_for_agent(&paths, "conv-missing", &["no-such-skill".to_string()])
@@ -2191,7 +2151,7 @@ mod tests {
     #[tokio::test]
     async fn materialize_rejects_bad_conversation_id() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let err = materialize_skills_for_agent(&paths, "../evil", &[])
             .await
@@ -2202,7 +2162,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_is_idempotent() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         materialize_skills_for_agent(&paths, "conv-del", &[])
             .await
@@ -2222,7 +2182,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_cleanup_removes_stale_but_preserves_live() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         // Seed: one live + one orphan conversation dir.
         let root = paths.data_dir.join(AGENT_SKILLS_SUBDIR);
@@ -2242,7 +2202,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_cleanup_missing_root_is_noop() {
         let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path());
+        let paths = make_embedded_paths(tmp.path()).await;
 
         let removed = cleanup_orphan_agent_skills(&paths, |_| true).await.unwrap();
         assert_eq!(removed, 0);
