@@ -556,6 +556,18 @@ impl ConversationService {
                 AppError::NotFound(format!("Conversation {conversation_id} not found"))
             })?;
 
+        // Short-circuit for legacy Gemini conversations: the dedicated Gemini
+        // runtime has been removed, so we cannot build an agent for this row.
+        // Return a clean BadRequest without touching the legacy `model` column,
+        // which may hold shapes the new parser can't deserialize.
+        if row.r#type == "gemini" {
+            return Err(AppError::BadRequest(
+                "This is a legacy Gemini conversation. The dedicated Gemini runtime has been \
+                 removed; please create a new conversation with the Gemini ACP backend to continue."
+                    .into(),
+            ));
+        }
+
         // Check if conversation is already processing (simple guard)
         let status: ConversationStatus = match row.status.as_deref() {
             None | Some("") => ConversationStatus::Finished,
