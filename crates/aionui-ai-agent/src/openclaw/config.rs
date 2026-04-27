@@ -178,10 +178,7 @@ mod tests {
 }"#;
         let clean = strip_jsonc_comments(input);
         let config: OpenClawFileConfig = serde_json::from_str(&clean).unwrap();
-        assert_eq!(
-            config.gateway.as_ref().and_then(|g| g.port),
-            Some(18789)
-        );
+        assert_eq!(config.gateway.as_ref().and_then(|g| g.port), Some(18789));
     }
 
     #[test]
@@ -231,7 +228,10 @@ mod tests {
 }"#;
         let config: OpenClawFileConfig = serde_json::from_str(json).unwrap();
         assert_eq!(get_gateway_port(Some(&config)), 9999);
-        assert_eq!(get_gateway_auth_password(Some(&config)).as_deref(), Some("my-pass"));
+        assert_eq!(
+            get_gateway_auth_password(Some(&config)).as_deref(),
+            Some("my-pass")
+        );
         assert!(get_gateway_auth_token(Some(&config)).is_none());
     }
 

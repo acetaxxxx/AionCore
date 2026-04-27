@@ -42,12 +42,7 @@ pub fn load_device_auth_token(device_id: &str, role: &str) -> Option<DeviceAuthE
     store.tokens.get(role).cloned()
 }
 
-pub fn store_device_auth_token(
-    device_id: &str,
-    role: &str,
-    token: &str,
-    scopes: &[String],
-) {
+pub fn store_device_auth_token(device_id: &str, role: &str, token: &str, scopes: &[String]) {
     let path = store_path();
 
     let mut store = fs::read_to_string(&path)

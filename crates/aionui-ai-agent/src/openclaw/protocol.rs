@@ -424,10 +424,7 @@ mod tests {
         });
         let hello: HelloOk = serde_json::from_value(json).unwrap();
         assert_eq!(hello.protocol, Some(3));
-        assert_eq!(
-            hello.policy.as_ref().unwrap().tick_interval_ms,
-            Some(30000)
-        );
+        assert_eq!(hello.policy.as_ref().unwrap().tick_interval_ms, Some(30000));
         assert_eq!(
             hello.auth.as_ref().unwrap().device_token.as_deref(),
             Some("tok123")

@@ -35,9 +35,7 @@ fn default_identity_path() -> PathBuf {
         .join("device.json")
 }
 
-pub fn load_or_create_identity(
-    custom_path: Option<&Path>,
-) -> Result<DeviceIdentity, AppError> {
+pub fn load_or_create_identity(custom_path: Option<&Path>) -> Result<DeviceIdentity, AppError> {
     let path = custom_path
         .map(PathBuf::from)
         .unwrap_or_else(default_identity_path);
@@ -54,13 +52,11 @@ pub fn load_or_create_identity(
 }
 
 fn load_identity(path: &Path) -> Result<DeviceIdentity, AppError> {
-    let content = fs::read_to_string(path).map_err(|e| {
-        AppError::Internal(format!("Failed to read device identity: {e}"))
-    })?;
+    let content = fs::read_to_string(path)
+        .map_err(|e| AppError::Internal(format!("Failed to read device identity: {e}")))?;
 
-    let stored: StoredIdentity = serde_json::from_str(&content).map_err(|e| {
-        AppError::Internal(format!("Failed to parse device identity: {e}"))
-    })?;
+    let stored: StoredIdentity = serde_json::from_str(&content)
+        .map_err(|e| AppError::Internal(format!("Failed to parse device identity: {e}")))?;
 
     if stored.version != 1 {
         return Err(AppError::Internal(format!(
@@ -84,9 +80,8 @@ fn load_identity(path: &Path) -> Result<DeviceIdentity, AppError> {
 
 fn save_identity(path: &Path, identity: &DeviceIdentity) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            AppError::Internal(format!("Failed to create identity directory: {e}"))
-        })?;
+        fs::create_dir_all(parent)
+            .map_err(|e| AppError::Internal(format!("Failed to create identity directory: {e}")))?;
     }
 
     let (pub_pem, priv_pem) = signing_key_to_pem(&identity.signing_key);
@@ -99,13 +94,11 @@ fn save_identity(path: &Path, identity: &DeviceIdentity) -> Result<(), AppError>
         created_at_ms: Some(aionui_common::now_ms()),
     };
 
-    let json = serde_json::to_string_pretty(&stored).map_err(|e| {
-        AppError::Internal(format!("Failed to serialize device identity: {e}"))
-    })?;
+    let json = serde_json::to_string_pretty(&stored)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize device identity: {e}")))?;
 
-    fs::write(path, format!("{json}\n")).map_err(|e| {
-        AppError::Internal(format!("Failed to write device identity: {e}"))
-    })?;
+    fs::write(path, format!("{json}\n"))
+        .map_err(|e| AppError::Internal(format!("Failed to write device identity: {e}")))?;
 
     #[cfg(unix)]
     {
@@ -215,8 +208,7 @@ fn public_key_base64url(signing_key: &SigningKey) -> String {
 // ── PEM Encoding/Decoding ───────────────────────────────────────────────
 
 const ED25519_PKCS8_PREFIX: [u8; 16] = [
-    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
-    0x20,
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ];
 
 const ED25519_SPKI_PREFIX: [u8; 12] = [
@@ -277,12 +269,14 @@ fn pem_decode(pem: &str, label: &str) -> Result<Vec<u8>, AppError> {
         .collect();
 
     if !pem.contains(&begin) || !pem.contains(&end) {
-        return Err(AppError::Internal(format!("Invalid PEM: missing {label} markers")));
+        return Err(AppError::Internal(format!(
+            "Invalid PEM: missing {label} markers"
+        )));
     }
 
-    STANDARD.decode(b64).map_err(|e| {
-        AppError::Internal(format!("Failed to decode PEM base64: {e}"))
-    })
+    STANDARD
+        .decode(b64)
+        .map_err(|e| AppError::Internal(format!("Failed to decode PEM base64: {e}")))
 }
 
 #[cfg(test)]
@@ -301,13 +295,13 @@ mod tests {
     #[test]
     fn sign_and_verify_roundtrip() {
         let identity = generate_identity();
-        let payload = "v2|device123|gateway-client|backend|operator|operator.admin|1700000000000||nonce123";
+        let payload =
+            "v2|device123|gateway-client|backend|operator|operator.admin|1700000000000||nonce123";
         let signature_b64 = sign_payload(&identity.signing_key, payload);
 
         let sig_bytes = URL_SAFE_NO_PAD.decode(&signature_b64).unwrap();
-        let signature = ed25519_dalek::Signature::from_bytes(
-            sig_bytes.as_slice().try_into().unwrap(),
-        );
+        let signature =
+            ed25519_dalek::Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
         identity
             .signing_key
             .verifying_key()
@@ -326,8 +320,14 @@ mod tests {
     #[test]
     fn build_auth_payload_v1() {
         let payload = build_auth_payload(
-            "abc123", "gateway-client", "backend", "operator", "operator.admin",
-            1700000000000, None, None,
+            "abc123",
+            "gateway-client",
+            "backend",
+            "operator",
+            "operator.admin",
+            1700000000000,
+            None,
+            None,
         );
         assert_eq!(
             payload,
@@ -338,8 +338,14 @@ mod tests {
     #[test]
     fn build_auth_payload_v2_with_nonce() {
         let payload = build_auth_payload(
-            "abc123", "gateway-client", "backend", "operator", "operator.admin",
-            1700000000000, Some("tok"), Some("nonce123"),
+            "abc123",
+            "gateway-client",
+            "backend",
+            "operator",
+            "operator.admin",
+            1700000000000,
+            Some("tok"),
+            Some("nonce123"),
         );
         assert_eq!(
             payload,
@@ -369,7 +375,10 @@ mod tests {
         let loaded = load_identity(&path).unwrap();
 
         assert_eq!(identity.device_id, loaded.device_id);
-        assert_eq!(identity.signing_key.as_bytes(), loaded.signing_key.as_bytes());
+        assert_eq!(
+            identity.signing_key.as_bytes(),
+            loaded.signing_key.as_bytes()
+        );
     }
 
     #[test]

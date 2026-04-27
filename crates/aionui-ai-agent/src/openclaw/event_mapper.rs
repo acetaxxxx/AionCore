@@ -96,7 +96,8 @@ fn map_chat_event(
             }
         }
         ChatEventState::Final => {
-            if text_state.accumulated_text.is_empty() && !text_state.agent_assistant_fallback.is_empty()
+            if text_state.accumulated_text.is_empty()
+                && !text_state.agent_assistant_fallback.is_empty()
             {
                 // Layer 2 fallback: use agent.assistant buffered text
                 if text_state.current_msg_id.is_none() {
@@ -167,7 +168,10 @@ fn map_agent_event(
             }
             vec![AgentStreamEvent::Thinking(ThinkingEventData {
                 content,
-                subject: data.get("subject").and_then(|v| v.as_str()).map(String::from),
+                subject: data
+                    .get("subject")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 duration: None,
                 status: Some("in_progress".into()),
             })]
@@ -200,7 +204,10 @@ fn map_agent_event(
 
 fn map_tool_event(data: &Value) -> Vec<AgentStreamEvent> {
     let phase = data.get("phase").and_then(|v| v.as_str()).unwrap_or("");
-    let is_error = data.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_error = data
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let status = match phase {
         "result" if is_error => ToolCallStatus::Error,
@@ -243,7 +250,9 @@ fn map_approval_event(event: &EventFrame) -> Vec<AgentStreamEvent> {
     let call_id = tool_call
         .and_then(|tc| tc.tool_call_id.as_deref())
         .unwrap_or(&approval.request_id);
-    let action = tool_call.and_then(|tc| tc.title.as_deref()).unwrap_or("unknown");
+    let action = tool_call
+        .and_then(|tc| tc.title.as_deref())
+        .unwrap_or("unknown");
     let command_type = tool_call.and_then(|tc| tc.kind.as_deref());
 
     let confirmation = serde_json::json!({
@@ -466,7 +475,9 @@ mod tests {
         let events = map_openclaw_event(&event, &mut state, None);
 
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], AgentStreamEvent::ToolCall(tc) if tc.status == ToolCallStatus::Completed));
+        assert!(
+            matches!(&events[0], AgentStreamEvent::ToolCall(tc) if tc.status == ToolCallStatus::Completed)
+        );
     }
 
     #[test]
@@ -482,7 +493,9 @@ mod tests {
         let events = map_openclaw_event(&event, &mut state, None);
 
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], AgentStreamEvent::ToolCall(tc) if tc.status == ToolCallStatus::Error));
+        assert!(
+            matches!(&events[0], AgentStreamEvent::ToolCall(tc) if tc.status == ToolCallStatus::Error)
+        );
     }
 
     #[test]
@@ -583,7 +596,10 @@ mod tests {
     #[test]
     fn extract_text_from_text_field() {
         let msg = json!({ "text": "fallback text" });
-        assert_eq!(extract_text_from_message(&msg), Some("fallback text".into()));
+        assert_eq!(
+            extract_text_from_message(&msg),
+            Some("fallback text".into())
+        );
     }
 
     #[test]

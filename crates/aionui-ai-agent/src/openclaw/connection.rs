@@ -13,21 +13,17 @@ use tracing::{debug, error, warn};
 
 use super::device_identity::{DeviceIdentity, build_device_auth_params};
 use super::protocol::{
-    CLIENT_DISPLAY_NAME, CLIENT_ID, CLIENT_MODE, CLIENT_VERSION, AuthParams, ClientInfo,
+    AuthParams, CLIENT_DISPLAY_NAME, CLIENT_ID, CLIENT_MODE, CLIENT_VERSION, ClientInfo,
     ConnectParams, EventFrame, HelloOk, IncomingFrame, OPENCLAW_PROTOCOL_VERSION, RequestFrame,
 };
 
 type WsSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
 
 type WsStream = futures_util::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -150,8 +146,11 @@ impl OpenClawConnection {
             _ => None,
         };
 
-        let device_params =
-            build_device_auth_params(identity, nonce, auth.as_ref().and_then(|a| a.token.as_deref()));
+        let device_params = build_device_auth_params(
+            identity,
+            nonce,
+            auth.as_ref().and_then(|a| a.token.as_deref()),
+        );
 
         let params = ConnectParams {
             min_protocol: OPENCLAW_PROTOCOL_VERSION,
@@ -197,15 +196,13 @@ impl OpenClawConnection {
 
         let result = tokio::time::timeout(REQUEST_TIMEOUT, rx)
             .await
-            .map_err(|_| {
-                AppError::Internal(format!("OpenClaw request '{method}' timed out"))
-            })?
-            .map_err(|_| {
-                AppError::Internal(format!("OpenClaw request '{method}' cancelled"))
-            })??;
+            .map_err(|_| AppError::Internal(format!("OpenClaw request '{method}' timed out")))?
+            .map_err(|_| AppError::Internal(format!("OpenClaw request '{method}' cancelled")))??;
 
         serde_json::from_value(result).map_err(|e| {
-            AppError::Internal(format!("Failed to parse OpenClaw response for '{method}': {e}"))
+            AppError::Internal(format!(
+                "Failed to parse OpenClaw response for '{method}': {e}"
+            ))
         })
     }
 
@@ -254,9 +251,7 @@ impl OpenClawConnection {
         // Fail all pending requests
         let mut pending = self.pending.lock().await;
         for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(AppError::Internal(
-                "OpenClaw connection closed".into(),
-            )));
+            let _ = tx.send(Err(AppError::Internal("OpenClaw connection closed".into())));
         }
     }
 
@@ -310,9 +305,8 @@ impl OpenClawConnection {
     }
 
     async fn ws_send_frame(&self, frame: &RequestFrame) -> Result<(), AppError> {
-        let text = serde_json::to_string(frame).map_err(|e| {
-            AppError::Internal(format!("Failed to serialize request frame: {e}"))
-        })?;
+        let text = serde_json::to_string(frame)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize request frame: {e}")))?;
 
         let mut guard = self.ws_sink.lock().await;
         let sink = guard
@@ -328,8 +322,8 @@ impl OpenClawConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::device_identity::generate_identity;
+    use super::*;
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -353,7 +347,9 @@ mod tests {
                     "payload": { "nonce": nonce }
                 });
                 let _ = sink
-                    .send(Message::Text(serde_json::to_string(&challenge).unwrap().into()))
+                    .send(Message::Text(
+                        serde_json::to_string(&challenge).unwrap().into(),
+                    ))
                     .await;
 
                 // Wait for connect request
@@ -414,7 +410,10 @@ mod tests {
     #[tokio::test]
     async fn connect_and_handshake() {
         let (url, _server) = spawn_mock_gateway(Some("test-nonce")).await;
-        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap().0;
+        let conn = OpenClawConnection::connect(&url, None, &generate_identity())
+            .await
+            .unwrap()
+            .0;
         assert!(conn.is_connected());
         conn.close().await;
     }
@@ -422,7 +421,10 @@ mod tests {
     #[tokio::test]
     async fn connect_without_challenge_nonce() {
         let (url, _server) = spawn_mock_gateway(None).await;
-        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap().0;
+        let conn = OpenClawConnection::connect(&url, None, &generate_identity())
+            .await
+            .unwrap()
+            .0;
         assert!(conn.is_connected());
         conn.close().await;
     }
@@ -430,7 +432,10 @@ mod tests {
     #[tokio::test]
     async fn request_response_correlation() {
         let (url, _server) = spawn_mock_gateway(None).await;
-        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap().0;
+        let conn = OpenClawConnection::connect(&url, None, &generate_identity())
+            .await
+            .unwrap()
+            .0;
 
         let result: super::super::protocol::SessionsResetResponse = conn
             .request(
@@ -502,7 +507,10 @@ mod tests {
             }
         });
 
-        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap().0;
+        let conn = OpenClawConnection::connect(&url, None, &generate_identity())
+            .await
+            .unwrap()
+            .0;
         let mut event_rx = conn.subscribe_events();
 
         let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())

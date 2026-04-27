@@ -93,7 +93,10 @@ impl OpenClawAgentManager {
 
                 Some(process)
             } else {
-                debug!(port = port, "OpenClaw gateway already listening, skipping spawn");
+                debug!(
+                    port = port,
+                    "OpenClaw gateway already listening, skipping spawn"
+                );
                 None
             }
         } else {
@@ -125,18 +128,17 @@ impl OpenClawAgentManager {
             None
         };
 
-        let (connection, hello) =
-            OpenClawConnection::connect(&ws_url, auth, &identity)
-                .await
-                .map_err(|e| {
-                    error!(
-                        conversation_id = %conversation_id,
-                        url = %ws_url,
-                        error = %e,
-                        "Failed to connect to OpenClaw gateway"
-                    );
-                    e
-                })?;
+        let (connection, hello) = OpenClawConnection::connect(&ws_url, auth, &identity)
+            .await
+            .map_err(|e| {
+                error!(
+                    conversation_id = %conversation_id,
+                    url = %ws_url,
+                    error = %e,
+                    "Failed to connect to OpenClaw gateway"
+                );
+                e
+            })?;
 
         if let Some(ref auth_info) = hello.auth
             && let Some(ref device_token) = auth_info.device_token
@@ -197,11 +199,7 @@ impl OpenClawAgentManager {
 
                     let stream_events = {
                         let mut text_state = self.text_state.lock().await;
-                        map_openclaw_event(
-                            &event_frame,
-                            &mut text_state,
-                            session_key.as_deref(),
-                        )
+                        map_openclaw_event(&event_frame, &mut text_state, session_key.as_deref())
                     };
 
                     for stream_event in stream_events {
@@ -372,7 +370,10 @@ impl IAgentManager for OpenClawAgentManager {
         };
 
         self.connection
-            .request::<Value>("chat.send", serde_json::to_value(params).unwrap_or_default())
+            .request::<Value>(
+                "chat.send",
+                serde_json::to_value(params).unwrap_or_default(),
+            )
             .await?;
 
         Ok(())
@@ -387,7 +388,10 @@ impl IAgentManager for OpenClawAgentManager {
             };
             let _ = self
                 .connection
-                .request::<Value>("chat.abort", serde_json::to_value(params).unwrap_or_default())
+                .request::<Value>(
+                    "chat.abort",
+                    serde_json::to_value(params).unwrap_or_default(),
+                )
                 .await;
         }
 
