@@ -267,8 +267,12 @@ mod tests {
 
     #[test]
     fn confirmation_has_three_options() {
-        let conf =
-            BackendProtocolSink::build_confirmation("c1", "Write", &ToolCategory::Edit, "Write file /tmp/test.txt");
+        let conf = BackendProtocolSink::build_confirmation(
+            "c1",
+            "Write",
+            &ToolCategory::Edit,
+            "Write file /tmp/test.txt",
+        );
         assert_eq!(conf.options.len(), 3);
         assert_eq!(conf.options[0].value, json!("proceed_once"));
         assert_eq!(conf.options[1].value, json!("proceed_always"));
