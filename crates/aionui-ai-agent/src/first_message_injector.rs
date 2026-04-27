@@ -17,6 +17,9 @@ pub struct InjectionConfig<'a> {
     pub enabled_skills: &'a [String],
     /// Builtin auto-inject skills the user disabled.
     pub exclude_builtin_skills: &'a [String],
+    /// Resolved skill snapshot (superset of enabled/exclude filtering).
+    /// Task 7 replaces the two fields above with this one.
+    pub skills: &'a [String],
     /// True iff the agent's native CLI reads skills from the workspace
     /// without needing prompt injection. Derived by callers from
     /// `AcpBackend::native_skills_dirs().is_some()` for ACP, or hardcoded
@@ -119,6 +122,7 @@ mod tests {
                 preset_context: Some("Be concise."),
                 enabled_skills: &[],
                 exclude_builtin_skills: &[],
+                skills: &[],
                 native_skill_support: true,
                 custom_workspace: false,
             },
@@ -142,6 +146,7 @@ mod tests {
                 preset_context: None,
                 enabled_skills: &[],
                 exclude_builtin_skills: &[],
+                skills: &[],
                 native_skill_support: true,
                 custom_workspace: false,
             },
@@ -163,6 +168,7 @@ mod tests {
                 preset_context: None,
                 enabled_skills: &[],
                 exclude_builtin_skills: &[],
+                skills: &[],
                 native_skill_support: false,
                 custom_workspace: false,
             },
@@ -184,6 +190,7 @@ mod tests {
                 preset_context: Some("Rule 1."),
                 enabled_skills: &[],
                 exclude_builtin_skills: &[],
+                skills: &[],
                 native_skill_support: false,
                 custom_workspace: false,
             },
@@ -208,6 +215,7 @@ mod tests {
                 preset_context: Some("Custom rule"),
                 enabled_skills: &[],
                 exclude_builtin_skills: &[],
+                skills: &[],
                 native_skill_support: true,
                 custom_workspace: true, // <-- overrides native
             },
