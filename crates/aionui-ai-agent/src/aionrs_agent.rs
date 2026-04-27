@@ -8,7 +8,7 @@ use aion_agent::session::Session;
 use aion_config::compat::ProviderCompat;
 use aion_config::config::{Config, ProviderType, SessionConfig};
 use aion_mcp::manager::McpManager;
-use aion_protocol::ToolApprovalManager;
+use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
 use aion_protocol::commands::SessionMode;
 use aionui_api_types::AgentModeResponse;
 use aionui_common::{
@@ -276,25 +276,43 @@ impl IAgentManager for AionrsAgentManager {
         &self,
         _msg_id: &str,
         call_id: &str,
-        _data: Value,
+        data: Value,
         always_allow: bool,
     ) -> Result<(), AppError> {
         if let Ok(mut confs) = self.confirmations.write() {
             confs.retain(|c| c.call_id != call_id);
         }
 
-        let scope = if always_allow {
-            aion_protocol::commands::ApprovalScope::Always
-        } else {
-            aion_protocol::commands::ApprovalScope::Once
-        };
+        let value = data
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("cancel");
+
+        let is_cancel = value == "cancel";
+
         debug!(
             conversation_id = %self.conversation_id,
             call_id,
+            value,
             always_allow,
             "Aionrs confirm"
         );
-        self.approval_manager.approve(call_id, scope);
+
+        if is_cancel {
+            self.approval_manager.resolve(
+                call_id,
+                ToolApprovalResult::Denied {
+                    reason: "User denied the tool request".into(),
+                },
+            );
+        } else {
+            let scope = if always_allow {
+                aion_protocol::commands::ApprovalScope::Always
+            } else {
+                aion_protocol::commands::ApprovalScope::Once
+            };
+            self.approval_manager.approve(call_id, scope);
+        }
         Ok(())
     }
 
