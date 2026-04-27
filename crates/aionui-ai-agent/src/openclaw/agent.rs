@@ -16,6 +16,7 @@ use crate::stream_event::AgentStreamEvent;
 use crate::types::{OpenClawBuildExtra, OpenClawGatewayConfig, SendMessageData};
 
 use super::connection::{AuthConfig, OpenClawConnection};
+use super::device_identity::load_or_create_identity;
 use super::event_mapper::{TextFallbackState, map_openclaw_event};
 use super::protocol::{
     ChatAbortParams, ChatSendParams, SessionsResetParams, SessionsResetResponse, normalize_ws_url,
@@ -89,17 +90,18 @@ impl OpenClawAgentManager {
 
         let ws_url = normalize_ws_url(host, port);
 
+        let identity = load_or_create_identity(None)?;
+
         let auth = if config.gateway.token.is_some() || config.gateway.password.is_some() {
             Some(AuthConfig {
                 token: config.gateway.token.clone(),
                 password: config.gateway.password.clone(),
-                device: None,
             })
         } else {
             None
         };
 
-        let connection = OpenClawConnection::connect(&ws_url, auth).await.map_err(|e| {
+        let connection = OpenClawConnection::connect(&ws_url, auth, &identity).await.map_err(|e| {
             error!(
                 conversation_id = %conversation_id,
                 url = %ws_url,
