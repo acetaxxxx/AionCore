@@ -62,16 +62,16 @@ async fn build_agent(
                     .get("backend")
                     .and_then(|v| serde_json::from_value::<AcpBackend>(v.clone()).ok());
                 match backend {
-                    Some(b) => format!("acp-{}", b.display_name()).to_lowercase(),
+                    Some(b) => b.display_name().to_lowercase(),
                     None => "acp".to_string(),
                 }
             }
-            other => format!("{other:?}").to_lowercase(),
+            other => match other {
+                AgentType::OpenclawGateway => "openclaw".to_string(),
+                t => format!("{t:?}").to_lowercase(),
+            },
         };
-        let dir = deps
-            .data_dir
-            .join("tmp")
-            .join(format!("{label}-temp-{}", now_ms()));
+        let dir = deps.data_dir.join(format!("{label}-temp-{}", now_ms()));
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Internal(format!("Failed to create temp workspace: {e}")))?;
         dir.to_string_lossy().into_owned()
