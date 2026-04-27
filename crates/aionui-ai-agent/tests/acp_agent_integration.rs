@@ -63,6 +63,7 @@ async fn make_mock_agent(
         custom_agent_id: None,
         preset_context: None,
         enabled_skills: vec![],
+        exclude_builtin_skills: vec![],
         preset_assistant_id: None,
         session_mode: None,
         cron_job_id: None,
