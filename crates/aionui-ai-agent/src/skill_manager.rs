@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
@@ -358,77 +358,6 @@ pub fn prepare_first_message(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Parse SKILL.md frontmatter to extract name and description.
-///
-/// Expected format:
-/// ```text
-/// ---
-/// name: skill-name
-/// description: One line description
-/// ---
-/// Body content here...
-/// ```
-async fn parse_skill_frontmatter(path: &Path) -> Option<SkillDefinition> {
-    let content = match tokio::fs::read_to_string(path).await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "Failed to read SKILL.md");
-            return None;
-        }
-    };
-
-    let (name, description) = parse_frontmatter_fields(&content)?;
-
-    // Use directory name as fallback for name
-    let final_name = if name.is_empty() {
-        path.parent()?.file_name()?.to_string_lossy().into_owned()
-    } else {
-        name
-    };
-
-    Some(SkillDefinition {
-        name: final_name,
-        description,
-        location: path.to_path_buf(),
-        source: aionui_extension::SkillSource::Custom,
-        relative_location: None,
-        body: None, // Lazy loaded
-    })
-}
-
-/// Parse frontmatter fields from SKILL.md content.
-///
-/// Returns `(name, description)` if valid frontmatter is found.
-fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return None;
-    }
-
-    // Find the closing `---`
-    let after_open = &trimmed[3..];
-    let close_idx = after_open.find("---")?;
-    let frontmatter = &after_open[..close_idx];
-
-    let mut name = String::new();
-    let mut description = String::new();
-
-    for line in frontmatter.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("name:") {
-            name = val.trim().to_string();
-        } else if let Some(val) = line.strip_prefix("description:") {
-            description = val.trim().to_string();
-        }
-    }
-
-    if description.is_empty() {
-        return None;
-    }
-
-    Some((name, description))
-}
-
 /// Extract the body content after YAML frontmatter.
 fn extract_body(content: &str) -> String {
     let trimmed = content.trim_start();
@@ -448,7 +377,6 @@ fn extract_body(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -479,55 +407,9 @@ mod tests {
         );
     }
 
-    fn create_skill_dir(base: &Path, dir_name: &str, skill_name: &str, desc: &str, body: &str) {
-        let dir = base.join(dir_name);
-        fs::create_dir_all(&dir).unwrap();
-        let content = format!(
-            "---\nname: {}\ndescription: {}\n---\n{}",
-            skill_name, desc, body
-        );
-        fs::write(dir.join("SKILL.md"), content).unwrap();
-    }
-
-    // -----------------------------------------------------------------------
-    // Frontmatter parsing
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_frontmatter_valid() {
-        let content = "---\nname: security-review\ndescription: Review code for security issues\n---\nBody here";
-        let result = parse_frontmatter_fields(content);
-        assert!(result.is_some());
-        let (name, desc) = result.unwrap();
-        assert_eq!(name, "security-review");
-        assert_eq!(desc, "Review code for security issues");
-    }
-
-    #[test]
-    fn parse_frontmatter_no_opening_delimiter() {
-        let content = "name: test\ndescription: desc\n---\nbody";
-        assert!(parse_frontmatter_fields(content).is_none());
-    }
-
-    #[test]
-    fn parse_frontmatter_no_closing_delimiter() {
-        let content = "---\nname: test\ndescription: desc\nbody without close";
-        assert!(parse_frontmatter_fields(content).is_none());
-    }
-
-    #[test]
-    fn parse_frontmatter_missing_description() {
-        let content = "---\nname: test\n---\nbody";
-        assert!(parse_frontmatter_fields(content).is_none());
-    }
-
-    #[test]
-    fn parse_frontmatter_empty_name_uses_dir() {
-        let content = "---\nname: \ndescription: A useful skill\n---\nbody";
-        let (name, desc) = parse_frontmatter_fields(content).unwrap();
-        assert!(name.is_empty()); // Will be replaced by dir name in parse_skill_frontmatter
-        assert_eq!(desc, "A useful skill");
-    }
+    // Frontmatter parsing tests live in aionui-extension (covers
+    // parse_frontmatter_fields there); removed from here when
+    // skill_manager stopped owning that helper.
 
     // -----------------------------------------------------------------------
     // Body extraction
