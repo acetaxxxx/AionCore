@@ -9,6 +9,8 @@ use aion_config::compat::ProviderCompat;
 use aion_config::config::{Config, ProviderType, SessionConfig};
 use aion_mcp::manager::McpManager;
 use aion_protocol::ToolApprovalManager;
+use aion_protocol::commands::SessionMode;
+use aionui_api_types::AgentModeResponse;
 use aionui_common::{
     AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs, now_ms,
 };
@@ -129,6 +131,16 @@ impl AionrsAgentManager {
         }
 
         let approval_manager = Arc::new(ToolApprovalManager::new());
+
+        if let Some(mode_str) = &config_extra.session_mode {
+            let mode = parse_session_mode(mode_str);
+            approval_manager.set_mode(mode);
+            info!(
+                conversation_id = %conversation_id,
+                session_mode = mode_str,
+                "Aionrs initial session mode applied"
+            );
+        }
 
         Ok(Self {
             conversation_id,
@@ -291,8 +303,35 @@ impl IAgentManager for AionrsAgentManager {
         Ok(())
     }
 
+    async fn get_mode(&self) -> Result<AgentModeResponse, AppError> {
+        Ok(AgentModeResponse {
+            mode: self.approval_manager.current_mode(),
+            initialized: true,
+        })
+    }
+
+    async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
+        let prev = self.approval_manager.current_mode();
+        self.approval_manager.set_mode(parse_session_mode(mode));
+        info!(
+            conversation_id = %self.conversation_id,
+            from = prev,
+            to = mode,
+            "Aionrs session mode switched"
+        );
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+fn parse_session_mode(s: &str) -> SessionMode {
+    match s {
+        "auto_edit" => SessionMode::AutoEdit,
+        "yolo" => SessionMode::Yolo,
+        _ => SessionMode::Default,
     }
 }
 
@@ -311,6 +350,7 @@ mod tests {
             max_turns: None,
             compat_overrides: Default::default(),
             session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
+            session_mode: None,
         }
     }
 

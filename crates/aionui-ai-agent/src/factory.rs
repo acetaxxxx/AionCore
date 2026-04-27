@@ -279,6 +279,7 @@ async fn build_agent(
                 max_turns: overrides.max_turns,
                 compat_overrides,
                 session_directory,
+                session_mode: overrides.session_mode,
             };
 
             let agent =

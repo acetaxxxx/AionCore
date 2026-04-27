@@ -24,7 +24,7 @@ mod team;
 mod websocket;
 
 pub use acp::{
-    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AcpModeResponse,
+    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AgentModeResponse,
     DetectCliRequest, DetectCliResponse, ProbeModelRequest, SetConfigOptionRequest, SetModeRequest,
     SetModelRequest, TestCustomAgentRequest, TestCustomAgentResponse,
 };
