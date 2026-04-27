@@ -523,6 +523,28 @@ async fn rp4_office_watch_proxy_ssrf_inactive_port() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+// ── RP-root: proxy root path (no trailing path segment) ─────────────
+
+#[tokio::test]
+async fn ppt_proxy_root_path_returns_non_404() {
+    let (app, _services, _tmp) = build_office_app().await;
+
+    let req = get_request("/api/ppt-proxy/19999");
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn office_watch_proxy_root_path_returns_non_404() {
+    let (app, _services, _tmp) = build_office_app().await;
+
+    let req = get_request("/api/office-watch-proxy/19999");
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
 // ── Test utilities ──────────────────────────────────────────────────
 
 fn create_test_xlsx(path: &std::path::Path) {
