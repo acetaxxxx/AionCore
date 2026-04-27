@@ -74,6 +74,7 @@ impl AcpBackend {
     /// All backends that have a detectable CLI binary.
     pub const CLI_BACKENDS: &[AcpBackend] = &[
         AcpBackend::Claude,
+        AcpBackend::Gemini,
         AcpBackend::Qwen,
         AcpBackend::Codex,
         AcpBackend::Codebuddy,
@@ -124,6 +125,7 @@ impl AcpBackend {
     pub fn binary_name(&self) -> Option<&'static str> {
         match self {
             AcpBackend::Claude => Some("claude"),
+            AcpBackend::Gemini => Some("gemini"),
             AcpBackend::Qwen => Some("qwen"),
             AcpBackend::Codex => Some("codex"),
             AcpBackend::Codebuddy => Some("codebuddy"),
@@ -139,7 +141,7 @@ impl AcpBackend {
             AcpBackend::Vibe => Some("vibe"),
             AcpBackend::Hermes => Some("hermes"),
             AcpBackend::Snow => Some("snow"),
-            AcpBackend::IFlow | AcpBackend::Gemini => None,
+            AcpBackend::IFlow => None,
         }
     }
 
@@ -153,6 +155,7 @@ impl AcpBackend {
             // Bridge-based — args handled by bridge_package + bridge_extra_args
             AcpBackend::Claude | AcpBackend::Codex | AcpBackend::Codebuddy => None,
             // Direct CLI with specific ACP args
+            AcpBackend::Gemini => Some(&["--experimental-acp"]),
             AcpBackend::Goose => Some(&["acp"]),
             AcpBackend::Droid => Some(&["exec", "--output-format", "acp"]),
             AcpBackend::Auggie => Some(&["--acp"]),
@@ -167,7 +170,7 @@ impl AcpBackend {
             AcpBackend::Snow => Some(&["--acp"]),
             AcpBackend::Qwen => Some(&["--acp"]),
             // Non-CLI backends
-            AcpBackend::IFlow | AcpBackend::Gemini => None,
+            AcpBackend::IFlow => None,
         }
     }
 
@@ -452,7 +455,10 @@ mod tests {
         // Non-ACP execution engines are dispatched via AgentType, not AcpBackend.
         // Rejecting them at the HTTP deserialization boundary prevents accidental
         // regression where a future change re-adds one of these variants.
-        for name in ["gemini", "nanobot", "remote", "aionrs", "openclaw-gateway"] {
+        //
+        // Note: "gemini" is intentionally NOT in this list — it is a valid
+        // AcpBackend variant (spawned via `gemini --experimental-acp`).
+        for name in ["nanobot", "remote", "aionrs", "openclaw-gateway"] {
             let json = format!("\"{name}\"");
             let result: Result<AcpBackend, _> = serde_json::from_str(&json);
             assert!(result.is_err(), "AcpBackend should not accept {name:?}");
@@ -555,7 +561,6 @@ mod tests {
     #[test]
     fn test_acp_backend_cli_binary_name_none() {
         assert_eq!(AcpBackend::IFlow.binary_name(), None);
-        assert_eq!(AcpBackend::Gemini.binary_name(), None);
     }
 
     #[test]
@@ -589,5 +594,17 @@ mod tests {
         let claude_id = AcpBackend::Claude.id();
         let codex_id = AcpBackend::Codex.id();
         assert_ne!(claude_id, codex_id);
+    }
+
+    #[test]
+    fn acp_gemini_is_registered_as_cli_backend() {
+        assert!(AcpBackend::CLI_BACKENDS.contains(&AcpBackend::Gemini));
+        assert_eq!(AcpBackend::Gemini.binary_name(), Some("gemini"));
+        assert_eq!(
+            AcpBackend::Gemini.args(),
+            Some(&["--experimental-acp"][..])
+        );
+        // Gemini is a direct-CLI backend, no bridge
+        assert_eq!(AcpBackend::Gemini.bridge_package(), None);
     }
 }
