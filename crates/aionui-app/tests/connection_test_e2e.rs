@@ -1,4 +1,4 @@
-//! E2E tests for Bedrock test-connection and Gemini subscription-status endpoints.
+//! E2E tests for Bedrock test-connection endpoint.
 
 mod common;
 
@@ -187,4 +187,3 @@ async fn t8_1_bedrock_invalid_credentials() {
             .contains("Bedrock credentials invalid")
     );
 }
-
