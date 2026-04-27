@@ -594,10 +594,7 @@ mod tests {
     fn acp_gemini_is_registered_as_cli_backend() {
         assert!(AcpBackend::CLI_BACKENDS.contains(&AcpBackend::Gemini));
         assert_eq!(AcpBackend::Gemini.binary_name(), Some("gemini"));
-        assert_eq!(
-            AcpBackend::Gemini.args(),
-            Some(&["--experimental-acp"][..])
-        );
+        assert_eq!(AcpBackend::Gemini.args(), Some(&["--experimental-acp"][..]));
         // Gemini is a direct-CLI backend, no bridge
         assert_eq!(AcpBackend::Gemini.bridge_package(), None);
     }
