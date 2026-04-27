@@ -143,10 +143,14 @@ async fn aionrs_agent_confirm_succeeds() {
 
 #[tokio::test]
 async fn aionrs_agent_metadata() {
-    let agent =
-        AionrsAgentManager::new("conv-abc".into(), "/work".into(), make_aionrs_config(), None)
-            .await
-            .unwrap();
+    let agent = AionrsAgentManager::new(
+        "conv-abc".into(),
+        "/work".into(),
+        make_aionrs_config(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(agent.agent_type(), AgentType::Aionrs);
     assert_eq!(agent.workspace(), "/work");
     assert_eq!(agent.conversation_id(), "conv-abc");

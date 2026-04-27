@@ -85,7 +85,10 @@ impl AionrsAgentManager {
             tools: Default::default(),
             session: SessionConfig {
                 enabled: true,
-                directory: config_extra.session_directory.to_string_lossy().into_owned(),
+                directory: config_extra
+                    .session_directory
+                    .to_string_lossy()
+                    .into_owned(),
                 ..Default::default()
             },
             compact: Default::default(),
@@ -115,16 +118,14 @@ impl AionrsAgentManager {
             .map_err(|e| AppError::Internal(format!("Agent bootstrap failed: {e}")))?;
 
         let mut engine = result.engine;
-        if !is_resume {
-            if let Err(e) =
-                engine.init_session(&provider_label, &workspace, Some(&conversation_id))
-            {
-                error!(
-                    conversation_id = %conversation_id,
-                    error = %e,
-                    "Failed to init session, continuing without persistence"
-                );
-            }
+        if !is_resume
+            && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id))
+        {
+            error!(
+                conversation_id = %conversation_id,
+                error = %e,
+                "Failed to init session, continuing without persistence"
+            );
         }
 
         let approval_manager = Arc::new(ToolApprovalManager::new());
