@@ -156,7 +156,9 @@ async fn build_agent(
                     AppError::BadRequest(format!("Invalid OpenClaw build options: {e}"))
                 })?;
             let agent = OpenClawAgentManager::new(conversation_id, workspace, config).await?;
-            Ok(Arc::new(agent) as AgentManagerHandle)
+            let arc = Arc::new(agent);
+            arc.start_relay();
+            Ok(arc as AgentManagerHandle)
         }
         AgentType::Nanobot => {
             let cli_path = which::which("nanobot")

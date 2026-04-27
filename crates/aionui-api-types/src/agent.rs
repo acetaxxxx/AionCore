@@ -10,6 +10,8 @@ pub struct AgentInfo {
     pub backend: Option<AcpBackend>,
     pub available: bool,
     pub source: crate::AgentSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_path: Option<String>,
 }
 
 impl From<crate::DetectedAgent> for AgentInfo {
@@ -21,6 +23,7 @@ impl From<crate::DetectedAgent> for AgentInfo {
             backend: a.backend,
             available: a.available,
             source: a.source,
+            cli_path: a.command,
         }
     }
 }
@@ -52,6 +55,7 @@ mod tests {
         assert_eq!(info.backend, Some(AcpBackend::Claude));
         assert!(info.available);
         assert_eq!(info.source, crate::AgentSource::Builtin);
+        assert_eq!(info.cli_path.as_deref(), Some("/usr/bin/claude"));
     }
 
     #[test]
@@ -63,6 +67,7 @@ mod tests {
             backend: Some(AcpBackend::Claude),
             available: true,
             source: crate::AgentSource::Builtin,
+            cli_path: Some("/usr/bin/claude".into()),
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["agent_type"], "acp");
@@ -78,6 +83,7 @@ mod tests {
             backend: None,
             available: true,
             source: crate::AgentSource::Internal,
+            cli_path: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["agent_type"], "aionrs");
