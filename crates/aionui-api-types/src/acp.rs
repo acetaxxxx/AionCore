@@ -39,14 +39,14 @@ pub struct AcpEnvResponse {
     pub env: HashMap<String, String>,
 }
 
-/// Response for ACP session mode.
+/// Response for agent session mode.
 #[derive(Debug, Serialize)]
-pub struct AcpModeResponse {
+pub struct AgentModeResponse {
     pub mode: String,
     pub initialized: bool,
 }
 
-/// Request body for setting ACP session mode.
+/// Request body for setting session mode.
 #[derive(Debug, Deserialize)]
 pub struct SetModeRequest {
     pub mode: String,
