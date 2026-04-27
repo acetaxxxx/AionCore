@@ -933,11 +933,7 @@ impl ConversationService {
     /// Persists the mutation asynchronously; failures are logged and
     /// swallowed so a read path never 500s because of a backfill write
     /// failure.
-    async fn backfill_extra_inplace(
-        &self,
-        conversation_id: &str,
-        extra: &mut serde_json::Value,
-    ) {
+    async fn backfill_extra_inplace(&self, conversation_id: &str, extra: &mut serde_json::Value) {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
         let mutated = crate::skill_snapshot::backfill_skills_if_missing(extra, &auto_inject);
         if !mutated {

@@ -32,16 +32,15 @@ async fn materialize_writes_only_listed_skills() {
     }
     let paths = resolve_skill_paths(tmp.path(), tmp.path());
 
-    let dir = skill_service::materialize_skills_for_agent(
-        &paths,
-        "conv-1",
-        &["cron".to_owned()],
-    )
-    .await
-    .unwrap();
+    let dir = skill_service::materialize_skills_for_agent(&paths, "conv-1", &["cron".to_owned()])
+        .await
+        .unwrap();
 
     assert!(dir.join("cron").join("SKILL.md").exists());
-    assert!(!dir.join("todo").exists(), "todo should not be materialized");
+    assert!(
+        !dir.join("todo").exists(),
+        "todo should not be materialized"
+    );
 
     unsafe {
         std::env::remove_var(aionui_extension::BUILTIN_SKILLS_ENV_VAR);
