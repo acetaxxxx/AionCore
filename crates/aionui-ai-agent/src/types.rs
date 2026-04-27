@@ -61,6 +61,9 @@ pub struct AcpBuildExtra {
     /// Skills to enable for this session.
     #[serde(default)]
     pub enabled_skills: Vec<String>,
+    /// Builtin auto-inject skills to exclude from this session.
+    #[serde(default)]
+    pub exclude_builtin_skills: Vec<String>,
     /// Preset assistant ID.
     #[serde(default)]
     pub preset_assistant_id: Option<String>,
@@ -237,6 +240,21 @@ pub struct SlashCommandItem {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn acp_build_extra_backcompat_no_new_fields() {
+        // Legacy payloads without exclude_builtin_skills should still deserialize
+        let legacy = r#"{"backend":"claude"}"#;
+        let parsed: AcpBuildExtra = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.exclude_builtin_skills.is_empty());
+    }
+
+    #[test]
+    fn acp_build_extra_accepts_exclude_builtin_skills() {
+        let with_field = r#"{"backend":"claude","exclude_builtin_skills":["cron"]}"#;
+        let parsed: AcpBuildExtra = serde_json::from_str(with_field).unwrap();
+        assert_eq!(parsed.exclude_builtin_skills, vec!["cron"]);
+    }
 
     #[test]
     fn send_message_data_serde_roundtrip() {
