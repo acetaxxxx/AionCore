@@ -15,6 +15,7 @@ use crate::cli_process::CliAgentProcess;
 use crate::stream_event::AgentStreamEvent;
 use crate::types::{OpenClawBuildExtra, OpenClawGatewayConfig, SendMessageData};
 
+use super::config::load_openclaw_config;
 use super::connection::{AuthConfig, OpenClawConnection};
 use super::device_identity::load_or_create_identity;
 use super::event_mapper::{TextFallbackState, map_openclaw_event};
@@ -56,8 +57,19 @@ impl OpenClawAgentManager {
         workspace: String,
         config: OpenClawBuildExtra,
     ) -> Result<Self, AppError> {
+        let file_config = load_openclaw_config();
+
         let host = config.gateway.host.as_deref().unwrap_or("127.0.0.1");
-        let port = config.gateway.port.unwrap_or(DEFAULT_GATEWAY_PORT);
+        let port = config
+            .gateway
+            .port
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|c| c.gateway.as_ref())
+                    .and_then(|g| g.port)
+            })
+            .unwrap_or(DEFAULT_GATEWAY_PORT);
 
         let gateway_process = if !config.gateway.use_external_gateway {
             let cli_path = config
@@ -92,24 +104,50 @@ impl OpenClawAgentManager {
 
         let identity = load_or_create_identity(None)?;
 
-        let auth = if config.gateway.token.is_some() || config.gateway.password.is_some() {
-            Some(AuthConfig {
-                token: config.gateway.token.clone(),
-                password: config.gateway.password.clone(),
-            })
+        let token = config
+            .gateway
+            .token
+            .clone()
+            .or_else(|| super::config::get_gateway_auth_token(file_config.as_ref()))
+            .or_else(|| {
+                super::device_auth_store::load_device_auth_token(&identity.device_id, "operator")
+                    .map(|e| e.token)
+            });
+        let password = config
+            .gateway
+            .password
+            .clone()
+            .or_else(|| super::config::get_gateway_auth_password(file_config.as_ref()));
+
+        let auth = if token.is_some() || password.is_some() {
+            Some(AuthConfig { token, password })
         } else {
             None
         };
 
-        let connection = OpenClawConnection::connect(&ws_url, auth, &identity).await.map_err(|e| {
-            error!(
-                conversation_id = %conversation_id,
-                url = %ws_url,
-                error = %e,
-                "Failed to connect to OpenClaw gateway"
+        let (connection, hello) =
+            OpenClawConnection::connect(&ws_url, auth, &identity)
+                .await
+                .map_err(|e| {
+                    error!(
+                        conversation_id = %conversation_id,
+                        url = %ws_url,
+                        error = %e,
+                        "Failed to connect to OpenClaw gateway"
+                    );
+                    e
+                })?;
+
+        if let Some(ref auth_info) = hello.auth
+            && let Some(ref device_token) = auth_info.device_token
+        {
+            super::device_auth_store::store_device_auth_token(
+                &identity.device_id,
+                auth_info.role.as_deref().unwrap_or("operator"),
+                device_token,
+                auth_info.scopes.as_deref().unwrap_or(&[]),
             );
-            e
-        })?;
+        }
 
         info!(
             conversation_id = %conversation_id,

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aionui_common::AppError;
@@ -33,6 +33,7 @@ type WsStream = futures_util::stream::SplitStream<
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TICK_INTERVAL_MS: u64 = 30_000;
 
 type PendingSender = oneshot::Sender<Result<Value, AppError>>;
 
@@ -48,6 +49,8 @@ pub struct OpenClawConnection {
     connected: AtomicBool,
     challenge_tx: Mutex<Option<oneshot::Sender<Option<String>>>>,
     _reader_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    last_tick: AtomicI64,
+    tick_interval_ms: AtomicU64,
 }
 
 impl OpenClawConnection {
@@ -55,7 +58,7 @@ impl OpenClawConnection {
         url: &str,
         auth: Option<AuthConfig>,
         identity: &DeviceIdentity,
-    ) -> Result<Arc<Self>, AppError> {
+    ) -> Result<(Arc<Self>, HelloOk), AppError> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(url).await.map_err(|e| {
             AppError::Internal(format!("OpenClaw WebSocket connection failed: {e}"))
         })?;
@@ -63,6 +66,7 @@ impl OpenClawConnection {
         let (sink, stream) = ws_stream.split();
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (challenge_tx, challenge_rx) = oneshot::channel();
+        let now = aionui_common::now_ms();
 
         let conn = Arc::new(Self {
             ws_sink: Mutex::new(Some(sink)),
@@ -71,16 +75,16 @@ impl OpenClawConnection {
             connected: AtomicBool::new(false),
             challenge_tx: Mutex::new(Some(challenge_tx)),
             _reader_handle: Mutex::new(None),
+            last_tick: AtomicI64::new(now),
+            tick_interval_ms: AtomicU64::new(DEFAULT_TICK_INTERVAL_MS),
         });
 
-        // Spawn reader task
         let reader_conn = Arc::clone(&conn);
         let reader_handle = tokio::spawn(async move {
             reader_conn.run_reader(stream).await;
         });
         *conn._reader_handle.lock().await = Some(reader_handle);
 
-        // Wait for challenge or timeout, then send connect
         let nonce = match tokio::time::timeout(CHALLENGE_TIMEOUT, challenge_rx).await {
             Ok(Ok(nonce)) => nonce,
             _ => None,
@@ -89,13 +93,47 @@ impl OpenClawConnection {
         let hello = conn.send_connect(nonce.as_deref(), auth, identity).await?;
         conn.connected.store(true, Ordering::Relaxed);
 
+        if let Some(ref policy) = hello.policy
+            && let Some(interval) = policy.tick_interval_ms
+        {
+            conn.tick_interval_ms.store(interval, Ordering::Relaxed);
+        }
+
+        conn.start_tick_watchdog();
+
         debug!(
             protocol = ?hello.protocol,
             server_version = ?hello.server.as_ref().and_then(|s| s.version.as_deref()),
             "OpenClaw handshake complete"
         );
 
-        Ok(conn)
+        Ok((conn, hello))
+    }
+
+    fn start_tick_watchdog(self: &Arc<Self>) {
+        let conn = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let interval_ms = conn.tick_interval_ms.load(Ordering::Relaxed).max(1000);
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+
+                if !conn.connected.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let last = conn.last_tick.load(Ordering::Relaxed);
+                let gap = aionui_common::now_ms() - last;
+                if gap > (interval_ms as i64) * 2 {
+                    warn!(
+                        gap_ms = gap,
+                        interval_ms = interval_ms,
+                        "OpenClaw tick timeout, closing connection"
+                    );
+                    conn.close().await;
+                    break;
+                }
+            }
+        });
     }
 
     async fn send_connect(
@@ -260,6 +298,12 @@ impl OpenClawConnection {
                     return;
                 }
 
+                if evt.event == "tick" {
+                    self.last_tick
+                        .store(aionui_common::now_ms(), Ordering::Relaxed);
+                    return;
+                }
+
                 let _ = self.event_tx.send(evt);
             }
         }
@@ -370,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn connect_and_handshake() {
         let (url, _server) = spawn_mock_gateway(Some("test-nonce")).await;
-        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap();
+        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap().0;
         assert!(conn.is_connected());
         conn.close().await;
     }
@@ -378,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn connect_without_challenge_nonce() {
         let (url, _server) = spawn_mock_gateway(None).await;
-        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap();
+        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap().0;
         assert!(conn.is_connected());
         conn.close().await;
     }
@@ -386,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn request_response_correlation() {
         let (url, _server) = spawn_mock_gateway(None).await;
-        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap();
+        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap().0;
 
         let result: super::super::protocol::SessionsResetResponse = conn
             .request(
@@ -458,7 +502,7 @@ mod tests {
             }
         });
 
-        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap();
+        let conn = OpenClawConnection::connect(&url, None, &generate_identity()).await.unwrap().0;
         let mut event_rx = conn.subscribe_events();
 
         let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
@@ -478,7 +522,9 @@ mod tests {
 
     #[tokio::test]
     async fn connection_failure_returns_error() {
-        let result = OpenClawConnection::connect("ws://127.0.0.1:1", None, &generate_identity()).await;
+        let result = OpenClawConnection::connect("ws://127.0.0.1:1", None, &generate_identity())
+            .await
+            .map(|(c, _)| c);
         assert!(result.is_err());
     }
 }
