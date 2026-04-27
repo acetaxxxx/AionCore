@@ -92,8 +92,7 @@ mod tests {
     fn compute_initial_exclude_does_not_affect_preset_opt_in() {
         // User excluded cron from auto-inject, but the preset still added it
         // explicitly — preset wins.
-        let skills =
-            compute_initial_skills(&["cron".into()], &["cron".into()], &["cron".into()]);
+        let skills = compute_initial_skills(&["cron".into()], &["cron".into()], &["cron".into()]);
         assert_eq!(skills, vec!["cron"]);
     }
 

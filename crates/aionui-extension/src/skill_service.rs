@@ -2105,10 +2105,9 @@ mod tests {
             "auto-inject must NOT be implicit anymore"
         );
 
-        let named =
-            materialize_skills_for_agent(&paths, "conv-named", &["cron".to_owned()])
-                .await
-                .unwrap();
+        let named = materialize_skills_for_agent(&paths, "conv-named", &["cron".to_owned()])
+            .await
+            .unwrap();
         assert!(
             named.join("cron").join(SKILL_MANIFEST_FILE).exists(),
             "named auto-inject skill not materialized"

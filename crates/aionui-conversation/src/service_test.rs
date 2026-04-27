@@ -1901,7 +1901,10 @@ async fn list_backfills_mixed_rows() {
     repo.create(&legacy).await.unwrap();
     repo.create(&modern).await.unwrap();
 
-    let resp = svc.list("u", ListConversationsQuery::default()).await.unwrap();
+    let resp = svc
+        .list("u", ListConversationsQuery::default())
+        .await
+        .unwrap();
     let extras: Vec<_> = resp.items.iter().map(|c| c.extra.clone()).collect();
     assert!(extras.iter().any(|e| e["skills"] == json!(["cron", "pdf"])));
 }
