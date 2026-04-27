@@ -122,6 +122,60 @@ impl ConversationService {
             extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
         }
 
+        // Consume transient skill-shaping inputs and freeze the initial
+        // `skills` snapshot into `extra.skills`. These request-only fields
+        // must not land in the stored row. Legacy names (`enabled_skills`,
+        // `exclude_builtin_skills`) are accepted as aliases so that
+        // `clone_create` — which merges a source conversation's legacy
+        // `extra` into the new request — keeps working on pre-snapshot rows
+        // until every legacy row has been backfilled (§7.1).
+        fn take_string_array(
+            obj: &mut serde_json::Map<String, serde_json::Value>,
+            keys: &[&str],
+        ) -> Vec<String> {
+            for key in keys {
+                if let Some(v) = obj.remove(*key)
+                    && let Ok(arr) = serde_json::from_value::<Vec<String>>(v)
+                {
+                    return arr;
+                }
+            }
+            Vec::new()
+        }
+
+        let (preset_enabled, exclude_auto_inject) = match extra.as_object_mut() {
+            Some(obj) => {
+                let preset = take_string_array(obj, &["preset_enabled_skills", "enabled_skills"]);
+                let exclude = take_string_array(
+                    obj,
+                    &["exclude_auto_inject_skills", "exclude_builtin_skills"],
+                );
+                // Strip the stale cache field if a clone copied it in.
+                obj.remove("loaded_skills");
+                (preset, exclude)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
+        let auto_inject_names = self.skill_resolver.auto_inject_names().await;
+        let initial_skills = crate::skill_snapshot::compute_initial_skills(
+            &auto_inject_names,
+            &preset_enabled,
+            &exclude_auto_inject,
+        );
+
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert(
+                "skills".to_owned(),
+                serde_json::Value::Array(
+                    initial_skills
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+
         let row = aionui_db::models::ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),

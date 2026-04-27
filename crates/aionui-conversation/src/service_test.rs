@@ -1708,3 +1708,75 @@ async fn check_approval_not_found() {
         .unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 }
+
+// ── Skill snapshot tests ───────────────────────────────────────────
+
+#[tokio::test]
+async fn create_writes_extra_skills_from_auto_inject_and_preset() {
+    let resolver = Arc::new(FixedSkillResolver {
+        names: vec!["cron".into(), "todo-tracker".into()],
+    });
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "extra": {
+            "workspace": "/project",
+            "backend": "claude",
+            "preset_enabled_skills": ["pdf", "cron"],
+            "exclude_auto_inject_skills": ["todo-tracker"],
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
+    assert!(resp.extra.get("preset_enabled_skills").is_none());
+    assert!(resp.extra.get("exclude_auto_inject_skills").is_none());
+}
+
+#[tokio::test]
+async fn create_writes_empty_skills_when_no_auto_inject_and_no_preset() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": "/project", "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["skills"], json!([]));
+}
+
+#[tokio::test]
+async fn create_honors_legacy_alias_fields_from_clone_merge() {
+    let resolver = Arc::new(FixedSkillResolver {
+        names: vec!["cron".into()],
+    });
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+
+    // Legacy-shaped extra — what clone_create might merge in from an
+    // unmigrated source conversation.
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": "/project",
+            "backend": "claude",
+            "enabled_skills": ["pdf"],
+            "exclude_builtin_skills": ["cron"],
+            "loaded_skills": [{"name": "cron", "description": "stale"}],
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("u", req).await.unwrap();
+
+    // Legacy enabled_skills ["pdf"] surfaces as preset; legacy exclude drops
+    // cron; snapshot = {} ∪ ["pdf"] = ["pdf"].
+    assert_eq!(resp.extra["skills"], json!(["pdf"]));
+    assert!(resp.extra.get("enabled_skills").is_none());
+    assert!(resp.extra.get("exclude_builtin_skills").is_none());
+    assert!(resp.extra.get("loaded_skills").is_none());
+}
