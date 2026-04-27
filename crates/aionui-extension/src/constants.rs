@@ -68,12 +68,6 @@ pub const BUILTIN_RULES_DIR_NAME: &str = "builtin-rules";
 /// `include_dir!`).
 pub const BUILTIN_AUTO_SKILLS_SUBDIR: &str = "auto-inject";
 
-/// Subdirectory under `data_dir` where the lazily materialized built-in
-/// skills "view" lives. Consumers (e.g. SkillsHubSettings export-symlink
-/// flow) need a real on-disk source path, even though the canonical
-/// corpus is embedded in the binary. See `skill_service::list_skills`.
-pub const BUILTIN_SKILLS_VIEW_SUBDIR: &str = "builtin-skills-view";
-
 /// Subdirectory under `data_dir` where per-conversation materialized
 /// skill directories are written for the gemini agent.
 pub const AGENT_SKILLS_SUBDIR: &str = "agent-skills";

@@ -5,8 +5,8 @@ use tracing::{debug, warn};
 
 use crate::constants::{
     AGENT_SKILLS_SUBDIR, ASSISTANT_RULES_DIR_NAME, ASSISTANT_SKILLS_DIR_NAME,
-    BUILTIN_AUTO_SKILLS_SUBDIR, BUILTIN_RULES_DIR_NAME, BUILTIN_SKILLS_VIEW_SUBDIR,
-    COMMON_SKILL_DIRS, SKILL_MANIFEST_FILE, SKILLS_DIR_NAME,
+    BUILTIN_AUTO_SKILLS_SUBDIR, BUILTIN_RULES_DIR_NAME, COMMON_SKILL_DIRS, SKILL_MANIFEST_FILE,
+    SKILLS_DIR_NAME,
 };
 use crate::error::ExtensionError;
 
@@ -212,9 +212,10 @@ pub enum SkillSource {
 
 /// A discovered skill item for listing.
 ///
-/// For `source=Builtin`, `location` is the absolute path of the lazily
-/// materialized on-disk "view" (under `{data_dir}/builtin-skills-view/`),
-/// and `relative_location` carries the relative path suitable for
+/// For `source=Builtin`, `location` is the absolute path of the on-disk
+/// SKILL.md under `paths.builtin_skills_dir` (populated at startup by
+/// [`crate::startup_materialize::materialize_if_needed`]). The
+/// `relative_location` carries the relative path suitable for
 /// `POST /api/skills/builtin-skill` (e.g. `"auto-inject/cron/SKILL.md"`
 /// or `"mermaid/SKILL.md"`). Other sources leave `relative_location`
 /// `None`.
@@ -233,10 +234,12 @@ pub struct SkillListItem {
 /// User custom skills override built-in skills with the same name.
 ///
 /// For built-in entries, the caller sees an absolute `location` pointing
-/// into `{data_dir}/builtin-skills-view/{name}/SKILL.md` — that view is
-/// lazily materialized from the embedded corpus so downstream consumers
-/// (e.g. the SkillsHubSettings export-symlink flow) can resolve the
-/// path on disk. `relative_location` is populated for built-ins only.
+/// at `paths.builtin_skills_dir/.../SKILL.md` — the tree is populated
+/// at startup by
+/// [`crate::startup_materialize::materialize_if_needed`] so downstream
+/// consumers (e.g. the SkillsHubSettings export-symlink flow) can
+/// resolve the path on disk. `relative_location` is populated for
+/// built-ins only.
 pub async fn list_available_skills(
     paths: &SkillPaths,
 ) -> Result<Vec<SkillListItem>, ExtensionError> {
@@ -270,13 +273,13 @@ pub async fn list_available_skills(
 }
 
 /// Emit a [`SkillListItem`] for every built-in skill (both auto-inject
-/// and opt-in), materializing the on-disk view lazily.
+/// and opt-in). All paths resolve directly against
+/// `paths.builtin_skills_dir`.
 async fn list_builtin_skills(paths: &SkillPaths) -> Vec<SkillListItem> {
-    let dir = paths.builtin_skills_dir.clone();
-    list_builtin_skills_from_disk(paths, &dir).await
+    list_builtin_skills_from_disk(&paths.builtin_skills_dir).await
 }
 
-async fn list_builtin_skills_from_disk(paths: &SkillPaths, dir: &Path) -> Vec<SkillListItem> {
+async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
     let mut items = Vec::new();
 
     // Top-level opt-in skills (siblings of auto-inject/).
@@ -286,15 +289,19 @@ async fn list_builtin_skills_from_disk(paths: &SkillPaths, dir: &Path) -> Vec<Sk
                 continue;
             }
             // Use the on-disk directory name (basename of scanned path)
-            // rather than the frontmatter name, so the view lookup hits
-            // the real filesystem layout when the two disagree.
+            // rather than the frontmatter name, so the path we emit
+            // matches the real filesystem layout when the two disagree.
             let dir_name = Path::new(&s.path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(&s.name)
                 .to_string();
             let rel = format!("{dir_name}/{SKILL_MANIFEST_FILE}");
-            let location = materialize_builtin_view_from_disk(paths, dir, &dir_name).await;
+            let location = dir
+                .join(&dir_name)
+                .join(SKILL_MANIFEST_FILE)
+                .to_string_lossy()
+                .into_owned();
             items.push(SkillListItem {
                 name: s.name,
                 description: s.description,
@@ -316,7 +323,11 @@ async fn list_builtin_skills_from_disk(paths: &SkillPaths, dir: &Path) -> Vec<Sk
                 .unwrap_or(&s.name)
                 .to_string();
             let rel = format!("{BUILTIN_AUTO_SKILLS_SUBDIR}/{dir_name}/{SKILL_MANIFEST_FILE}");
-            let location = materialize_builtin_view_from_disk(paths, dir, &dir_name).await;
+            let location = auto_dir
+                .join(&dir_name)
+                .join(SKILL_MANIFEST_FILE)
+                .to_string_lossy()
+                .into_owned();
             items.push(SkillListItem {
                 name: s.name,
                 description: s.description,
@@ -329,177 +340,6 @@ async fn list_builtin_skills_from_disk(paths: &SkillPaths, dir: &Path) -> Vec<Sk
     }
 
     items
-}
-
-#[allow(dead_code)]
-async fn list_builtin_skills_from_embedded(paths: &SkillPaths) -> Vec<SkillListItem> {
-    let mut items = Vec::new();
-
-    // Top-level opt-in skills.
-    for subdir in BUILTIN_SKILLS.dirs() {
-        let Some(sub_name) = subdir
-            .path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-        else {
-            continue;
-        };
-        if sub_name == BUILTIN_AUTO_SKILLS_SUBDIR {
-            continue;
-        }
-        let skill_rel = format!("{sub_name}/{SKILL_MANIFEST_FILE}");
-        let Some((name, description)) = read_embedded_skill_meta(&skill_rel) else {
-            continue;
-        };
-        let final_name = if name.is_empty() {
-            sub_name.clone()
-        } else {
-            name
-        };
-        let location = materialize_builtin_view_from_embedded(paths, subdir).await;
-        items.push(SkillListItem {
-            name: final_name,
-            description,
-            location,
-            relative_location: Some(skill_rel),
-            is_custom: false,
-            source: SkillSource::Builtin,
-        });
-    }
-
-    // auto-inject children.
-    if let Some(auto_dir) = BUILTIN_SKILLS.get_dir(BUILTIN_AUTO_SKILLS_SUBDIR) {
-        for subdir in auto_dir.dirs() {
-            let Some(sub_name) = subdir
-                .path()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-            else {
-                continue;
-            };
-            let skill_rel =
-                format!("{BUILTIN_AUTO_SKILLS_SUBDIR}/{sub_name}/{SKILL_MANIFEST_FILE}");
-            let Some((name, description)) = read_embedded_skill_meta(&skill_rel) else {
-                continue;
-            };
-            let final_name = if name.is_empty() {
-                sub_name.clone()
-            } else {
-                name
-            };
-            let location = materialize_builtin_view_from_embedded(paths, subdir).await;
-            items.push(SkillListItem {
-                name: final_name,
-                description,
-                location,
-                relative_location: Some(skill_rel),
-                is_custom: false,
-                source: SkillSource::Builtin,
-            });
-        }
-    }
-
-    items
-}
-
-#[allow(dead_code)]
-fn read_embedded_skill_meta(skill_rel: &str) -> Option<(String, String)> {
-    let file = BUILTIN_SKILLS.get_file(skill_rel)?;
-    let content = file.contents_utf8()?;
-    parse_frontmatter_fields(content)
-}
-
-/// Materialize a single built-in skill (keyed by `skill_name`) into
-/// `{data_dir}/builtin-skills-view/{skill_name}/` from the on-disk
-/// source corpus. Returns the absolute path to the SKILL.md file; the
-/// caller treats any materialization failure as a recoverable warning
-/// and surfaces the would-be absolute path anyway so the UI can at
-/// least display something consistent.
-async fn materialize_builtin_view_from_disk(
-    paths: &SkillPaths,
-    source_root: &Path,
-    skill_name: &str,
-) -> String {
-    let target_dir = paths
-        .data_dir
-        .join(BUILTIN_SKILLS_VIEW_SUBDIR)
-        .join(skill_name);
-    let target_file = target_dir.join(SKILL_MANIFEST_FILE);
-    // Source can live either at {root}/{name}/ or {root}/auto-inject/{name}/.
-    let candidates = [
-        source_root.join(skill_name),
-        source_root
-            .join(BUILTIN_AUTO_SKILLS_SUBDIR)
-            .join(skill_name),
-    ];
-    let source_dir = candidates.into_iter().find(|p| p.is_dir());
-    if let Some(src) = source_dir
-        && let Err(e) = copy_dir_recursive(&src, &target_dir).await
-    {
-        warn!(
-            skill = %skill_name,
-            error = %e,
-            "failed to materialize builtin skill view (disk source)"
-        );
-    }
-    target_file.to_string_lossy().into_owned()
-}
-
-/// Materialize a single built-in skill into `{data_dir}/builtin-skills-view/`
-/// from the embedded corpus. Returns the absolute SKILL.md path.
-async fn materialize_builtin_view_from_embedded(
-    paths: &SkillPaths,
-    source_dir: &Dir<'static>,
-) -> String {
-    let skill_name = source_dir
-        .path()
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_string();
-    let target_dir = paths
-        .data_dir
-        .join(BUILTIN_SKILLS_VIEW_SUBDIR)
-        .join(&skill_name);
-    if let Err(e) = extract_embedded_dir(source_dir, &target_dir).await {
-        warn!(
-            skill = %skill_name,
-            error = %e,
-            "failed to materialize builtin skill view (embedded source)"
-        );
-    }
-    target_dir
-        .join(SKILL_MANIFEST_FILE)
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Recursively extract an embedded [`Dir`] into a filesystem target,
-/// overwriting existing files. Parent directories are created as needed.
-async fn extract_embedded_dir(source: &Dir<'static>, target: &Path) -> Result<(), ExtensionError> {
-    tokio::fs::create_dir_all(target).await?;
-    for file in source.files() {
-        let rel = file
-            .path()
-            .strip_prefix(source.path())
-            .unwrap_or(file.path());
-        let dest = target.join(rel);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&dest, file.contents()).await?;
-    }
-    for subdir in source.dirs() {
-        let rel = subdir
-            .path()
-            .strip_prefix(source.path())
-            .unwrap_or(subdir.path());
-        let sub_target = target.join(rel);
-        Box::pin(extract_embedded_dir(subdir, &sub_target)).await?;
-    }
-    Ok(())
 }
 
 /// A skill discovered during directory scanning.
@@ -555,42 +395,6 @@ async fn list_auto_skills_from_disk(auto_dir: &Path) -> Vec<BuiltinAutoSkillItem
             }
         })
         .collect()
-}
-
-#[allow(dead_code)]
-fn list_auto_skills_from_embedded() -> Vec<BuiltinAutoSkillItem> {
-    let Some(auto_dir) = BUILTIN_SKILLS.get_dir(BUILTIN_AUTO_SKILLS_SUBDIR) else {
-        return Vec::new();
-    };
-    let mut items = Vec::new();
-    for subdir in auto_dir.dirs() {
-        let Some(skill_name) = subdir
-            .path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-        else {
-            continue;
-        };
-        let skill_rel = format!("{BUILTIN_AUTO_SKILLS_SUBDIR}/{skill_name}/{SKILL_MANIFEST_FILE}");
-        let Some(file) = BUILTIN_SKILLS.get_file(&skill_rel) else {
-            continue;
-        };
-        let Some(content) = file.contents_utf8() else {
-            warn!(path = %skill_rel, "embedded SKILL.md is not valid UTF-8");
-            continue;
-        };
-        let Some((name, description)) = parse_frontmatter_fields(content) else {
-            continue;
-        };
-        let final_name = if name.is_empty() { skill_name } else { name };
-        items.push(BuiltinAutoSkillItem {
-            name: final_name,
-            description,
-            location: skill_rel,
-        });
-    }
-    items
 }
 
 /// Read skill info from a SKILL.md file without importing.
@@ -2059,7 +1863,8 @@ mod tests {
                 "relative_location must end in /SKILL.md, got {rel}"
             );
             assert!(
-                s.location.contains(BUILTIN_SKILLS_VIEW_SUBDIR),
+                s.location
+                    .contains(crate::constants::BUILTIN_SKILLS_DIR_NAME),
                 "builtin location must live under the view dir, got {}",
                 s.location
             );

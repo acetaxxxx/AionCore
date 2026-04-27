@@ -272,13 +272,14 @@ async fn list_skills_builtin_entries_carry_relative_location() {
                 assert!(rel.ends_with("/SKILL.md"));
                 let loc = item["location"].as_str().unwrap();
                 assert!(
-                    loc.contains("builtin-skills-view"),
-                    "builtin location should live under view dir: {loc}"
+                    loc.contains("builtin-skills"),
+                    "builtin location should live under builtin-skills dir: {loc}"
                 );
-                // View is materialized lazily; SKILL.md must now exist.
+                // The builtin-skills tree is materialized at startup, so
+                // SKILL.md must already exist on disk.
                 assert!(
                     std::path::Path::new(loc).exists(),
-                    "view file missing on disk: {loc}"
+                    "builtin skill file missing on disk: {loc}"
                 );
             }
             "custom" => {
