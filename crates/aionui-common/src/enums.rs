@@ -6,35 +6,41 @@ use crate::id::fnv1a_hex8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentType {
-    Gemini,
     Acp,
     #[serde(rename = "openclaw-gateway")]
     OpenclawGateway,
     Nanobot,
     Remote,
     Aionrs,
+    /// Legacy Gemini conversations. Kept solely so that historical rows
+    /// with `type='gemini'` remain readable in the conversation list and
+    /// message history. Any attempt to run the agent (send a message,
+    /// resume a session) returns an error — this variant has no factory
+    /// branch. New Gemini conversations use `AgentType::Acp` with
+    /// `backend='gemini'`.
+    Gemini,
 }
 
 impl AgentType {
     pub fn display_name(&self) -> &'static str {
         match self {
-            AgentType::Gemini => "Gemini",
             AgentType::Acp => "ACP",
             AgentType::OpenclawGateway => "OpenClaw Gateway",
             AgentType::Nanobot => "Nanobot",
             AgentType::Remote => "Remote",
             AgentType::Aionrs => "Aion CLI",
+            AgentType::Gemini => "Gemini (legacy)",
         }
     }
 
     pub fn serde_name(&self) -> &'static str {
         match self {
-            AgentType::Gemini => "gemini",
             AgentType::Acp => "acp",
             AgentType::OpenclawGateway => "openclaw-gateway",
             AgentType::Nanobot => "nanobot",
             AgentType::Remote => "remote",
             AgentType::Aionrs => "aionrs",
+            AgentType::Gemini => "gemini",
         }
     }
 
@@ -72,6 +78,7 @@ impl AcpBackend {
     /// All backends that have a detectable CLI binary.
     pub const CLI_BACKENDS: &[AcpBackend] = &[
         AcpBackend::Claude,
+        AcpBackend::Gemini,
         AcpBackend::Qwen,
         AcpBackend::Codex,
         AcpBackend::Codebuddy,
@@ -121,6 +128,7 @@ impl AcpBackend {
     pub fn binary_name(&self) -> Option<&'static str> {
         match self {
             AcpBackend::Claude => Some("claude"),
+            AcpBackend::Gemini => Some("gemini"),
             AcpBackend::Qwen => Some("qwen"),
             AcpBackend::Codex => Some("codex"),
             AcpBackend::Codebuddy => Some("codebuddy"),
@@ -136,7 +144,6 @@ impl AcpBackend {
             AcpBackend::Vibe => Some("vibe"),
             AcpBackend::Hermes => Some("hermes"),
             AcpBackend::Snow => Some("snow"),
-            AcpBackend::Gemini => None,
         }
     }
 
@@ -150,6 +157,7 @@ impl AcpBackend {
             // Bridge-based — args handled by bridge_package + bridge_extra_args
             AcpBackend::Claude | AcpBackend::Codex | AcpBackend::Codebuddy => None,
             // Direct CLI with specific ACP args
+            AcpBackend::Gemini => Some(&["--experimental-acp"]),
             AcpBackend::Goose => Some(&["acp"]),
             AcpBackend::Droid => Some(&["exec", "--output-format", "acp"]),
             AcpBackend::Auggie => Some(&["--acp"]),
@@ -163,8 +171,6 @@ impl AcpBackend {
             AcpBackend::Hermes => Some(&["acp"]),
             AcpBackend::Snow => Some(&["--acp"]),
             AcpBackend::Qwen => Some(&["--acp"]),
-            // Non-CLI backends
-            AcpBackend::Gemini => None,
         }
     }
 
@@ -187,6 +193,38 @@ impl AcpBackend {
         match self {
             AcpBackend::Codebuddy => &["--acp"],
             _ => &[],
+        }
+    }
+
+    /// Native workspace skill directories the CLI reads on its own,
+    /// without backend prompt-side injection.
+    ///
+    /// Returns `Some(&[".xxx/skills"])` for backends that support native
+    /// skill discovery via workspace symlinks, and `None` for backends
+    /// that must receive skills through prompt injection.
+    ///
+    /// Mirrors `src/common/types/acpTypes.ts` `ACP_BACKENDS_ALL` `skillsDirs`
+    /// entries. Keep in sync when adding or modifying backends.
+    pub fn native_skills_dirs(&self) -> Option<&'static [&'static str]> {
+        match self {
+            AcpBackend::Claude => Some(&[".claude/skills"]),
+            AcpBackend::Qwen => Some(&[".qwen/skills"]),
+            AcpBackend::Codex => Some(&[".codex/skills"]),
+            AcpBackend::Codebuddy => Some(&[".codebuddy/skills"]),
+            AcpBackend::Goose => Some(&[".goose/skills"]),
+            AcpBackend::Kimi => Some(&[".kimi/skills"]),
+            AcpBackend::Opencode => Some(&[".opencode/skills"]),
+            AcpBackend::Droid => Some(&[".factory/skills"]),
+            AcpBackend::Vibe => Some(&[".vibe/skills"]),
+            AcpBackend::Cursor => Some(&[".cursor/skills"]),
+            // Explicitly no native skill discovery:
+            AcpBackend::Copilot
+            | AcpBackend::Qoder
+            | AcpBackend::Kiro
+            | AcpBackend::Hermes
+            | AcpBackend::Snow
+            | AcpBackend::Gemini
+            | AcpBackend::Auggie => None,
         }
     }
 }
@@ -353,6 +391,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claude_supports_native_skills() {
+        assert_eq!(
+            AcpBackend::Claude.native_skills_dirs(),
+            Some(&[".claude/skills"][..])
+        );
+    }
+
+    #[test]
+    fn copilot_has_no_native_skills() {
+        assert_eq!(AcpBackend::Copilot.native_skills_dirs(), None);
+    }
+
+    #[test]
+    fn qoder_kiro_hermes_snow_have_no_native_skills() {
+        assert_eq!(AcpBackend::Qoder.native_skills_dirs(), None);
+        assert_eq!(AcpBackend::Kiro.native_skills_dirs(), None);
+        assert_eq!(AcpBackend::Hermes.native_skills_dirs(), None);
+        assert_eq!(AcpBackend::Snow.native_skills_dirs(), None);
+    }
+
+    #[test]
+    fn all_backends_with_skills_dirs() {
+        // Mirrors src/common/types/acpTypes.ts ACP_BACKENDS_ALL skillsDirs entries.
+        let expected_with_skills: &[AcpBackend] = &[
+            AcpBackend::Claude,
+            AcpBackend::Qwen,
+            AcpBackend::Codex,
+            AcpBackend::Codebuddy,
+            AcpBackend::Goose,
+            AcpBackend::Kimi,
+            AcpBackend::Opencode,
+            AcpBackend::Droid,
+            AcpBackend::Vibe,
+            AcpBackend::Cursor,
+        ];
+        for b in expected_with_skills {
+            assert!(
+                b.native_skills_dirs().is_some(),
+                "{b:?} should expose native_skills_dirs"
+            );
+        }
+    }
+
+    #[test]
     fn test_agent_type_display_names() {
         assert_eq!(
             AgentType::OpenclawGateway.display_name(),
@@ -360,7 +442,6 @@ mod tests {
         );
         assert_eq!(AgentType::Aionrs.display_name(), "Aion CLI");
         assert_eq!(AgentType::Nanobot.display_name(), "Nanobot");
-        assert_eq!(AgentType::Gemini.display_name(), "Gemini");
         assert_eq!(AgentType::Remote.display_name(), "Remote");
         assert_eq!(AgentType::Acp.display_name(), "ACP");
     }
@@ -376,7 +457,6 @@ mod tests {
     #[test]
     fn test_agent_type_id_unique_per_variant() {
         let ids: Vec<String> = [
-            AgentType::Gemini,
             AgentType::Acp,
             AgentType::OpenclawGateway,
             AgentType::Nanobot,
@@ -402,7 +482,6 @@ mod tests {
     #[test]
     fn test_agent_type_all_variants() {
         let cases = [
-            (AgentType::Gemini, "gemini"),
             (AgentType::Acp, "acp"),
             (AgentType::OpenclawGateway, "openclaw-gateway"),
             (AgentType::Nanobot, "nanobot"),
@@ -439,7 +518,10 @@ mod tests {
         // Non-ACP execution engines are dispatched via AgentType, not AcpBackend.
         // Rejecting them at the HTTP deserialization boundary prevents accidental
         // regression where a future change re-adds one of these variants.
-        for name in ["gemini", "nanobot", "remote", "aionrs", "openclaw-gateway"] {
+        //
+        // Note: "gemini" is intentionally NOT in this list — it is a valid
+        // AcpBackend variant (spawned via `gemini --experimental-acp`).
+        for name in ["nanobot", "remote", "aionrs", "openclaw-gateway"] {
             let json = format!("\"{name}\"");
             let result: Result<AcpBackend, _> = serde_json::from_str(&json);
             assert!(result.is_err(), "AcpBackend should not accept {name:?}");
@@ -539,11 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn test_acp_backend_cli_binary_name_none() {
-        assert_eq!(AcpBackend::Gemini.binary_name(), None);
-    }
-
-    #[test]
     fn test_acp_backend_display_name() {
         assert_eq!(AcpBackend::Claude.display_name(), "Claude");
         assert_eq!(AcpBackend::Codebuddy.display_name(), "CodeBuddy");
@@ -573,5 +650,14 @@ mod tests {
         let claude_id = AcpBackend::Claude.id();
         let codex_id = AcpBackend::Codex.id();
         assert_ne!(claude_id, codex_id);
+    }
+
+    #[test]
+    fn acp_gemini_is_registered_as_cli_backend() {
+        assert!(AcpBackend::CLI_BACKENDS.contains(&AcpBackend::Gemini));
+        assert_eq!(AcpBackend::Gemini.binary_name(), Some("gemini"));
+        assert_eq!(AcpBackend::Gemini.args(), Some(&["--experimental-acp"][..]));
+        // Gemini is a direct-CLI backend, no bridge
+        assert_eq!(AcpBackend::Gemini.bridge_package(), None);
     }
 }

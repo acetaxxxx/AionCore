@@ -48,9 +48,7 @@ pub use channel::{
 pub use confirmation::{
     ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse,
 };
-pub use connection_test::{
-    GeminiSubscriptionData, GeminiSubscriptionQuery, TestBedrockConnectionRequest,
-};
+pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
     CloneConversationRequest, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse,

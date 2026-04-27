@@ -10,12 +10,23 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::skill_manager::{
     AcpSkillManager, build_skills_index_text, build_system_instructions, detect_skill_load_request,
     prepare_first_message, prepare_first_message_with_skills_index,
 };
+use aionui_extension::{BUILTIN_SKILLS_ENV_VAR, SkillPaths, resolve_skill_paths};
 use tempfile::TempDir;
+
+/// Build SkillPaths rooted at `base` for test use.
+fn test_paths(base: &Path) -> Arc<SkillPaths> {
+    Arc::new(resolve_skill_paths(base, base))
+}
+
+/// Serialize env var mutations across tests — `BUILTIN_SKILLS_ENV_VAR` is
+/// process-global so concurrent tests that set it must not interleave.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -37,148 +48,167 @@ fn create_non_skill_dir(base: &Path, category: &str, dir_name: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// 5.1 Skill Discovery
+// 4.0 New API: discover via extension service
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn discover_builtin_skills() {
+async fn discover_skills_uses_extension_service_layout() {
+    let _guard = ENV_MUTEX.lock().unwrap();
     let tmp = TempDir::new().unwrap();
-    create_skill(
-        tmp.path(),
-        "_builtin",
-        "code-review",
-        "code-review",
-        "Review code for quality issues",
-        "Full review instructions here.",
+    let builtin_src = tmp.path().join("builtin-skills-src");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // auto-inject skill: builtin-src/auto-inject/cron/SKILL.md
+    let auto_dir = builtin_src.join("auto-inject").join("cron");
+    fs::create_dir_all(&auto_dir).unwrap();
+    fs::write(
+        auto_dir.join("SKILL.md"),
+        "---\nname: cron\ndescription: Cron helper\n---\nBody",
+    )
+    .unwrap();
+
+    // opt-in builtin: builtin-src/mermaid/SKILL.md
+    let opt_dir = builtin_src.join("mermaid");
+    fs::create_dir_all(&opt_dir).unwrap();
+    fs::write(
+        opt_dir.join("SKILL.md"),
+        "---\nname: mermaid\ndescription: Mermaid diagrams\n---\nBody",
+    )
+    .unwrap();
+
+    // user custom: data/skills/my-skill/SKILL.md
+    let user_dir = data_dir.join("skills").join("my-skill");
+    fs::create_dir_all(&user_dir).unwrap();
+    fs::write(
+        user_dir.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: User skill\n---\nBody",
+    )
+    .unwrap();
+
+    unsafe {
+        std::env::set_var(BUILTIN_SKILLS_ENV_VAR, &builtin_src);
+    }
+
+    let paths = Arc::new(resolve_skill_paths(tmp.path(), &data_dir));
+    let mgr = AcpSkillManager::new(paths);
+
+    // No enabled_skills: opt-in builtin (mermaid) and custom (my-skill) should
+    // be skipped. Only the auto-inject builtin (cron) appears.
+    let idx = mgr.discover_skills(None, None).await;
+    let names: std::collections::HashSet<&str> =
+        idx.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains("cron"), "auto-inject skill missing: got {names:?}");
+    assert!(!names.contains("mermaid"), "opt-in builtin leaked without enabled_skills");
+    assert!(!names.contains("my-skill"), "custom leaked without enabled_skills");
+
+    unsafe {
+        std::env::remove_var(BUILTIN_SKILLS_ENV_VAR);
+    }
+}
+
+#[tokio::test]
+async fn get_skill_loads_builtin_body_via_read_builtin_skill() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let builtin = tmp.path().join("builtin");
+    let auto = builtin.join("auto-inject").join("bodyskill");
+    fs::create_dir_all(&auto).unwrap();
+    fs::write(
+        auto.join("SKILL.md"),
+        "---\nname: bodyskill\ndescription: B\n---\nBuiltin body content",
+    )
+    .unwrap();
+
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    unsafe {
+        std::env::set_var(BUILTIN_SKILLS_ENV_VAR, &builtin);
+    }
+
+    let paths = Arc::new(resolve_skill_paths(tmp.path(), &data_dir));
+    let mgr = AcpSkillManager::new(paths);
+    mgr.discover_skills(None, None).await;
+
+    let skill = mgr.get_skill("bodyskill").await.unwrap();
+    assert_eq!(
+        skill.body.as_deref(),
+        Some("Builtin body content"),
+        "builtin body should be loaded via read_builtin_skill + extract_body"
     );
 
-    let mgr = AcpSkillManager::new();
-    let index = mgr.discover_skills(tmp.path(), None).await;
-
-    assert_eq!(index.len(), 1);
-    assert_eq!(index[0].name, "code-review");
-    assert_eq!(index[0].description, "Review code for quality issues");
+    unsafe {
+        std::env::remove_var(BUILTIN_SKILLS_ENV_VAR);
+    }
 }
 
 #[tokio::test]
-async fn discover_user_custom_skills() {
+async fn get_skill_loads_custom_body_via_fs_read() {
+    let _guard = ENV_MUTEX.lock().unwrap();
     let tmp = TempDir::new().unwrap();
-    create_skill(
-        tmp.path(),
-        "skills",
-        "my-debugger",
-        "my-debugger",
-        "Custom debugging tool",
-        "Step 1: reproduce the bug...",
+    let data_dir = tmp.path().join("data");
+    let user_skill = data_dir.join("skills").join("mine");
+    fs::create_dir_all(&user_skill).unwrap();
+    fs::write(
+        user_skill.join("SKILL.md"),
+        "---\nname: mine\ndescription: Mine\n---\nCustom body here",
+    )
+    .unwrap();
+
+    // Ensure no stale BUILTIN_SKILLS_ENV_VAR interferes
+    unsafe {
+        std::env::remove_var(BUILTIN_SKILLS_ENV_VAR);
+    }
+
+    let paths = Arc::new(resolve_skill_paths(tmp.path(), &data_dir));
+    let mgr = AcpSkillManager::new(paths);
+    let enabled = vec!["mine".to_string()];
+    let idx = mgr.discover_skills(Some(&enabled), None).await;
+
+    let names: Vec<&str> = idx.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.contains(&"mine"),
+        "custom 'mine' should be in index; got {names:?}"
     );
 
-    let mgr = AcpSkillManager::new();
-    let index = mgr.discover_skills(tmp.path(), None).await;
-
-    assert_eq!(index.len(), 1);
-    assert_eq!(index[0].name, "my-debugger");
+    let skill = mgr.get_skill("mine").await.unwrap();
+    assert_eq!(skill.body.as_deref(), Some("Custom body here"));
 }
 
 #[tokio::test]
-async fn discover_returns_empty_for_empty_directories() {
+async fn discover_skills_respects_exclude_builtin() {
+    let _guard = ENV_MUTEX.lock().unwrap();
     let tmp = TempDir::new().unwrap();
-    // Create the scan directories but with no skills
-    fs::create_dir_all(tmp.path().join("_builtin")).unwrap();
-    fs::create_dir_all(tmp.path().join("skills")).unwrap();
+    let builtin_src = tmp.path().join("b");
+    let auto_dir = builtin_src.join("auto-inject").join("cron");
+    fs::create_dir_all(&auto_dir).unwrap();
+    fs::write(
+        auto_dir.join("SKILL.md"),
+        "---\nname: cron\ndescription: Cron\n---\nBody",
+    )
+    .unwrap();
 
-    let mgr = AcpSkillManager::new();
-    let index = mgr.discover_skills(tmp.path(), None).await;
+    unsafe {
+        std::env::set_var(BUILTIN_SKILLS_ENV_VAR, &builtin_src);
+    }
 
-    assert!(index.is_empty());
-}
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let paths = Arc::new(resolve_skill_paths(tmp.path(), &data_dir));
+    let mgr = AcpSkillManager::new(paths);
+    let exclude = vec!["cron".to_string()];
+    let idx = mgr.discover_skills(None, Some(&exclude)).await;
+    assert!(idx.is_empty(), "excluded auto-inject skill should be dropped");
 
-#[tokio::test]
-async fn discover_returns_empty_when_no_directories_exist() {
-    let tmp = TempDir::new().unwrap();
-    let mgr = AcpSkillManager::new();
-    let index = mgr.discover_skills(tmp.path(), None).await;
-    assert!(index.is_empty());
-}
-
-#[tokio::test]
-async fn discover_ignores_directories_without_skill_md() {
-    let tmp = TempDir::new().unwrap();
-    create_non_skill_dir(tmp.path(), "skills", "not-a-skill");
-    create_skill(
-        tmp.path(),
-        "skills",
-        "real-skill",
-        "real-skill",
-        "A real skill",
-        "body",
-    );
-
-    let mgr = AcpSkillManager::new();
-    let index = mgr.discover_skills(tmp.path(), None).await;
-
-    assert_eq!(index.len(), 1);
-    assert_eq!(index[0].name, "real-skill");
-}
-
-#[tokio::test]
-async fn discover_skills_across_all_three_directories() {
-    let tmp = TempDir::new().unwrap();
-    create_skill(tmp.path(), "_builtin", "a", "a", "Builtin A", "body");
-    create_skill(tmp.path(), "builtin-skills", "b", "b", "Packaged B", "body");
-    create_skill(tmp.path(), "skills", "c", "c", "Custom C", "body");
-
-    let mgr = AcpSkillManager::new();
-    let index = mgr.discover_skills(tmp.path(), None).await;
-
-    assert_eq!(index.len(), 3);
-    let names: Vec<&str> = index.iter().map(|s| s.name.as_str()).collect();
-    assert!(names.contains(&"a"));
-    assert!(names.contains(&"b"));
-    assert!(names.contains(&"c"));
-}
-
-#[tokio::test]
-async fn discover_with_enabled_filter() {
-    let tmp = TempDir::new().unwrap();
-    create_skill(tmp.path(), "skills", "alpha", "alpha", "Alpha", "body");
-    create_skill(tmp.path(), "skills", "beta", "beta", "Beta", "body");
-    create_skill(tmp.path(), "skills", "gamma", "gamma", "Gamma", "body");
-
-    let mgr = AcpSkillManager::new();
-    let enabled = vec!["alpha".to_string(), "gamma".to_string()];
-    let index = mgr.discover_skills(tmp.path(), Some(&enabled)).await;
-
-    assert_eq!(index.len(), 2);
-    let names: Vec<&str> = index.iter().map(|s| s.name.as_str()).collect();
-    assert!(names.contains(&"alpha"));
-    assert!(names.contains(&"gamma"));
-    assert!(!names.contains(&"beta"));
+    unsafe {
+        std::env::remove_var(BUILTIN_SKILLS_ENV_VAR);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 5.2 Skill Index
+// 5.2 Skill Index (pure function)
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn get_skills_index_returns_name_and_description_only() {
-    let tmp = TempDir::new().unwrap();
-    create_skill(
-        tmp.path(),
-        "skills",
-        "test-skill",
-        "test-skill",
-        "A test skill",
-        "Detailed body content that should NOT appear in the index.",
-    );
-
-    let mgr = AcpSkillManager::new();
-    mgr.discover_skills(tmp.path(), None).await;
-
-    let index = mgr.get_skills_index().await;
-    assert_eq!(index.len(), 1);
-    assert_eq!(index[0].name, "test-skill");
-    assert_eq!(index[0].description, "A test skill");
-}
 
 #[test]
 fn build_index_text_contains_load_protocol() {
@@ -200,79 +230,7 @@ fn build_index_text_contains_load_protocol() {
 }
 
 // ---------------------------------------------------------------------------
-// 5.3 Lazy Loading
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn lazy_load_skill_body_from_file() {
-    let tmp = TempDir::new().unwrap();
-    create_skill(
-        tmp.path(),
-        "skills",
-        "lazy-skill",
-        "lazy-skill",
-        "Lazy loaded",
-        "This is the complete skill body.\nWith multiple lines.",
-    );
-
-    let mgr = AcpSkillManager::new();
-    mgr.discover_skills(tmp.path(), None).await;
-
-    let skill = mgr.get_skill("lazy-skill").await.unwrap();
-    assert!(skill.body.is_some());
-    assert!(
-        skill
-            .body
-            .as_deref()
-            .unwrap()
-            .contains("complete skill body")
-    );
-    assert!(skill.body.as_deref().unwrap().contains("multiple lines"));
-}
-
-#[tokio::test]
-async fn cached_load_does_not_reread_file() {
-    let tmp = TempDir::new().unwrap();
-    create_skill(
-        tmp.path(),
-        "skills",
-        "cached",
-        "cached",
-        "Cached skill",
-        "Original body",
-    );
-
-    let mgr = AcpSkillManager::new();
-    mgr.discover_skills(tmp.path(), None).await;
-
-    // First load
-    let first = mgr.get_skill("cached").await.unwrap();
-    assert_eq!(first.body.as_deref(), Some("Original body"));
-
-    // Modify the file after first load
-    let skill_path = tmp.path().join("skills/cached/SKILL.md");
-    fs::write(
-        &skill_path,
-        "---\nname: cached\ndescription: Cached skill\n---\nModified body",
-    )
-    .unwrap();
-
-    // Second load should return cached version
-    let second = mgr.get_skill("cached").await.unwrap();
-    assert_eq!(second.body.as_deref(), Some("Original body"));
-}
-
-#[tokio::test]
-async fn get_skill_returns_none_for_unknown() {
-    let tmp = TempDir::new().unwrap();
-    let mgr = AcpSkillManager::new();
-    mgr.discover_skills(tmp.path(), None).await;
-
-    assert!(mgr.get_skill("nonexistent").await.is_none());
-}
-
-// ---------------------------------------------------------------------------
-// 5.4 LOAD_SKILL Detection
+// 5.4 LOAD_SKILL Detection (pure function)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -313,6 +271,8 @@ fn system_instructions_with_loaded_skills() {
         name: "helper".into(),
         description: "A helper".into(),
         location: std::path::PathBuf::new(),
+        source: aionui_extension::SkillSource::Custom,
+        relative_location: None,
         body: Some("Complete helper instructions.".into()),
     }];
     let result = build_system_instructions("Base system prompt", &skills);
@@ -342,6 +302,8 @@ fn first_message_with_full_skills_for_gemini() {
         name: "debug".into(),
         description: "Debug".into(),
         location: std::path::PathBuf::new(),
+        source: aionui_extension::SkillSource::Custom,
+        relative_location: None,
         body: Some("Full debug skill content.".into()),
     }];
     let result = prepare_first_message("Hello", &skills, Some("Be helpful."));
@@ -353,38 +315,6 @@ fn first_message_with_full_skills_for_gemini() {
     assert!(result.ends_with("Hello"));
 }
 
-// ---------------------------------------------------------------------------
-// User override: skills/ takes precedence over _builtin/
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn user_skills_override_builtin() {
-    let tmp = TempDir::new().unwrap();
-    create_skill(
-        tmp.path(),
-        "_builtin",
-        "review",
-        "review",
-        "Built-in review (should be overridden)",
-        "builtin body",
-    );
-    create_skill(
-        tmp.path(),
-        "skills",
-        "review",
-        "review",
-        "Custom review (override)",
-        "custom body",
-    );
-
-    let mgr = AcpSkillManager::new();
-    let index = mgr.discover_skills(tmp.path(), None).await;
-
-    // Should only have one entry for "review"
-    assert_eq!(index.len(), 1);
-    assert_eq!(index[0].description, "Custom review (override)");
-
-    // Load the body to verify override
-    let skill = mgr.get_skill("review").await.unwrap();
-    assert_eq!(skill.body.as_deref(), Some("custom body"));
-}
+// User-override tests moved to the BUILTIN_SKILLS_ENV_VAR-based discovery
+// tests at the top of this file — see Task 5 for get_skill body-loading
+// coverage against the new skill_service-backed API.

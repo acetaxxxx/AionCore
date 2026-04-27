@@ -22,6 +22,39 @@ fn create_conv_body(name: &str, agent_type: &str) -> serde_json::Value {
     })
 }
 
+fn create_conv_body_with_workspace(
+    name: &str,
+    agent_type: &str,
+    workspace: &str,
+) -> serde_json::Value {
+    json!({
+        "type": agent_type,
+        "name": name,
+        "model": { "provider_id": "p1", "model": "m1" },
+        "extra": { "workspace": workspace }
+    })
+}
+
+async fn create_conversation_with_workspace(
+    app: &mut axum::Router,
+    token: &str,
+    csrf: &str,
+    name: &str,
+    agent_type: &str,
+    workspace: &str,
+) -> String {
+    let req = common::json_with_token(
+        "POST",
+        "/api/conversations",
+        create_conv_body_with_workspace(name, agent_type, workspace),
+        token,
+        csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let json = common::body_json(resp).await;
+    json["data"]["id"].as_str().unwrap().to_owned()
+}
+
 async fn create_conversation(
     app: &mut axum::Router,
     token: &str,
@@ -66,14 +99,41 @@ async fn workspace_browse_requires_auth() {
 async fn workspace_browse_no_active_task() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let conv_id = create_conversation(&mut app, &token, &csrf, "Test Conv", "gemini").await;
+
+    // Seed a real workspace on disk so the handler can canonicalize it.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), b"// hi").unwrap();
+
+    let ws = tmp.path().to_string_lossy().into_owned();
+    let conv_id =
+        create_conversation_with_workspace(&mut app, &token, &csrf, "Test Conv", "acp", &ws)
+            .await;
 
     let req = get_with_token(
         &format!("/api/conversations/{conv_id}/workspace?path=/src"),
         &token,
     );
     let resp = app.oneshot(req).await.unwrap();
-    // No active agent task → 404
+    // Workspace comes from DB; no active agent required.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let entries = json["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "lib.rs");
+    assert_eq!(entries[0]["type"], "file");
+}
+
+#[tokio::test]
+async fn workspace_browse_conversation_not_found() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+
+    let req = get_with_token(
+        "/api/conversations/does-not-exist/workspace?path=/src",
+        &token,
+    );
+    let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -123,7 +183,7 @@ async fn side_question_empty_question() {
 async fn side_question_no_active_task() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let conv_id = create_conversation(&mut app, &token, &csrf, "Side Q Test", "gemini").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Side Q Test", "acp").await;
 
     let req = json_with_token(
         "POST",
@@ -156,7 +216,7 @@ async fn reload_context_requires_auth() {
 async fn reload_context_no_active_task() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let conv_id = create_conversation(&mut app, &token, &csrf, "Reload Test", "gemini").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Reload Test", "acp").await;
 
     let req = json_with_token(
         "POST",
@@ -187,7 +247,7 @@ async fn slash_commands_requires_auth() {
 async fn slash_commands_no_active_task() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let conv_id = create_conversation(&mut app, &token, &_csrf, "Slash Test", "gemini").await;
+    let conv_id = create_conversation(&mut app, &token, &_csrf, "Slash Test", "acp").await;
 
     let req = get_with_token(
         &format!("/api/conversations/{conv_id}/slash-commands"),
@@ -291,7 +351,7 @@ async fn check_approval_no_task() {
 async fn stop_stream_no_task() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let conv_id = create_conversation(&mut app, &token, &csrf, "Stop Test", "gemini").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Stop Test", "acp").await;
 
     let req = json_with_token(
         "POST",

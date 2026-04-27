@@ -12,11 +12,11 @@ use crate::skill_manager::AcpSkillManager;
 use crate::task_manager::AgentFactory;
 use crate::types::{
     AcpBuildExtra, AionrsBuildExtra, AionrsCompatOverrides, AionrsResolvedConfig, BuildTaskOptions,
-    GeminiBuildExtra, OpenClawBuildExtra, RemoteBuildExtra,
+    OpenClawBuildExtra, RemoteBuildExtra,
 };
 use crate::{
-    AcpAgentManager, AionrsAgentManager, GeminiAgentManager, NanobotAgentManager,
-    OpenClawAgentManager, RemoteAgentManager,
+    AcpAgentManager, AionrsAgentManager, NanobotAgentManager, OpenClawAgentManager,
+    RemoteAgentManager,
 };
 
 /// Dependencies needed by the agent factory to construct agents.
@@ -62,16 +62,16 @@ async fn build_agent(
                     .get("backend")
                     .and_then(|v| serde_json::from_value::<AcpBackend>(v.clone()).ok());
                 match backend {
-                    Some(b) => format!("acp-{}", b.display_name()).to_lowercase(),
+                    Some(b) => b.display_name().to_lowercase(),
                     None => "acp".to_string(),
                 }
             }
-            other => format!("{other:?}").to_lowercase(),
+            other => match other {
+                AgentType::OpenclawGateway => "openclaw".to_string(),
+                t => format!("{t:?}").to_lowercase(),
+            },
         };
-        let dir = deps
-            .data_dir
-            .join("tmp")
-            .join(format!("{label}-temp-{}", now_ms()));
+        let dir = deps.data_dir.join(format!("{label}-temp-{}", now_ms()));
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Internal(format!("Failed to create temp workspace: {e}")))?;
         dir.to_string_lossy().into_owned()
@@ -80,6 +80,11 @@ async fn build_agent(
     };
 
     match options.agent_type {
+        AgentType::Gemini => Err(AppError::ConversationArchived(
+            "This conversation was created with the legacy Gemini runtime, which has been \
+             removed. Please start a new conversation with the Gemini ACP backend to continue."
+                .into(),
+        )),
         AgentType::Acp => {
             let mut config: AcpBuildExtra = serde_json::from_value(options.extra)
                 .map_err(|e| AppError::BadRequest(format!("Invalid ACP build options: {e}")))?;
@@ -138,28 +143,12 @@ async fn build_agent(
                     cwd: Some(workspace),
                 },
                 config,
+                deps.skill_manager.clone(),
             )
             .await?;
             let arc = Arc::new(agent);
             arc.start_permission_handler();
             Ok(arc as AgentManagerHandle)
-        }
-        AgentType::Gemini => {
-            let config: GeminiBuildExtra = serde_json::from_value(options.extra)
-                .map_err(|e| AppError::BadRequest(format!("Invalid Gemini build options: {e}")))?;
-            // Gemini CLI path detected via `which gemini`
-            let cli_path = which::which("gemini")
-                .map(|p| p.to_string_lossy().into_owned())
-                .map_err(|_| AppError::BadRequest("Gemini CLI not found in PATH".into()))?;
-            let agent = GeminiAgentManager::new(
-                conversation_id,
-                workspace,
-                cli_path,
-                config,
-                Some(deps.skill_manager.clone()),
-            )
-            .await?;
-            Ok(Arc::new(agent) as AgentManagerHandle)
         }
         AgentType::OpenclawGateway => {
             let config: OpenClawBuildExtra =
