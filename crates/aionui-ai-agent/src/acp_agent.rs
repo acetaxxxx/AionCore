@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
@@ -8,8 +9,8 @@ use aionui_common::{
     ConversationStatus, TimestampMs, now_ms,
 };
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
-use tracing::{debug, error, info, warn};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
+use tracing::{debug, error, info};
 
 use crate::acp_protocol::{
     AcpProtocol, CancelNotification, ContentBlock, LoadSessionRequest, NewSessionRequest,
@@ -17,7 +18,7 @@ use crate::acp_protocol::{
     SetSessionModeRequest, SetSessionModelRequest,
 };
 use crate::cli_process::CliAgentProcess;
-use crate::stream_event::AgentStreamEvent;
+use crate::stream_event::{AgentStreamEvent, permission_request_to_event_data};
 use crate::types::{AcpBuildExtra, AcpModelInfo, SendMessageData};
 
 /// Grace period before force-killing an ACP process (ms).
@@ -41,12 +42,15 @@ impl SessionResumeStrategy {
     }
 }
 
-/// YOLO mode value for each ACP backend.
-/// Returns `None` for backends that don't support YOLO.
-fn yolo_mode_value(backend: AcpBackend) -> Option<&'static str> {
-    match backend {
-        AcpBackend::Claude | AcpBackend::Codebuddy => Some("bypassPermissions"),
-        AcpBackend::Qwen => Some("yolo"),
+fn confirm_option_id(data: &Value) -> Option<String> {
+    match data {
+        Value::String(v) => Some(v.clone()),
+        Value::Object(map) => map
+            .get("option_id")
+            .or_else(|| map.get("optionId"))
+            .or_else(|| map.get("value"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         _ => None,
     }
 }
@@ -57,18 +61,11 @@ struct AcpState {
     status: Option<ConversationStatus>,
     /// Active session ID (set after session/new or session/load).
     session_id: Option<String>,
-    /// Pending tool-call confirmations.
-    confirmations: Vec<Confirmation>,
     /// Model info from ACP backend.
     model_info: Option<AcpModelInfo>,
     /// Whether this session has sent at least one message.
     has_messages: bool,
-    /// Session-level approval memory (action key → always allowed).
-    /// Cleared when the agent is killed, not persisted.
-    approval_memory: HashMap<String, bool>,
 }
-
-use crate::agent_manager::approval_key;
 
 /// Manages a single ACP Agent instance.
 ///
@@ -99,6 +96,8 @@ pub struct AcpAgentManager {
     session_lock: Mutex<()>,
     /// Receiver for permission requests from the protocol layer.
     permission_rx: Mutex<mpsc::Receiver<PermissionRequest>>,
+    /// Pending ACP permission responders keyed by tool call ID.
+    pending_permissions: StdMutex<HashMap<String, oneshot::Sender<PermissionDecision>>>,
     /// Whether a graceful shutdown is in progress.
     closing: std::sync::atomic::AtomicBool,
     /// Shared skill manager — used to discover skills for first-message injection.
@@ -156,14 +155,13 @@ impl AcpAgentManager {
             state: RwLock::new(AcpState {
                 status: None,
                 session_id: None,
-                confirmations: Vec::new(),
                 model_info: None,
                 has_messages: false,
-                approval_memory: HashMap::new(),
             }),
             last_activity: AtomicI64::new(now_ms()),
             session_lock: Mutex::new(()),
             permission_rx: Mutex::new(permission_rx),
+            pending_permissions: StdMutex::new(HashMap::new()),
             closing: std::sync::atomic::AtomicBool::new(false),
             skill_manager,
         };
@@ -189,78 +187,24 @@ impl AcpAgentManager {
         while let Some(perm_req) = rx.recv().await {
             self.last_activity.store(now_ms(), Ordering::Relaxed);
 
-            // Convert to Confirmation and store
-            let call_id = format!(
-                "perm-{}",
-                perm_req.session_id.chars().take(8).collect::<String>()
-            );
+            let call_id = perm_req.request.tool_call.tool_call_id.to_string();
 
-            // Emit Permission event for the frontend
-            let permission_event = json!({
-                "call_id": &call_id,
-                "session_id": &perm_req.session_id,
-                "tool_call": &perm_req.tool_call,
-                "options": &perm_req.options,
-            });
-
-            let confirmation = Confirmation {
-                id: call_id.clone(),
-                call_id: call_id.clone(),
-                title: perm_req
-                    .tool_call
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                action: perm_req
-                    .tool_call
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                description: perm_req
-                    .tool_call
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Permission requested")
-                    .to_owned(),
-                command_type: None,
-                options: perm_req
-                    .options
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            };
-
-            // Store the response channel so confirm() can use it
-            {
-                let mut state = self.state.write().await;
-                state.confirmations.push(confirmation);
+            let mut pending = self.pending_permissions.lock().unwrap();
+            if let Some(previous) = pending.insert(call_id.clone(), perm_req.response_tx) {
+                let _ = previous.send(PermissionDecision::Cancelled);
             }
+            drop(pending);
 
-            // Broadcast Permission event
-            let _ = self
+            let permission_event = permission_request_to_event_data(&perm_req.request);
+
+            if self
                 .event_tx
-                .send(AgentStreamEvent::Permission(permission_event));
-
-            // Store the response_tx in a side map keyed by call_id
-            // For now, we cancel if the permission_rx loop continues
-            // The actual response is sent by confirm() via the stored channel
-            // This is simplified — the response_tx is dropped here and confirm()
-            // sends via the protocol directly. See confirm() implementation.
-
-            // Since we can't easily store the oneshot sender across the
-            // async boundary of confirm(), we auto-cancel this request
-            // and instead handle confirm() by sending a new response
-            // through the protocol.
-            //
-            // TODO: In a future iteration, store response_tx in a HashMap
-            // keyed by call_id so confirm() can complete the circuit.
-            // For now, the permission request handler auto-cancels,
-            // and confirm() is a separate fire-and-forget path.
-            let _ = perm_req.response_tx.send(PermissionDecision::Cancelled);
+                .send(AgentStreamEvent::AcpPermission(permission_event))
+                .is_err()
+                && let Some(response_tx) = self.pending_permissions.lock().unwrap().remove(&call_id)
+            {
+                let _ = response_tx.send(PermissionDecision::Cancelled);
+            }
         }
     }
 
@@ -406,44 +350,6 @@ impl AcpAgentManager {
         Ok(())
     }
 
-    /// Enable YOLO mode for the current session if the backend supports it.
-    pub async fn ensure_yolo_mode(&self) -> bool {
-        let mode = match yolo_mode_value(self.backend) {
-            Some(m) => m,
-            None => return false,
-        };
-
-        let session_id = self.state.read().await.session_id.clone();
-        let sid = match session_id {
-            Some(ref s) => s.as_str(),
-            None => return false,
-        };
-
-        match self
-            .protocol
-            .set_mode(SetSessionModeRequest::new(SessionId::new(sid), mode))
-            .await
-        {
-            Ok(()) => {
-                debug!(
-                    conversation_id = %self.conversation_id,
-                    backend = ?self.backend,
-                    mode,
-                    "YOLO mode enabled"
-                );
-                true
-            }
-            Err(e) => {
-                warn!(
-                    conversation_id = %self.conversation_id,
-                    error = %e,
-                    "Failed to enable YOLO mode"
-                );
-                false
-            }
-        }
-    }
-
     // -- ACP-specific extended methods (beyond IAgentManager) --
 
     /// Query the ACP backend for current session mode.
@@ -582,10 +488,9 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
             self.protocol
                 .cancel(CancelNotification::new(SessionId::new(sid)));
         }
-
-        // Clear pending confirmations on stop
-        let mut state = self.state.write().await;
-        state.confirmations.clear();
+        for (_, responder) in self.pending_permissions.lock().unwrap().drain() {
+            let _ = responder.send(PermissionDecision::Cancelled);
+        }
 
         Ok(())
     }
@@ -594,53 +499,38 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
         &self,
         _msg_id: &str,
         call_id: &str,
-        _data: serde_json::Value,
-        always_allow: bool,
+        data: serde_json::Value,
+        _always_allow: bool,
     ) -> Result<(), AppError> {
-        // Remove the confirmation from the pending list and optionally
-        // record in approval memory.
-        if let Ok(mut state) = self.state.try_write() {
-            if always_allow {
-                // Find the confirmation before removing it to read action/command_type
-                if let Some(conf) = state.confirmations.iter().find(|c| c.call_id == call_id) {
-                    let key = approval_key(conf.action.as_deref(), conf.command_type.as_deref());
-                    state.approval_memory.insert(key, true);
-                }
-            }
-            state.confirmations.retain(|c| c.call_id != call_id);
-        }
+        let option_id = confirm_option_id(&data).ok_or_else(|| {
+            AppError::BadRequest("ACP confirmation requires an option_id string".into())
+        })?;
 
-        // NOTE: With the SDK-based protocol, permission responses are handled
-        // through the PermissionRequest.response_tx channel in the permission
-        // handler. Since we currently auto-cancel there, confirm() is a no-op
-        // for the protocol layer. A future iteration will wire this properly
-        // by storing response_tx channels keyed by call_id.
-        //
-        // For now, log the confirmation for debugging.
-        debug!(
-            conversation_id = %self.conversation_id,
-            call_id,
-            "Confirmation processed (protocol response pending future iteration)"
-        );
+        let responder = self
+            .pending_permissions
+            .lock()
+            .unwrap()
+            .remove(call_id)
+            .ok_or_else(|| {
+                AppError::BadRequest(format!("Pending ACP permission not found: {call_id}"))
+            })?;
 
+        responder
+            .send(PermissionDecision::Selected { option_id })
+            .map_err(|_| {
+                AppError::BadRequest(format!("Pending ACP permission expired: {call_id}"))
+            })?;
+
+        debug!(conversation_id = %self.conversation_id, call_id, "ACP permission response forwarded");
         Ok(())
     }
 
     fn get_confirmations(&self) -> Vec<Confirmation> {
-        match self.state.try_read() {
-            Ok(guard) => guard.confirmations.clone(),
-            Err(_) => Vec::new(),
-        }
+        Vec::new()
     }
 
-    fn check_approval(&self, action: &str, command_type: Option<&str>) -> bool {
-        match self.state.try_read() {
-            Ok(guard) => {
-                let key = approval_key(Some(action), command_type);
-                guard.approval_memory.get(&key).copied().unwrap_or(false)
-            }
-            Err(_) => false,
-        }
+    fn check_approval(&self, _action: &str, _command_type: Option<&str>) -> bool {
+        false
     }
 
     fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
@@ -671,6 +561,10 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
             }
         });
 
+        for (_, responder) in self.pending_permissions.lock().unwrap().drain() {
+            let _ = responder.send(PermissionDecision::Cancelled);
+        }
+
         Ok(())
     }
 
@@ -688,34 +582,6 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-}
-
-impl AcpAgentManager {
-    /// Add a confirmation to the pending list.
-    ///
-    /// Replaces an existing confirmation with the same `call_id`, or appends.
-    pub async fn add_confirmation(&self, confirmation: Confirmation) {
-        let mut guard = self.state.write().await;
-        if let Some(existing) = guard
-            .confirmations
-            .iter_mut()
-            .find(|c| c.call_id == confirmation.call_id)
-        {
-            *existing = confirmation;
-        } else {
-            guard.confirmations.push(confirmation);
-        }
-    }
-
-    /// Remove a confirmation by `call_id`.
-    pub async fn remove_confirmation(&self, call_id: &str) -> Option<Confirmation> {
-        let mut guard = self.state.write().await;
-        let pos = guard
-            .confirmations
-            .iter()
-            .position(|c| c.call_id == call_id);
-        pos.map(|i| guard.confirmations.remove(i))
     }
 }
 
@@ -748,131 +614,18 @@ mod tests {
     }
 
     #[test]
-    fn yolo_mode_for_backends() {
+    fn confirm_option_id_accepts_string_or_object() {
         assert_eq!(
-            yolo_mode_value(AcpBackend::Claude),
-            Some("bypassPermissions")
+            confirm_option_id(&Value::String("allow_once".into())).as_deref(),
+            Some("allow_once")
         );
         assert_eq!(
-            yolo_mode_value(AcpBackend::Codebuddy),
-            Some("bypassPermissions")
+            confirm_option_id(&json!({ "option_id": "reject_once" })).as_deref(),
+            Some("reject_once")
         );
-        assert_eq!(yolo_mode_value(AcpBackend::Qwen), Some("yolo"));
-        assert_eq!(yolo_mode_value(AcpBackend::Kiro), None);
-        assert_eq!(yolo_mode_value(AcpBackend::Gemini), None);
-        assert_eq!(yolo_mode_value(AcpBackend::Goose), None);
-    }
-
-    // ── approval_key tests ────────────────────────────────────────────
-
-    #[test]
-    fn approval_key_with_action_and_command_type() {
         assert_eq!(
-            approval_key(Some("edit_file"), Some("bash")),
-            "edit_file:bash"
+            confirm_option_id(&json!({ "value": "allow_always" })).as_deref(),
+            Some("allow_always")
         );
-    }
-
-    #[test]
-    fn approval_key_with_action_only() {
-        assert_eq!(approval_key(Some("edit_file"), None), "edit_file");
-    }
-
-    #[test]
-    fn approval_key_with_no_action() {
-        assert_eq!(approval_key(None, Some("bash")), "");
-        assert_eq!(approval_key(None, None), "");
-    }
-
-    // ── approval memory tests ────────────────────────────────────────
-
-    #[test]
-    fn confirm_with_always_allow_stores_approval() {
-        let state = RwLock::new(AcpState {
-            status: None,
-            session_id: None,
-            confirmations: vec![Confirmation {
-                id: "c1".into(),
-                call_id: "call-1".into(),
-                title: Some("Allow edit".into()),
-                action: Some("edit_file".into()),
-                description: "Edit main.rs".into(),
-                command_type: Some("bash".into()),
-                options: vec![],
-            }],
-            model_info: None,
-            has_messages: false,
-            approval_memory: HashMap::new(),
-        });
-
-        // Simulate the confirm logic with always_allow=true
-        {
-            let mut guard = state.try_write().unwrap();
-            let call_id = "call-1";
-            if let Some(conf) = guard.confirmations.iter().find(|c| c.call_id == call_id) {
-                let key = approval_key(conf.action.as_deref(), conf.command_type.as_deref());
-                guard.approval_memory.insert(key, true);
-            }
-            guard.confirmations.retain(|c| c.call_id != call_id);
-        }
-
-        let guard = state.try_read().unwrap();
-        assert!(guard.confirmations.is_empty());
-        assert_eq!(guard.approval_memory.get("edit_file:bash"), Some(&true));
-    }
-
-    #[test]
-    fn confirm_without_always_allow_does_not_store_approval() {
-        let state = RwLock::new(AcpState {
-            status: None,
-            session_id: None,
-            confirmations: vec![Confirmation {
-                id: "c1".into(),
-                call_id: "call-1".into(),
-                title: Some("Allow edit".into()),
-                action: Some("edit_file".into()),
-                description: "Edit main.rs".into(),
-                command_type: None,
-                options: vec![],
-            }],
-            model_info: None,
-            has_messages: false,
-            approval_memory: HashMap::new(),
-        });
-
-        // Simulate the confirm logic with always_allow=false
-        {
-            let mut guard = state.try_write().unwrap();
-            guard.confirmations.retain(|c| c.call_id != "call-1");
-        }
-
-        let guard = state.try_read().unwrap();
-        assert!(guard.confirmations.is_empty());
-        assert!(guard.approval_memory.is_empty());
-    }
-
-    #[test]
-    fn check_approval_returns_true_after_always_allow() {
-        let state = RwLock::new(AcpState {
-            status: None,
-            session_id: None,
-            confirmations: Vec::new(),
-            model_info: None,
-            has_messages: false,
-            approval_memory: HashMap::from([
-                ("edit_file:bash".into(), true),
-                ("read_file".into(), true),
-            ]),
-        });
-
-        let guard = state.try_read().unwrap();
-        let key1 = approval_key(Some("edit_file"), Some("bash"));
-        assert!(guard.approval_memory.get(&key1).copied().unwrap_or(false));
-
-        let key2 = approval_key(Some("read_file"), None);
-        assert!(guard.approval_memory.get(&key2).copied().unwrap_or(false));
-
-        let key3 = approval_key(Some("delete_file"), None);
-        assert!(!guard.approval_memory.get(&key3).copied().unwrap_or(false));
     }
 }
