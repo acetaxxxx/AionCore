@@ -53,8 +53,13 @@ fn make_factory(
     provider_repo: Arc<dyn IProviderRepository>,
     remote_agent_repo: Arc<SqliteRemoteAgentRepository>,
 ) -> aionui_ai_agent::AgentFactory {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(
+        tmp.path(),
+        tmp.path(),
+    ));
     build_agent_factory(AgentFactoryDeps {
-        skill_manager: AcpSkillManager::new(),
+        skill_manager: AcpSkillManager::new(skill_paths),
         remote_agent_repo,
         provider_repo,
         encryption_key: test_encryption_key(),

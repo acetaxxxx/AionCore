@@ -83,8 +83,7 @@ pub struct AcpAgentManager {
     workspace: String,
     /// ACP sub-backend.
     backend: AcpBackend,
-    /// Build configuration (used for preset context, skills, session mode injection).
-    #[allow(dead_code)]
+    /// Build configuration (preset context, enabled/excluded skills, session mode, …).
     config: AcpBuildExtra,
     /// Underlying CLI process (for lifecycle management: kill, is_running).
     process: Arc<CliAgentProcess>,
@@ -102,6 +101,8 @@ pub struct AcpAgentManager {
     permission_rx: Mutex<mpsc::Receiver<PermissionRequest>>,
     /// Whether a graceful shutdown is in progress.
     closing: std::sync::atomic::AtomicBool,
+    /// Shared skill manager — used to discover skills for first-message injection.
+    skill_manager: Arc<crate::skill_manager::AcpSkillManager>,
 }
 
 impl AcpAgentManager {
@@ -116,6 +117,7 @@ impl AcpAgentManager {
         workspace: String,
         command_spec: CommandSpec,
         config: AcpBuildExtra,
+        skill_manager: Arc<crate::skill_manager::AcpSkillManager>,
     ) -> Result<Self, AppError> {
         let backend = config
             .backend
@@ -163,6 +165,7 @@ impl AcpAgentManager {
             session_lock: Mutex::new(()),
             permission_rx: Mutex::new(permission_rx),
             closing: std::sync::atomic::AtomicBool::new(false),
+            skill_manager,
         };
 
         Ok(manager)
@@ -310,11 +313,28 @@ impl AcpAgentManager {
             state.session_id = Some(sid.clone());
         }
 
+        // Inject first-message prefix (preset context + skills index).
+        // Backends with native skill discovery (e.g. Claude via .claude/skills/)
+        // only need preset_context here; others get the full [Assistant Rules]
+        // block with a skills index.
+        let injected_content = crate::first_message_injector::inject_first_message_prefix(
+            &data.content,
+            &self.skill_manager,
+            crate::first_message_injector::InjectionConfig {
+                preset_context: self.config.preset_context.as_deref(),
+                enabled_skills: &self.config.enabled_skills,
+                exclude_builtin_skills: &self.config.exclude_builtin_skills,
+                native_skill_support: self.backend.native_skills_dirs().is_some(),
+                custom_workspace: self.config.custom_workspace,
+            },
+        )
+        .await;
+
         // Send the prompt
         self.protocol
             .prompt(PromptRequest::new(
                 SessionId::new(sid.clone()),
-                vec![ContentBlock::from(data.content.clone())],
+                vec![ContentBlock::from(injected_content)],
             ))
             .await
             .map_err(AppError::from)?;
