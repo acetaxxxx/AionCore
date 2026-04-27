@@ -313,6 +313,8 @@ fn system_instructions_with_loaded_skills() {
         name: "helper".into(),
         description: "A helper".into(),
         location: std::path::PathBuf::new(),
+        source: aionui_extension::SkillSource::Custom,
+        relative_location: None,
         body: Some("Complete helper instructions.".into()),
     }];
     let result = build_system_instructions("Base system prompt", &skills);
@@ -342,6 +344,8 @@ fn first_message_with_full_skills_for_gemini() {
         name: "debug".into(),
         description: "Debug".into(),
         location: std::path::PathBuf::new(),
+        source: aionui_extension::SkillSource::Custom,
+        relative_location: None,
         body: Some("Full debug skill content.".into()),
     }];
     let result = prepare_first_message("Hello", &skills, Some("Be helpful."));
