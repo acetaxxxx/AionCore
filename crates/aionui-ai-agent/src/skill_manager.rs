@@ -16,8 +16,14 @@ pub struct SkillDefinition {
     pub name: String,
     /// One-line description from SKILL.md frontmatter.
     pub description: String,
-    /// File system path to the SKILL.md file.
+    /// File system path to the SKILL.md file (absolute for custom/extension,
+    /// or the materialized view path for builtin).
     pub location: PathBuf,
+    /// Origin of this skill (builtin/custom/extension).
+    pub source: aionui_extension::SkillSource,
+    /// Relative path inside the builtin skill corpus
+    /// (e.g. `auto-inject/cron/SKILL.md`); `None` for non-builtin sources.
+    pub relative_location: Option<String>,
     /// Lazily-loaded full content (body after frontmatter).
     pub body: Option<String>,
 }
@@ -330,6 +336,8 @@ async fn parse_skill_frontmatter(path: &Path) -> Option<SkillDefinition> {
         name: final_name,
         description,
         location: path.to_path_buf(),
+        source: aionui_extension::SkillSource::Custom,
+        relative_location: None,
         body: None, // Lazy loaded
     })
 }
@@ -388,6 +396,23 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn skill_definition_has_source_and_relative_location() {
+        let def = SkillDefinition {
+            name: "x".into(),
+            description: "d".into(),
+            location: PathBuf::from("/tmp/x"),
+            source: aionui_extension::SkillSource::Builtin,
+            relative_location: Some("auto-inject/x/SKILL.md".into()),
+            body: None,
+        };
+        assert_eq!(def.source, aionui_extension::SkillSource::Builtin);
+        assert_eq!(
+            def.relative_location.as_deref(),
+            Some("auto-inject/x/SKILL.md")
+        );
+    }
 
     fn create_skill_dir(base: &Path, dir_name: &str, skill_name: &str, desc: &str, body: &str) {
         let dir = base.join(dir_name);
@@ -559,6 +584,8 @@ mod tests {
             name: "review".into(),
             description: "Review".into(),
             location: PathBuf::new(),
+            source: aionui_extension::SkillSource::Custom,
+            relative_location: None,
             body: Some("Full review instructions here.".into()),
         }];
         let result = prepare_first_message("Hello", &skills, None);
@@ -599,6 +626,8 @@ mod tests {
             name: "helper".into(),
             description: "A helper".into(),
             location: PathBuf::new(),
+            source: aionui_extension::SkillSource::Custom,
+            relative_location: None,
             body: Some("Helper body content.".into()),
         }];
         let result = build_system_instructions("Base prompt", &skills);
@@ -632,6 +661,8 @@ mod tests {
             name: "unloaded".into(),
             description: "Not loaded".into(),
             location: PathBuf::new(),
+            source: aionui_extension::SkillSource::Custom,
+            relative_location: None,
             body: None,
         }];
         let result = build_system_instructions("Base", &skills);
