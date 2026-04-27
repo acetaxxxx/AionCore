@@ -1211,7 +1211,7 @@ async fn send_message_persists_factory_resolved_workspace() {
     // Factory resolves a *different* temp dir (simulating legacy-conv fallback).
     // After send_message, conversation.extra.workspace must match what the
     // agent reports.
-    let (svc, _broadcaster, repo) = make_service();
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
     let auto_workspace = "/tmp/factory-resolved";
     let task_mgr: Arc<dyn IWorkerTaskManager> =
         Arc::new(MockTaskManagerWithWorkspace::new(auto_workspace));
