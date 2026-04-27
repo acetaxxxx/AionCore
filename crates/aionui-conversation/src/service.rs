@@ -88,7 +88,14 @@ impl ConversationService {
 
         let mut extra = req.extra;
         if extra.get("workspace").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-            let ws_path = self.workspace_root.join("workspaces").join(&id);
+            let agent_type_label = match req.r#type {
+                aionui_common::AgentType::Acp => "acp".to_owned(),
+                ref t => format!("{:?}", t).to_lowercase(),
+            };
+            let ws_path = self
+                .workspace_root
+                .join("tmp")
+                .join(format!("{}-temp-{}", agent_type_label, now));
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| AppError::Internal(format!("Failed to create workspace: {e}")))?;
             extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
