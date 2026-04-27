@@ -28,12 +28,10 @@ pub enum AgentStreamEvent {
     Thinking(ThinkingEventData),
     /// Execution plan.
     Plan(PlanEventData),
-    /// ACP permission request (tool approval).
-    AcpPermission(serde_json::Value),
+    /// Tool permission request (approval confirmation).
+    Permission(serde_json::Value),
     /// ACP tool call progress.
     AcpToolCall(serde_json::Value),
-    /// Codex permission request.
-    CodexPermission(serde_json::Value),
     /// Codex tool call progress.
     CodexToolCall(serde_json::Value),
     /// Available slash commands update.
