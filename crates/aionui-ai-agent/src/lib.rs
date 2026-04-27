@@ -11,6 +11,7 @@ pub mod aionrs_agent;
 pub mod api_client;
 pub mod auxiliary_routes;
 pub mod backend_output_sink;
+pub mod backend_protocol_sink;
 pub mod cli_process;
 pub mod connection_test_routes;
 pub mod connection_test_service;
@@ -41,6 +42,7 @@ pub use api_client::{
 };
 pub use auxiliary_routes::{AuxiliaryRouterState, auxiliary_routes};
 pub use backend_output_sink::BackendOutputSink;
+pub use backend_protocol_sink::BackendProtocolSink;
 pub use cli_process::CliAgentProcess;
 pub use connection_test_routes::{ConnectionTestRouterState, connection_test_routes};
 pub use connection_test_service::ConnectionTestService;
