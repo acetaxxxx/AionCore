@@ -532,11 +532,7 @@ async fn ppt_proxy_root_path_returns_non_404() {
     let req = get_request("/api/ppt-proxy/19999");
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_ne!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "root path must hit the proxy handler, not 404"
-    );
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -546,11 +542,7 @@ async fn office_watch_proxy_root_path_returns_non_404() {
     let req = get_request("/api/office-watch-proxy/19999");
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_ne!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "root path must hit the proxy handler, not 404"
-    );
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ── Test utilities ──────────────────────────────────────────────────

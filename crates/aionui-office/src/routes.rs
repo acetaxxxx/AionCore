@@ -225,15 +225,6 @@ async fn office_watch_proxy(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let path = params.path.as_deref().unwrap_or("/");
-    watch_proxy_forward(state, params.port, path, &headers).await
-}
-
-async fn watch_proxy_forward(
-    state: OfficeRouterState,
-    port: u16,
-    path: &str,
-    headers: &HeaderMap,
-) -> Result<Response, AppError> {
     let request_headers: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(k, v)| {
@@ -245,7 +236,7 @@ async fn watch_proxy_forward(
 
     let proxy_resp = state
         .proxy_service
-        .forward_watch(port, path, &request_headers)
+        .forward_watch(params.port, path, &request_headers)
         .await?;
 
     let status =
