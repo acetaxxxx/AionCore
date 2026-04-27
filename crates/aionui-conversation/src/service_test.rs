@@ -232,11 +232,17 @@ impl IConversationRepository for MockRepo {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-fn make_service() -> (ConversationService, Arc<MockBroadcaster>, Arc<MockRepo>) {
+fn make_service() -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+) {
     let repo = Arc::new(MockRepo::new());
     let broadcaster = Arc::new(MockBroadcaster::new());
     let svc = ConversationService::new(repo.clone(), broadcaster.clone());
-    (svc, broadcaster, repo)
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    (svc, broadcaster, repo, task_mgr)
 }
 
 fn make_create_req() -> CreateConversationRequest {
@@ -252,7 +258,7 @@ fn make_create_req() -> CreateConversationRequest {
 
 #[tokio::test]
 async fn create_returns_conversation_with_defaults() {
-    let (svc, broadcaster, _repo) = make_service();
+    let (svc, broadcaster, _repo, _task_mgr) = make_service();
 
     let resp = svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -277,7 +283,7 @@ async fn create_returns_conversation_with_defaults() {
 
 #[tokio::test]
 async fn create_with_custom_name_and_source() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
@@ -299,7 +305,7 @@ async fn create_with_custom_name_and_source() {
 
 #[tokio::test]
 async fn create_stores_model_as_json() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
     let resp = svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -312,7 +318,7 @@ async fn create_stores_model_as_json() {
 
 #[tokio::test]
 async fn get_existing_conversation() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let created = svc.create("user_1", make_create_req()).await.unwrap();
 
     let fetched = svc.get("user_1", &created.id).await.unwrap();
@@ -322,7 +328,7 @@ async fn get_existing_conversation() {
 
 #[tokio::test]
 async fn get_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let err = svc.get("user_1", "non-existent").await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 }
@@ -331,7 +337,7 @@ async fn get_not_found() {
 
 #[tokio::test]
 async fn list_empty() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let result = svc
         .list("user_1", ListConversationsQuery::default())
         .await
@@ -343,7 +349,7 @@ async fn list_empty() {
 
 #[tokio::test]
 async fn list_returns_created_conversations() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     svc.create("user_1", make_create_req()).await.unwrap();
     svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -357,7 +363,7 @@ async fn list_returns_created_conversations() {
 
 #[tokio::test]
 async fn list_filters_by_user() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     svc.create("user_1", make_create_req()).await.unwrap();
     svc.create("user_2", make_create_req()).await.unwrap();
 
@@ -370,7 +376,7 @@ async fn list_filters_by_user() {
 
 #[tokio::test]
 async fn list_with_source_filter() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     svc.create("user_1", make_create_req()).await.unwrap();
 
     let telegram_req: CreateConversationRequest = serde_json::from_value(json!({
@@ -393,14 +399,16 @@ async fn list_with_source_filter() {
 
 #[tokio::test]
 async fn list_with_pinned_filter() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     svc.create("user_1", make_create_req()).await.unwrap();
 
     // Pin the first one
     let update_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": true })).unwrap();
-    svc.update("user_1", &conv.id, update_req).await.unwrap();
+    svc.update("user_1", &conv.id, update_req, &task_mgr)
+        .await
+        .unwrap();
 
     let query = ListConversationsQuery {
         pinned: Some(true),
@@ -415,13 +423,16 @@ async fn list_with_pinned_filter() {
 
 #[tokio::test]
 async fn update_name() {
-    let (svc, broadcaster, _repo) = make_service();
+    let (svc, broadcaster, _repo, task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     broadcaster.take_events(); // clear create event
 
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "name": "New Name" })).unwrap();
-    let updated = svc.update("user_1", &conv.id, req).await.unwrap();
+    let updated = svc
+        .update("user_1", &conv.id, req, &task_mgr)
+        .await
+        .unwrap();
 
     assert_eq!(updated.name, "New Name");
     assert!(updated.modified_at >= conv.modified_at);
@@ -433,39 +444,48 @@ async fn update_name() {
 
 #[tokio::test]
 async fn update_pin() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     assert!(!conv.pinned);
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let updated = svc.update("user_1", &conv.id, req).await.unwrap();
+    let updated = svc
+        .update("user_1", &conv.id, req, &task_mgr)
+        .await
+        .unwrap();
     assert!(updated.pinned);
     assert!(updated.pinned_at.is_some());
 }
 
 #[tokio::test]
 async fn update_unpin_clears_pinned_at() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     // Pin first
     let pin_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let pinned = svc.update("user_1", &conv.id, pin_req).await.unwrap();
+    let pinned = svc
+        .update("user_1", &conv.id, pin_req, &task_mgr)
+        .await
+        .unwrap();
     assert!(pinned.pinned);
     assert!(pinned.pinned_at.is_some());
 
     // Unpin
     let unpin_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": false })).unwrap();
-    let unpinned = svc.update("user_1", &conv.id, unpin_req).await.unwrap();
+    let unpinned = svc
+        .update("user_1", &conv.id, unpin_req, &task_mgr)
+        .await
+        .unwrap();
     assert!(!unpinned.pinned);
     assert!(unpinned.pinned_at.is_none());
 }
 
 #[tokio::test]
 async fn update_extra_merge() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
@@ -478,7 +498,10 @@ async fn update_extra_merge() {
     // Update only workspace — contextFileName should be preserved
     let update_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
-    let updated = svc.update("user_1", &conv.id, update_req).await.unwrap();
+    let updated = svc
+        .update("user_1", &conv.id, update_req, &task_mgr)
+        .await
+        .unwrap();
 
     assert_eq!(updated.extra["workspace"], "/new");
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
@@ -486,14 +509,17 @@ async fn update_extra_merge() {
 
 #[tokio::test]
 async fn update_model() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({
         "model": { "provider_id": "p2", "model": "new-model" }
     }))
     .unwrap();
-    let updated = svc.update("user_1", &conv.id, req).await.unwrap();
+    let updated = svc
+        .update("user_1", &conv.id, req, &task_mgr)
+        .await
+        .unwrap();
 
     let model = updated.model.unwrap();
     assert_eq!(model.provider_id, "p2");
@@ -502,9 +528,12 @@ async fn update_model() {
 
 #[tokio::test]
 async fn update_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
-    let err = svc.update("user_1", "non-existent", req).await.unwrap_err();
+    let err = svc
+        .update("user_1", "non-existent", req, &task_mgr)
+        .await
+        .unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 }
 
@@ -512,7 +541,7 @@ async fn update_not_found() {
 
 #[tokio::test]
 async fn delete_conversation() {
-    let (svc, broadcaster, _repo) = make_service();
+    let (svc, broadcaster, _repo, _task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     broadcaster.take_events();
 
@@ -531,7 +560,7 @@ async fn delete_conversation() {
 
 #[tokio::test]
 async fn delete_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let err = svc.delete("user_1", "non-existent").await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 }
@@ -540,7 +569,7 @@ async fn delete_not_found() {
 
 #[tokio::test]
 async fn broadcast_includes_source_on_delete() {
-    let (svc, broadcaster, _repo) = make_service();
+    let (svc, broadcaster, _repo, _task_mgr) = make_service();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
@@ -559,7 +588,7 @@ async fn broadcast_includes_source_on_delete() {
 
 #[tokio::test]
 async fn all_crud_operations_broadcast() {
-    let (svc, broadcaster, _repo) = make_service();
+    let (svc, broadcaster, _repo, task_mgr) = make_service();
 
     // Create
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -568,7 +597,9 @@ async fn all_crud_operations_broadcast() {
 
     // Update
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
-    svc.update("user_1", &conv.id, req).await.unwrap();
+    svc.update("user_1", &conv.id, req, &task_mgr)
+        .await
+        .unwrap();
     let events = broadcaster.take_events();
     assert_eq!(events[0].data["action"], "updated");
 
@@ -582,7 +613,7 @@ async fn all_crud_operations_broadcast() {
 
 #[tokio::test]
 async fn get_wrong_user_returns_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let err = svc.get("user_2", &conv.id).await.unwrap_err();
@@ -591,12 +622,15 @@ async fn get_wrong_user_returns_not_found() {
 
 #[tokio::test]
 async fn update_wrong_user_returns_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "name": "hacked" })).unwrap();
-    let err = svc.update("user_2", &conv.id, req).await.unwrap_err();
+    let err = svc
+        .update("user_2", &conv.id, req, &task_mgr)
+        .await
+        .unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 
     // Original should be unchanged
@@ -606,7 +640,7 @@ async fn update_wrong_user_returns_not_found() {
 
 #[tokio::test]
 async fn delete_wrong_user_returns_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let err = svc.delete("user_2", &conv.id).await.unwrap_err();
@@ -621,7 +655,7 @@ async fn delete_wrong_user_returns_not_found() {
 
 #[tokio::test]
 async fn clone_without_source_creates_new() {
-    let (svc, broadcaster, _repo) = make_service();
+    let (svc, broadcaster, _repo, _task_mgr) = make_service();
 
     let req: CloneConversationRequest = serde_json::from_value(json!({
         "conversation": {
@@ -644,7 +678,7 @@ async fn clone_without_source_creates_new() {
 
 #[tokio::test]
 async fn clone_from_source_inherits_config() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
     // Create source with name and extra
     let source_req: CreateConversationRequest = serde_json::from_value(json!({
@@ -679,7 +713,7 @@ async fn clone_from_source_inherits_config() {
 
 #[tokio::test]
 async fn clone_source_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
     let req: CloneConversationRequest = serde_json::from_value(json!({
         "source_conversation_id": "no-such-id",
@@ -697,7 +731,7 @@ async fn clone_source_not_found() {
 
 #[tokio::test]
 async fn clone_source_wrong_user() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
     let source = svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -717,7 +751,7 @@ async fn clone_source_wrong_user() {
 
 #[tokio::test]
 async fn clone_strips_cron_job_id_by_default() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
     let source_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
@@ -744,7 +778,7 @@ async fn clone_strips_cron_job_id_by_default() {
 
 #[tokio::test]
 async fn clone_with_migrate_cron_preserves_cron_job_id() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
     let source_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
@@ -773,7 +807,7 @@ async fn clone_with_migrate_cron_preserves_cron_job_id() {
 
 #[tokio::test]
 async fn reset_sets_status_to_pending() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     svc.reset("user_1", &conv.id).await.unwrap();
@@ -784,14 +818,14 @@ async fn reset_sets_status_to_pending() {
 
 #[tokio::test]
 async fn reset_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let err = svc.reset("user_1", "no-such-id").await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 }
 
 #[tokio::test]
 async fn reset_wrong_user() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let err = svc.reset("user_2", &conv.id).await.unwrap_err();
@@ -802,7 +836,7 @@ async fn reset_wrong_user() {
 
 #[tokio::test]
 async fn search_messages_empty_keyword_returns_bad_request() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
     let query = SearchMessagesQuery {
         keyword: "".into(),
@@ -815,7 +849,7 @@ async fn search_messages_empty_keyword_returns_bad_request() {
 
 #[tokio::test]
 async fn search_messages_whitespace_keyword_returns_bad_request() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
     let query = SearchMessagesQuery {
         keyword: "   ".into(),
@@ -1009,7 +1043,7 @@ fn make_send_req() -> SendMessageRequest {
 
 #[tokio::test]
 async fn send_message_returns_accepted() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1022,7 +1056,7 @@ async fn send_message_returns_accepted() {
 
 #[tokio::test]
 async fn send_message_empty_content_returns_bad_request() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1041,7 +1075,7 @@ async fn send_message_empty_content_returns_bad_request() {
 
 #[tokio::test]
 async fn send_message_whitespace_content_returns_bad_request() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1060,7 +1094,7 @@ async fn send_message_whitespace_content_returns_bad_request() {
 
 #[tokio::test]
 async fn send_message_conversation_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let err = svc
@@ -1072,7 +1106,7 @@ async fn send_message_conversation_not_found() {
 
 #[tokio::test]
 async fn send_message_wrong_user_returns_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1085,7 +1119,7 @@ async fn send_message_wrong_user_returns_not_found() {
 
 #[tokio::test]
 async fn send_message_running_conversation_returns_conflict() {
-    let (svc, _broadcaster, repo) = make_service();
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1108,7 +1142,7 @@ async fn send_message_running_conversation_returns_conflict() {
 
 #[tokio::test]
 async fn stop_stream_with_active_agent() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1136,7 +1170,7 @@ async fn stop_stream_with_active_agent() {
 
 #[tokio::test]
 async fn stop_stream_conversation_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let err = svc
@@ -1148,7 +1182,7 @@ async fn stop_stream_conversation_not_found() {
 
 #[tokio::test]
 async fn stop_stream_no_active_agent_returns_conflict() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1162,7 +1196,7 @@ async fn stop_stream_no_active_agent_returns_conflict() {
 
 #[tokio::test]
 async fn stop_stream_wrong_user_returns_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1177,7 +1211,7 @@ async fn stop_stream_wrong_user_returns_not_found() {
 
 #[tokio::test]
 async fn warmup_creates_agent_task() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1197,7 +1231,7 @@ async fn warmup_creates_agent_task() {
 
 #[tokio::test]
 async fn warmup_conversation_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let err = svc
@@ -1209,7 +1243,7 @@ async fn warmup_conversation_not_found() {
 
 #[tokio::test]
 async fn warmup_wrong_user_returns_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1244,7 +1278,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
 
 #[tokio::test]
 async fn list_confirmations_empty_when_no_agent() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1257,7 +1291,7 @@ async fn list_confirmations_empty_when_no_agent() {
 
 #[tokio::test]
 async fn list_confirmations_returns_items() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1283,7 +1317,7 @@ async fn list_confirmations_returns_items() {
 
 #[tokio::test]
 async fn list_confirmations_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let err = svc
@@ -1295,7 +1329,7 @@ async fn list_confirmations_not_found() {
 
 #[tokio::test]
 async fn list_confirmations_wrong_user() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1308,7 +1342,7 @@ async fn list_confirmations_wrong_user() {
 
 #[tokio::test]
 async fn confirm_removes_confirmation_and_broadcasts() {
-    let (svc, broadcaster, _repo) = make_service();
+    let (svc, broadcaster, _repo, task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1350,7 +1384,7 @@ async fn confirm_removes_confirmation_and_broadcasts() {
 
 #[tokio::test]
 async fn confirm_with_always_allow_stores_approval() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1379,7 +1413,7 @@ async fn confirm_with_always_allow_stores_approval() {
 
 #[tokio::test]
 async fn confirm_nonexistent_call_id_returns_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1410,7 +1444,7 @@ async fn confirm_nonexistent_call_id_returns_not_found() {
 
 #[tokio::test]
 async fn confirm_no_agent_returns_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1429,7 +1463,7 @@ async fn confirm_no_agent_returns_not_found() {
 
 #[tokio::test]
 async fn check_approval_returns_false_when_not_set() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1452,7 +1486,7 @@ async fn check_approval_returns_false_when_not_set() {
 
 #[tokio::test]
 async fn check_approval_returns_true_after_always_allow() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1484,7 +1518,7 @@ async fn check_approval_returns_true_after_always_allow() {
 
 #[tokio::test]
 async fn check_approval_returns_false_when_no_agent() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -1498,7 +1532,7 @@ async fn check_approval_returns_false_when_no_agent() {
 
 #[tokio::test]
 async fn check_approval_not_found() {
-    let (svc, _broadcaster, _repo) = make_service();
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let err = svc
