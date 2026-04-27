@@ -117,32 +117,41 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         max_tokens: 4096,
         max_turns: None,
         compat_overrides: Default::default(),
+        session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
+        session_mode: None,
     }
 }
 
 #[tokio::test]
 async fn aionrs_agent_kill_succeeds() {
-    let agent = AionrsAgentManager::new("conv-1".into(), "/proj".into(), make_aionrs_config())
-        .await
-        .unwrap();
+    let agent =
+        AionrsAgentManager::new("conv-1".into(), "/proj".into(), make_aionrs_config(), None)
+            .await
+            .unwrap();
     assert!(agent.kill(None).is_ok());
     assert!(agent.kill(Some(AgentKillReason::IdleTimeout)).is_ok());
 }
 
 #[tokio::test]
 async fn aionrs_agent_confirm_succeeds() {
-    let agent = AionrsAgentManager::new("conv-1".into(), "/proj".into(), make_aionrs_config())
-        .await
-        .unwrap();
+    let agent =
+        AionrsAgentManager::new("conv-1".into(), "/proj".into(), make_aionrs_config(), None)
+            .await
+            .unwrap();
     let result = agent.confirm("msg", "call", json!({}), false);
     assert!(result.is_ok());
 }
 
 #[tokio::test]
 async fn aionrs_agent_metadata() {
-    let agent = AionrsAgentManager::new("conv-abc".into(), "/work".into(), make_aionrs_config())
-        .await
-        .unwrap();
+    let agent = AionrsAgentManager::new(
+        "conv-abc".into(),
+        "/work".into(),
+        make_aionrs_config(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(agent.agent_type(), AgentType::Aionrs);
     assert_eq!(agent.workspace(), "/work");
     assert_eq!(agent.conversation_id(), "conv-abc");
@@ -183,8 +192,6 @@ fn collect_idle_ignores_non_acp_agent_types() {
         extra: json!(null),
     };
 
-    mgr.get_or_build_task("gem-1", make_opts(AgentType::Gemini, "gem-1"))
-        .unwrap();
     mgr.get_or_build_task("nanobot-1", make_opts(AgentType::Nanobot, "nanobot-1"))
         .unwrap();
     mgr.get_or_build_task(
@@ -197,7 +204,7 @@ fn collect_idle_ignores_non_acp_agent_types() {
     mgr.get_or_build_task("remote-1", make_opts(AgentType::Remote, "remote-1"))
         .unwrap();
 
-    assert_eq!(mgr.active_count(), 5);
+    assert_eq!(mgr.active_count(), 4);
 
     // Only ACP should be collected
     let idle = mgr.collect_idle(300_000); // 5-min threshold
@@ -288,7 +295,6 @@ fn build_system_instructions_with_skills_index_appends_index() {
 fn agent_type_serde_all_variants() {
     // Verify that all AgentType variants serialize/deserialize correctly
     for (variant, expected_json) in [
-        (AgentType::Gemini, "\"gemini\""),
         (AgentType::Acp, "\"acp\""),
         (AgentType::OpenclawGateway, "\"openclaw-gateway\""),
         (AgentType::Nanobot, "\"nanobot\""),

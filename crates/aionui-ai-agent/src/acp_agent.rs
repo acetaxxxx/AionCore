@@ -46,7 +46,7 @@ impl SessionResumeStrategy {
 fn yolo_mode_value(backend: AcpBackend) -> Option<&'static str> {
     match backend {
         AcpBackend::Claude | AcpBackend::Codebuddy => Some("bypassPermissions"),
-        AcpBackend::Qwen | AcpBackend::IFlow => Some("yolo"),
+        AcpBackend::Qwen => Some("yolo"),
         _ => None,
     }
 }
@@ -446,15 +446,15 @@ impl AcpAgentManager {
 
     // -- ACP-specific extended methods (beyond IAgentManager) --
 
-    /// Get the current session mode.
-    pub async fn get_mode(&self) -> Result<Value, AppError> {
+    /// Query the ACP backend for current session mode.
+    pub async fn acp_get_mode(&self) -> Result<Value, AppError> {
         // With the SDK, mode info arrives via session update events.
         // We return a placeholder — the actual mode is tracked internally.
         Ok(json!({ "sent": true }))
     }
 
-    /// Set the session mode.
-    pub async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
+    /// Set the session mode via ACP protocol.
+    pub async fn acp_set_mode(&self, mode: &str) -> Result<(), AppError> {
         let sid = self
             .state
             .read()
@@ -674,6 +674,18 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
         Ok(())
     }
 
+    async fn get_mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
+        self.acp_get_mode().await?;
+        Ok(aionui_api_types::AgentModeResponse {
+            mode: String::new(),
+            initialized: self.session_id().await.is_some(),
+        })
+    }
+
+    async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
+        self.acp_set_mode(mode).await
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -746,7 +758,6 @@ mod tests {
             Some("bypassPermissions")
         );
         assert_eq!(yolo_mode_value(AcpBackend::Qwen), Some("yolo"));
-        assert_eq!(yolo_mode_value(AcpBackend::IFlow), Some("yolo"));
         assert_eq!(yolo_mode_value(AcpBackend::Kiro), None);
         assert_eq!(yolo_mode_value(AcpBackend::Gemini), None);
         assert_eq!(yolo_mode_value(AcpBackend::Goose), None);
