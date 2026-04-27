@@ -30,6 +30,7 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 18789;
 const OPENCLAW_KILL_GRACE_MS: u64 = 1000;
 const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const GATEWAY_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const STOP_FINISH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct OpenClawState {
     status: Option<ConversationStatus>,
@@ -46,7 +47,7 @@ pub struct OpenClawAgentManager {
     gateway_process: Option<Arc<CliAgentProcess>>,
     connection: Arc<OpenClawConnection>,
     event_tx: broadcast::Sender<AgentStreamEvent>,
-    state: RwLock<OpenClawState>,
+    state: Arc<RwLock<OpenClawState>>,
     last_activity: AtomicI64,
     text_state: Mutex<TextFallbackState>,
 }
@@ -166,13 +167,13 @@ impl OpenClawAgentManager {
             gateway_process,
             connection: Arc::clone(&connection),
             event_tx: event_tx.clone(),
-            state: RwLock::new(OpenClawState {
+            state: Arc::new(RwLock::new(OpenClawState {
                 status: None,
                 session_key: None,
                 confirmations: Vec::new(),
                 has_messages: false,
                 approval_memory: HashMap::new(),
-            }),
+            })),
             last_activity: AtomicI64::new(now_ms()),
             text_state: Mutex::new(TextFallbackState::new()),
         };
@@ -268,6 +269,55 @@ impl OpenClawAgentManager {
         }
     }
 
+    async fn do_send_message(&self, is_first: bool, data: SendMessageData) -> Result<(), AppError> {
+        if is_first {
+            let resp: SessionsResetResponse = self
+                .connection
+                .request(
+                    "sessions.reset",
+                    serde_json::to_value(SessionsResetParams {
+                        key: self.conversation_id.clone(),
+                        reason: "new".into(),
+                    })
+                    .unwrap_or_default(),
+                )
+                .await?;
+
+            if let Some(ref key) = resp.key {
+                let mut state = self.state.write().await;
+                state.session_key = Some(key.clone());
+            }
+        }
+
+        let session_key = self
+            .state
+            .read()
+            .await
+            .session_key
+            .clone()
+            .ok_or_else(|| AppError::Internal("No active session key".into()))?;
+
+        let params = ChatSendParams {
+            session_key,
+            message: data.content,
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            attachments: if data.files.is_empty() {
+                None
+            } else {
+                Some(data.files.into_iter().map(|f| json!(f)).collect())
+            },
+        };
+
+        self.connection
+            .request::<Value>(
+                "chat.send",
+                serde_json::to_value(params).unwrap_or_default(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn get_diagnostics(&self) -> Value {
         let state = self.state.read().await;
         let host = self.config.gateway.host.as_deref().unwrap_or("127.0.0.1");
@@ -325,58 +375,29 @@ impl IAgentManager for OpenClawAgentManager {
             first
         };
 
-        // Reset text fallback state for the new turn
         {
             let mut text_state = self.text_state.lock().await;
             text_state.reset_for_new_turn();
         }
 
-        if is_first {
-            let resp: SessionsResetResponse = self
-                .connection
-                .request(
-                    "sessions.reset",
-                    serde_json::to_value(SessionsResetParams {
-                        key: self.conversation_id.clone(),
-                        reason: "new".into(),
-                    })
-                    .unwrap_or_default(),
-                )
-                .await?;
-
-            if let Some(ref key) = resp.key {
-                let mut state = self.state.write().await;
-                state.session_key = Some(key.clone());
-            }
+        let result = self.do_send_message(is_first, data).await;
+        if let Err(ref e) = result {
+            error!(
+                conversation_id = %self.conversation_id,
+                error = %e,
+                "OpenClaw send_message failed, emitting Error+Finish"
+            );
+            let _ = self.event_tx.send(AgentStreamEvent::Error(
+                crate::stream_event::ErrorEventData {
+                    message: format!("OpenClaw send failed: {e}"),
+                    code: None,
+                },
+            ));
+            let _ = self.event_tx.send(AgentStreamEvent::Finish(
+                crate::stream_event::FinishEventData { session_id: None },
+            ));
         }
-
-        let session_key = self
-            .state
-            .read()
-            .await
-            .session_key
-            .clone()
-            .ok_or_else(|| AppError::Internal("No active session key".into()))?;
-
-        let params = ChatSendParams {
-            session_key,
-            message: data.content,
-            idempotency_key: uuid::Uuid::new_v4().to_string(),
-            attachments: if data.files.is_empty() {
-                None
-            } else {
-                Some(data.files.into_iter().map(|f| json!(f)).collect())
-            },
-        };
-
-        self.connection
-            .request::<Value>(
-                "chat.send",
-                serde_json::to_value(params).unwrap_or_default(),
-            )
-            .await?;
-
-        Ok(())
+        result
     }
 
     async fn stop(&self) -> Result<(), AppError> {
@@ -395,8 +416,39 @@ impl IAgentManager for OpenClawAgentManager {
                 .await;
         }
 
-        let mut state = self.state.write().await;
-        state.confirmations.clear();
+        {
+            let mut state = self.state.write().await;
+            state.confirmations.clear();
+        }
+
+        let state = Arc::clone(&self.state);
+        let event_tx = self.event_tx.clone();
+        let conversation_id = self.conversation_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(STOP_FINISH_FALLBACK_TIMEOUT).await;
+            let needs_fallback = state
+                .read()
+                .await
+                .status
+                .map(|s| s == ConversationStatus::Running)
+                .unwrap_or(false);
+            if needs_fallback {
+                warn!(
+                    conversation_id = %conversation_id,
+                    "Gateway did not send abort event within timeout, emitting fallback Finish"
+                );
+                let _ = event_tx.send(AgentStreamEvent::Error(
+                    crate::stream_event::ErrorEventData {
+                        message: "Stopped by user".into(),
+                        code: None,
+                    },
+                ));
+                let _ = event_tx.send(AgentStreamEvent::Finish(
+                    crate::stream_event::FinishEventData { session_id: None },
+                ));
+            }
+        });
+
         Ok(())
     }
 
@@ -419,10 +471,16 @@ impl IAgentManager for OpenClawAgentManager {
 
         let connection = Arc::clone(&self.connection);
         let call_id = call_id.to_owned();
+        let option_id = if always_allow {
+            "allow_always"
+        } else {
+            "allow_once"
+        };
+        let option_id = option_id.to_owned();
         tokio::spawn(async move {
             let params = json!({
                 "requestId": call_id,
-                "optionId": "allow_once",
+                "optionId": option_id,
             });
             if let Err(e) = connection
                 .request::<Value>("exec.approval.respond", params)
