@@ -60,56 +60,78 @@ impl AcpSkillManager {
         })
     }
 
-    /// Discover skills by scanning the standard directories relative to `base_path`.
+    /// Discover skills via `aionui_extension::list_available_skills`.
     ///
-    /// Scans `_builtin/`, `builtin-skills/`, and `skills/` directories.
-    /// If `enabled_skills` is provided, only skills in that list are included.
+    /// Filtering rules:
+    /// - Auto-inject builtin skills (under `auto-inject/` in the corpus) are
+    ///   always included unless listed in `exclude_builtin_skills`.
+    /// - Opt-in builtin skills (siblings of `auto-inject/`) and custom/extension
+    ///   skills are included only if `enabled_skills` contains their name.
+    ///
+    /// Populates the cache; subsequent `get_skill(name)` calls read body lazily.
     pub async fn discover_skills(
         &self,
-        base_path: &Path,
         enabled_skills: Option<&[String]>,
+        exclude_builtin_skills: Option<&[String]>,
     ) -> Vec<SkillIndex> {
-        let scan_dirs = ["_builtin", "builtin-skills", "skills"];
-        let mut found: HashMap<String, SkillDefinition> = HashMap::new();
+        let items = match aionui_extension::list_available_skills(&self.paths).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "Failed to list skills via extension service");
+                Vec::new()
+            }
+        };
 
-        for dir_name in &scan_dirs {
-            let dir_path = base_path.join(dir_name);
-            if let Ok(mut entries) = tokio::fs::read_dir(&dir_path).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let skill_file = path.join("SKILL.md");
-                    if !skill_file.exists() {
-                        continue;
-                    }
-                    if let Some(def) = parse_skill_frontmatter(&skill_file).await {
-                        // Filter by enabled_skills if provided
-                        if let Some(enabled) = enabled_skills
-                            && !enabled.iter().any(|s| s == &def.name)
-                        {
-                            continue;
-                        }
-                        // Later directories override earlier ones (user > builtin)
-                        found.insert(def.name.clone(), def);
+        let mut cache = self.cache.write().await;
+        cache.clear();
+
+        for item in items {
+            let is_auto_inject = item
+                .relative_location
+                .as_deref()
+                .is_some_and(|r| r.starts_with("auto-inject/"));
+
+            let keep = match item.source {
+                aionui_extension::SkillSource::Builtin => {
+                    if is_auto_inject {
+                        !exclude_builtin_skills
+                            .is_some_and(|ex| ex.iter().any(|n| n == &item.name))
+                    } else {
+                        enabled_skills
+                            .is_some_and(|en| en.iter().any(|n| n == &item.name))
                     }
                 }
+                aionui_extension::SkillSource::Custom
+                | aionui_extension::SkillSource::Extension => enabled_skills
+                    .is_some_and(|en| en.iter().any(|n| n == &item.name)),
+            };
+            if !keep {
+                continue;
             }
+
+            cache.insert(
+                item.name.clone(),
+                SkillDefinition {
+                    name: item.name.clone(),
+                    description: item.description.clone(),
+                    location: std::path::PathBuf::from(&item.location),
+                    source: item.source,
+                    relative_location: item.relative_location.clone(),
+                    body: None,
+                },
+            );
         }
 
-        let index: Vec<SkillIndex> = found
+        let mut discovered = self.discovered.write().await;
+        *discovered = true;
+
+        let index: Vec<SkillIndex> = cache
             .values()
             .map(|d| SkillIndex {
                 name: d.name.clone(),
                 description: d.description.clone(),
             })
             .collect();
-
-        let mut cache = self.cache.write().await;
-        *cache = found;
-        let mut discovered = self.discovered.write().await;
-        *discovered = true;
 
         debug!(count = index.len(), "Skills discovered");
         index
@@ -687,133 +709,12 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // AcpSkillManager async tests
+    //
+    // Discovery-layout tests moved to `tests/skill_manager_integration.rs`
+    // because they now need `aionui_extension::BUILTIN_SKILLS_ENV_VAR` to
+    // point the extension service at a tempdir corpus. Only the tests that
+    // don't require a skill corpus remain here.
     // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn discover_skills_from_directories() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-
-        // Create skills in different directories
-        create_skill_dir(
-            &base.join("_builtin"),
-            "core-review",
-            "core-review",
-            "Built-in code review",
-            "Review instructions",
-        );
-        create_skill_dir(
-            &base.join("skills"),
-            "custom-debug",
-            "custom-debug",
-            "Custom debugger",
-            "Debug steps",
-        );
-
-        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
-        let index = mgr.discover_skills(base, None).await;
-
-        assert_eq!(index.len(), 2);
-        let names: Vec<&str> = index.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"core-review"));
-        assert!(names.contains(&"custom-debug"));
-    }
-
-    #[tokio::test]
-    async fn discover_skills_with_filter() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-
-        create_skill_dir(
-            &base.join("skills"),
-            "allowed",
-            "allowed",
-            "Allowed skill",
-            "body",
-        );
-        create_skill_dir(
-            &base.join("skills"),
-            "excluded",
-            "excluded",
-            "Excluded skill",
-            "body",
-        );
-
-        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
-        let enabled = vec!["allowed".to_string()];
-        let index = mgr.discover_skills(base, Some(&enabled)).await;
-
-        assert_eq!(index.len(), 1);
-        assert_eq!(index[0].name, "allowed");
-    }
-
-    #[tokio::test]
-    async fn discover_skills_empty_directory() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
-        let index = mgr.discover_skills(tmp.path(), None).await;
-        assert!(index.is_empty());
-    }
-
-    #[tokio::test]
-    async fn discover_skills_user_overrides_builtin() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-
-        // Same skill name in _builtin and skills (user override)
-        create_skill_dir(
-            &base.join("_builtin"),
-            "review",
-            "review",
-            "Built-in review",
-            "built-in body",
-        );
-        create_skill_dir(
-            &base.join("skills"),
-            "review",
-            "review",
-            "Custom review",
-            "custom body",
-        );
-
-        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
-        let index = mgr.discover_skills(base, None).await;
-
-        // Only one entry for "review"
-        assert_eq!(index.len(), 1);
-        assert_eq!(index[0].description, "Custom review");
-    }
-
-    #[tokio::test]
-    async fn get_skill_lazy_loads_body() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-
-        create_skill_dir(
-            &base.join("skills"),
-            "lazy",
-            "lazy",
-            "Lazy skill",
-            "The full body content here.",
-        );
-
-        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
-        mgr.discover_skills(base, None).await;
-
-        // Body should not be loaded yet
-        {
-            let cache = mgr.cache.read().await;
-            assert!(cache.get("lazy").unwrap().body.is_none());
-        }
-
-        // Load the skill
-        let skill = mgr.get_skill("lazy").await.unwrap();
-        assert_eq!(skill.body.as_deref(), Some("The full body content here."));
-
-        // Second load should hit cache
-        let skill2 = mgr.get_skill("lazy").await.unwrap();
-        assert_eq!(skill2.body.as_deref(), Some("The full body content here."));
-    }
 
     #[tokio::test]
     async fn get_skill_unknown_returns_none() {
@@ -822,57 +723,5 @@ mod tests {
             aionui_extension::resolve_skill_paths(tmp.path(), tmp.path()),
         ));
         assert!(mgr.get_skill("nonexistent").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn get_skills_index_after_discover() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-
-        create_skill_dir(
-            &base.join("skills"),
-            "alpha",
-            "alpha",
-            "Alpha skill",
-            "body",
-        );
-
-        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
-        mgr.discover_skills(base, None).await;
-
-        let index = mgr.get_skills_index().await;
-        assert_eq!(index.len(), 1);
-        assert_eq!(index[0].name, "alpha");
-    }
-
-    #[tokio::test]
-    async fn is_discovered_flag() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
-        assert!(!mgr.is_discovered().await);
-
-        mgr.discover_skills(tmp.path(), None).await;
-        assert!(mgr.is_discovered().await);
-    }
-
-    #[tokio::test]
-    async fn skill_with_dir_name_fallback() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-
-        // Create skill without a name in frontmatter
-        let dir = base.join("skills").join("dir-fallback");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("SKILL.md"),
-            "---\nname: \ndescription: Uses dir name\n---\nBody",
-        )
-        .unwrap();
-
-        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
-        let index = mgr.discover_skills(base, None).await;
-
-        assert_eq!(index.len(), 1);
-        assert_eq!(index[0].name, "dir-fallback");
     }
 }
