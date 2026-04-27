@@ -100,4 +100,3 @@ async fn bedrock_fake_credentials_error() {
         "Expected credential error, got: {err}"
     );
 }
-
