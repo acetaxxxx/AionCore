@@ -58,7 +58,6 @@ async fn make_mock_agent(
         agent_id: None,
         backend: Some(backend),
         cli_path: Some(script_path.to_string_lossy().into_owned()),
-        custom_workspace: false,
         agent_name: None,
         custom_agent_id: None,
         preset_context: None,

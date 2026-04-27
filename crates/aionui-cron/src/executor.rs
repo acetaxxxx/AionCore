@@ -768,9 +768,10 @@ mod tests {
         let stub_broadcaster: Arc<dyn aionui_realtime::EventBroadcaster> =
             Arc::new(StubBroadcaster);
         let stub_repo: Arc<dyn IConversationRepository> = Arc::new(StubConvRepo);
-        let conv_service = Arc::new(ConversationService::new(
+        let conv_service = Arc::new(ConversationService::new_with_workspace_root(
             Arc::clone(&stub_repo),
             stub_broadcaster,
+            std::env::temp_dir(),
         ));
 
         JobExecutor::new(Arc::new(StubTaskManager), stub_repo, conv_service, guard)

@@ -70,7 +70,11 @@ async fn setup() -> (
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     let broadcaster = Arc::new(TestBroadcaster::new());
-    let svc = ConversationService::new(repo, broadcaster.clone());
+    let svc = ConversationService::new_with_workspace_root(
+        repo,
+        broadcaster.clone(),
+        std::env::temp_dir(),
+    );
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
     (svc, broadcaster, task_mgr)
 }
