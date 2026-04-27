@@ -258,7 +258,7 @@ impl GeminiAgentManager {
                 let mut state = self.state.write().await;
                 state.status = Some(ConversationStatus::Finished);
             }
-            AgentStreamEvent::AcpPermission(data) => {
+            AgentStreamEvent::Permission(data) => {
                 if let Ok(conf) = serde_json::from_value::<Confirmation>(data.clone()) {
                     self.add_confirmation(conf).await;
                 }

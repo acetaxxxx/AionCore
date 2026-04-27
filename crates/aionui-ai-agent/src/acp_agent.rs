@@ -172,7 +172,7 @@ impl AcpAgentManager {
     /// is wrapped in Arc.
     ///
     /// This background task receives permission requests from the protocol
-    /// layer, converts them to `AcpPermission` events, and waits for user
+    /// layer, converts them to `Permission` events, and waits for user
     /// responses routed through the `confirm()` method.
     pub fn start_permission_handler(self: &Arc<Self>) {
         let this = Arc::clone(self);
@@ -192,7 +192,7 @@ impl AcpAgentManager {
                 perm_req.session_id.chars().take(8).collect::<String>()
             );
 
-            // Emit AcpPermission event for the frontend
+            // Emit Permission event for the frontend
             let permission_event = json!({
                 "call_id": &call_id,
                 "session_id": &perm_req.session_id,
@@ -237,10 +237,10 @@ impl AcpAgentManager {
                 state.confirmations.push(confirmation);
             }
 
-            // Broadcast AcpPermission event
+            // Broadcast Permission event
             let _ = self
                 .event_tx
-                .send(AgentStreamEvent::AcpPermission(permission_event));
+                .send(AgentStreamEvent::Permission(permission_event));
 
             // Store the response_tx in a side map keyed by call_id
             // For now, we cancel if the permission_rx loop continues

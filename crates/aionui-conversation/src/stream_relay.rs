@@ -148,7 +148,7 @@ impl StreamRelay {
     /// for confirmations whose ID has already been seen.
     fn maybe_broadcast_confirmation(&self, event: &AgentStreamEvent, seen: &mut HashSet<String>) {
         let data = match event {
-            AgentStreamEvent::AcpPermission(d) | AgentStreamEvent::CodexPermission(d) => d,
+            AgentStreamEvent::Permission(d) => d,
             _ => return,
         };
 
