@@ -167,8 +167,22 @@ impl AppServices {
         let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let agent_registry = Arc::new(AgentRegistry::new());
+
+        // Skill paths need app resource dir (for builtin rules) + data dir
+        // (for user skills + materialized views). AcpSkillManager uses these
+        // for first-message skill index/body loading.
+        let app_resource_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.canonicalize().ok())
+            .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(
+            &app_resource_dir,
+            std::path::Path::new(&data_dir),
+        ));
+
         let factory = build_agent_factory(AgentFactoryDeps {
-            skill_manager: AcpSkillManager::new(),
+            skill_manager: AcpSkillManager::new(skill_paths.clone()),
             remote_agent_repo,
             provider_repo,
             encryption_key,

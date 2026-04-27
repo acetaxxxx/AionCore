@@ -143,6 +143,7 @@ async fn build_agent(
                     cwd: Some(workspace),
                 },
                 config,
+                deps.skill_manager.clone(),
             )
             .await?;
             let arc = Arc::new(agent);

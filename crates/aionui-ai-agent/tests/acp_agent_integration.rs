@@ -63,10 +63,18 @@ async fn make_mock_agent(
         custom_agent_id: None,
         preset_context: None,
         enabled_skills: vec![],
+        exclude_builtin_skills: vec![],
         preset_assistant_id: None,
         session_mode: None,
         cron_job_id: None,
     };
+
+    let tmp_skills = tempfile::TempDir::new().unwrap();
+    let skill_paths = std::sync::Arc::new(aionui_extension::resolve_skill_paths(
+        tmp_skills.path(),
+        tmp_skills.path(),
+    ));
+    let skill_manager = aionui_ai_agent::skill_manager::AcpSkillManager::new(skill_paths);
 
     let manager = AcpAgentManager::new(
         "test-conv-1".into(),
@@ -78,6 +86,7 @@ async fn make_mock_agent(
             cwd: None,
         },
         config,
+        skill_manager,
     )
     .await
     .expect("Failed to spawn mock ACP agent");
