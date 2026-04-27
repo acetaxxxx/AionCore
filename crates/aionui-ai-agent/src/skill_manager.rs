@@ -45,13 +45,18 @@ pub struct AcpSkillManager {
     cache: RwLock<HashMap<String, SkillDefinition>>,
     /// Whether discovery has been performed.
     discovered: RwLock<bool>,
+    /// Resolved skill paths, shared across the app.
+    /// Consumed by `discover_skills` / `get_skill` (Task 4 / 5 of the refactor).
+    #[allow(dead_code)]
+    paths: Arc<aionui_extension::SkillPaths>,
 }
 
 impl AcpSkillManager {
-    pub fn new() -> Arc<Self> {
+    pub fn new(paths: Arc<aionui_extension::SkillPaths>) -> Arc<Self> {
         Arc::new(Self {
             cache: RwLock::new(HashMap::new()),
             discovered: RwLock::new(false),
+            paths,
         })
     }
 
@@ -397,6 +402,17 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn new_accepts_skill_paths() {
+        let tmp = TempDir::new().unwrap();
+        let paths = std::sync::Arc::new(aionui_extension::resolve_skill_paths(
+            tmp.path(),
+            tmp.path(),
+        ));
+        let mgr = AcpSkillManager::new(paths.clone());
+        assert!(!mgr.is_discovered().await);
+    }
+
     #[test]
     fn skill_definition_has_source_and_relative_location() {
         let def = SkillDefinition {
@@ -694,7 +710,7 @@ mod tests {
             "Debug steps",
         );
 
-        let mgr = AcpSkillManager::new();
+        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
         let index = mgr.discover_skills(base, None).await;
 
         assert_eq!(index.len(), 2);
@@ -723,7 +739,7 @@ mod tests {
             "body",
         );
 
-        let mgr = AcpSkillManager::new();
+        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
         let enabled = vec!["allowed".to_string()];
         let index = mgr.discover_skills(base, Some(&enabled)).await;
 
@@ -734,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn discover_skills_empty_directory() {
         let tmp = TempDir::new().unwrap();
-        let mgr = AcpSkillManager::new();
+        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
         let index = mgr.discover_skills(tmp.path(), None).await;
         assert!(index.is_empty());
     }
@@ -760,7 +776,7 @@ mod tests {
             "custom body",
         );
 
-        let mgr = AcpSkillManager::new();
+        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
         let index = mgr.discover_skills(base, None).await;
 
         // Only one entry for "review"
@@ -781,7 +797,7 @@ mod tests {
             "The full body content here.",
         );
 
-        let mgr = AcpSkillManager::new();
+        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
         mgr.discover_skills(base, None).await;
 
         // Body should not be loaded yet
@@ -801,7 +817,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_skill_unknown_returns_none() {
-        let mgr = AcpSkillManager::new();
+        let tmp = TempDir::new().unwrap();
+        let mgr = AcpSkillManager::new(std::sync::Arc::new(
+            aionui_extension::resolve_skill_paths(tmp.path(), tmp.path()),
+        ));
         assert!(mgr.get_skill("nonexistent").await.is_none());
     }
 
@@ -818,7 +837,7 @@ mod tests {
             "body",
         );
 
-        let mgr = AcpSkillManager::new();
+        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
         mgr.discover_skills(base, None).await;
 
         let index = mgr.get_skills_index().await;
@@ -829,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn is_discovered_flag() {
         let tmp = TempDir::new().unwrap();
-        let mgr = AcpSkillManager::new();
+        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
         assert!(!mgr.is_discovered().await);
 
         mgr.discover_skills(tmp.path(), None).await;
@@ -850,7 +869,7 @@ mod tests {
         )
         .unwrap();
 
-        let mgr = AcpSkillManager::new();
+        let mgr = AcpSkillManager::new(std::sync::Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path())));
         let index = mgr.discover_skills(base, None).await;
 
         assert_eq!(index.len(), 1);
