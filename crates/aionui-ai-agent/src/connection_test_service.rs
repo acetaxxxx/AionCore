@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use aionui_api_types::{BedrockAuthMethod, BedrockConfig, GeminiSubscriptionData};
+use aionui_api_types::{BedrockAuthMethod, BedrockConfig};
 use aionui_common::AppError;
 use aws_sdk_bedrock::config::Credentials;
 use tracing::{info, warn};
@@ -11,21 +11,18 @@ const DEFAULT_BEDROCK_TEST_MODEL: &str = "anthropic.claude-sonnet-4-5-20250929-v
 /// Timeout for Bedrock connection test.
 const BEDROCK_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Timeout for Gemini subscription status check.
-const GEMINI_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Base URL for Gemini generative AI API.
-const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
-
-/// Service for external connection testing (Bedrock credentials, Gemini subscription).
-#[derive(Clone)]
-pub struct ConnectionTestService {
-    http_client: reqwest::Client,
-}
+/// Service for external connection testing (Bedrock credentials).
+#[derive(Clone, Default)]
+pub struct ConnectionTestService;
 
 impl ConnectionTestService {
-    pub fn new(http_client: reqwest::Client) -> Self {
-        Self { http_client }
+    /// Create a new `ConnectionTestService`.
+    ///
+    /// The `_http_client` parameter is retained for API compatibility but is
+    /// currently unused — Bedrock uses its own AWS SDK HTTP client and no
+    /// other connection types live on this service.
+    pub fn new(_http_client: reqwest::Client) -> Self {
+        Self
     }
 
     /// Test AWS Bedrock credentials by performing a lightweight API call.
@@ -57,62 +54,6 @@ impl ConnectionTestService {
 
         info!("Bedrock connection test passed");
         Ok(())
-    }
-
-    /// Query Gemini subscription status via the generative AI API.
-    ///
-    /// Uses a lightweight model listing request to verify API access.
-    /// The caller provides the API key (typically from `GEMINI_API_KEY` env var).
-    /// An optional HTTP proxy can be specified.
-    pub async fn get_gemini_subscription_status(
-        &self,
-        api_key: &str,
-        proxy: Option<&str>,
-    ) -> Result<GeminiSubscriptionData, AppError> {
-        let client = match proxy {
-            Some(proxy_url) => {
-                let proxy = reqwest::Proxy::all(proxy_url)
-                    .map_err(|e| AppError::BadRequest(format!("Invalid proxy URL: {e}")))?;
-                reqwest::Client::builder()
-                    .proxy(proxy)
-                    .timeout(GEMINI_STATUS_TIMEOUT)
-                    .build()
-                    .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?
-            }
-            None => self.http_client.clone(),
-        };
-
-        let url = format!("{GEMINI_API_BASE}/v1beta/models?key={api_key}&pageSize=1");
-
-        let resp = client
-            .get(&url)
-            .timeout(GEMINI_STATUS_TIMEOUT)
-            .send()
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "Gemini subscription check failed");
-                AppError::BadGateway(format!("Gemini service unreachable: {e}"))
-            })?;
-
-        let status = resp.status();
-        if status.is_success() {
-            info!("Gemini subscription status: active");
-            Ok(GeminiSubscriptionData {
-                subscription_status: "active".into(),
-            })
-        } else if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
-            Ok(GeminiSubscriptionData {
-                subscription_status: "inactive".into(),
-            })
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            warn!(status = %status, body = %body, "Gemini subscription check returned error");
-            Err(AppError::BadGateway(format!(
-                "Gemini API returned status {status}"
-            )))
-        }
     }
 }
 
