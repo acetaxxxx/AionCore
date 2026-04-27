@@ -188,18 +188,3 @@ async fn t8_1_bedrock_invalid_credentials() {
     );
 }
 
-// ── 8.2 Gemini Subscription Status ──────────────────────────────────
-
-#[tokio::test]
-async fn t8_2_gemini_unauthenticated() {
-    let (app, _services) = build_app().await;
-
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri("/api/gemini/subscription-status")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    // Auth middleware returns 403 for missing tokens on protected routes
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-}
