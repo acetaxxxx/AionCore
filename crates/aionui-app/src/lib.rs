@@ -470,8 +470,11 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 
 /// Build the default `AuxiliaryRouterState` from application services.
 pub fn build_auxiliary_state(services: &AppServices) -> AuxiliaryRouterState {
+    let pool = services.database.pool().clone();
+    let conversation_repo = Arc::new(SqliteConversationRepository::new(pool));
     AuxiliaryRouterState {
         worker_task_manager: services.worker_task_manager.clone(),
+        conversation_repo,
     }
 }
 
