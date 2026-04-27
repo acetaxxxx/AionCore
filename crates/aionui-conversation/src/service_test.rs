@@ -240,7 +240,11 @@ fn make_service() -> (
 ) {
     let repo = Arc::new(MockRepo::new());
     let broadcaster = Arc::new(MockBroadcaster::new());
-    let svc = ConversationService::new(repo.clone(), broadcaster.clone());
+    let svc = ConversationService::new_with_workspace_root(
+        repo.clone(),
+        broadcaster.clone(),
+        std::path::PathBuf::from(std::env::temp_dir()),
+    );
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
     (svc, broadcaster, repo, task_mgr)
 }
@@ -868,6 +872,8 @@ struct MockAgent {
     stopped: Mutex<bool>,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
+    /// Optional workspace override; falls back to "/tmp/test" when `None`.
+    workspace_override: Option<String>,
 }
 
 impl MockAgent {
@@ -879,6 +885,7 @@ impl MockAgent {
             stopped: Mutex::new(false),
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
+            workspace_override: None,
         }
     }
 
@@ -890,6 +897,7 @@ impl MockAgent {
             stopped: Mutex::new(false),
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
+            workspace_override: None,
         }
     }
 }
@@ -903,7 +911,7 @@ impl IAgentManager for MockAgent {
         None
     }
     fn workspace(&self) -> &str {
-        "/tmp/test"
+        self.workspace_override.as_deref().unwrap_or("/tmp/test")
     }
     fn conversation_id(&self) -> &str {
         &self.conversation_id
@@ -1007,6 +1015,65 @@ impl IWorkerTaskManager for MockTaskManager {
         let agent: AgentManagerHandle = Arc::new(MockAgent::new(conversation_id));
         agents.insert(conversation_id.to_owned(), agent.clone());
         Ok(agent)
+    }
+
+    fn kill(
+        &self,
+        conversation_id: &str,
+        _reason: Option<AgentKillReason>,
+    ) -> Result<(), AppError> {
+        self.agents.lock().unwrap().remove(conversation_id);
+        Ok(())
+    }
+
+    fn clear(&self) {
+        self.agents.lock().unwrap().clear();
+    }
+
+    fn active_count(&self) -> usize {
+        self.agents.lock().unwrap().len()
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        vec![]
+    }
+}
+
+/// A variant of MockTaskManager that always builds agents with a specific workspace.
+struct MockTaskManagerWithWorkspace {
+    workspace: String,
+    agents: Mutex<std::collections::HashMap<String, AgentManagerHandle>>,
+}
+
+impl MockTaskManagerWithWorkspace {
+    fn new(workspace: &str) -> Self {
+        Self {
+            workspace: workspace.to_owned(),
+            agents: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
+    fn get_task(&self, conversation_id: &str) -> Option<AgentManagerHandle> {
+        self.agents.lock().unwrap().get(conversation_id).cloned()
+    }
+
+    fn get_or_build_task(
+        &self,
+        conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentManagerHandle, AppError> {
+        let workspace = self.workspace.clone();
+        let mut agents = self.agents.lock().unwrap();
+        if let Some(existing) = agents.get(conversation_id) {
+            return Ok(existing.clone());
+        }
+        let mut agent = MockAgent::new(conversation_id);
+        agent.workspace_override = Some(workspace);
+        let handle: AgentManagerHandle = Arc::new(agent);
+        agents.insert(conversation_id.to_owned(), handle.clone());
+        Ok(handle)
     }
 
     fn kill(
@@ -1136,6 +1203,42 @@ async fn send_message_running_conversation_returns_conflict() {
         .await
         .unwrap_err();
     assert!(matches!(err, AppError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn send_message_persists_factory_resolved_workspace() {
+    // Conversation created with no workspace → create() auto-assigns one.
+    // Factory resolves a *different* temp dir (simulating legacy-conv fallback).
+    // After send_message, conversation.extra.workspace must match what the
+    // agent reports.
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let auto_workspace = "/tmp/factory-resolved";
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(MockTaskManagerWithWorkspace::new(auto_workspace));
+
+    // Create a conversation with an empty workspace to simulate legacy case.
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "model": { "provider_id": "p1", "model": "m1" },
+        "extra": {}
+    }))
+    .unwrap();
+    let conv = svc.create("user_1", req).await.unwrap();
+
+    // Inject an empty workspace directly into the repo to mimic legacy state.
+    let empty_ws_update = ConversationRowUpdate {
+        extra: Some(r#"{"workspace":""}"#.to_owned()),
+        ..Default::default()
+    };
+    repo.update(&conv.id, &empty_ws_update).await.unwrap();
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    // Verify the workspace was written back.
+    let updated = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(updated.extra["workspace"], auto_workspace);
 }
 
 // ── stop_stream tests ───────────────────────────────────────────

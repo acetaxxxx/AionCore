@@ -8,6 +8,7 @@ use axum::routing::{get, post};
 use aionui_api_types::{AgentModeResponse, ApiResponse, SetModeRequest};
 use aionui_auth::CurrentUser;
 use aionui_common::{AgentType, AppError};
+use aionui_db::IConversationRepository;
 use serde::{Deserialize, Serialize};
 
 use crate::acp_agent::AcpAgentManager;
@@ -20,6 +21,7 @@ use crate::types::SlashCommandItem;
 #[derive(Clone)]
 pub struct AuxiliaryRouterState {
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
+    pub conversation_repo: Arc<dyn IConversationRepository>,
 }
 
 /// Build the auxiliary routes router.
@@ -118,6 +120,9 @@ const MAX_DIR_DEPTH: usize = 10;
 /// GET /api/conversations/:id/workspace
 ///
 /// Browse the workspace directory associated with a conversation.
+///
+/// Reads the workspace path from `conversation.extra.workspace` in the
+/// database so it works before any agent session has been started.
 async fn browse_workspace(
     State(state): State<AuxiliaryRouterState>,
     Extension(_user): Extension<CurrentUser>,
@@ -128,11 +133,29 @@ async fn browse_workspace(
         return Err(AppError::BadRequest("path must not be empty".into()));
     }
 
-    let handle = get_task(&state, &id)?;
-    let workspace = handle.workspace();
+    let row = state
+        .conversation_repo
+        .get(&id)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to load conversation: {e}")))?
+        .ok_or_else(|| AppError::NotFound(format!("Conversation '{id}' not found")))?;
+
+    let extra: serde_json::Value = serde_json::from_str(&row.extra)
+        .map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
+    let workspace = extra
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if workspace.is_empty() {
+        return Err(AppError::BadRequest(
+            "Conversation has no workspace assigned".into(),
+        ));
+    }
 
     // Resolve the browsed path relative to the workspace root
-    let base = std::path::Path::new(workspace);
+    let base = std::path::Path::new(&workspace);
     let browse_path = base.join(query.path.trim_start_matches('/'));
 
     // Security: ensure the resolved path is within the workspace

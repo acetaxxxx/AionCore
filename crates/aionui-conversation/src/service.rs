@@ -31,6 +31,7 @@ pub struct ConversationService {
     repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     delete_hooks: Vec<Arc<dyn OnConversationDelete>>,
+    workspace_root: std::path::PathBuf,
 }
 
 impl ConversationService {
@@ -42,6 +43,20 @@ impl ConversationService {
             repo,
             broadcaster,
             delete_hooks: Vec::new(),
+            workspace_root: std::path::PathBuf::from("data"),
+        }
+    }
+
+    pub fn new_with_workspace_root(
+        repo: Arc<dyn IConversationRepository>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        workspace_root: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            repo,
+            broadcaster,
+            delete_hooks: Vec::new(),
+            workspace_root,
         }
     }
 
@@ -54,6 +69,7 @@ impl ConversationService {
             repo,
             broadcaster,
             delete_hooks,
+            workspace_root: std::path::PathBuf::from("data"),
         }
     }
 
@@ -70,12 +86,40 @@ impl ConversationService {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
+        let mut extra = req.extra;
+        if extra
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty()
+        {
+            let agent_type_label = match req.r#type {
+                aionui_common::AgentType::Acp => {
+                    let backend = extra.get("backend").and_then(|v| {
+                        serde_json::from_value::<aionui_common::AcpBackend>(v.clone()).ok()
+                    });
+                    match backend {
+                        Some(b) => b.display_name().to_lowercase(),
+                        None => "acp".to_owned(),
+                    }
+                }
+                aionui_common::AgentType::OpenclawGateway => "openclaw".to_owned(),
+                ref t => format!("{:?}", t).to_lowercase(),
+            };
+            let ws_path = self
+                .workspace_root
+                .join(format!("{}-temp-{}", agent_type_label, now));
+            std::fs::create_dir_all(&ws_path)
+                .map_err(|e| AppError::Internal(format!("Failed to create workspace: {e}")))?;
+            extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
+        }
+
         let row = aionui_db::models::ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.unwrap_or_default(),
             r#type: enum_to_db(&req.r#type)?,
-            extra: serde_json::to_string(&req.extra)
+            extra: serde_json::to_string(&extra)
                 .map_err(|e| AppError::Internal(format!("Failed to serialize extra: {e}")))?,
             model: req
                 .model
@@ -597,7 +641,13 @@ impl ConversationService {
 
         // Build task options from conversation row
         let build_opts = self.build_task_options(&row)?;
+        let stored_workspace = build_opts.workspace.clone();
         let agent = task_manager.get_or_build_task(conversation_id, build_opts)?;
+
+        // If the factory resolved a different workspace (e.g. auto-created temp
+        // dir for a legacy conversation with empty workspace), persist it back.
+        self.maybe_persist_workspace(conversation_id, &stored_workspace, agent.workspace())
+            .await?;
 
         // Update conversation status to running
         let update = ConversationRowUpdate {
@@ -688,7 +738,12 @@ impl ConversationService {
             })?;
 
         let build_opts = self.build_task_options(&row)?;
-        let _agent = task_manager.get_or_build_task(conversation_id, build_opts)?;
+        let stored_workspace = build_opts.workspace.clone();
+        let agent = task_manager.get_or_build_task(conversation_id, build_opts)?;
+
+        // Persist auto-resolved workspace if factory picked a different path.
+        self.maybe_persist_workspace(conversation_id, &stored_workspace, agent.workspace())
+            .await?;
 
         debug!(conversation_id, "Agent warmed up");
         Ok(())
@@ -730,6 +785,49 @@ impl ConversationService {
             conversation_id: row.id.clone(),
             extra,
         })
+    }
+
+    /// Write the resolved workspace back to `conversation.extra.workspace` when
+    /// the factory picked a different (auto-generated) path than what was stored.
+    ///
+    /// This handles legacy conversations whose `extra.workspace` was empty:
+    /// the factory creates a temp dir at task-build time, and we persist that
+    /// path here so the frontend can display the workspace panel correctly.
+    async fn maybe_persist_workspace(
+        &self,
+        conversation_id: &str,
+        stored_workspace: &str,
+        resolved_workspace: &str,
+    ) -> Result<(), AppError> {
+        if resolved_workspace.is_empty() || resolved_workspace == stored_workspace {
+            return Ok(());
+        }
+
+        // Fetch latest extra, merge the resolved workspace path in, and persist.
+        let row = self.repo.get(conversation_id).await?.ok_or_else(|| {
+            AppError::Internal("Conversation vanished during workspace sync".into())
+        })?;
+
+        let mut extra: serde_json::Value =
+            serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        extra["workspace"] = serde_json::Value::String(resolved_workspace.to_owned());
+
+        let extra_json = serde_json::to_string(&extra)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize extra: {e}")))?;
+
+        let update = ConversationRowUpdate {
+            extra: Some(extra_json),
+            updated_at: Some(now_ms()),
+            ..Default::default()
+        };
+        self.repo.update(conversation_id, &update).await?;
+
+        debug!(
+            conversation_id,
+            workspace = resolved_workspace,
+            "Persisted auto-resolved workspace to conversation.extra"
+        );
+        Ok(())
     }
 
     /// Broadcast a `conversation.listChanged` WebSocket event.
