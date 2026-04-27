@@ -79,6 +79,11 @@ async fn build_agent(
     };
 
     match options.agent_type {
+        AgentType::Gemini => Err(AppError::BadRequest(
+            "This is a legacy Gemini conversation. The dedicated Gemini runtime has been \
+             removed; please create a new conversation with the Gemini ACP backend to continue."
+                .into(),
+        )),
         AgentType::Acp => {
             let mut config: AcpBuildExtra = serde_json::from_value(options.extra)
                 .map_err(|e| AppError::BadRequest(format!("Invalid ACP build options: {e}")))?;

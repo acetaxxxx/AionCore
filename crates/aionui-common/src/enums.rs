@@ -12,6 +12,13 @@ pub enum AgentType {
     Nanobot,
     Remote,
     Aionrs,
+    /// Legacy Gemini conversations. Kept solely so that historical rows
+    /// with `type='gemini'` remain readable in the conversation list and
+    /// message history. Any attempt to run the agent (send a message,
+    /// resume a session) returns an error — this variant has no factory
+    /// branch. New Gemini conversations use `AgentType::Acp` with
+    /// `backend='gemini'`.
+    Gemini,
 }
 
 impl AgentType {
@@ -22,6 +29,7 @@ impl AgentType {
             AgentType::Nanobot => "Nanobot",
             AgentType::Remote => "Remote",
             AgentType::Aionrs => "Aion CLI",
+            AgentType::Gemini => "Gemini (legacy)",
         }
     }
 
@@ -32,6 +40,7 @@ impl AgentType {
             AgentType::Nanobot => "nanobot",
             AgentType::Remote => "remote",
             AgentType::Aionrs => "aionrs",
+            AgentType::Gemini => "gemini",
         }
     }
 
