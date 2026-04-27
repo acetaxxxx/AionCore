@@ -10,12 +10,19 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use aionui_ai_agent::skill_manager::{
     AcpSkillManager, build_skills_index_text, build_system_instructions, detect_skill_load_request,
     prepare_first_message, prepare_first_message_with_skills_index,
 };
+use aionui_extension::{SkillPaths, resolve_skill_paths};
 use tempfile::TempDir;
+
+/// Build SkillPaths rooted at `base` for test use.
+fn test_paths(base: &Path) -> Arc<SkillPaths> {
+    Arc::new(resolve_skill_paths(base, base))
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -52,7 +59,7 @@ async fn discover_builtin_skills() {
         "Full review instructions here.",
     );
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     let index = mgr.discover_skills(tmp.path(), None).await;
 
     assert_eq!(index.len(), 1);
@@ -72,7 +79,7 @@ async fn discover_user_custom_skills() {
         "Step 1: reproduce the bug...",
     );
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     let index = mgr.discover_skills(tmp.path(), None).await;
 
     assert_eq!(index.len(), 1);
@@ -86,7 +93,7 @@ async fn discover_returns_empty_for_empty_directories() {
     fs::create_dir_all(tmp.path().join("_builtin")).unwrap();
     fs::create_dir_all(tmp.path().join("skills")).unwrap();
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     let index = mgr.discover_skills(tmp.path(), None).await;
 
     assert!(index.is_empty());
@@ -95,7 +102,7 @@ async fn discover_returns_empty_for_empty_directories() {
 #[tokio::test]
 async fn discover_returns_empty_when_no_directories_exist() {
     let tmp = TempDir::new().unwrap();
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     let index = mgr.discover_skills(tmp.path(), None).await;
     assert!(index.is_empty());
 }
@@ -113,7 +120,7 @@ async fn discover_ignores_directories_without_skill_md() {
         "body",
     );
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     let index = mgr.discover_skills(tmp.path(), None).await;
 
     assert_eq!(index.len(), 1);
@@ -127,7 +134,7 @@ async fn discover_skills_across_all_three_directories() {
     create_skill(tmp.path(), "builtin-skills", "b", "b", "Packaged B", "body");
     create_skill(tmp.path(), "skills", "c", "c", "Custom C", "body");
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     let index = mgr.discover_skills(tmp.path(), None).await;
 
     assert_eq!(index.len(), 3);
@@ -144,7 +151,7 @@ async fn discover_with_enabled_filter() {
     create_skill(tmp.path(), "skills", "beta", "beta", "Beta", "body");
     create_skill(tmp.path(), "skills", "gamma", "gamma", "Gamma", "body");
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     let enabled = vec!["alpha".to_string(), "gamma".to_string()];
     let index = mgr.discover_skills(tmp.path(), Some(&enabled)).await;
 
@@ -171,7 +178,7 @@ async fn get_skills_index_returns_name_and_description_only() {
         "Detailed body content that should NOT appear in the index.",
     );
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     mgr.discover_skills(tmp.path(), None).await;
 
     let index = mgr.get_skills_index().await;
@@ -215,7 +222,7 @@ async fn lazy_load_skill_body_from_file() {
         "This is the complete skill body.\nWith multiple lines.",
     );
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     mgr.discover_skills(tmp.path(), None).await;
 
     let skill = mgr.get_skill("lazy-skill").await.unwrap();
@@ -242,7 +249,7 @@ async fn cached_load_does_not_reread_file() {
         "Original body",
     );
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     mgr.discover_skills(tmp.path(), None).await;
 
     // First load
@@ -265,7 +272,7 @@ async fn cached_load_does_not_reread_file() {
 #[tokio::test]
 async fn get_skill_returns_none_for_unknown() {
     let tmp = TempDir::new().unwrap();
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     mgr.discover_skills(tmp.path(), None).await;
 
     assert!(mgr.get_skill("nonexistent").await.is_none());
@@ -381,7 +388,7 @@ async fn user_skills_override_builtin() {
         "custom body",
     );
 
-    let mgr = AcpSkillManager::new();
+    let mgr = AcpSkillManager::new(test_paths(tmp.path()));
     let index = mgr.discover_skills(tmp.path(), None).await;
 
     // Should only have one entry for "review"
