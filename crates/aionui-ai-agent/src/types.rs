@@ -48,9 +48,6 @@ pub struct AcpBuildExtra {
     /// Path to the CLI executable (resolved from registry when `agent_id` is set).
     #[serde(default)]
     pub cli_path: Option<String>,
-    /// Whether the user picked a custom workspace path.
-    #[serde(default)]
-    pub custom_workspace: bool,
     /// Agent name within the ACP backend.
     #[serde(default)]
     pub agent_name: Option<String>,
@@ -63,42 +60,7 @@ pub struct AcpBuildExtra {
     /// Skills to enable for this session.
     #[serde(default)]
     pub enabled_skills: Vec<String>,
-    /// Preset assistant ID.
-    #[serde(default)]
-    pub preset_assistant_id: Option<String>,
-    /// Session mode override.
-    #[serde(default)]
-    pub session_mode: Option<String>,
-    /// Associated cron job ID.
-    #[serde(default)]
-    pub cron_job_id: Option<String>,
-}
-
-/// Gemini-specific fields extracted from `extra` in [`BuildTaskOptions`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GeminiBuildExtra {
-    /// Whether the user picked a custom workspace path.
-    #[serde(default)]
-    pub custom_workspace: bool,
-    /// Web search engine preference.
-    #[serde(default)]
-    pub web_search_engine: Option<String>,
-    /// Context file name.
-    #[serde(default)]
-    pub context_file_name: Option<String>,
-    /// Context content to inject.
-    #[serde(default)]
-    pub context_content: Option<String>,
-    /// Preset rules.
-    #[serde(default)]
-    pub preset_rules: Option<String>,
-    /// Skills to enable.
-    #[serde(default)]
-    pub enabled_skills: Vec<String>,
-    /// Extra skill paths.
-    #[serde(default)]
-    pub extra_skill_paths: Vec<String>,
-    /// Built-in skills to exclude.
+    /// Builtin auto-inject skills to exclude from this session.
     #[serde(default)]
     pub exclude_builtin_skills: Vec<String>,
     /// Preset assistant ID.
@@ -132,9 +94,6 @@ pub struct OpenClawBuildExtra {
     /// Agent name.
     #[serde(default)]
     pub agent_name: Option<String>,
-    /// Whether the user picked a custom workspace path.
-    #[serde(default)]
-    pub custom_workspace: bool,
     /// OpenClaw gateway configuration.
     pub gateway: OpenClawGatewayConfig,
     /// Skills to enable.
@@ -246,6 +205,21 @@ pub struct SlashCommandItem {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn acp_build_extra_backcompat_no_new_fields() {
+        // Legacy payloads without exclude_builtin_skills should still deserialize
+        let legacy = r#"{"backend":"claude"}"#;
+        let parsed: AcpBuildExtra = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.exclude_builtin_skills.is_empty());
+    }
+
+    #[test]
+    fn acp_build_extra_accepts_exclude_builtin_skills() {
+        let with_field = r#"{"backend":"claude","exclude_builtin_skills":["cron"]}"#;
+        let parsed: AcpBuildExtra = serde_json::from_str(with_field).unwrap();
+        assert_eq!(parsed.exclude_builtin_skills, vec!["cron"]);
+    }
 
     #[test]
     fn send_message_data_serde_roundtrip() {

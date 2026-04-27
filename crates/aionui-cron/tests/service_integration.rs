@@ -220,9 +220,10 @@ async fn setup() -> (CronService, Arc<dyn ICronRepository>, Arc<MockBroadcaster>
     let bc = Arc::new(MockBroadcaster::new());
 
     let stub_conv_repo: Arc<dyn IConversationRepository> = Arc::new(StubConvRepo);
-    let conv_service = Arc::new(ConversationService::new(
+    let conv_service = Arc::new(ConversationService::new_with_workspace_root(
         Arc::clone(&stub_conv_repo),
         bc.clone() as Arc<dyn EventBroadcaster>,
+        std::env::temp_dir(),
     ));
     let busy_guard = Arc::new(CronBusyGuard::new());
     let executor = Arc::new(JobExecutor::new(

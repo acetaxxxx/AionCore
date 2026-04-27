@@ -1,11 +1,9 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Query, State};
-use axum::routing::{get, post};
+use axum::extract::{Extension, Json, State};
+use axum::routing::post;
 
-use aionui_api_types::{
-    ApiResponse, GeminiSubscriptionData, GeminiSubscriptionQuery, TestBedrockConnectionRequest,
-};
+use aionui_api_types::{ApiResponse, TestBedrockConnectionRequest};
 use aionui_auth::CurrentUser;
 use aionui_common::AppError;
 
@@ -21,16 +19,11 @@ pub struct ConnectionTestRouterState {
 ///
 /// Routes:
 /// - `POST /api/bedrock/test-connection` — test AWS Bedrock credentials
-/// - `GET /api/gemini/subscription-status` — query Gemini subscription status
 ///
 /// All routes require authentication (applied by the caller).
 pub fn connection_test_routes(state: ConnectionTestRouterState) -> Router {
     Router::new()
         .route("/api/bedrock/test-connection", post(test_bedrock))
-        .route(
-            "/api/gemini/subscription-status",
-            get(gemini_subscription_status),
-        )
         .with_state(state)
 }
 
@@ -50,24 +43,6 @@ async fn test_bedrock(
         .test_bedrock_connection(req.bedrock_config)
         .await?;
     Ok(Json(ApiResponse::message("Connection successful")))
-}
-
-/// GET /api/gemini/subscription-status
-///
-/// Query Gemini CLI subscription status. Supports optional proxy parameter.
-/// Reads GEMINI_API_KEY from environment.
-async fn gemini_subscription_status(
-    State(state): State<ConnectionTestRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-    Query(query): Query<GeminiSubscriptionQuery>,
-) -> Result<Json<ApiResponse<GeminiSubscriptionData>>, AppError> {
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .map_err(|_| AppError::BadRequest("GEMINI_API_KEY environment variable not set".into()))?;
-    let data = state
-        .service
-        .get_gemini_subscription_status(&api_key, query.proxy.as_deref())
-        .await?;
-    Ok(Json(ApiResponse::ok(data)))
 }
 
 #[cfg(test)]

@@ -272,7 +272,11 @@ fn setup() -> TeamSessionService {
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(FullMockTeamRepo::new());
     let conv_repo: Arc<dyn IConversationRepository> = Arc::new(MockConversationRepo::new());
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-    let conv_service = ConversationService::new(conv_repo, broadcaster.clone());
+    let conv_service = ConversationService::new_with_workspace_root(
+        conv_repo,
+        broadcaster.clone(),
+        std::env::temp_dir(),
+    );
     TeamSessionService::new(team_repo, conv_service, broadcaster)
 }
 

@@ -155,12 +155,10 @@ async fn login_flow(tx: mpsc::Sender<WeixinLoginEvent>) {
                 debug!(status = state, "WeChat QR code status");
 
                 match state {
-                    "scanned" => {
-                        if !scanned_sent {
-                            scanned_sent = true;
-                            if tx.send(WeixinLoginEvent::Scanned).await.is_err() {
-                                return;
-                            }
+                    "scanned" if !scanned_sent => {
+                        scanned_sent = true;
+                        if tx.send(WeixinLoginEvent::Scanned).await.is_err() {
+                            return;
                         }
                     }
                     "confirmed" => {
