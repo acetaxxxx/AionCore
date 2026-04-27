@@ -184,7 +184,14 @@ impl StreamRelay {
     }
 
     /// Forward an agent event to connected WebSocket clients.
+    ///
+    /// Permission events are skipped here because they are routed via
+    /// `maybe_broadcast_confirmation` as `confirmation.add` / `confirmation.update`
+    /// WebSocket events instead.
     fn forward_to_websocket(&self, event: &AgentStreamEvent) {
+        if matches!(event, AgentStreamEvent::Permission(_)) {
+            return;
+        }
         let event_data = match serde_json::to_value(event) {
             Ok(v) => v,
             Err(e) => {
