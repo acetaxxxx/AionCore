@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use aionui_common::{AcpBackend, AgentType, ProviderWithModel};
@@ -202,6 +204,8 @@ pub struct AionrsResolvedConfig {
     pub max_turns: Option<usize>,
     /// Provider-specific compat overrides.
     pub compat_overrides: AionrsCompatOverrides,
+    /// Directory for aionrs session persistence files.
+    pub session_directory: PathBuf,
 }
 
 fn default_aionrs_max_tokens() -> u32 {

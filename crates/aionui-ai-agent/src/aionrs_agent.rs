@@ -4,8 +4,9 @@ use std::sync::{Arc, RwLock};
 use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
+use aion_agent::session::Session;
 use aion_config::compat::ProviderCompat;
-use aion_config::config::{Config, ProviderType};
+use aion_config::config::{Config, ProviderType, SessionConfig};
 use aion_mcp::manager::McpManager;
 use aion_protocol::ToolApprovalManager;
 use aionui_common::{
@@ -37,6 +38,7 @@ impl AionrsAgentManager {
         conversation_id: String,
         workspace: String,
         config_extra: AionrsResolvedConfig,
+        resume_session: Option<Session>,
     ) -> Result<Self, AppError> {
         let (event_tx, _) = broadcast::channel(128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(event_tx.clone()));
@@ -65,8 +67,11 @@ impl AionrsAgentManager {
             ProviderType::Anthropic | ProviderType::Bedrock | ProviderType::Vertex
         );
 
+        let is_resume = resume_session.is_some();
+        let provider_label = config_extra.provider.clone();
+
         let config = Config {
-            provider_label: config_extra.provider.clone(),
+            provider_label: provider_label.clone(),
             provider: provider_type,
             api_key: config_extra.api_key,
             base_url: config_extra.base_url.unwrap_or_default(),
@@ -78,7 +83,14 @@ impl AionrsAgentManager {
             prompt_caching,
             compat,
             tools: Default::default(),
-            session: Default::default(),
+            session: SessionConfig {
+                enabled: true,
+                directory: config_extra
+                    .session_directory
+                    .to_string_lossy()
+                    .into_owned(),
+                ..Default::default()
+            },
             compact: Default::default(),
             plan: Default::default(),
             file_cache: Default::default(),
@@ -89,10 +101,32 @@ impl AionrsAgentManager {
             debug: Default::default(),
         };
 
-        let result = AgentBootstrap::new(config, &workspace, sink)
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink);
+        if let Some(session) = resume_session {
+            info!(
+                conversation_id = %conversation_id,
+                session_id = %session.id,
+                message_count = session.messages.len(),
+                "Resuming aionrs session"
+            );
+            bootstrap = bootstrap.resume(session);
+        }
+
+        let result = bootstrap
             .build()
             .await
             .map_err(|e| AppError::Internal(format!("Agent bootstrap failed: {e}")))?;
+
+        let mut engine = result.engine;
+        if !is_resume
+            && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id))
+        {
+            error!(
+                conversation_id = %conversation_id,
+                error = %e,
+                "Failed to init session, continuing without persistence"
+            );
+        }
 
         let approval_manager = Arc::new(ToolApprovalManager::new());
 
@@ -101,7 +135,7 @@ impl AionrsAgentManager {
             workspace,
             event_tx,
             last_activity: AtomicI64::new(now_ms()),
-            engine: Mutex::new(result.engine),
+            engine: Mutex::new(engine),
             mcp_managers: result.mcp_managers,
             status: RwLock::new(Some(ConversationStatus::Pending)),
             approval_manager,
@@ -276,14 +310,16 @@ mod tests {
             max_tokens: 4096,
             max_turns: None,
             compat_overrides: Default::default(),
+            session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
         }
     }
 
     #[tokio::test]
     async fn aionrs_agent_returns_correct_type() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config())
-            .await
-            .unwrap();
+        let agent =
+            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
+                .await
+                .unwrap();
         assert_eq!(agent.agent_type(), AgentType::Aionrs);
         assert_eq!(agent.workspace(), "/project");
         assert_eq!(agent.conversation_id(), "conv-1");
@@ -291,59 +327,69 @@ mod tests {
 
     #[tokio::test]
     async fn aionrs_agent_initial_status_is_pending() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config())
-            .await
-            .unwrap();
+        let agent =
+            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
+                .await
+                .unwrap();
         assert_eq!(agent.status(), Some(ConversationStatus::Pending));
     }
 
     #[tokio::test]
     async fn aionrs_agent_subscribe_returns_receiver() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config())
-            .await
-            .unwrap();
+        let agent =
+            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
+                .await
+                .unwrap();
         let _rx = agent.subscribe();
     }
 
     #[tokio::test]
     async fn aionrs_agent_kill_succeeds() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config())
-            .await
-            .unwrap();
+        let agent =
+            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
+                .await
+                .unwrap();
         assert!(agent.kill(None).is_ok());
         assert_eq!(agent.status(), None);
     }
 
     #[tokio::test]
     async fn aionrs_agent_kill_with_reason_succeeds() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config())
-            .await
-            .unwrap();
+        let agent =
+            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
+                .await
+                .unwrap();
         assert!(agent.kill(Some(AgentKillReason::IdleTimeout)).is_ok());
     }
 
     #[tokio::test]
     async fn aionrs_agent_confirmations_initially_empty() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config())
-            .await
-            .unwrap();
+        let agent =
+            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
+                .await
+                .unwrap();
         assert!(agent.get_confirmations().is_empty());
     }
 
     #[tokio::test]
     async fn aionrs_agent_check_approval_returns_false_by_default() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config())
-            .await
-            .unwrap();
+        let agent =
+            AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
+                .await
+                .unwrap();
         assert!(!agent.check_approval("any_action", None));
     }
 
     #[tokio::test]
     async fn stop_emits_finish_event_and_sets_status() {
-        let agent =
-            AionrsAgentManager::new("conv-stop".into(), "/project".into(), make_test_config())
-                .await
-                .unwrap();
+        let agent = AionrsAgentManager::new(
+            "conv-stop".into(),
+            "/project".into(),
+            make_test_config(),
+            None,
+        )
+        .await
+        .unwrap();
         let mut rx = agent.subscribe();
 
         agent.stop().await.unwrap();
@@ -364,10 +410,14 @@ mod tests {
 
     #[tokio::test]
     async fn event_tx_can_send_error_and_finish() {
-        let agent =
-            AionrsAgentManager::new("conv-err".into(), "/project".into(), make_test_config())
-                .await
-                .unwrap();
+        let agent = AionrsAgentManager::new(
+            "conv-err".into(),
+            "/project".into(),
+            make_test_config(),
+            None,
+        )
+        .await
+        .unwrap();
         let mut rx = agent.subscribe();
 
         let _ = agent.event_tx.send(AgentStreamEvent::Error(
