@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
+use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
     CreateConversationRequest, ListConversationsQuery, UpdateConversationRequest, WebSocketMessage,
 };
-use aionui_common::{AgentType, ConversationSource, ConversationStatus};
+use aionui_common::{
+    AgentKillReason, AgentType, AppError, ConversationSource, ConversationStatus, TimestampMs,
+};
 use aionui_conversation::ConversationService;
 use aionui_db::{SqliteConversationRepository, init_database_memory};
 use aionui_realtime::EventBroadcaster;
@@ -34,12 +37,42 @@ impl EventBroadcaster for TestBroadcaster {
     }
 }
 
-async fn setup() -> (ConversationService, Arc<TestBroadcaster>) {
+struct NoopTaskManager;
+
+impl IWorkerTaskManager for NoopTaskManager {
+    fn get_task(&self, _: &str) -> Option<Arc<dyn aionui_ai_agent::agent_manager::IAgentManager>> {
+        None
+    }
+    fn get_or_build_task(
+        &self,
+        _: &str,
+        _: aionui_ai_agent::types::BuildTaskOptions,
+    ) -> Result<Arc<dyn aionui_ai_agent::agent_manager::IAgentManager>, AppError> {
+        Err(AppError::Internal("noop".into()))
+    }
+    fn kill(&self, _: &str, _: Option<AgentKillReason>) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn clear(&self) {}
+    fn active_count(&self) -> usize {
+        0
+    }
+    fn collect_idle(&self, _: TimestampMs) -> Vec<String> {
+        vec![]
+    }
+}
+
+async fn setup() -> (
+    ConversationService,
+    Arc<TestBroadcaster>,
+    Arc<dyn IWorkerTaskManager>,
+) {
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     let broadcaster = Arc::new(TestBroadcaster::new());
     let svc = ConversationService::new(repo, broadcaster.clone());
-    (svc, broadcaster)
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+    (svc, broadcaster, task_mgr)
 }
 
 const USER_ID: &str = "system_default_user";
@@ -57,7 +90,7 @@ fn make_create_req() -> CreateConversationRequest {
 
 #[tokio::test]
 async fn t1_1_create_with_defaults() {
-    let (svc, broadcaster) = setup().await;
+    let (svc, broadcaster, _task_mgr) = setup().await;
 
     let resp = svc.create(USER_ID, make_create_req()).await.unwrap();
 
@@ -87,7 +120,7 @@ async fn t1_1_create_with_defaults() {
 
 #[tokio::test]
 async fn t1_2_create_each_agent_type() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
 
     let types = vec![
         ("gemini", AgentType::Gemini),
@@ -112,7 +145,7 @@ async fn t1_2_create_each_agent_type() {
 
 #[tokio::test]
 async fn t1_3_create_with_optional_fields() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
@@ -134,7 +167,7 @@ async fn t1_3_create_with_optional_fields() {
 
 #[tokio::test]
 async fn t2_1_list_empty() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
     let result = svc
         .list(USER_ID, ListConversationsQuery::default())
         .await
@@ -146,7 +179,7 @@ async fn t2_1_list_empty() {
 
 #[tokio::test]
 async fn t2_2_list_basic() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
     for _ in 0..3 {
         svc.create(USER_ID, make_create_req()).await.unwrap();
     }
@@ -161,7 +194,7 @@ async fn t2_2_list_basic() {
 
 #[tokio::test]
 async fn t2_3_cursor_pagination() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
     for _ in 0..5 {
         svc.create(USER_ID, make_create_req()).await.unwrap();
     }
@@ -212,7 +245,7 @@ async fn t2_3_cursor_pagination() {
 
 #[tokio::test]
 async fn t2_4_source_filter() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
 
     // 2 aionui + 1 telegram
     svc.create(USER_ID, make_create_req()).await.unwrap();
@@ -238,7 +271,7 @@ async fn t2_4_source_filter() {
 
 #[tokio::test]
 async fn t2_5_pinned_filter() {
-    let (svc, _) = setup().await;
+    let (svc, _, task_mgr) = setup().await;
 
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     svc.create(USER_ID, make_create_req()).await.unwrap();
@@ -246,7 +279,9 @@ async fn t2_5_pinned_filter() {
     // Pin one
     let pin_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": true })).unwrap();
-    svc.update(USER_ID, &conv.id, pin_req).await.unwrap();
+    svc.update(USER_ID, &conv.id, pin_req, &task_mgr)
+        .await
+        .unwrap();
 
     let query = ListConversationsQuery {
         pinned: Some(true),
@@ -261,7 +296,7 @@ async fn t2_5_pinned_filter() {
 
 #[tokio::test]
 async fn t3_1_get_existing() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
     let created = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let fetched = svc.get(USER_ID, &created.id).await.unwrap();
@@ -273,7 +308,7 @@ async fn t3_1_get_existing() {
 
 #[tokio::test]
 async fn t3_2_get_not_found() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
     let err = svc.get(USER_ID, "non-existent-uuid").await.unwrap_err();
     assert!(matches!(err, aionui_common::AppError::NotFound(_)));
 }
@@ -282,13 +317,13 @@ async fn t3_2_get_not_found() {
 
 #[tokio::test]
 async fn t4_1_update_name() {
-    let (svc, broadcaster) = setup().await;
+    let (svc, broadcaster, task_mgr) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     broadcaster.take_events();
 
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "name": "New Name" })).unwrap();
-    let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
 
     assert_eq!(updated.name, "New Name");
     assert!(updated.modified_at >= conv.modified_at);
@@ -300,11 +335,11 @@ async fn t4_1_update_name() {
 
 #[tokio::test]
 async fn t4_2_pin_conversation() {
-    let (svc, _) = setup().await;
+    let (svc, _, task_mgr) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
 
     assert!(updated.pinned);
     assert!(updated.pinned_at.is_some());
@@ -312,25 +347,28 @@ async fn t4_2_pin_conversation() {
 
 #[tokio::test]
 async fn t4_3_unpin_clears_pinned_at() {
-    let (svc, _) = setup().await;
+    let (svc, _, task_mgr) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     // Pin
     let pin: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let pinned = svc.update(USER_ID, &conv.id, pin).await.unwrap();
+    let pinned = svc.update(USER_ID, &conv.id, pin, &task_mgr).await.unwrap();
     assert!(pinned.pinned_at.is_some());
 
     // Unpin
     let unpin: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": false })).unwrap();
-    let unpinned = svc.update(USER_ID, &conv.id, unpin).await.unwrap();
+    let unpinned = svc
+        .update(USER_ID, &conv.id, unpin, &task_mgr)
+        .await
+        .unwrap();
     assert!(!unpinned.pinned);
     assert!(unpinned.pinned_at.is_none());
 }
 
 #[tokio::test]
 async fn t4_4_extra_merge_preserves_existing_keys() {
-    let (svc, _) = setup().await;
+    let (svc, _, task_mgr) = setup().await;
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "gemini",
@@ -343,7 +381,10 @@ async fn t4_4_extra_merge_preserves_existing_keys() {
     // Update only workspace
     let update_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
-    let updated = svc.update(USER_ID, &conv.id, update_req).await.unwrap();
+    let updated = svc
+        .update(USER_ID, &conv.id, update_req, &task_mgr)
+        .await
+        .unwrap();
 
     assert_eq!(updated.extra["workspace"], "/new");
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
@@ -351,14 +392,14 @@ async fn t4_4_extra_merge_preserves_existing_keys() {
 
 #[tokio::test]
 async fn t4_5_update_model() {
-    let (svc, _) = setup().await;
+    let (svc, _, task_mgr) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({
         "model": { "provider_id": "p2", "model": "new-model" }
     }))
     .unwrap();
-    let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
 
     let model = updated.model.unwrap();
     assert_eq!(model.provider_id, "p2");
@@ -367,9 +408,12 @@ async fn t4_5_update_model() {
 
 #[tokio::test]
 async fn t4_6_update_not_found() {
-    let (svc, _) = setup().await;
+    let (svc, _, task_mgr) = setup().await;
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
-    let err = svc.update(USER_ID, "non-existent", req).await.unwrap_err();
+    let err = svc
+        .update(USER_ID, "non-existent", req, &task_mgr)
+        .await
+        .unwrap_err();
     assert!(matches!(err, aionui_common::AppError::NotFound(_)));
 }
 
@@ -377,7 +421,7 @@ async fn t4_6_update_not_found() {
 
 #[tokio::test]
 async fn t5_1_delete_conversation() {
-    let (svc, broadcaster) = setup().await;
+    let (svc, broadcaster, _task_mgr) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     broadcaster.take_events();
 
@@ -396,7 +440,7 @@ async fn t5_1_delete_conversation() {
 
 #[tokio::test]
 async fn t5_2_delete_then_get_returns_404() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     svc.delete(USER_ID, &conv.id).await.unwrap();
@@ -406,7 +450,7 @@ async fn t5_2_delete_then_get_returns_404() {
 
 #[tokio::test]
 async fn t5_3_delete_not_found() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
     let err = svc.delete(USER_ID, "non-existent").await.unwrap_err();
     assert!(matches!(err, aionui_common::AppError::NotFound(_)));
 }
@@ -415,7 +459,7 @@ async fn t5_3_delete_not_found() {
 
 #[tokio::test]
 async fn t11_1_create_broadcasts_created() {
-    let (svc, broadcaster) = setup().await;
+    let (svc, broadcaster, _task_mgr) = setup().await;
     let resp = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let events = broadcaster.take_events();
@@ -427,12 +471,12 @@ async fn t11_1_create_broadcasts_created() {
 
 #[tokio::test]
 async fn t11_2_update_broadcasts_updated() {
-    let (svc, broadcaster) = setup().await;
+    let (svc, broadcaster, task_mgr) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     broadcaster.take_events();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
-    svc.update(USER_ID, &conv.id, req).await.unwrap();
+    svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
 
     let events = broadcaster.take_events();
     assert_eq!(events[0].data["action"], "updated");
@@ -440,7 +484,7 @@ async fn t11_2_update_broadcasts_updated() {
 
 #[tokio::test]
 async fn t11_3_delete_broadcasts_deleted() {
-    let (svc, broadcaster) = setup().await;
+    let (svc, broadcaster, _task_mgr) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     broadcaster.take_events();
 
@@ -454,7 +498,7 @@ async fn t11_3_delete_broadcasts_deleted() {
 
 #[tokio::test]
 async fn t12_1_long_name() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
     let long_name = "x".repeat(1000);
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
@@ -470,7 +514,7 @@ async fn t12_1_long_name() {
 
 #[tokio::test]
 async fn t12_2_large_extra_json() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
 
     let large_extra = json!({
         "workspace": "/project",
@@ -497,7 +541,7 @@ async fn t12_2_large_extra_json() {
 
 #[tokio::test]
 async fn t12_3_concurrent_creates() {
-    let (svc, _) = setup().await;
+    let (svc, _, _task_mgr) = setup().await;
 
     let mut handles = vec![];
     for _ in 0..10 {
@@ -522,7 +566,7 @@ async fn t12_3_concurrent_creates() {
 
 #[tokio::test]
 async fn full_lifecycle_create_get_update_delete() {
-    let (svc, broadcaster) = setup().await;
+    let (svc, broadcaster, task_mgr) = setup().await;
 
     // Create
     let created = svc.create(USER_ID, make_create_req()).await.unwrap();
@@ -539,7 +583,10 @@ async fn full_lifecycle_create_get_update_delete() {
         "extra": { "workspace": "/updated" }
     }))
     .unwrap();
-    let updated = svc.update(USER_ID, &created.id, update_req).await.unwrap();
+    let updated = svc
+        .update(USER_ID, &created.id, update_req, &task_mgr)
+        .await
+        .unwrap();
     assert_eq!(updated.name, "Updated");
     assert!(updated.pinned);
     assert_eq!(updated.extra["workspace"], "/updated");
