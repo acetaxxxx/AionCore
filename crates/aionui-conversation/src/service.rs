@@ -14,7 +14,7 @@ use aionui_common::{
 };
 use aionui_db::{ConversationFilters, ConversationRowUpdate, IConversationRepository, SortOrder};
 use aionui_realtime::EventBroadcaster;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::convert::{
     row_to_message_response, row_to_response, search_row_to_item, string_to_enum,
@@ -131,11 +131,28 @@ impl ConversationService {
 
         let result = self.repo.list_paginated(user_id, &filters).await?;
 
+        // Tolerate per-row deserialization failures — a single legacy row
+        // (e.g. an abandoned agent_type='gemini' conversation post-migration)
+        // must not take down the whole listing. Skip-and-log is the
+        // explicit resilience contract from the Gemini→ACP migration spec.
         let items = result
             .items
             .into_iter()
-            .map(row_to_response)
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|row| {
+                let row_id = row.id.clone();
+                match row_to_response(row) {
+                    Ok(resp) => Some(resp),
+                    Err(err) => {
+                        warn!(
+                            conversation_id = %row_id,
+                            error = %err,
+                            "Skipping unreadable conversation row in list"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
 
         Ok(PaginatedResult {
             items,
