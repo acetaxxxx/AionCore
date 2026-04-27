@@ -35,7 +35,7 @@ impl SnapshotService {
 
         let content = tokio::fs::read_to_string(&index_path).await?;
         let mut snapshots: Vec<PreviewSnapshotInfoDto> = serde_json::from_str(&content)?;
-        snapshots.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        snapshots.sort_by_key(|a| a.created_at);
         Ok(snapshots)
     }
 
@@ -116,7 +116,7 @@ impl SnapshotService {
         dir: &Path,
         snapshots: &mut Vec<PreviewSnapshotInfoDto>,
     ) -> Result<(), OfficeError> {
-        snapshots.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        snapshots.sort_by_key(|a| a.created_at);
 
         while snapshots.len() > MAX_SNAPSHOTS {
             if let Some(oldest) = snapshots.first() {
