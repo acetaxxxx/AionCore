@@ -1752,6 +1752,55 @@ async fn create_writes_empty_skills_when_no_auto_inject_and_no_preset() {
 }
 
 #[tokio::test]
+async fn update_rejects_extra_skills() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": "/project", "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("u", req).await.unwrap();
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "skills": ["cron"] },
+    }))
+    .unwrap();
+    let err = svc
+        .update("u", &resp.id, update_req, &task_mgr)
+        .await
+        .unwrap_err();
+
+    match err {
+        AppError::BadRequest(msg) => assert!(msg.contains("skills"), "msg = {msg:?}"),
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn update_allows_other_extra_fields() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": "/project", "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("u", req).await.unwrap();
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "current_model_id": "claude-3-5-sonnet" },
+    }))
+    .unwrap();
+    let updated = svc
+        .update("u", &resp.id, update_req, &task_mgr)
+        .await
+        .unwrap();
+
+    assert_eq!(updated.extra["current_model_id"], "claude-3-5-sonnet");
+}
+
+#[tokio::test]
 async fn get_backfills_legacy_row_and_persists() {
     let resolver = Arc::new(FixedSkillResolver {
         names: vec!["cron".into(), "todo-tracker".into()],

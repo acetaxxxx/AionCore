@@ -297,6 +297,17 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
 
+        // Snapshot invariant: once written at create time, `extra.skills`
+        // must not be re-shaped by PATCH. The frontend must clone the
+        // conversation to produce a new snapshot.
+        if let Some(incoming) = &req.extra
+            && incoming.get("skills").is_some()
+        {
+            return Err(AppError::BadRequest(
+                "extra.skills is immutable post-creation".into(),
+            ));
+        }
+
         let now = now_ms();
 
         // Merge extra if provided
