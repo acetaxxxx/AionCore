@@ -6,9 +6,8 @@ use axum::extract::{Extension, Json, Path, State};
 use axum::routing::{get, post, put};
 
 use aionui_api_types::{
-    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AcpModeResponse, ApiResponse,
-    DetectCliRequest, DetectCliResponse, ProbeModelRequest, SetConfigOptionRequest, SetModeRequest,
-    SetModelRequest,
+    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, ApiResponse, DetectCliRequest,
+    DetectCliResponse, ProbeModelRequest, SetConfigOptionRequest, SetModelRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{AgentType, AppError};
@@ -37,10 +36,6 @@ pub fn acp_routes(state: AcpRouterState) -> Router {
         .route("/api/acp/env", get(get_env))
         .route("/api/acp/probe-model", post(probe_model))
         // Per-conversation ACP session routes
-        .route(
-            "/api/conversations/{id}/acp/mode",
-            get(get_mode).put(set_mode),
-        )
         .route(
             "/api/conversations/{id}/acp/model",
             get(get_model).put(set_model),
@@ -136,37 +131,6 @@ async fn probe_model(
 }
 
 // ── Per-conversation ACP session routes ──────────────────────────
-
-async fn get_mode(
-    State(state): State<AcpRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<AcpModeResponse>>, AppError> {
-    let handle = require_acp_task(&state, &id)?;
-    let acp = downcast_acp(&handle)?;
-    acp.get_mode().await?;
-    // The actual mode is returned via the event stream; provide best-effort sync state
-    Ok(Json(ApiResponse::ok(AcpModeResponse {
-        mode: String::new(),
-        initialized: acp.session_id().await.is_some(),
-    })))
-}
-
-async fn set_mode(
-    State(state): State<AcpRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
-    body: Result<Json<SetModeRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    if req.mode.trim().is_empty() {
-        return Err(AppError::BadRequest("mode must not be empty".into()));
-    }
-    let handle = require_acp_task(&state, &id)?;
-    let acp = downcast_acp(&handle)?;
-    acp.set_mode(&req.mode).await?;
-    Ok(Json(ApiResponse::success()))
-}
 
 async fn get_model(
     State(state): State<AcpRouterState>,

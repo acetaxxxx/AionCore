@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::routing::{get, post};
 
-use aionui_api_types::ApiResponse;
+use aionui_api_types::{AgentModeResponse, ApiResponse, SetModeRequest};
 use aionui_auth::CurrentUser;
 use aionui_common::{AgentType, AppError};
 use serde::{Deserialize, Serialize};
@@ -35,10 +36,47 @@ pub fn auxiliary_routes(state: AuxiliaryRouterState) -> Router {
             get(get_slash_commands),
         )
         .route(
+            "/api/conversations/{id}/mode",
+            get(get_agent_mode).put(set_agent_mode),
+        )
+        .route(
             "/api/conversations/{id}/openclaw/runtime",
             get(get_openclaw_runtime),
         )
         .with_state(state)
+}
+
+// ── Generic mode endpoints ────────────────────────────────────────
+
+async fn get_agent_mode(
+    State(state): State<AuxiliaryRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AgentModeResponse>>, AppError> {
+    let handle = state
+        .worker_task_manager
+        .get_task(&id)
+        .ok_or_else(|| AppError::NotFound(format!("No active agent for conversation '{id}'")))?;
+    let resp = handle.get_mode().await?;
+    Ok(Json(ApiResponse::ok(resp)))
+}
+
+async fn set_agent_mode(
+    State(state): State<AuxiliaryRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<SetModeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if req.mode.trim().is_empty() {
+        return Err(AppError::BadRequest("mode must not be empty".into()));
+    }
+    let handle = state
+        .worker_task_manager
+        .get_task(&id)
+        .ok_or_else(|| AppError::NotFound(format!("No active agent for conversation '{id}'")))?;
+    handle.set_mode(&req.mode).await?;
+    Ok(Json(ApiResponse::success()))
 }
 
 // ── Request / Response types ───────────────────────────────────────
