@@ -14,7 +14,7 @@ use aionui_common::{
 };
 use aionui_db::{ConversationFilters, ConversationRowUpdate, IConversationRepository, SortOrder};
 use aionui_realtime::EventBroadcaster;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::convert::{
     row_to_message_response, row_to_response, search_row_to_item, string_to_enum,
@@ -131,11 +131,28 @@ impl ConversationService {
 
         let result = self.repo.list_paginated(user_id, &filters).await?;
 
+        // Tolerate per-row deserialization failures — a single legacy row
+        // (e.g. an abandoned agent_type='gemini' conversation post-migration)
+        // must not take down the whole listing. Skip-and-log is the
+        // explicit resilience contract from the Gemini→ACP migration spec.
         let items = result
             .items
             .into_iter()
-            .map(row_to_response)
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|row| {
+                let row_id = row.id.clone();
+                match row_to_response(row) {
+                    Ok(resp) => Some(resp),
+                    Err(err) => {
+                        warn!(
+                            conversation_id = %row_id,
+                            error = %err,
+                            "Skipping unreadable conversation row in list"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
 
         Ok(PaginatedResult {
             items,
@@ -539,6 +556,20 @@ impl ConversationService {
                 AppError::NotFound(format!("Conversation {conversation_id} not found"))
             })?;
 
+        // Short-circuit for legacy Gemini conversations: the dedicated Gemini
+        // runtime has been removed, so we cannot build an agent for this row.
+        // Emit CONVERSATION_ARCHIVED (HTTP 410 Gone) without touching the
+        // legacy `model` column, which may hold shapes the new parser can't
+        // deserialize. The client identifies this case by `code` and renders
+        // a dedicated archived-conversation UI rather than a generic banner.
+        if row.r#type == "gemini" {
+            return Err(AppError::ConversationArchived(
+                "This conversation was created with the legacy Gemini runtime, which has been \
+                 removed. Please start a new conversation with the Gemini ACP backend to continue."
+                    .into(),
+            ));
+        }
+
         // Check if conversation is already processing (simple guard)
         let status: ConversationStatus = match row.status.as_deref() {
             None | Some("") => ConversationStatus::Finished,
@@ -722,7 +753,7 @@ impl ConversationService {
 
 /// Serialize a serde-compatible enum to its JSON string form for DB storage.
 ///
-/// e.g. `AgentType::Gemini` → `"gemini"`
+/// e.g. `AgentType::Acp` → `"acp"`
 fn enum_to_db<T: serde::Serialize>(val: &T) -> Result<String, AppError> {
     let json_val = serde_json::to_value(val)
         .map_err(|e| AppError::Internal(format!("Enum serialization failed: {e}")))?;
@@ -749,8 +780,8 @@ mod tests {
     #[test]
     fn enum_to_db_agent_type() {
         use aionui_common::AgentType;
-        assert_eq!(enum_to_db(&AgentType::Gemini).unwrap(), "gemini");
         assert_eq!(enum_to_db(&AgentType::Acp).unwrap(), "acp");
+        assert_eq!(enum_to_db(&AgentType::Nanobot).unwrap(), "nanobot");
         assert_eq!(
             enum_to_db(&AgentType::OpenclawGateway).unwrap(),
             "openclaw-gateway"

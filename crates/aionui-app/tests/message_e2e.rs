@@ -13,10 +13,10 @@ use common::{body_json, build_app, get_request, get_with_token, setup_and_login}
 
 fn create_conv_body(name: &str) -> serde_json::Value {
     json!({
-        "type": "gemini",
+        "type": "acp",
         "name": name,
         "model": { "provider_id": "p1", "model": "m1" },
-        "extra": { "workspace": "/project" }
+        "extra": { "workspace": "/project", "backend": "gemini" }
     })
 }
 
