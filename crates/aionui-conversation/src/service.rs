@@ -17,7 +17,8 @@ use aionui_realtime::EventBroadcaster;
 use tracing::{debug, info, warn};
 
 use crate::convert::{
-    row_to_message_response, row_to_response, search_row_to_item, string_to_enum,
+    row_to_message_response, row_to_response, row_to_response_with_extra, search_row_to_item,
+    string_to_enum,
 };
 use crate::skill_resolver::SkillResolver;
 use crate::stream_relay::StreamRelay;
@@ -218,7 +219,11 @@ impl ConversationService {
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
-        row_to_response(row)
+
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
+            .map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
+        self.backfill_extra_inplace(&row.id, &mut extra).await;
+        row_to_response_with_extra(row, extra)
     }
 
     /// List conversations with cursor-based pagination and optional filters.
@@ -241,24 +246,30 @@ impl ConversationService {
         // (e.g. an abandoned agent_type='gemini' conversation post-migration)
         // must not take down the whole listing. Skip-and-log is the
         // explicit resilience contract from the Gemini→ACP migration spec.
-        let items = result
-            .items
-            .into_iter()
-            .filter_map(|row| {
-                let row_id = row.id.clone();
-                match row_to_response(row) {
-                    Ok(resp) => Some(resp),
-                    Err(err) => {
-                        warn!(
-                            conversation_id = %row_id,
-                            error = %err,
-                            "Skipping unreadable conversation row in list"
-                        );
-                        None
-                    }
+        let mut items = Vec::with_capacity(result.items.len());
+        for row in result.items {
+            let row_id = row.id.clone();
+            let mut extra: serde_json::Value = match serde_json::from_str(&row.extra) {
+                Ok(v) => v,
+                Err(err) => {
+                    warn!(
+                        conversation_id = %row_id,
+                        error = %err,
+                        "Skipping unreadable conversation row in list"
+                    );
+                    continue;
                 }
-            })
-            .collect();
+            };
+            self.backfill_extra_inplace(&row_id, &mut extra).await;
+            match row_to_response_with_extra(row, extra) {
+                Ok(resp) => items.push(resp),
+                Err(err) => warn!(
+                    conversation_id = %row_id,
+                    error = %err,
+                    "Skipping unreadable conversation row in list"
+                ),
+            }
+        }
 
         Ok(PaginatedResult {
             items,
@@ -905,6 +916,44 @@ impl ConversationService {
         });
         let event = WebSocketMessage::new("conversation.listChanged", payload);
         self.broadcaster.broadcast(event);
+    }
+
+    /// Backfill `extra.skills` if the row predates the snapshot model.
+    /// Persists the mutation asynchronously; failures are logged and
+    /// swallowed so a read path never 500s because of a backfill write
+    /// failure.
+    async fn backfill_extra_inplace(
+        &self,
+        conversation_id: &str,
+        extra: &mut serde_json::Value,
+    ) {
+        let auto_inject = self.skill_resolver.auto_inject_names().await;
+        let mutated = crate::skill_snapshot::backfill_skills_if_missing(extra, &auto_inject);
+        if !mutated {
+            return;
+        }
+        let serialized = match serde_json::to_string(extra) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    conversation_id,
+                    error = %e,
+                    "backfill serialize failed; returning in-memory value"
+                );
+                return;
+            }
+        };
+        let update = ConversationRowUpdate {
+            extra: Some(serialized),
+            ..Default::default()
+        };
+        if let Err(e) = self.repo.update(conversation_id, &update).await {
+            warn!(
+                conversation_id,
+                error = %e,
+                "backfill persist failed; returning in-memory value"
+            );
+        }
     }
 }
 
