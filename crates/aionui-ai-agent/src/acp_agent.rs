@@ -325,7 +325,7 @@ impl AcpAgentManager {
                 enabled_skills: &self.config.enabled_skills,
                 exclude_builtin_skills: &self.config.exclude_builtin_skills,
                 native_skill_support: self.backend.native_skills_dirs().is_some(),
-                custom_workspace: self.config.custom_workspace,
+                custom_workspace: !self.workspace.contains("-temp-"),
             },
         )
         .await;
