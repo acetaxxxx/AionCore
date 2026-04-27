@@ -154,6 +154,7 @@ impl ConversationService {
         user_id: &str,
         id: &str,
         req: UpdateConversationRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, AppError> {
         let existing = self
             .repo
@@ -179,6 +180,11 @@ impl ConversationService {
         // Handle pinned_at: set timestamp on pin, clear on unpin
         let pinned_at = req.pinned.map(|p| if p { Some(now) } else { None });
 
+        let model_changed = req.model.as_ref().is_some_and(|new_model| {
+            let new_json = serde_json::to_string(new_model).unwrap_or_default();
+            existing.model.as_deref() != Some(new_json.as_str())
+        });
+
         let model_json = req
             .model
             .as_ref()
@@ -200,6 +206,10 @@ impl ConversationService {
         };
 
         self.repo.update(id, &updates).await?;
+
+        if model_changed {
+            let _ = task_manager.kill(id, None);
+        }
 
         // Re-fetch to return the updated version
         let updated = self

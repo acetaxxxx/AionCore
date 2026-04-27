@@ -49,8 +49,6 @@ pub enum AcpBackend {
     Claude,
     Gemini,
     Qwen,
-    #[serde(rename = "iFlow")]
-    IFlow,
     Codex,
     Codebuddy,
     Droid,
@@ -100,7 +98,6 @@ impl AcpBackend {
             AcpBackend::Claude => "Claude",
             AcpBackend::Gemini => "Gemini",
             AcpBackend::Qwen => "Qwen",
-            AcpBackend::IFlow => "iFlow",
             AcpBackend::Codex => "Codex",
             AcpBackend::Codebuddy => "CodeBuddy",
             AcpBackend::Droid => "Droid",
@@ -138,7 +135,6 @@ impl AcpBackend {
             AcpBackend::Vibe => Some("vibe"),
             AcpBackend::Hermes => Some("hermes"),
             AcpBackend::Snow => Some("snow"),
-            AcpBackend::IFlow => None,
         }
     }
 
@@ -166,8 +162,6 @@ impl AcpBackend {
             AcpBackend::Hermes => Some(&["acp"]),
             AcpBackend::Snow => Some(&["--acp"]),
             AcpBackend::Qwen => Some(&["--acp"]),
-            // Non-CLI backends
-            AcpBackend::IFlow => None,
         }
     }
 
@@ -332,8 +326,6 @@ pub enum McpSource {
     Claude,
     Gemini,
     Qwen,
-    #[serde(rename = "iflow")]
-    IFlow,
     Codex,
     #[serde(rename = "codebuddy")]
     CodeBuddy,
@@ -421,13 +413,6 @@ mod tests {
     }
 
     #[test]
-    fn test_acp_backend_iflow() {
-        let val = AcpBackend::IFlow;
-        let json = serde_json::to_string(&val).unwrap();
-        assert_eq!(json, r#""iFlow""#);
-    }
-
-    #[test]
     fn test_acp_backend_lowercase_variants() {
         let cases = [
             (AcpBackend::Claude, "claude"),
@@ -509,7 +494,6 @@ mod tests {
             (McpSource::Claude, r#""claude""#),
             (McpSource::Gemini, r#""gemini""#),
             (McpSource::Qwen, r#""qwen""#),
-            (McpSource::IFlow, r#""iflow""#),
             (McpSource::Codex, r#""codex""#),
             (McpSource::CodeBuddy, r#""codebuddy""#),
             (McpSource::OpenCode, r#""opencode""#),
@@ -553,14 +537,8 @@ mod tests {
     }
 
     #[test]
-    fn test_acp_backend_cli_binary_name_none() {
-        assert_eq!(AcpBackend::IFlow.binary_name(), None);
-    }
-
-    #[test]
     fn test_acp_backend_display_name() {
         assert_eq!(AcpBackend::Claude.display_name(), "Claude");
-        assert_eq!(AcpBackend::IFlow.display_name(), "iFlow");
         assert_eq!(AcpBackend::Codebuddy.display_name(), "CodeBuddy");
         assert_eq!(AcpBackend::Opencode.display_name(), "OpenCode");
     }

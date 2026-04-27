@@ -104,7 +104,7 @@ async fn update(
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let conversation = state
         .conversation_service
-        .update(&user.id, &id, req)
+        .update(&user.id, &id, req, &state.worker_task_manager)
         .await?;
     Ok(Json(ApiResponse::ok(conversation)))
 }
