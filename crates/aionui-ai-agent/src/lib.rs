@@ -16,7 +16,6 @@ pub mod connection_test_routes;
 pub mod connection_test_service;
 pub mod factory;
 pub mod first_message_injector;
-pub mod gemini_agent;
 pub mod idle_scanner;
 pub mod middleware;
 pub mod nanobot_agent;
@@ -46,7 +45,6 @@ pub use cli_process::CliAgentProcess;
 pub use connection_test_routes::{ConnectionTestRouterState, connection_test_routes};
 pub use connection_test_service::ConnectionTestService;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
-pub use gemini_agent::GeminiAgentManager;
 pub use idle_scanner::start_idle_scanner;
 pub use middleware::{
     CronCommand, CronCommandResult, CronCreateParams, ICronService, MessageMiddleware,
@@ -67,6 +65,6 @@ pub use stream_event::AgentStreamEvent;
 pub use task_manager::{AgentFactory, IWorkerTaskManager, WorkerTaskManagerImpl};
 pub use types::{
     AcpBuildExtra, AcpModelInfo, AcpSessionConfigOption, AionrsBuildExtra, AionrsCompatOverrides,
-    AionrsResolvedConfig, BuildTaskOptions, GeminiBuildExtra, OpenClawBuildExtra,
-    OpenClawGatewayConfig, RemoteBuildExtra, SendMessageData, SlashCommandItem,
+    AionrsResolvedConfig, BuildTaskOptions, OpenClawBuildExtra, OpenClawGatewayConfig,
+    RemoteBuildExtra, SendMessageData, SlashCommandItem,
 };

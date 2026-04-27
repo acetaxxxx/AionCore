@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use aionui_api_types::AgentModeResponse;
 use aionui_common::{
     AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs,
 };
@@ -73,6 +74,23 @@ pub trait IAgentManager: Send + Sync {
     /// - `reason: Some(IdleTimeout)` — idle cleanup
     /// - `reason: None` — explicit user/system kill
     fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError>;
+
+    /// Get the current session mode.
+    /// Default: returns "default" with initialized=false.
+    async fn get_mode(&self) -> Result<AgentModeResponse, AppError> {
+        Ok(AgentModeResponse {
+            mode: "default".into(),
+            initialized: false,
+        })
+    }
+
+    /// Set the session mode.
+    /// Default: returns error (unsupported).
+    async fn set_mode(&self, _mode: &str) -> Result<(), AppError> {
+        Err(AppError::BadRequest(
+            "Mode switching is not supported for this agent type".into(),
+        ))
+    }
 
     /// Downcast helper for accessing type-specific extensions.
     ///

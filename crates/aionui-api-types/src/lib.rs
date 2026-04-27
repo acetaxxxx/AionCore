@@ -24,7 +24,7 @@ mod team;
 mod websocket;
 
 pub use acp::{
-    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AcpModeResponse,
+    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AgentModeResponse,
     DetectCliRequest, DetectCliResponse, ProbeModelRequest, SetConfigOptionRequest, SetModeRequest,
     SetModelRequest, TestCustomAgentRequest, TestCustomAgentResponse,
 };
@@ -48,9 +48,7 @@ pub use channel::{
 pub use confirmation::{
     ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse,
 };
-pub use connection_test::{
-    GeminiSubscriptionData, GeminiSubscriptionQuery, TestBedrockConnectionRequest,
-};
+pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
     CloneConversationRequest, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse,

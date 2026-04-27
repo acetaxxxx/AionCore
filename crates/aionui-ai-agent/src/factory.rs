@@ -1,8 +1,9 @@
+use aion_agent::session::SessionManager;
 use aionui_common::{AcpBackend, AgentType, AppError, CommandSpec, now_ms};
 use aionui_db::{IProviderRepository, IRemoteAgentRepository};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::agent_manager::AgentManagerHandle;
 use crate::agent_registry::AgentRegistry;
@@ -11,11 +12,11 @@ use crate::skill_manager::AcpSkillManager;
 use crate::task_manager::AgentFactory;
 use crate::types::{
     AcpBuildExtra, AionrsBuildExtra, AionrsCompatOverrides, AionrsResolvedConfig, BuildTaskOptions,
-    GeminiBuildExtra, OpenClawBuildExtra, RemoteBuildExtra,
+    OpenClawBuildExtra, RemoteBuildExtra,
 };
 use crate::{
-    AcpAgentManager, AionrsAgentManager, GeminiAgentManager, NanobotAgentManager,
-    OpenClawAgentManager, RemoteAgentManager,
+    AcpAgentManager, AionrsAgentManager, NanobotAgentManager, OpenClawAgentManager,
+    RemoteAgentManager,
 };
 
 /// Dependencies needed by the agent factory to construct agents.
@@ -79,6 +80,11 @@ async fn build_agent(
     };
 
     match options.agent_type {
+        AgentType::Gemini => Err(AppError::ConversationArchived(
+            "This conversation was created with the legacy Gemini runtime, which has been \
+             removed. Please start a new conversation with the Gemini ACP backend to continue."
+                .into(),
+        )),
         AgentType::Acp => {
             let mut config: AcpBuildExtra = serde_json::from_value(options.extra)
                 .map_err(|e| AppError::BadRequest(format!("Invalid ACP build options: {e}")))?;
@@ -143,23 +149,6 @@ async fn build_agent(
             let arc = Arc::new(agent);
             arc.start_permission_handler();
             Ok(arc as AgentManagerHandle)
-        }
-        AgentType::Gemini => {
-            let config: GeminiBuildExtra = serde_json::from_value(options.extra)
-                .map_err(|e| AppError::BadRequest(format!("Invalid Gemini build options: {e}")))?;
-            // Gemini CLI path detected via `which gemini`
-            let cli_path = which::which("gemini")
-                .map(|p| p.to_string_lossy().into_owned())
-                .map_err(|_| AppError::BadRequest("Gemini CLI not found in PATH".into()))?;
-            let agent = GeminiAgentManager::new(
-                conversation_id,
-                workspace,
-                cli_path,
-                config,
-                Some(deps.skill_manager.clone()),
-            )
-            .await?;
-            Ok(Arc::new(agent) as AgentManagerHandle)
         }
         AgentType::OpenclawGateway => {
             let config: OpenClawBuildExtra =
@@ -244,6 +233,31 @@ async fn build_agent(
             let (base_url, compat_overrides) =
                 resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider);
 
+            let session_directory = deps.data_dir.join("aionrs-sessions");
+
+            let resume_session = {
+                let session_mgr = SessionManager::new(session_directory.clone(), 100);
+                match session_mgr.load(&conversation_id) {
+                    Ok(session) => {
+                        info!(
+                            conversation_id = %conversation_id,
+                            session_id = %session.id,
+                            message_count = session.messages.len(),
+                            "Loaded existing aionrs session for resume"
+                        );
+                        Some(session)
+                    }
+                    Err(e) => {
+                        debug!(
+                            conversation_id = %conversation_id,
+                            error = %e,
+                            "No existing aionrs session found, starting fresh"
+                        );
+                        None
+                    }
+                }
+            };
+
             let config = AionrsResolvedConfig {
                 provider,
                 api_key,
@@ -253,9 +267,12 @@ async fn build_agent(
                 max_tokens: overrides.max_tokens,
                 max_turns: overrides.max_turns,
                 compat_overrides,
+                session_directory,
+                session_mode: overrides.session_mode,
             };
 
-            let agent = AionrsAgentManager::new(conversation_id, workspace, config).await?;
+            let agent =
+                AionrsAgentManager::new(conversation_id, workspace, config, resume_session).await?;
             Ok(Arc::new(agent) as AgentManagerHandle)
         }
     }
