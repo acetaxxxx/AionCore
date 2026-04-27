@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acp_agent::AcpAgentManager;
 use crate::agent_manager::AgentManagerHandle;
-use crate::openclaw_agent::OpenClawAgentManager;
+use crate::openclaw::OpenClawAgentManager;
 use crate::task_manager::IWorkerTaskManager;
 use crate::types::SlashCommandItem;
 
