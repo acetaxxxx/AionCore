@@ -266,8 +266,6 @@ impl AcpAgentManager {
             &self.skill_manager,
             crate::first_message_injector::InjectionConfig {
                 preset_context: self.config.preset_context.as_deref(),
-                enabled_skills: &[],
-                exclude_builtin_skills: &[],
                 skills: &self.config.skills,
                 native_skill_support: self.backend.native_skills_dirs().is_some(),
                 custom_workspace: !self.workspace.contains("-temp-"),
