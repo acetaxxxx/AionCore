@@ -118,6 +118,7 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         max_turns: None,
         compat_overrides: Default::default(),
         session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
+        session_mode: None,
     }
 }
 

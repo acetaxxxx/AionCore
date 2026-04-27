@@ -171,6 +171,9 @@ pub struct AionrsBuildExtra {
     /// Max agentic turns.
     #[serde(default)]
     pub max_turns: Option<usize>,
+    /// Session mode (default, auto_edit, yolo).
+    #[serde(default)]
+    pub session_mode: Option<String>,
 }
 
 /// Provider-specific compat overrides resolved in the factory.
@@ -206,6 +209,8 @@ pub struct AionrsResolvedConfig {
     pub compat_overrides: AionrsCompatOverrides,
     /// Directory for aionrs session persistence files.
     pub session_directory: PathBuf,
+    /// Session mode (default, auto_edit, yolo).
+    pub session_mode: Option<String>,
 }
 
 fn default_aionrs_max_tokens() -> u32 {
