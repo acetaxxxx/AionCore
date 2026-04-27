@@ -7,6 +7,7 @@ use crate::stream_event::{
     TextEventData, ThinkingEventData, ToolCallEventData, ToolCallStatus,
 };
 
+#[derive(Default)]
 pub struct TextFallbackState {
     pub accumulated_text: String,
     pub agent_assistant_fallback: String,
@@ -18,14 +19,7 @@ pub struct TextFallbackState {
 
 impl TextFallbackState {
     pub fn new() -> Self {
-        Self {
-            accumulated_text: String::new(),
-            agent_assistant_fallback: String::new(),
-            turn_active: false,
-            current_msg_id: None,
-            current_run_id: None,
-            current_session_key: None,
-        }
+        Self::default()
     }
 
     pub fn reset_for_new_turn(&mut self) {
@@ -187,15 +181,13 @@ fn map_agent_event(
             vec![]
         }
         "lifecycle" => {
-            if let Some(phase) = data.get("phase").and_then(|v| v.as_str()) {
-                if phase == "start" {
-                    return vec![AgentStreamEvent::AgentStatus(AgentStatusEventData {
-                        backend: "openclaw-gateway".into(),
-                        status: "session_active".into(),
-                        agent_name: None,
-                        session_id: agent_evt.session_key,
-                    })];
-                }
+            if data.get("phase").and_then(|v| v.as_str()) == Some("start") {
+                return vec![AgentStreamEvent::AgentStatus(AgentStatusEventData {
+                    backend: "openclaw-gateway".into(),
+                    status: "session_active".into(),
+                    agent_name: None,
+                    session_id: agent_evt.session_key,
+                })];
             }
             vec![]
         }

@@ -157,7 +157,7 @@ async fn build_agent(
                 })?;
             let agent = OpenClawAgentManager::new(conversation_id, workspace, config).await?;
             let arc = Arc::new(agent);
-            arc.start_relay();
+            arc.start_event_relay();
             Ok(arc as AgentManagerHandle)
         }
         AgentType::Nanobot => {
