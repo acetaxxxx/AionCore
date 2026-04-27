@@ -88,8 +88,9 @@ pub struct OpenClawGatewayConfig {
 /// OpenClaw-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenClawBuildExtra {
-    /// ACP sub-backend identifier.
-    pub backend: AcpBackend,
+    /// Optional downstream AI backend (informational only).
+    #[serde(default)]
+    pub backend: Option<AcpBackend>,
     /// Agent name.
     #[serde(default)]
     pub agent_name: Option<String>,

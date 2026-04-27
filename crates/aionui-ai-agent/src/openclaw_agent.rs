@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use aionui_common::{
-    AcpBackend, AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus,
+    AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus,
     TimestampMs, now_ms,
 };
 use serde_json::{Value, json};
@@ -40,7 +40,6 @@ struct OpenClawState {
 pub struct OpenClawAgentManager {
     conversation_id: String,
     workspace: String,
-    backend: AcpBackend,
     config: OpenClawBuildExtra,
     process: Arc<CliAgentProcess>,
     event_tx: broadcast::Sender<AgentStreamEvent>,
@@ -70,12 +69,9 @@ impl OpenClawAgentManager {
             .expect("Initial receiver should be available immediately after spawn");
         let (event_tx, _) = broadcast::channel(256);
 
-        let backend = config.backend;
-
         Ok(Self {
             conversation_id,
             workspace,
-            backend,
             config,
             process: Arc::new(process),
             event_tx,
@@ -125,7 +121,11 @@ impl OpenClawAgentManager {
 
         CommandSpec {
             command: cli_path.into(),
-            args: vec![],
+            args: vec![
+                "gateway".into(),
+                "--port".into(),
+                port.to_string(),
+            ],
             env,
             cwd: Some(workspace.to_owned()),
         }
@@ -245,7 +245,7 @@ impl OpenClawAgentManager {
 
         json!({
             "workspace": self.workspace,
-            "backend": serde_json::to_value(self.backend).unwrap_or_default(),
+            "backend": serde_json::to_value(self.config.backend).unwrap_or_default(),
             "agentName": self.config.agent_name,
             "cliPath": self.config.gateway.cli_path,
             "gatewayHost": host,
