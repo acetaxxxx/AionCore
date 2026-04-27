@@ -20,6 +20,7 @@ use tracing::{debug, error, info};
 
 use crate::agent_manager::IAgentManager;
 use crate::backend_output_sink::BackendOutputSink;
+use crate::backend_protocol_sink::BackendProtocolSink;
 use crate::stream_event::AgentStreamEvent;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
@@ -33,6 +34,7 @@ pub struct AionrsAgentManager {
     mcp_managers: Vec<Arc<McpManager>>,
     status: RwLock<Option<ConversationStatus>>,
     approval_manager: Arc<ToolApprovalManager>,
+    confirmations: Arc<std::sync::RwLock<Vec<Confirmation>>>,
 }
 
 impl AionrsAgentManager {
@@ -142,6 +144,11 @@ impl AionrsAgentManager {
             );
         }
 
+        let confirmations = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let protocol_sink = BackendProtocolSink::new(event_tx.clone(), confirmations.clone());
+        engine.set_approval_manager(approval_manager.clone());
+        engine.set_protocol_writer(Arc::new(protocol_sink));
+
         Ok(Self {
             conversation_id,
             workspace,
@@ -151,6 +158,7 @@ impl AionrsAgentManager {
             mcp_managers: result.mcp_managers,
             status: RwLock::new(Some(ConversationStatus::Pending)),
             approval_manager,
+            confirmations,
         })
     }
 }
@@ -246,6 +254,9 @@ impl IAgentManager for AionrsAgentManager {
             conversation_id = %self.conversation_id,
             "Aionrs stop requested"
         );
+        if let Ok(mut confs) = self.confirmations.write() {
+            confs.clear();
+        }
         let _ = self.event_tx.send(AgentStreamEvent::Error(
             crate::stream_event::ErrorEventData {
                 message: "Stopped by user".into(),
@@ -268,6 +279,10 @@ impl IAgentManager for AionrsAgentManager {
         _data: Value,
         always_allow: bool,
     ) -> Result<(), AppError> {
+        if let Ok(mut confs) = self.confirmations.write() {
+            confs.retain(|c| c.call_id != call_id);
+        }
+
         let scope = if always_allow {
             aion_protocol::commands::ApprovalScope::Always
         } else {
@@ -284,7 +299,10 @@ impl IAgentManager for AionrsAgentManager {
     }
 
     fn get_confirmations(&self) -> Vec<Confirmation> {
-        Vec::new()
+        self.confirmations
+            .read()
+            .map(|c| c.clone())
+            .unwrap_or_default()
     }
 
     fn check_approval(&self, action: &str, _command_type: Option<&str>) -> bool {
