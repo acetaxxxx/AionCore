@@ -94,12 +94,20 @@ impl ConversationService {
             .is_empty()
         {
             let agent_type_label = match req.r#type {
-                aionui_common::AgentType::Acp => "acp".to_owned(),
+                aionui_common::AgentType::Acp => {
+                    let backend = extra.get("backend").and_then(|v| {
+                        serde_json::from_value::<aionui_common::AcpBackend>(v.clone()).ok()
+                    });
+                    match backend {
+                        Some(b) => b.display_name().to_lowercase(),
+                        None => "acp".to_owned(),
+                    }
+                }
+                aionui_common::AgentType::OpenclawGateway => "openclaw".to_owned(),
                 ref t => format!("{:?}", t).to_lowercase(),
             };
             let ws_path = self
                 .workspace_root
-                .join("tmp")
                 .join(format!("{}-temp-{}", agent_type_label, now));
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| AppError::Internal(format!("Failed to create workspace: {e}")))?;
