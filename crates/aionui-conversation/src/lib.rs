@@ -2,6 +2,7 @@
 mod convert;
 pub mod routes;
 pub mod service;
+pub mod skill_snapshot;
 pub mod state;
 pub mod stream_relay;
 
