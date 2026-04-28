@@ -1,8 +1,11 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use aionui_ai_agent::IWorkerTaskManager;
+use aionui_ai_agent::{
+    CronCommandResult, CronCreateParams, CronUpdateParams, ICronService, IWorkerTaskManager,
+};
 use aionui_ai_agent::agent_manager::{AgentManagerHandle, IAgentManager};
-use aionui_ai_agent::stream_event::AgentStreamEvent;
+use aionui_ai_agent::stream_event::{AgentStreamEvent, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery,
@@ -791,6 +794,7 @@ async fn clone_strips_cron_job_id_by_default() {
 
     // cronJobId should not be carried over
     assert!(cloned.extra.get("cronJobId").is_none());
+    assert!(cloned.extra.get("cron_job_id").is_none());
 }
 
 #[tokio::test]
@@ -818,6 +822,35 @@ async fn clone_with_migrate_cron_preserves_cron_job_id() {
     let cloned = svc.clone_create("user_1", clone_req).await.unwrap();
 
     assert_eq!(cloned.extra["cronJobId"], "cron_1");
+    assert_eq!(cloned.extra["cron_job_id"], "cron_1");
+}
+
+#[tokio::test]
+async fn clone_with_migrate_cron_preserves_snake_case_cron_job_id() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    let source_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "model": { "provider_id": "p1", "model": "m1" },
+        "extra": { "workspace": "/p", "cron_job_id": "cron_2" }
+    }))
+    .unwrap();
+    let source = svc.create("user_1", source_req).await.unwrap();
+
+    let clone_req: CloneConversationRequest = serde_json::from_value(json!({
+        "source_conversation_id": source.id,
+        "conversation": {
+            "type": "acp",
+            "model": { "provider_id": "p1", "model": "m1" },
+            "extra": {}
+        },
+        "migrate_cron": true
+    }))
+    .unwrap();
+    let cloned = svc.clone_create("user_1", clone_req).await.unwrap();
+
+    assert_eq!(cloned.extra["cronJobId"], "cron_2");
+    assert_eq!(cloned.extra["cron_job_id"], "cron_2");
 }
 
 // ── Reset tests ───────────────────────────────────────────────────
@@ -1133,6 +1166,143 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
     }
 }
 
+struct ScriptedAgent {
+    conversation_id: String,
+    event_tx: broadcast::Sender<AgentStreamEvent>,
+    scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
+    sent_contents: Mutex<Vec<String>>,
+}
+
+impl ScriptedAgent {
+    fn new(conversation_id: &str, scripts: Vec<Vec<AgentStreamEvent>>) -> Self {
+        let (event_tx, _) = broadcast::channel(64);
+        Self {
+            conversation_id: conversation_id.to_owned(),
+            event_tx,
+            scripts: Mutex::new(VecDeque::from(scripts)),
+            sent_contents: Mutex::new(vec![]),
+        }
+    }
+
+    fn sent_contents(&self) -> Vec<String> {
+        self.sent_contents.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentManager for ScriptedAgent {
+    fn agent_type(&self) -> AgentType {
+        AgentType::Acp
+    }
+
+    fn status(&self) -> Option<ConversationStatus> {
+        Some(ConversationStatus::Finished)
+    }
+
+    fn workspace(&self) -> &str {
+        "/tmp/test"
+    }
+
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+
+    fn last_activity_at(&self) -> TimestampMs {
+        0
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+        self.event_tx.subscribe()
+    }
+
+    async fn send_message(&self, data: SendMessageData) -> Result<(), AppError> {
+        self.sent_contents.lock().unwrap().push(data.content);
+        let script = self
+            .scripts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![AgentStreamEvent::Finish(FinishEventData::default())]);
+        for event in script {
+            let _ = self.event_tx.send(event);
+        }
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn confirm(
+        &self,
+        _msg_id: &str,
+        _call_id: &str,
+        _data: serde_json::Value,
+        _always_allow: bool,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn get_confirmations(&self) -> Vec<Confirmation> {
+        vec![]
+    }
+
+    fn check_approval(&self, _action: &str, _command_type: Option<&str>) -> bool {
+        false
+    }
+
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct MockCronContinuationService;
+
+#[async_trait::async_trait]
+impl ICronService for MockCronContinuationService {
+    async fn create_job(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        params: &CronCreateParams,
+    ) -> CronCommandResult {
+        CronCommandResult {
+            success: true,
+            message: format!("Created cron job '{}'", params.name),
+        }
+    }
+
+    async fn update_job(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _params: &CronUpdateParams,
+    ) -> CronCommandResult {
+        CronCommandResult {
+            success: true,
+            message: "Updated cron job".into(),
+        }
+    }
+
+    async fn list_jobs(&self, _user_id: &str, _conversation_id: &str) -> CronCommandResult {
+        CronCommandResult {
+            success: true,
+            message: "No scheduled tasks".into(),
+        }
+    }
+
+    async fn delete_job(&self, _user_id: &str, _job_id: &str) -> CronCommandResult {
+        CronCommandResult {
+            success: true,
+            message: "Deleted cron job".into(),
+        }
+    }
+}
+
 // ── send_message tests ──────────────────────────────────────────
 
 fn make_send_req() -> SendMessageRequest {
@@ -1274,6 +1444,74 @@ async fn send_message_persists_factory_resolved_workspace() {
     // Verify the workspace was written back.
     let updated = svc.get("user_1", &conv.id).await.unwrap();
     assert_eq!(updated.extra["workspace"], auto_workspace);
+}
+
+#[tokio::test]
+async fn send_message_continues_cron_system_responses() {
+    let (svc, broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![
+            vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "I'll check. [CRON_LIST]".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ],
+            vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "[CRON_CREATE]\nname: Daily Greeting\nschedule: 0 9 * * *\nschedule_description: Daily at 9:00 AM\nmessage: Say good morning\n[/CRON_CREATE]".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ],
+            vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "Done. The task is scheduled.".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ],
+        ],
+    ));
+    task_mgr.insert_agent(&conv.id, scripted_agent.clone());
+    svc.set_cron_service(Some(Arc::new(MockCronContinuationService)));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let req: SendMessageRequest = serde_json::from_value(json!({
+        "content": "Create the task now",
+        "msg_id": "msg-1"
+    }))
+    .unwrap();
+
+    svc.send_message("user_1", &conv.id, req, &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if scripted_agent.sent_contents().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let sends = scripted_agent.sent_contents();
+    assert_eq!(sends.len(), 3);
+    assert_eq!(sends[0], "Create the task now");
+    assert_eq!(sends[1], "[System: No scheduled tasks]");
+    assert_eq!(sends[2], "[System: Created cron job 'Daily Greeting']");
+
+    let finished = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(finished.status, ConversationStatus::Finished);
+
+    let events = broadcaster.take_events();
+    let turn_completed = events.iter().filter(|evt| evt.name == "turn.completed").count();
+    assert_eq!(turn_completed, 1);
 }
 
 // ── stop_stream tests ───────────────────────────────────────────

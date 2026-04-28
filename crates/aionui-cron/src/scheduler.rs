@@ -88,6 +88,9 @@ pub fn validate_schedule(schedule: &CronSchedule) -> Result<(), CronError> {
             Ok(())
         }
         CronSchedule::Cron { expr, tz, .. } => {
+            if expr.trim().is_empty() {
+                return Ok(());
+            }
             validate_cron_expression(expr)?;
             if let Some(tz_str) = tz {
                 validate_timezone(tz_str)?;
@@ -394,6 +397,17 @@ mod tests {
             description: None,
         };
         assert!(validate_schedule(&s).is_ok());
+    }
+
+    #[test]
+    fn validate_cron_empty_expr_is_manual_only() {
+        let s = CronSchedule::Cron {
+            expr: String::new(),
+            tz: None,
+            description: Some("manual".into()),
+        };
+        assert!(validate_schedule(&s).is_ok());
+        assert_eq!(compute_next_run(&s, 1000), None);
     }
 
     #[test]

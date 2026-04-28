@@ -259,6 +259,30 @@ async fn filter_by_cron_job_id() {
     assert_eq!(result.items[0].id, c1.id);
 }
 
+#[tokio::test]
+async fn filter_by_cron_job_id_accepts_snake_case_extra() {
+    let (repo, _db) = setup().await;
+
+    let mut c1 = make_conversation("cron-snake");
+    c1.extra = r#"{"cron_job_id":"cron_123","workspace":"/p"}"#.to_string();
+    repo.create(&c1).await.unwrap();
+
+    let result = repo
+        .list_paginated(
+            USER_ID,
+            &ConversationFilters {
+                cron_job_id: Some("cron_123".to_string()),
+                limit: 20,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].id, c1.id);
+}
+
 // ── Extended queries ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -294,6 +318,22 @@ async fn list_by_cron_job_returns_matching() {
     let mut c3 = make_conversation("cron3");
     c3.extra = r#"{"cronJobId":"job_y","workspace":"/c"}"#.to_string();
     repo.create(&c3).await.unwrap();
+
+    let result = repo.list_by_cron_job(USER_ID, "job_x").await.unwrap();
+    assert_eq!(result.len(), 2);
+}
+
+#[tokio::test]
+async fn list_by_cron_job_accepts_mixed_key_formats() {
+    let (repo, _db) = setup().await;
+
+    let mut c1 = make_conversation("cron-old");
+    c1.extra = r#"{"cronJobId":"job_x","workspace":"/a"}"#.to_string();
+    repo.create(&c1).await.unwrap();
+
+    let mut c2 = make_conversation("cron-new");
+    c2.extra = r#"{"cron_job_id":"job_x","workspace":"/b"}"#.to_string();
+    repo.create(&c2).await.unwrap();
 
     let result = repo.list_by_cron_job(USER_ID, "job_x").await.unwrap();
     assert_eq!(result.len(), 2);

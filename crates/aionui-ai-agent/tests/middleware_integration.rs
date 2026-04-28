@@ -6,8 +6,9 @@
 //! - MessageMiddleware pipeline end-to-end
 
 use aionui_ai_agent::{
-    CronCommand, CronCommandResult, CronCreateParams, ICronService, MessageMiddleware,
-    detect_cron_commands, has_cron_commands, strip_cron_commands, strip_think_tags,
+    CronCommand, CronCommandResult, CronCreateParams, CronUpdateParams, ICronService,
+    MessageMiddleware, detect_cron_commands, has_cron_commands, strip_cron_commands,
+    strip_think_tags,
 };
 use async_trait::async_trait;
 
@@ -98,6 +99,23 @@ fn detect_cron_list() {
 }
 
 #[test]
+fn detect_cron_update_with_all_fields() {
+    let input = "[CRON_UPDATE: job-456]\nname: 更新后的任务\nschedule: 0 10 * * MON\nschedule_description: 每周一上午 10 点\nmessage: 请发送更新后的提醒\n[/CRON_UPDATE]";
+    let commands = detect_cron_commands(input);
+    assert_eq!(commands.len(), 1);
+    match &commands[0] {
+        CronCommand::Update(params) => {
+            assert_eq!(params.job_id, "job-456");
+            assert_eq!(params.name, "更新后的任务");
+            assert_eq!(params.schedule, "0 10 * * MON");
+            assert_eq!(params.schedule_description, "每周一上午 10 点");
+            assert_eq!(params.message, "请发送更新后的提醒");
+        }
+        _ => panic!("Expected Update"),
+    }
+}
+
+#[test]
 fn detect_cron_delete_with_id() {
     let input = "[CRON_DELETE: job-123]";
     let commands = detect_cron_commands(input);
@@ -107,12 +125,13 @@ fn detect_cron_delete_with_id() {
 
 #[test]
 fn detect_mixed_content_with_cron() {
-    let input = "Here's what I did:\n\n[CRON_CREATE]\nname: cleanup\nschedule: 0 0 * * *\nschedule_description: daily midnight\nmessage: clean old files\n[/CRON_CREATE]\n\nAlso check: [CRON_LIST]\n\nAnd remove old one: [CRON_DELETE: old-123]";
+    let input = "Here's what I did:\n\n[CRON_CREATE]\nname: cleanup\nschedule: 0 0 * * *\nschedule_description: daily midnight\nmessage: clean old files\n[/CRON_CREATE]\n\nThen updated one:\n[CRON_UPDATE: job-22]\nname: cleanup-v2\nschedule: 0 1 * * *\nschedule_description: daily 1am\nmessage: clean old files carefully\n[/CRON_UPDATE]\n\nAlso check: [CRON_LIST]\n\nAnd remove old one: [CRON_DELETE: old-123]";
     let commands = detect_cron_commands(input);
-    assert_eq!(commands.len(), 3);
+    assert_eq!(commands.len(), 4);
     assert!(matches!(&commands[0], CronCommand::Create(_)));
-    assert_eq!(commands[1], CronCommand::List);
-    assert_eq!(commands[2], CronCommand::Delete("old-123".to_string()));
+    assert!(matches!(&commands[1], CronCommand::Update(_)));
+    assert_eq!(commands[2], CronCommand::List);
+    assert_eq!(commands[3], CronCommand::Delete("old-123".to_string()));
 }
 
 #[test]
@@ -126,6 +145,9 @@ fn has_cron_detects_all_types() {
     assert!(has_cron_commands(
         "[CRON_CREATE]\nschedule: *\n[/CRON_CREATE]"
     ));
+    assert!(has_cron_commands(
+        "[CRON_UPDATE: job-1]\nschedule: *\n[/CRON_UPDATE]"
+    ));
     assert!(has_cron_commands("[CRON_LIST]"));
     assert!(has_cron_commands("[CRON_DELETE: x]"));
     assert!(!has_cron_commands("nothing here"));
@@ -133,7 +155,7 @@ fn has_cron_detects_all_types() {
 
 #[test]
 fn strip_cron_removes_all_types_preserves_text() {
-    let input = "Before\n[CRON_CREATE]\nname: t\nschedule: *\n[/CRON_CREATE]\nMiddle [CRON_LIST] After [CRON_DELETE: x] End";
+    let input = "Before\n[CRON_CREATE]\nname: t\nschedule: *\n[/CRON_CREATE]\nMiddle [CRON_LIST] After [CRON_DELETE: x] Between [CRON_UPDATE: id-7]\nname: t2\nschedule: 0 * * * *\n[/CRON_UPDATE] End";
     let stripped = strip_cron_commands(input);
     assert!(!stripped.contains("[CRON_"));
     assert!(stripped.contains("Before"));
@@ -195,10 +217,28 @@ impl ICronService for TrackingCronService {
         }
     }
 
-    async fn list_jobs(&self, _user_id: &str) -> CronCommandResult {
+    async fn update_job(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+        params: &CronUpdateParams,
+    ) -> CronCommandResult {
         CronCommandResult {
             success: true,
-            message: "Active jobs: daily-check (0 9 * * *)".to_string(),
+            message: format!(
+                "Job '{}' updated in conversation '{}'",
+                params.job_id, conversation_id
+            ),
+        }
+    }
+
+    async fn list_jobs(&self, _user_id: &str, conversation_id: &str) -> CronCommandResult {
+        CronCommandResult {
+            success: true,
+            message: format!(
+                "Active jobs for '{}': daily-check (0 9 * * *)",
+                conversation_id
+            ),
         }
     }
 
@@ -227,7 +267,19 @@ impl ICronService for FailingCronService {
         }
     }
 
-    async fn list_jobs(&self, _user_id: &str) -> CronCommandResult {
+    async fn update_job(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _params: &CronUpdateParams,
+    ) -> CronCommandResult {
+        CronCommandResult {
+            success: false,
+            message: "Update rejected".to_string(),
+        }
+    }
+
+    async fn list_jobs(&self, _user_id: &str, _conversation_id: &str) -> CronCommandResult {
         CronCommandResult {
             success: false,
             message: "Service unavailable".to_string(),
@@ -280,7 +332,19 @@ async fn middleware_executes_cron_list() {
 
     assert!(!result.message.contains("[CRON_LIST]"));
     assert_eq!(result.system_responses.len(), 1);
-    assert!(result.system_responses[0].contains("Active jobs"));
+    assert!(result.system_responses[0].contains("Active jobs for 'c1'"));
+}
+
+#[tokio::test]
+async fn middleware_executes_cron_update() {
+    let mw = MessageMiddleware::new(Some(Box::new(TrackingCronService)));
+    let input = "Updating it now. [CRON_UPDATE: job-42]\nname: renamed\nschedule: 0 8 * * *\nschedule_description: Daily at 8am\nmessage: New prompt\n[/CRON_UPDATE]";
+    let result = mw.process(input, "u1", "c1").await;
+
+    assert!(!result.message.contains("[CRON_UPDATE"));
+    assert_eq!(result.system_responses.len(), 1);
+    assert!(result.system_responses[0].contains("job-42"));
+    assert!(result.system_responses[0].contains("c1"));
 }
 
 #[tokio::test]
@@ -297,12 +361,12 @@ async fn middleware_executes_cron_delete() {
 #[tokio::test]
 async fn middleware_handles_cron_failure() {
     let mw = MessageMiddleware::new(Some(Box::new(FailingCronService)));
-    let input = "[CRON_DELETE: x]";
+    let input = "[CRON_UPDATE: x]\nname: renamed\nschedule: 0 8 * * *\nschedule_description: Daily at 8am\nmessage: New prompt\n[/CRON_UPDATE]";
     let result = mw.process(input, "u1", "c1").await;
 
     assert_eq!(result.system_responses.len(), 1);
     assert!(result.system_responses[0].contains("System Error"));
-    assert!(result.system_responses[0].contains("Permission denied"));
+    assert!(result.system_responses[0].contains("Update rejected"));
 }
 
 #[tokio::test]
@@ -335,8 +399,8 @@ async fn middleware_combined_think_tags_and_cron_commands() {
 #[tokio::test]
 async fn middleware_multiple_cron_commands_all_executed() {
     let mw = MessageMiddleware::new(Some(Box::new(TrackingCronService)));
-    let input = "[CRON_CREATE]\nname: job1\nschedule: 0 * * * *\n[/CRON_CREATE] and [CRON_LIST] and [CRON_DELETE: old]";
+    let input = "[CRON_CREATE]\nname: job1\nschedule: 0 * * * *\n[/CRON_CREATE] and [CRON_UPDATE: old]\nname: job2\nschedule: 0 1 * * *\nschedule_description: daily 1am\nmessage: New prompt\n[/CRON_UPDATE] and [CRON_LIST] and [CRON_DELETE: old]";
     let result = mw.process(input, "u1", "c1").await;
 
-    assert_eq!(result.system_responses.len(), 3);
+    assert_eq!(result.system_responses.len(), 4);
 }

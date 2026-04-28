@@ -26,6 +26,7 @@ fn make_paths(base: &Path) -> SkillPaths {
     SkillPaths {
         data_dir: base.to_path_buf(),
         user_skills_dir: base.join("skills"),
+        cron_skills_dir: base.join("cron").join("skills"),
         builtin_skills_dir: base.join("builtin-skills"),
         builtin_rules_dir: base.join("builtin-rules"),
         assistant_rules_dir: base.join("assistant-rules"),

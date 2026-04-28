@@ -50,9 +50,9 @@ pub use connection_test_service::ConnectionTestService;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
 pub use idle_scanner::start_idle_scanner;
 pub use middleware::{
-    CronCommand, CronCommandResult, CronCreateParams, ICronService, MessageMiddleware,
-    MiddlewareResult, detect_cron_commands, has_cron_commands, strip_cron_commands,
-    strip_think_tags,
+    CronCommand, CronCommandResult, CronCreateParams, CronUpdateParams, ICronService,
+    MessageMiddleware, MiddlewareResult, detect_cron_commands, has_cron_commands,
+    strip_cron_commands, strip_think_tags,
 };
 pub use nanobot_agent::NanobotAgentManager;
 pub use openclaw::OpenClawAgentManager;

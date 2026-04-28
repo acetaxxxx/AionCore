@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::{BuildTaskOptions, IWorkerTaskManager, SendMessageData};
+use aionui_ai_agent::{BuildTaskOptions, ICronService, IWorkerTaskManager, SendMessageData};
 use aionui_api_types::{
     ApprovalCheckResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationListResponse, ConversationResponse, CreateConversationRequest,
@@ -23,6 +23,8 @@ use crate::convert::{
 use crate::skill_resolver::SkillResolver;
 use crate::stream_relay::StreamRelay;
 
+const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
+
 #[async_trait::async_trait]
 pub trait OnConversationDelete: Send + Sync {
     async fn on_conversation_deleted(&self, conversation_id: &str);
@@ -35,6 +37,7 @@ pub struct ConversationService {
     delete_hooks: Vec<Arc<dyn OnConversationDelete>>,
     workspace_root: std::path::PathBuf,
     skill_resolver: Arc<dyn SkillResolver>,
+    cron_service: Arc<std::sync::RwLock<Option<Arc<dyn ICronService>>>>,
 }
 
 impl ConversationService {
@@ -49,6 +52,7 @@ impl ConversationService {
             delete_hooks: Vec::new(),
             workspace_root: std::path::PathBuf::from("data"),
             skill_resolver,
+            cron_service: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -64,6 +68,7 @@ impl ConversationService {
             delete_hooks: Vec::new(),
             workspace_root,
             skill_resolver,
+            cron_service: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -79,6 +84,13 @@ impl ConversationService {
             delete_hooks,
             workspace_root: std::path::PathBuf::from("data"),
             skill_resolver,
+            cron_service: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    pub fn set_cron_service(&self, cron_service: Option<Arc<dyn ICronService>>) {
+        if let Ok(mut guard) = self.cron_service.write() {
+            *guard = cron_service;
         }
     }
 
@@ -466,11 +478,25 @@ impl ConversationService {
             let mut merged = source_extra;
             merge_json(&mut merged, &create_req.extra);
 
-            // Handle cronJobId migration
-            if req.migrate_cron != Some(true)
-                && let Some(obj) = merged.as_object_mut()
-            {
-                obj.remove("cronJobId");
+            // Handle cron job binding migration across both legacy and new keys.
+            if let Some(obj) = merged.as_object_mut() {
+                if req.migrate_cron == Some(true) {
+                    let cron_job_id = obj
+                        .get("cron_job_id")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| obj.get("cronJobId").and_then(|value| value.as_str()))
+                        .map(ToOwned::to_owned);
+                    if let Some(cron_job_id) = cron_job_id {
+                        obj.insert(
+                            "cron_job_id".into(),
+                            serde_json::Value::String(cron_job_id.clone()),
+                        );
+                        obj.insert("cronJobId".into(), serde_json::Value::String(cron_job_id));
+                    }
+                } else {
+                    obj.remove("cron_job_id");
+                    obj.remove("cronJobId");
+                }
             }
 
             create_req.extra = merged;
@@ -778,20 +804,6 @@ impl ConversationService {
         };
         self.repo.update(conversation_id, &update).await?;
 
-        // Subscribe to agent events before sending (no events lost)
-        let rx = agent.subscribe();
-
-        // Spawn background relay BEFORE sending — prompt() blocks until the
-        // agent turn completes, so the relay must already be running to
-        // consume streaming events as they arrive.
-        let relay = StreamRelay::new(
-            conversation_id.to_owned(),
-            generate_id(),
-            Arc::clone(&self.repo),
-            Arc::clone(&self.broadcaster),
-        );
-        tokio::spawn(relay.run(rx));
-
         // Send message to the agent in a background task.
         // prompt() blocks until the PromptResponse arrives (turn completed),
         // but the HTTP handler should return 202 immediately.
@@ -804,13 +816,70 @@ impl ConversationService {
         };
         let conv_id = conversation_id.to_owned();
         let repo = Arc::clone(&self.repo);
+        let broadcaster = Arc::clone(&self.broadcaster);
+        let cron_service = self.current_cron_service();
+        let user_id_owned = user_id.to_owned();
         tokio::spawn(async move {
-            if let Err(e) = agent.send_message(send_data).await {
-                tracing::error!(conversation_id = %conv_id, error = %e, "Agent send_message failed");
+            let mut pending_send = Some(send_data);
+            let mut continuation_count = 0usize;
+
+            loop {
+                let Some(current_send) = pending_send.take() else {
+                    break;
+                };
+
+                let relay = StreamRelay::new(
+                    conv_id.clone(),
+                    generate_id(),
+                    user_id_owned.clone(),
+                    Arc::clone(&repo),
+                    Arc::clone(&broadcaster),
+                    cron_service.clone(),
+                )
+                .with_turn_completion(false);
+
+                let rx = agent.subscribe();
+                let send_agent = Arc::clone(&agent);
+                let send_task = tokio::spawn(async move { send_agent.send_message(current_send).await });
+                let outcome = relay.run(rx).await;
+
+                match send_task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!(conversation_id = %conv_id, error = %e, "Agent send_message failed");
+                    }
+                    Err(e) => {
+                        tracing::error!(conversation_id = %conv_id, error = %e, "Agent send task join failed");
+                    }
+                }
+
+                if let Some(session_key) = agent.get_session_key() {
+                    persist_session_key(&repo, &conv_id, &session_key).await;
+                }
+
+                if outcome.system_responses.is_empty() {
+                    break;
+                }
+
+                if continuation_count >= MAX_CRON_CONTINUATIONS_PER_TURN {
+                    warn!(
+                        conversation_id = %conv_id,
+                        max = MAX_CRON_CONTINUATIONS_PER_TURN,
+                        "Reached cron continuation limit; ending turn early"
+                    );
+                    break;
+                }
+
+                continuation_count += 1;
+                pending_send = Some(SendMessageData {
+                    content: outcome.system_responses.join("\n"),
+                    msg_id: generate_id(),
+                    files: vec![],
+                    inject_skills: vec![],
+                });
             }
-            if let Some(session_key) = agent.get_session_key() {
-                persist_session_key(&repo, &conv_id, &session_key).await;
-            }
+
+            StreamRelay::complete_conversation(&repo, &broadcaster, &conv_id).await;
         });
 
         info!(conversation_id, msg_id = %msg_id_log, "Message dispatched, stream relay started");
@@ -971,13 +1040,21 @@ impl ConversationService {
         self.broadcaster.broadcast(event);
     }
 
+    fn current_cron_service(&self) -> Option<Arc<dyn ICronService>> {
+        match self.cron_service.read() {
+            Ok(guard) => guard.as_ref().map(Arc::clone),
+            Err(_) => None,
+        }
+    }
+
     /// Backfill `extra.skills` if the row predates the snapshot model.
     /// Persists the mutation asynchronously; failures are logged and
     /// swallowed so a read path never 500s because of a backfill write
     /// failure.
     async fn backfill_extra_inplace(&self, conversation_id: &str, extra: &mut serde_json::Value) {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
-        let mutated = crate::skill_snapshot::backfill_skills_if_missing(extra, &auto_inject);
+        let mut mutated = crate::skill_snapshot::backfill_skills_if_missing(extra, &auto_inject);
+        mutated |= backfill_cron_job_id_alias(extra);
         if !mutated {
             return;
         }
@@ -1004,6 +1081,37 @@ impl ConversationService {
             );
         }
     }
+}
+
+fn backfill_cron_job_id_alias(extra: &mut serde_json::Value) -> bool {
+    let Some(obj) = extra.as_object_mut() else {
+        return false;
+    };
+
+    let cron_job_id = obj
+        .get("cron_job_id")
+        .and_then(|value| value.as_str())
+        .or_else(|| obj.get("cronJobId").and_then(|value| value.as_str()))
+        .map(ToOwned::to_owned);
+
+    let Some(cron_job_id) = cron_job_id else {
+        return false;
+    };
+
+    let mut mutated = false;
+    if obj.get("cron_job_id").and_then(|value| value.as_str()) != Some(cron_job_id.as_str()) {
+        obj.insert(
+            "cron_job_id".into(),
+            serde_json::Value::String(cron_job_id.clone()),
+        );
+        mutated = true;
+    }
+    if obj.get("cronJobId").and_then(|value| value.as_str()) != Some(cron_job_id.as_str()) {
+        obj.insert("cronJobId".into(), serde_json::Value::String(cron_job_id));
+        mutated = true;
+    }
+
+    mutated
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

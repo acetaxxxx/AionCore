@@ -53,7 +53,6 @@ pub fn row_to_response_with_extra(
         );
     }
 
-
     let agent_type: AgentType = string_to_enum(&row.r#type)?;
     let status: ConversationStatus = match row.status.as_deref() {
         None | Some("") => ConversationStatus::Finished,

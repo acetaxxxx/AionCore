@@ -3,9 +3,12 @@ use std::sync::Arc;
 use aionui_api_types::{
     CronJobExecutedEvent, CronJobRemovedPayload, CronJobResponse, WebSocketMessage,
 };
+use aionui_common::generate_id;
 use aionui_realtime::EventBroadcaster;
+use serde_json::json;
 use tracing::error;
 
+#[derive(Clone)]
 pub struct CronEventEmitter {
     broadcaster: Arc<dyn EventBroadcaster>,
 }
@@ -16,16 +19,16 @@ impl CronEventEmitter {
     }
 
     pub fn emit_job_created(&self, job: &CronJobResponse) {
-        self.broadcast("cron.jobCreated", job);
+        self.broadcast("cron.job-created", job);
     }
 
     pub fn emit_job_updated(&self, job: &CronJobResponse) {
-        self.broadcast("cron.jobUpdated", job);
+        self.broadcast("cron.job-updated", job);
     }
 
     pub fn emit_job_removed(&self, job_id: &str) {
         self.broadcast(
-            "cron.jobRemoved",
+            "cron.job-removed",
             &CronJobRemovedPayload {
                 job_id: job_id.to_owned(),
             },
@@ -34,13 +37,28 @@ impl CronEventEmitter {
 
     pub fn emit_job_executed(&self, job_id: &str, status: &str, err: Option<&str>) {
         self.broadcast(
-            "cron.jobExecuted",
+            "cron.job-executed",
             &CronJobExecutedEvent {
                 job_id: job_id.to_owned(),
                 status: status.to_owned(),
                 error: err.map(|s| s.to_owned()),
             },
         );
+    }
+
+    pub fn emit_conversation_tips(&self, conversation_id: &str, content: &str, tip_type: &str) {
+        let payload = json!({
+            "conversation_id": conversation_id,
+            "msg_id": generate_id(),
+            "type": "tips",
+            "data": {
+                "content": content,
+                "type": tip_type,
+            },
+            "hidden": false,
+        });
+        self.broadcaster
+            .broadcast(WebSocketMessage::new("message.stream", payload));
     }
 
     fn broadcast<T: serde::Serialize>(&self, event_name: &str, payload: &T) {
@@ -96,6 +114,7 @@ mod tests {
         CronJobResponse {
             id: "cron_123".into(),
             name: "Test Job".into(),
+            description: Some("Test description".into()),
             enabled: true,
             schedule: CronScheduleDto::Every {
                 every_ms: 60000,
@@ -136,7 +155,7 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "cron.jobCreated");
+        assert_eq!(events[0].name, "cron.job-created");
 
         let parsed: CronJobResponse = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(parsed.id, "cron_123");
@@ -151,7 +170,7 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "cron.jobUpdated");
+        assert_eq!(events[0].name, "cron.job-updated");
 
         let parsed: CronJobResponse = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(parsed.id, "cron_123");
@@ -164,7 +183,7 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "cron.jobRemoved");
+        assert_eq!(events[0].name, "cron.job-removed");
 
         let parsed: CronJobRemovedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(parsed.job_id, "cron_456");
@@ -177,7 +196,7 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "cron.jobExecuted");
+        assert_eq!(events[0].name, "cron.job-executed");
 
         let parsed: CronJobExecutedEvent = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(parsed.job_id, "cron_789");
@@ -219,9 +238,9 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 4);
-        assert_eq!(events[0].name, "cron.jobCreated");
-        assert_eq!(events[1].name, "cron.jobUpdated");
-        assert_eq!(events[2].name, "cron.jobRemoved");
-        assert_eq!(events[3].name, "cron.jobExecuted");
+        assert_eq!(events[0].name, "cron.job-created");
+        assert_eq!(events[1].name, "cron.job-updated");
+        assert_eq!(events[2].name, "cron.job-removed");
+        assert_eq!(events[3].name, "cron.job-executed");
     }
 }
