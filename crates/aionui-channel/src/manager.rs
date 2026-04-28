@@ -441,6 +441,8 @@ impl ChannelManager {
         row: &ChannelPluginRow,
         live_status: Option<String>,
     ) -> PluginStatusResponse {
+        let is_running = self.plugins.contains_key(&row.id);
+        let has_token = !row.config.is_empty();
         PluginStatusResponse {
             plugin_id: row.id.clone(),
             plugin_type: row.r#type.clone(),
@@ -450,6 +452,10 @@ impl ChannelManager {
             last_connected: row.last_connected,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            connected: is_running,
+            has_token,
+            bot_username: None,
+            active_users: 0,
         }
     }
 
