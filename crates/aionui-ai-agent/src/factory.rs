@@ -155,7 +155,10 @@ async fn build_agent(
                 serde_json::from_value(options.extra).map_err(|e| {
                     AppError::BadRequest(format!("Invalid OpenClaw build options: {e}"))
                 })?;
-            let agent = OpenClawAgentManager::new(conversation_id, workspace, config).await?;
+            let resume_session_key = config.session_key.clone();
+            let agent =
+                OpenClawAgentManager::new(conversation_id, workspace, config, resume_session_key)
+                    .await?;
             let arc = Arc::new(agent);
             arc.start_event_relay();
             Ok(arc as AgentManagerHandle)

@@ -106,6 +106,9 @@ pub struct OpenClawBuildExtra {
     /// Associated cron job ID.
     #[serde(default)]
     pub cron_job_id: Option<String>,
+    /// Persisted session key for resume (from conversation.extra.sessionKey).
+    #[serde(default, rename = "sessionKey")]
+    pub session_key: Option<String>,
 }
 
 /// Remote agent-specific fields extracted from `extra` in [`BuildTaskOptions`].
