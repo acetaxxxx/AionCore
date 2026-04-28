@@ -184,10 +184,30 @@ pub struct MaterializeSkillsRequest {
     pub skills: Vec<String>,
 }
 
+/// One entry in the `MaterializeSkillsResponse::skills` list.
+///
+/// Each entry tells the frontend the absolute on-disk directory of a
+/// resolved skill. The frontend is expected to symlink that directory
+/// into the agent CLI's native skills dir — the backend no longer
+/// copies files per-conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MaterializedSkillRef {
+    pub name: String,
+    /// Absolute path on disk to the skill's source directory. May live
+    /// under `{data_dir}/builtin-skills/` (top-level or `auto-inject/`)
+    /// or `{data_dir}/skills/` (user-created skills).
+    pub source_path: String,
+}
+
 /// Response for `POST /api/skills/materialize-for-agent`.
+///
+/// Returns a list of resolved skill references rather than a copied
+/// directory; the frontend symlinks each `source_path` into the CLI's
+/// native skills dir. Unknown names from the request are silently
+/// omitted from the list.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MaterializeSkillsResponse {
-    pub dir_path: String,
+    pub skills: Vec<MaterializedSkillRef>,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,11 +323,41 @@ mod tests {
     #[test]
     fn test_materialize_response_serializes_snake() {
         let resp = MaterializeSkillsResponse {
-            dir_path: "/tmp/agent-skills/conv-abc".into(),
+            skills: vec![
+                MaterializedSkillRef {
+                    name: "cron".into(),
+                    source_path: "/tmp/builtin-skills/auto-inject/cron".into(),
+                },
+                MaterializedSkillRef {
+                    name: "mermaid".into(),
+                    source_path: "/tmp/builtin-skills/mermaid".into(),
+                },
+            ],
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["dir_path"], "/tmp/agent-skills/conv-abc");
-        assert!(json.get("dirPath").is_none());
+        let skills = json["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 2);
+        // Project-wide wire contract: snake_case fields on the wire.
+        assert_eq!(skills[0]["name"], "cron");
+        assert_eq!(skills[0]["source_path"], "/tmp/builtin-skills/auto-inject/cron");
+        assert!(skills[0].get("sourcePath").is_none());
+    }
+
+    #[test]
+    fn test_materialize_response_roundtrip() {
+        let raw = json!({
+            "skills": [
+                {"name": "cron", "source_path": "/tmp/builtin-skills/auto-inject/cron"}
+            ]
+        });
+        let resp: MaterializeSkillsResponse = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(resp.skills.len(), 1);
+        assert_eq!(resp.skills[0].name, "cron");
+        assert_eq!(
+            resp.skills[0].source_path,
+            "/tmp/builtin-skills/auto-inject/cron"
+        );
+        assert_eq!(serde_json::to_value(&resp).unwrap(), raw);
     }
 
     #[test]
