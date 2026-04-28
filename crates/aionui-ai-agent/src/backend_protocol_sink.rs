@@ -93,19 +93,6 @@ impl ProtocolEmitter for BackendProtocolSink {
                 );
             }
 
-            ProtocolEvent::ToolRunning {
-                call_id, tool_name, ..
-            } => {
-                let _ = self
-                    .event_tx
-                    .send(AgentStreamEvent::ToolCall(ToolCallEventData {
-                        call_id: call_id.clone(),
-                        name: tool_name.clone(),
-                        args: serde_json::Value::Null,
-                        status: ToolCallStatus::Running,
-                    }));
-            }
-
             ProtocolEvent::ToolCancelled {
                 call_id, reason, ..
             } => {
@@ -120,6 +107,9 @@ impl ProtocolEmitter for BackendProtocolSink {
                         name: format!("cancelled: {reason}"),
                         args: serde_json::Value::Null,
                         status: ToolCallStatus::Error,
+                        input: None,
+                        output: None,
+                        description: None,
                     }));
             }
 
@@ -176,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_running_emits_tool_call_event() {
+    fn tool_running_is_ignored() {
         let (sink, mut rx, _) = make_sink();
         let event = ProtocolEvent::ToolRunning {
             msg_id: "m1".into(),
@@ -185,16 +175,7 @@ mod tests {
         };
 
         sink.emit(&event).unwrap();
-
-        let received = rx.try_recv().unwrap();
-        match received {
-            AgentStreamEvent::ToolCall(data) => {
-                assert_eq!(data.call_id, "c1");
-                assert_eq!(data.name, "Write");
-                assert_eq!(data.status, ToolCallStatus::Running);
-            }
-            other => panic!("Expected ToolCall, got {:?}", other),
-        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
