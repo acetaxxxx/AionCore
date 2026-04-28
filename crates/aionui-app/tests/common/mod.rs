@@ -36,7 +36,7 @@ pub async fn build_app_with_skill_paths(
     let paths = SkillPaths {
         data_dir: root.to_path_buf(),
         user_skills_dir: root.join("skills"),
-        builtin_skills_dir: Some(builtin_dir.clone()),
+        builtin_skills_dir: builtin_dir.clone(),
         builtin_rules_dir: root.join("builtin-rules"),
         assistant_rules_dir: root.join("assistant-rules"),
         assistant_skills_dir: root.join("assistant-skills"),

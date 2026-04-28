@@ -175,7 +175,7 @@ async fn fixture() -> Fixture {
     let skill_paths = SkillPaths {
         data_dir: ext_data_dir.clone(),
         user_skills_dir: ext_data_dir.join("skills"),
-        builtin_skills_dir: Some(ext_data_dir.join("builtin-skills")),
+        builtin_skills_dir: ext_data_dir.join("builtin-skills"),
         builtin_rules_dir: ext_data_dir.join("builtin-rules"),
         assistant_rules_dir: user_data_dir.join("assistant-rules"),
         assistant_skills_dir: user_data_dir.join("assistant-skills"),
