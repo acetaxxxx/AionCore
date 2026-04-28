@@ -765,9 +765,13 @@ impl ConversationService {
             inject_skills: req.inject_skills,
         };
         let conv_id = conversation_id.to_owned();
+        let repo = Arc::clone(&self.repo);
         tokio::spawn(async move {
             if let Err(e) = agent.send_message(send_data).await {
                 tracing::error!(conversation_id = %conv_id, error = %e, "Agent send_message failed");
+            }
+            if let Some(session_key) = agent.get_session_key() {
+                persist_session_key(&repo, &conv_id, &session_key).await;
             }
         });
 
@@ -976,6 +980,52 @@ fn enum_to_db<T: serde::Serialize>(val: &T) -> Result<String, AppError> {
         .as_str()
         .map(|s| s.to_owned())
         .ok_or_else(|| AppError::Internal("Expected string enum value".into()))
+}
+
+/// Persist the agent's session key into `conversation.extra.sessionKey`.
+///
+/// Called after send_message completes so the session can be resumed
+/// when the user re-enters this conversation later.
+async fn persist_session_key(
+    repo: &Arc<dyn IConversationRepository>,
+    conversation_id: &str,
+    session_key: &str,
+) {
+    let row = match repo.get(conversation_id).await {
+        Ok(Some(r)) => r,
+        _ => return,
+    };
+
+    let mut extra: serde_json::Value =
+        serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+
+    if extra.get("sessionKey").and_then(|v| v.as_str()) == Some(session_key) {
+        return;
+    }
+
+    extra["sessionKey"] = serde_json::Value::String(session_key.to_owned());
+
+    let extra_json = match serde_json::to_string(&extra) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(conversation_id, error = %e, "Failed to serialize extra for session key persist");
+            return;
+        }
+    };
+
+    let update = ConversationRowUpdate {
+        extra: Some(extra_json),
+        updated_at: Some(now_ms()),
+        ..Default::default()
+    };
+    if let Err(e) = repo.update(conversation_id, &update).await {
+        warn!(conversation_id, error = %e, "Failed to persist session key");
+    } else {
+        debug!(
+            conversation_id,
+            "Persisted session key to conversation.extra"
+        );
+    }
 }
 
 /// Merge `patch` into `base` (top-level key overwrite).

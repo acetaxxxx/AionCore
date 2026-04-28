@@ -92,6 +92,14 @@ pub trait IAgentManager: Send + Sync {
         ))
     }
 
+    /// Return the current session key if the agent type supports it.
+    ///
+    /// Used by the conversation service to persist session keys for
+    /// agent types that support session resume (e.g. OpenClaw Gateway).
+    fn get_session_key(&self) -> Option<String> {
+        None
+    }
+
     /// Downcast helper for accessing type-specific extensions.
     ///
     /// Concrete implementations return `self` so that route handlers can
