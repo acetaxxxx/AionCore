@@ -339,7 +339,10 @@ mod tests {
         assert_eq!(skills.len(), 2);
         // Project-wide wire contract: snake_case fields on the wire.
         assert_eq!(skills[0]["name"], "cron");
-        assert_eq!(skills[0]["source_path"], "/tmp/builtin-skills/auto-inject/cron");
+        assert_eq!(
+            skills[0]["source_path"],
+            "/tmp/builtin-skills/auto-inject/cron"
+        );
         assert!(skills[0].get("sourcePath").is_none());
     }
 
