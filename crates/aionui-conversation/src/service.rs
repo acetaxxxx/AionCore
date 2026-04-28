@@ -9,8 +9,8 @@ use aionui_api_types::{
     WebSocketMessage,
 };
 use aionui_common::{
-    AppError, ConversationSource, ConversationStatus, PaginatedResult, generate_id,
-    generate_short_id, now_ms,
+    AcpBackend, AgentType, AppError, ConversationSource, ConversationStatus, PaginatedResult,
+    generate_id, generate_short_id, now_ms,
 };
 use aionui_db::{ConversationFilters, ConversationRowUpdate, IConversationRepository, SortOrder};
 use aionui_realtime::EventBroadcaster;
@@ -96,31 +96,41 @@ impl ConversationService {
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
         let mut extra = req.extra;
-        if extra
+
+        // Determine whether the user chose this workspace ("custom") or we
+        // auto-provision one under `{data_dir}/conversations/{label}-temp-{id}/`.
+        // `is_custom_workspace` is the authoritative signal consumed later to
+        // decide whether we should wire skill symlinks (temp workspaces only
+        // — user-chosen paths must not be mutated).
+        let user_supplied_workspace = extra
             .get("workspace")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .is_empty()
-        {
-            let agent_type_label = match req.r#type {
-                aionui_common::AgentType::Acp => {
-                    let backend = extra.get("backend").and_then(|v| {
-                        serde_json::from_value::<aionui_common::AcpBackend>(v.clone()).ok()
-                    });
-                    match backend {
-                        Some(b) => b.display_name().to_lowercase(),
-                        None => "acp".to_owned(),
-                    }
-                }
-                aionui_common::AgentType::OpenclawGateway => "openclaw".to_owned(),
-                ref t => format!("{:?}", t).to_lowercase(),
-            };
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned());
+        let is_custom_workspace = user_supplied_workspace.is_some();
+
+        let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
+            // Per-conversation temp workspaces live under
+            // `{data_dir}/conversations/{label}-temp-{id}/`. The label lets
+            // operators eyeball the agent type; the conversation id keeps
+            // the mapping back to the DB row unique.
+            let label = conversation_label(&req.r#type, extra.get("backend"));
             let ws_path = self
                 .workspace_root
-                .join(format!("{}-temp-{}", agent_type_label, now));
+                .join("conversations")
+                .join(format!("{label}-temp-{id}"));
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| AppError::Internal(format!("Failed to create workspace: {e}")))?;
             extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
+            Some(ws_path)
+        } else {
+            None
+        };
+
+        // Strip the request-only custom_workspace toggle — it was read above
+        // and must not be persisted as an extra field.
+        if let Some(obj) = extra.as_object_mut() {
+            obj.remove("custom_workspace");
         }
 
         // Consume transient skill-shaping inputs and freeze the initial
@@ -165,6 +175,30 @@ impl ConversationService {
             &exclude_auto_inject,
         );
 
+        // Wire skill symlinks into the auto-provisioned workspace so the
+        // agent CLI picks them up via its native skills dir (e.g.
+        // `.claude/skills/`). Runs only for temp workspaces — a user-chosen
+        // path must not be mutated.
+        if let Some(ws_path) = auto_provisioned_workspace.as_ref()
+            && !is_custom_workspace
+            && !initial_skills.is_empty()
+            && let Some(rel_dirs) = native_skills_dirs(&req.r#type, extra.get("backend"))
+        {
+            let resolved = self.skill_resolver.resolve_skills(&initial_skills).await;
+            if !resolved.is_empty() {
+                let n = self
+                    .skill_resolver
+                    .link_workspace_skills(ws_path, rel_dirs, &resolved)
+                    .await;
+                debug!(
+                    conversation_id = %id,
+                    workspace = %ws_path.display(),
+                    links = n,
+                    "wired skill symlinks into workspace"
+                );
+            }
+        }
+
         if let Some(obj) = extra.as_object_mut() {
             obj.insert(
                 "skills".to_owned(),
@@ -201,7 +235,7 @@ impl ConversationService {
 
         self.repo.create(&row).await?;
 
-        let response = row_to_response(row)?;
+        let response = row_to_response(row, &self.workspace_root)?;
 
         self.broadcast_list_changed(&response.id, "created", response.source.as_ref());
 
@@ -223,7 +257,7 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
             .map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(&row.id, &mut extra).await;
-        row_to_response_with_extra(row, extra)
+        row_to_response_with_extra(row, extra, &self.workspace_root)
     }
 
     /// List conversations with cursor-based pagination and optional filters.
@@ -261,7 +295,7 @@ impl ConversationService {
                 }
             };
             self.backfill_extra_inplace(&row_id, &mut extra).await;
-            match row_to_response_with_extra(row, extra) {
+            match row_to_response_with_extra(row, extra, &self.workspace_root) {
                 Ok(resp) => items.push(resp),
                 Err(err) => warn!(
                     conversation_id = %row_id,
@@ -363,7 +397,7 @@ impl ConversationService {
             .await?
             .ok_or_else(|| AppError::Internal("Conversation vanished after update".into()))?;
 
-        let response = row_to_response(updated)?;
+        let response = row_to_response(updated, &self.workspace_root)?;
 
         self.broadcast_list_changed(id, "updated", response.source.as_ref());
 
@@ -476,7 +510,9 @@ impl ConversationService {
         id: &str,
     ) -> Result<Vec<ConversationResponse>, AppError> {
         let rows = self.repo.list_associated(user_id, id).await?;
-        rows.into_iter().map(row_to_response).collect()
+        rows.into_iter()
+            .map(|row| row_to_response(row, &self.workspace_root))
+            .collect()
     }
 
     /// List conversations spawned by a specific cron job.
@@ -486,7 +522,9 @@ impl ConversationService {
         cron_job_id: &str,
     ) -> Result<Vec<ConversationResponse>, AppError> {
         let rows = self.repo.list_by_cron_job(user_id, cron_job_id).await?;
-        rows.into_iter().map(row_to_response).collect()
+        rows.into_iter()
+            .map(|row| row_to_response(row, &self.workspace_root))
+            .collect()
     }
 
     /// List messages for a conversation with page-based pagination.
@@ -969,6 +1007,44 @@ impl ConversationService {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+/// Compute the label used in auto-provisioned workspace directory names.
+///
+/// For ACP conversations the label is the sub-backend id
+/// (e.g. `"claude"`, `"gemini"`); otherwise it's the serde name of the
+/// `AgentType` (e.g. `"aionrs"`). Falls back to the agent type's serde
+/// name when the backend field is missing or unparseable.
+fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
+    if *agent_type == AgentType::Acp
+        && let Some(v) = backend
+        && let Ok(be) = serde_json::from_value::<AcpBackend>(v.clone())
+    {
+        // AcpBackend's Display uses the serde rename — re-serialize to get it.
+        if let Ok(serde_json::Value::String(s)) = serde_json::to_value(be) {
+            return s;
+        }
+    }
+    agent_type.serde_name().to_owned()
+}
+
+/// Resolve the native skills directory list (relative to the workspace
+/// root) for the given agent_type + backend combination.
+///
+/// Returns `None` when the backend does not support native skill
+/// discovery — callers should then skip the workspace-symlink step and
+/// rely on prompt injection instead.
+fn native_skills_dirs(
+    agent_type: &AgentType,
+    backend: Option<&serde_json::Value>,
+) -> Option<&'static [&'static str]> {
+    if *agent_type == AgentType::Acp
+        && let Some(v) = backend
+        && let Ok(be) = serde_json::from_value::<AcpBackend>(v.clone())
+    {
+        return be.native_skills_dirs();
+    }
+    agent_type.native_skills_dirs()
+}
 
 /// Serialize a serde-compatible enum to its JSON string form for DB storage.
 ///

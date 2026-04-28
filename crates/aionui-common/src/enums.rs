@@ -49,6 +49,34 @@ impl AgentType {
         // SAFETY: fnv1a_hex8 only produces ASCII hex digits
         unsafe { std::str::from_utf8_unchecked(&hash) }.into()
     }
+
+    /// Native skill-discovery directories for non-ACP agent types.
+    ///
+    /// ACP backends expose their own skill dirs via
+    /// [`AcpBackend::native_skills_dirs`]; this method covers the few
+    /// non-ACP agent types that still support native skill discovery.
+    /// Returns `None` for agent types that require prompt-injection
+    /// instead of workspace symlinks.
+    ///
+    /// `AgentType::Gemini` is intentionally absent: new Gemini
+    /// conversations use `AgentType::Acp` with `backend = gemini`, so
+    /// their skill dirs come from `AcpBackend::Gemini.native_skills_dirs()`.
+    /// Historical `AgentType::Gemini` rows cannot start a new runtime
+    /// (see the variant's doc comment) and therefore never reach this
+    /// path during workspace provisioning.
+    ///
+    /// Mirrors the `NON_ACP_SKILLS_DIRS` table in
+    /// `src/common/types/acpTypes.ts`.
+    pub fn native_skills_dirs(&self) -> Option<&'static [&'static str]> {
+        match self {
+            AgentType::Aionrs => Some(&[".aionrs/skills"]),
+            AgentType::Acp
+            | AgentType::OpenclawGateway
+            | AgentType::Nanobot
+            | AgentType::Remote
+            | AgentType::Gemini => None,
+        }
+    }
 }
 
 /// ACP sub-backend identifier.
@@ -208,6 +236,7 @@ impl AcpBackend {
     pub fn native_skills_dirs(&self) -> Option<&'static [&'static str]> {
         match self {
             AcpBackend::Claude => Some(&[".claude/skills"]),
+            AcpBackend::Gemini => Some(&[".gemini/skills"]),
             AcpBackend::Qwen => Some(&[".qwen/skills"]),
             AcpBackend::Codex => Some(&[".codex/skills"]),
             AcpBackend::Codebuddy => Some(&[".codebuddy/skills"]),
@@ -223,7 +252,6 @@ impl AcpBackend {
             | AcpBackend::Kiro
             | AcpBackend::Hermes
             | AcpBackend::Snow
-            | AcpBackend::Gemini
             | AcpBackend::Auggie => None,
         }
     }

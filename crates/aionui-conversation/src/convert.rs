@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use aionui_api_types::{ConversationResponse, MessageResponse, MessageSearchItem};
 use aionui_common::{
     AgentType, AppError, ConversationSource, ConversationStatus, MessagePosition, MessageStatus,
@@ -10,19 +12,48 @@ use aionui_db::models::MessageRow;
 /// Convert a database row into an API response DTO.
 ///
 /// Parses string enum fields and JSON text fields back into typed values.
-pub fn row_to_response(row: ConversationRow) -> Result<ConversationResponse, AppError> {
+/// `data_dir` is required so the response can expose a derived
+/// `is_temporary_workspace` flag without storing that attribute on disk —
+/// see [`row_to_response_with_extra`].
+pub fn row_to_response(
+    row: ConversationRow,
+    data_dir: &Path,
+) -> Result<ConversationResponse, AppError> {
     let extra: serde_json::Value = serde_json::from_str(&row.extra)
         .map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
-    row_to_response_with_extra(row, extra)
+    row_to_response_with_extra(row, extra, data_dir)
 }
 
 /// Same as [`row_to_response`] but takes a pre-parsed `extra` value. Used
 /// by callers that need to mutate `extra` (e.g. lazy `skills` backfill)
 /// before building the response DTO.
+///
+/// Injects a derived `is_temporary_workspace: bool` into the returned
+/// `extra` blob by checking whether `extra.workspace` sits under the
+/// backend-managed `data_dir`. The flag is not persisted — it is
+/// computed on every read so the frontend never has to pattern-match
+/// the directory name. Old rows that have no such flag on disk
+/// automatically gain it on read, which means no migration is needed.
 pub fn row_to_response_with_extra(
     row: ConversationRow,
-    extra: serde_json::Value,
+    mut extra: serde_json::Value,
+    data_dir: &Path,
 ) -> Result<ConversationResponse, AppError> {
+    let is_temporary_workspace = {
+        let ws = extra
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        !ws.is_empty() && Path::new(ws).starts_with(data_dir)
+    };
+    if let Some(obj) = extra.as_object_mut() {
+        obj.insert(
+            "is_temporary_workspace".to_owned(),
+            serde_json::Value::Bool(is_temporary_workspace),
+        );
+    }
+
+
     let agent_type: AgentType = string_to_enum(&row.r#type)?;
     let status: ConversationStatus = match row.status.as_deref() {
         None | Some("") => ConversationStatus::Finished,
@@ -186,7 +217,7 @@ mod tests {
             Some(&model.to_string()),
             r#"{"workspace": "/project"}"#,
         );
-        let resp = row_to_response(row).unwrap();
+        let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert_eq!(resp.id, "conv_1");
         assert_eq!(resp.r#type, AgentType::Acp);
         assert_eq!(resp.status, ConversationStatus::Pending);
@@ -199,7 +230,7 @@ mod tests {
     #[test]
     fn row_to_response_no_source() {
         let row = make_row("acp", "running", None, None, "{}");
-        let resp = row_to_response(row).unwrap();
+        let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert!(resp.source.is_none());
         assert!(resp.model.is_none());
     }
@@ -207,7 +238,7 @@ mod tests {
     #[test]
     fn row_to_response_invalid_type() {
         let row = make_row("invalid", "pending", None, None, "{}");
-        let err = row_to_response(row).unwrap_err();
+        let err = row_to_response(row, Path::new("/tmp/data")).unwrap_err();
         assert!(matches!(err, AppError::Internal(_)));
     }
 
@@ -228,7 +259,7 @@ mod tests {
             created_at: 1000,
             updated_at: 2000,
         };
-        let err = row_to_response(row).unwrap_err();
+        let err = row_to_response(row, Path::new("/tmp/data")).unwrap_err();
         assert!(matches!(err, AppError::Internal(_)));
     }
 
@@ -276,6 +307,39 @@ mod tests {
     }
 
     #[test]
+    fn row_to_response_marks_workspace_inside_data_dir_as_temporary() {
+        let row = make_row(
+            "acp",
+            "pending",
+            Some("aionui"),
+            None,
+            r#"{"workspace":"/srv/aionui-data/conversations/claude-temp-abc"}"#,
+        );
+        let resp = row_to_response(row, Path::new("/srv/aionui-data")).unwrap();
+        assert_eq!(resp.extra["is_temporary_workspace"], true);
+    }
+
+    #[test]
+    fn row_to_response_marks_workspace_outside_data_dir_as_non_temporary() {
+        let row = make_row(
+            "acp",
+            "pending",
+            Some("aionui"),
+            None,
+            r#"{"workspace":"/Users/alice/my-project"}"#,
+        );
+        let resp = row_to_response(row, Path::new("/srv/aionui-data")).unwrap();
+        assert_eq!(resp.extra["is_temporary_workspace"], false);
+    }
+
+    #[test]
+    fn row_to_response_marks_missing_workspace_as_non_temporary() {
+        let row = make_row("acp", "pending", Some("aionui"), None, r#"{}"#);
+        let resp = row_to_response(row, Path::new("/srv/aionui-data")).unwrap();
+        assert_eq!(resp.extra["is_temporary_workspace"], false);
+    }
+
+    #[test]
     fn row_with_pinned_at() {
         let row = ConversationRow {
             id: "conv_2".into(),
@@ -292,7 +356,7 @@ mod tests {
             created_at: 1000,
             updated_at: 3000,
         };
-        let resp = row_to_response(row).unwrap();
+        let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert!(resp.pinned);
         assert_eq!(resp.pinned_at, Some(5000));
         assert_eq!(resp.channel_chat_id.as_deref(), Some("chat:1"));

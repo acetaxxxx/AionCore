@@ -9,7 +9,7 @@ use axum::routing::{delete, get, post};
 use aionui_api_types::{
     AddExternalPathRequest, ApiResponse, BuiltinAutoSkillResponse, ExportSkillRequest,
     ExternalSkillSourceResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
-    MaterializeSkillsResponse, NamedPathResponse, ReadAssistantRuleRequest,
+    MaterializeSkillsResponse, MaterializedSkillRef, NamedPathResponse, ReadAssistantRuleRequest,
     ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse,
     RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
     SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
@@ -70,14 +70,10 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         // Built-in resources
         .route("/api/skills/builtin-rule", post(read_builtin_rule))
         .route("/api/skills/builtin-skill", post(read_builtin_skill))
-        // Per-agent skill materialization (for gemini CLI)
+        // Per-agent skill resolution (for agent CLI symlink layout).
         .route(
             "/api/skills/materialize-for-agent",
             post(materialize_for_agent),
-        )
-        .route(
-            "/api/skills/materialize-for-agent/{conversation_id}",
-            delete(cleanup_for_agent),
         )
         // Assistant rules CRUD
         .route("/api/skills/assistant-rule/read", post(read_assistant_rule))
@@ -319,9 +315,10 @@ async fn read_builtin_skill(
     Ok(Json(ApiResponse::ok(content)))
 }
 
-/// `POST /api/skills/materialize-for-agent` — flatten auto-inject + opt-in
-/// skills into `{data_dir}/agent-skills/{conversationId}/` and hand the
-/// frontend an absolute path for gemini CLI `--extensions` loading.
+/// `POST /api/skills/materialize-for-agent` — resolve each requested skill
+/// name to its on-disk source directory. The frontend symlinks each
+/// returned `source_path` into the agent CLI's native skills dir. The
+/// backend no longer copies any files per-conversation.
 async fn materialize_for_agent(
     State(state): State<SkillRouterState>,
     body: Result<Json<MaterializeSkillsRequest>, JsonRejection>,
@@ -332,30 +329,20 @@ async fn materialize_for_agent(
             "conversationId must not be empty".into(),
         ));
     }
-    let dir = skill_service::materialize_skills_for_agent(
+    let resolved = skill_service::materialize_skills_for_agent(
         &state.skill_paths,
         &req.conversation_id,
         &req.skills,
     )
     .await?;
-    Ok(Json(ApiResponse::ok(MaterializeSkillsResponse {
-        dir_path: dir.to_string_lossy().into_owned(),
-    })))
-}
-
-/// `DELETE /api/skills/materialize-for-agent/:conversation_id` — remove the
-/// per-conversation agent-skills directory. Idempotent.
-async fn cleanup_for_agent(
-    State(state): State<SkillRouterState>,
-    AxumPath(conversation_id): AxumPath<String>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    if conversation_id.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "conversationId must not be empty".into(),
-        ));
-    }
-    skill_service::cleanup_agent_skills(&state.skill_paths, &conversation_id).await?;
-    Ok(Json(ApiResponse::success()))
+    let skills: Vec<MaterializedSkillRef> = resolved
+        .into_iter()
+        .map(|s| MaterializedSkillRef {
+            name: s.name,
+            source_path: s.source_path.to_string_lossy().into_owned(),
+        })
+        .collect();
+    Ok(Json(ApiResponse::ok(MaterializeSkillsResponse { skills })))
 }
 
 // ---------------------------------------------------------------------------
