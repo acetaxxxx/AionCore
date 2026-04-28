@@ -24,6 +24,7 @@ pub struct ChannelMessageService {
     conversation_svc: Arc<ConversationService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     default_model: ProviderWithModel,
+    owner_user_id: String,
 }
 
 impl ChannelMessageService {
@@ -31,11 +32,13 @@ impl ChannelMessageService {
         conversation_svc: Arc<ConversationService>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         default_model: ProviderWithModel,
+        owner_user_id: String,
     ) -> Self {
         Self {
             conversation_svc,
             task_manager,
             default_model,
+            owner_user_id,
         }
     }
 
@@ -73,8 +76,7 @@ impl ChannelMessageService {
             hidden: false,
         };
 
-        // Use a fixed user_id for channel messages (they're system-level)
-        let user_id = "channel";
+        let user_id = &self.owner_user_id;
         self.conversation_svc
             .send_message(user_id, &conversation_id, req, &self.task_manager)
             .await
@@ -125,10 +127,9 @@ impl ChannelMessageService {
             extra: Self::build_channel_extra(),
         };
 
-        let user_id = "channel";
         let response = self
             .conversation_svc
-            .create(user_id, req)
+            .create(&self.owner_user_id, req)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
 
@@ -262,10 +263,15 @@ impl ChannelMessageService {
     ///
     /// Sets `session_mode` to `"yolo"` so the agent auto-approves tool calls —
     /// channel users have no interactive UI for confirmations.
-    pub fn build_channel_extra() -> serde_json::Value {
+    pub fn build_channel_extra_with_backend(backend: &str) -> serde_json::Value {
         serde_json::json!({
-            "session_mode": "yolo"
+            "session_mode": "yolo",
+            "backend": backend
         })
+    }
+
+    pub fn build_channel_extra() -> serde_json::Value {
+        Self::build_channel_extra_with_backend("claude")
     }
 }
 
