@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use common::{body_json, delete_with_token, get_with_token, json_with_token, setup_and_login};
+use common::{body_json, get_with_token, json_with_token, setup_and_login};
 
 // ---------------------------------------------------------------------------
 // Fixture — build router with embedded-corpus paths rooted at a temp dir
@@ -300,10 +300,11 @@ async fn list_skills_builtin_entries_carry_relative_location() {
 // ===========================================================================
 
 #[tokio::test]
-async fn materialize_for_agent_writes_named_skill_flat() {
-    // Post-snapshot contract: `materialize-for-agent` does NOT implicitly
-    // include auto-inject. Callers pass the fully resolved snapshot;
-    // naming an auto-inject skill produces a flat `{name}/SKILL.md` entry.
+async fn materialize_for_agent_returns_source_path_for_auto_inject_skill() {
+    // Post-snapshot contract: `materialize-for-agent` resolves each
+    // requested name to its on-disk source directory without copying.
+    // The frontend symlinks `source_path` into the CLI's native skills
+    // dir. `cron` lives under `auto-inject/cron/` in the builtin tree.
     let fx = fixture_embedded().await;
 
     let resp = fx
@@ -323,23 +324,27 @@ async fn materialize_for_agent_writes_named_skill_flat() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json: Value = body_json(resp).await;
-    let dir_path = json["data"]["dir_path"].as_str().unwrap().to_owned();
-    let dir = std::path::Path::new(&dir_path);
-    assert!(dir.is_absolute(), "dir_path must be absolute: {dir_path}");
-    assert!(dir.is_dir(), "agent-skills dir must exist: {dir_path}");
+    let skills = json["data"]["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0]["name"], "cron");
+    let source_path = skills[0]["source_path"].as_str().unwrap();
+    let path = std::path::Path::new(source_path);
+    assert!(path.is_absolute(), "source_path must be absolute: {source_path}");
+    assert!(path.is_dir(), "source_path must exist: {source_path}");
     assert!(
-        dir.join("cron").join("SKILL.md").exists(),
-        "cron skill not materialized at {dir_path}/cron/SKILL.md",
+        path.join("SKILL.md").exists(),
+        "source_path must contain SKILL.md at {source_path}",
     );
-    // Flat layout — no `auto-inject` wrapper remains.
+    // It must live under the builtin tree, not under a
+    // per-conversation copy dir.
     assert!(
-        !dir.join("auto-inject").exists(),
-        "auto-inject wrapper should be flattened away",
+        source_path.contains("builtin-skills"),
+        "expected auto-inject source under builtin-skills, got {source_path}",
     );
 }
 
 #[tokio::test]
-async fn materialize_for_agent_includes_opt_in_skill() {
+async fn materialize_for_agent_returns_source_path_for_opt_in_skill() {
     let fx = fixture_embedded().await;
 
     let resp = fx
@@ -359,13 +364,13 @@ async fn materialize_for_agent_includes_opt_in_skill() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json: Value = body_json(resp).await;
-    let dir_path = json["data"]["dir_path"].as_str().unwrap().to_owned();
+    let skills = json["data"]["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0]["name"], "mermaid");
+    let source_path = skills[0]["source_path"].as_str().unwrap();
     assert!(
-        std::path::Path::new(&dir_path)
-            .join("mermaid")
-            .join("SKILL.md")
-            .exists(),
-        "mermaid not materialized at {dir_path}/mermaid/SKILL.md",
+        std::path::Path::new(source_path).join("SKILL.md").exists(),
+        "mermaid source_path must exist: {source_path}",
     );
 }
 
@@ -390,64 +395,59 @@ async fn materialize_for_agent_silently_skips_unknown_skill() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json: Value = body_json(resp).await;
-    let dir_path = json["data"]["dir_path"].as_str().unwrap().to_owned();
-    assert!(std::path::Path::new(&dir_path).is_dir());
-    // Unknown skill does not materialize into a subdir.
-    assert!(
-        !std::path::Path::new(&dir_path)
-            .join("this-does-not-exist")
-            .exists(),
-        "unknown skill must be silently skipped, not created",
-    );
+    let skills = json["data"]["skills"].as_array().unwrap();
+    // Unknown skill is silently dropped.
+    assert!(skills.is_empty(), "unknown skills must be silently omitted");
 }
 
 #[tokio::test]
-async fn materialize_for_agent_fresh_on_each_call() {
+async fn materialize_for_agent_does_not_touch_data_dir() {
+    // Symlink-contract guardrail: the backend no longer writes anywhere
+    // under {data_dir}/agent-skills/ or {data_dir}/conversations/ for
+    // materialize-for-agent — it only reads the source tree.
     let fx = fixture_embedded().await;
 
-    // First call.
-    let resp1 = fx
-        .app
+    fx.app
         .clone()
         .oneshot(json_with_token(
             "POST",
             "/api/skills/materialize-for-agent",
-            json!({"conversation_id": "conv-fresh", "enabled_skills": []}),
+            json!({"conversation_id": "conv-noop", "enabled_skills": ["cron"]}),
             &fx.token,
             &fx.csrf,
         ))
         .await
         .unwrap();
-    let json1 = body_json(resp1).await;
-    let dir = json1["data"]["dir_path"].as_str().unwrap().to_owned();
 
-    // Sentinel file under the materialized dir.
-    std::fs::write(
-        std::path::Path::new(&dir).join("sentinel.txt"),
-        b"stale-state",
-    )
-    .unwrap();
+    assert!(!fx.data_dir.join("agent-skills").exists());
+    assert!(!fx.data_dir.join("conversations").join("conv-noop").exists());
+}
 
-    // Second call — must wipe the sentinel.
-    let resp2 = fx
+#[tokio::test]
+async fn materialize_for_agent_returns_sorted_list() {
+    let fx = fixture_embedded().await;
+
+    let resp = fx
         .app
         .clone()
         .oneshot(json_with_token(
             "POST",
             "/api/skills/materialize-for-agent",
-            json!({"conversation_id": "conv-fresh", "enabled_skills": []}),
+            json!({
+                "conversation_id": "conv-sorted",
+                "skills": ["mermaid", "cron"],
+            }),
             &fx.token,
             &fx.csrf,
         ))
         .await
         .unwrap();
-    let json2 = body_json(resp2).await;
-    let dir2 = json2["data"]["dir_path"].as_str().unwrap().to_owned();
-    assert_eq!(dir, dir2);
-    assert!(
-        !std::path::Path::new(&dir2).join("sentinel.txt").exists(),
-        "materialize must start fresh",
-    );
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: Value = body_json(resp).await;
+    let skills = json["data"]["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[0]["name"], "cron");
+    assert_eq!(skills[1]["name"], "mermaid");
 }
 
 #[tokio::test]
@@ -489,67 +489,6 @@ async fn materialize_for_agent_rejects_traversal_in_conversation_id() {
 }
 
 // ===========================================================================
-// DELETE /api/skills/materialize-for-agent/:conversation_id
+// DELETE /api/skills/materialize-for-agent/:conversation_id removed — the
+// symlink contract has nothing to clean up on the backend side.
 // ===========================================================================
-
-#[tokio::test]
-async fn cleanup_for_agent_is_idempotent() {
-    let fx = fixture_embedded().await;
-
-    // Materialize first so there is something to clean up.
-    fx.app
-        .clone()
-        .oneshot(json_with_token(
-            "POST",
-            "/api/skills/materialize-for-agent",
-            json!({"conversation_id": "conv-del", "enabled_skills": []}),
-            &fx.token,
-            &fx.csrf,
-        ))
-        .await
-        .unwrap();
-
-    // First delete — dir exists → 200 + removed from disk.
-    let resp1 = fx
-        .app
-        .clone()
-        .oneshot(delete_with_token(
-            "/api/skills/materialize-for-agent/conv-del",
-            &fx.token,
-            &fx.csrf,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp1.status(), StatusCode::OK);
-    assert!(!fx.data_dir.join("agent-skills").join("conv-del").exists());
-
-    // Second delete — dir missing → still 200 (idempotent).
-    let resp2 = fx
-        .app
-        .clone()
-        .oneshot(delete_with_token(
-            "/api/skills/materialize-for-agent/conv-del",
-            &fx.token,
-            &fx.csrf,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp2.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn cleanup_for_agent_unknown_conversation_still_succeeds() {
-    let fx = fixture_embedded().await;
-
-    let resp = fx
-        .app
-        .clone()
-        .oneshot(delete_with_token(
-            "/api/skills/materialize-for-agent/never-existed",
-            &fx.token,
-            &fx.csrf,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-}
