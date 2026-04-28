@@ -140,6 +140,14 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Looks up a session by its unique ID.
+    pub async fn get_session_by_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<AssistantSessionRow>, ChannelError> {
+        Ok(self.repo.get_session(session_id).await?)
+    }
+
     /// Persists the conversation binding for a session.
     ///
     /// Called after a new conversation is created for this session,
