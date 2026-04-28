@@ -17,6 +17,7 @@ pub mod resolvers;
 pub mod routes;
 pub mod skill_routes;
 pub mod skill_service;
+pub mod startup_materialize;
 pub mod state;
 pub mod template;
 pub mod types;
@@ -36,6 +37,7 @@ pub use registry::{ExtensionRegistry, ExtensionSummary};
 pub use resolvers::{
     resolve_all_contributions, resolve_extension_contributions, resolve_i18n_for_all,
 };
+pub use startup_materialize::materialize_if_needed;
 pub use state::{ExtensionStateStore, load_states_from_file, save_states_to_file};
 pub use template::{resolve_env_map, resolve_env_templates, resolve_file_reference};
 pub use types::*;
@@ -48,11 +50,12 @@ pub use routes::{ExtensionRouterState, extension_routes};
 pub use skill_routes::{SkillRouterState, skill_routes};
 pub use skill_service::{
     BUILTIN_SKILLS_ENV_VAR, BuiltinAutoSkillItem, ExternalSkillSource, NamedPath, ScannedSkill,
-    SkillListItem, SkillPaths, SkillSource, cleanup_agent_skills, cleanup_orphan_agent_skills,
-    delete_skill, detect_and_count_external_skills, detect_common_skill_paths,
-    export_skill_with_symlink, get_skill_paths, import_skill, import_skill_with_symlink,
-    list_available_skills, list_builtin_auto_skills, materialize_skills_for_agent,
-    read_builtin_rule, read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills,
+    SkillListItem, SkillPaths, SkillSource, builtin_skills_corpus, cleanup_agent_skills,
+    cleanup_orphan_agent_skills, delete_skill, detect_and_count_external_skills,
+    detect_common_skill_paths, export_skill_with_symlink, get_skill_paths, import_skill,
+    import_skill_with_symlink, list_available_skills, list_builtin_auto_skills,
+    materialize_skills_for_agent, read_builtin_rule, read_builtin_skill, read_skill_info,
+    resolve_skill_paths, scan_for_skills,
 };
 pub use skill_service::{
     delete_assistant_rule, delete_assistant_skill, read_assistant_rule, read_assistant_skill,
