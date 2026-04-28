@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::stream_event::{ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::AgentStreamEvent;
+use aionui_ai_agent::stream_event::{ErrorEventData, FinishEventData, TextEventData};
 use aionui_channel::stream_relay::{ChannelStreamRelay, MessageRecorder, RelayConfig};
 use aionui_channel::types::PluginType;
 use tokio::sync::broadcast;
@@ -118,11 +118,13 @@ async fn relay_handles_channel_closed() {
 
     let edits = recorder.take_edits();
     assert!(!edits.is_empty());
-    assert!(edits
-        .last()
-        .unwrap()
-        .text
-        .as_deref()
-        .unwrap()
-        .contains("partial"));
+    assert!(
+        edits
+            .last()
+            .unwrap()
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("partial")
+    );
 }

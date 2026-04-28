@@ -49,8 +49,7 @@ fn lark_bold_and_code() {
 
 #[test]
 fn lark_link_with_protocol_whitelist() {
-    let input =
-        r#"<a href="https://ok.com">safe</a> <a href="javascript:void(0)">evil</a>"#;
+    let input = r#"<a href="https://ok.com">safe</a> <a href="javascript:void(0)">evil</a>"#;
     let result = format_text_for_platform(input, PluginType::Lark);
     assert!(result.contains("[safe](https://ok.com)"), "got: {result}");
     assert!(!result.contains("javascript:"), "got: {result}");
