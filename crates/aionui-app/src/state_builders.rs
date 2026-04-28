@@ -69,8 +69,22 @@ pub(crate) async fn resolve_extension_agents(registry: &ExtensionRegistry) -> Ve
         .collect()
 }
 
+/// Components needed to start the channel orchestrator.
+///
+/// Returned alongside `ChannelRouterState` by `build_channel_state`.
+/// The caller must spawn the orchestrator as a background task.
+pub struct ChannelOrchestratorComponents {
+    pub orchestrator: aionui_channel::orchestrator::ChannelOrchestrator,
+    pub message_rx: tokio::sync::mpsc::Receiver<aionui_channel::types::UnifiedIncomingMessage>,
+    pub confirm_rx: tokio::sync::mpsc::Receiver<(String, String)>,
+    pub manager: Arc<aionui_channel::manager::ChannelManager>,
+    pub plugin_factory: Arc<aionui_channel::manager::PluginFactory>,
+}
+
 /// Build all default `ModuleStates` from application services.
-pub async fn build_module_states(services: &AppServices) -> ModuleStates {
+pub async fn build_module_states(
+    services: &AppServices,
+) -> (ModuleStates, ChannelOrchestratorComponents) {
     let (ext_state, hub_state, mut skill_state) = build_extension_states(services).await;
     let assistant = build_assistant_state(services, ext_state.registry.clone());
     let cron = build_cron_state(services);
@@ -82,7 +96,9 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
     let dispatcher: Arc<dyn AssistantRuleDispatcher> = assistant.service.clone();
     skill_state.assistant_dispatcher = Some(dispatcher);
 
-    ModuleStates {
+    let (channel_state, channel_components) = build_channel_state(services);
+
+    let states = ModuleStates {
         system: build_system_state(services),
         conversation: build_conversation_state(services, Some(cron.cron_service.clone())),
         remote_agent: build_remote_agent_state(services),
@@ -94,7 +110,7 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
         extension: ext_state,
         hub: hub_state,
         skill: skill_state,
-        channel: build_channel_state(services),
+        channel: channel_state,
         team: build_team_state(services, Some(cron.cron_service.clone())),
         cron,
         office: build_office_state(services),
@@ -103,7 +119,9 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
         agent: AgentRouterState {
             agent_registry: services.agent_registry.clone(),
         },
-    }
+    };
+
+    (states, channel_components)
 }
 
 /// Build the default `AssistantRouterState` from application services.
@@ -263,15 +281,17 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     }
 }
 
-/// Build the default `ChannelRouterState` from application services.
-pub fn build_channel_state(services: &AppServices) -> ChannelRouterState {
+/// Build the default `ChannelRouterState` and orchestrator components.
+pub fn build_channel_state(
+    services: &AppServices,
+) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> =
         Arc::new(aionui_db::SqliteChannelRepository::new(pool));
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
 
-    let (message_tx, _message_rx) = tokio::sync::mpsc::channel(256);
-    let (confirm_tx, _confirm_rx) = tokio::sync::mpsc::channel(256);
+    let (message_tx, message_rx) = tokio::sync::mpsc::channel(256);
+    let (confirm_tx, confirm_rx) = tokio::sync::mpsc::channel(256);
 
     let manager = Arc::new(aionui_channel::manager::ChannelManager::new(
         repo.clone(),
@@ -291,13 +311,67 @@ pub fn build_channel_state(services: &AppServices) -> ChannelRouterState {
     let plugin_factory: Arc<aionui_channel::manager::PluginFactory> =
         Arc::new(Box::new(aionui_channel::plugins::create_plugin));
 
-    ChannelRouterState {
-        manager,
+    // Build orchestrator dependencies
+    let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
+        Arc::clone(&pairing_service),
+        Arc::clone(&session_manager),
+        "acp",
+    ));
+
+    let conv_repo: Arc<dyn aionui_db::IConversationRepository> =
+        Arc::new(aionui_db::SqliteConversationRepository::new(
+            services.database.pool().clone(),
+        ));
+    let skill_resolver = Arc::new(
+        aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
+            services.skill_paths.clone(),
+        ),
+    );
+    let conversation_svc = Arc::new(ConversationService::new_with_workspace_root(
+        conv_repo,
+        services.event_bus.clone(),
+        std::path::PathBuf::from(&services.data_dir),
+        skill_resolver,
+    ));
+
+    let default_model = aionui_common::ProviderWithModel {
+        provider_id: String::new(),
+        model: String::new(),
+        use_model: None,
+    };
+
+    let message_service = Arc::new(
+        aionui_channel::message_service::ChannelMessageService::new(
+            conversation_svc,
+            services.worker_task_manager.clone(),
+            default_model,
+        ),
+    );
+
+    let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
+        action_executor,
+        message_service,
+        Arc::clone(&session_manager),
+        manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
+    );
+
+    let state = ChannelRouterState {
+        manager: Arc::clone(&manager),
         pairing_service,
         session_manager,
         repo,
+        plugin_factory: Arc::clone(&plugin_factory),
+    };
+
+    let components = ChannelOrchestratorComponents {
+        orchestrator,
+        message_rx,
+        confirm_rx,
+        manager,
         plugin_factory,
-    }
+    };
+
+    (state, components)
 }
 
 /// Build the default `TeamRouterState` from application services.
