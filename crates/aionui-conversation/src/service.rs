@@ -127,16 +127,10 @@ impl ConversationService {
             None
         };
 
-        // Persist the normalized custom_workspace flag so readers (both
-        // backend and frontend) have an authoritative signal without having
-        // to reverse-engineer it from the workspace path. The create request
-        // may omit it, but from here on the row always carries an explicit
-        // boolean.
+        // Strip the request-only custom_workspace toggle — it was read above
+        // and must not be persisted as an extra field.
         if let Some(obj) = extra.as_object_mut() {
-            obj.insert(
-                "custom_workspace".to_owned(),
-                serde_json::Value::Bool(is_custom_workspace),
-            );
+            obj.remove("custom_workspace");
         }
 
         // Consume transient skill-shaping inputs and freeze the initial
