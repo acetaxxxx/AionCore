@@ -151,6 +151,19 @@ pub struct HelloAuthInfo {
 // ── Session Management ──────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
+pub struct SessionsResolveParams {
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionsResolveResponse {
+    pub key: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct SessionsResetParams {
     pub key: String,
     pub reason: String,
@@ -429,6 +442,26 @@ mod tests {
             hello.auth.as_ref().unwrap().device_token.as_deref(),
             Some("tok123")
         );
+    }
+
+    #[test]
+    fn sessions_resolve_serializes() {
+        let params = SessionsResolveParams {
+            key: "sk-prev".into(),
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["key"], "sk-prev");
+    }
+
+    #[test]
+    fn sessions_resolve_response_deserializes() {
+        let json = serde_json::json!({
+            "key": "sk-resolved",
+            "sessionId": "sess-42"
+        });
+        let resp: SessionsResolveResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.key, "sk-resolved");
+        assert_eq!(resp.session_id.unwrap(), "sess-42");
     }
 
     #[test]

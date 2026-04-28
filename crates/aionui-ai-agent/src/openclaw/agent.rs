@@ -20,7 +20,8 @@ use super::connection::{AuthConfig, OpenClawConnection};
 use super::device_identity::load_or_create_identity;
 use super::event_mapper::{TextFallbackState, map_openclaw_event};
 use super::protocol::{
-    ChatAbortParams, ChatSendParams, SessionsResetParams, SessionsResetResponse, normalize_ws_url,
+    ChatAbortParams, ChatSendParams, SessionsResetParams, SessionsResetResponse,
+    SessionsResolveParams, SessionsResolveResponse, normalize_ws_url,
 };
 
 use aionui_common::{CommandSpec, EnvVar};
@@ -57,6 +58,7 @@ impl OpenClawAgentManager {
         conversation_id: String,
         workspace: String,
         config: OpenClawBuildExtra,
+        resume_session_key: Option<String>,
     ) -> Result<Self, AppError> {
         let file_config = load_openclaw_config();
 
@@ -160,6 +162,14 @@ impl OpenClawAgentManager {
 
         let (event_tx, _) = broadcast::channel(256);
 
+        let has_resume_key = resume_session_key.is_some();
+        if has_resume_key {
+            info!(
+                conversation_id = %conversation_id,
+                "Resuming OpenClaw session with stored session key"
+            );
+        }
+
         let manager = Self {
             conversation_id,
             workspace,
@@ -169,9 +179,9 @@ impl OpenClawAgentManager {
             event_tx: event_tx.clone(),
             state: Arc::new(RwLock::new(OpenClawState {
                 status: None,
-                session_key: None,
+                session_key: resume_session_key,
                 confirmations: Vec::new(),
-                has_messages: false,
+                has_messages: has_resume_key,
                 approval_memory: HashMap::new(),
             })),
             last_activity: AtomicI64::new(now_ms()),
@@ -271,22 +281,7 @@ impl OpenClawAgentManager {
 
     async fn do_send_message(&self, is_first: bool, data: SendMessageData) -> Result<(), AppError> {
         if is_first {
-            let resp: SessionsResetResponse = self
-                .connection
-                .request(
-                    "sessions.reset",
-                    serde_json::to_value(SessionsResetParams {
-                        key: self.conversation_id.clone(),
-                        reason: "new".into(),
-                    })
-                    .unwrap_or_default(),
-                )
-                .await?;
-
-            if let Some(ref key) = resp.key {
-                let mut state = self.state.write().await;
-                state.session_key = Some(key.clone());
-            }
+            self.resolve_session().await?;
         }
 
         let session_key = self
@@ -314,6 +309,61 @@ impl OpenClawAgentManager {
                 serde_json::to_value(params).unwrap_or_default(),
             )
             .await?;
+
+        Ok(())
+    }
+
+    /// Resolve gateway session: try to resume an existing session first,
+    /// then fall back to creating a new one via sessions.reset.
+    async fn resolve_session(&self) -> Result<(), AppError> {
+        let resume_key = self.state.read().await.session_key.clone();
+
+        if let Some(ref key) = resume_key {
+            match self
+                .connection
+                .request::<SessionsResolveResponse>(
+                    "sessions.resolve",
+                    serde_json::to_value(SessionsResolveParams { key: key.clone() })
+                        .unwrap_or_default(),
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let mut state = self.state.write().await;
+                    state.session_key = Some(resp.key.clone());
+                    info!(
+                        conversation_id = %self.conversation_id,
+                        session_key = %resp.key,
+                        "Resumed OpenClaw session via sessions.resolve"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        conversation_id = %self.conversation_id,
+                        error = %e,
+                        "Failed to resume OpenClaw session, falling back to sessions.reset"
+                    );
+                }
+            }
+        }
+
+        let resp: SessionsResetResponse = self
+            .connection
+            .request(
+                "sessions.reset",
+                serde_json::to_value(SessionsResetParams {
+                    key: self.conversation_id.clone(),
+                    reason: "new".into(),
+                })
+                .unwrap_or_default(),
+            )
+            .await?;
+
+        if let Some(ref key) = resp.key {
+            let mut state = self.state.write().await;
+            state.session_key = Some(key.clone());
+        }
 
         Ok(())
     }
@@ -533,6 +583,13 @@ impl IAgentManager for OpenClawAgentManager {
         }
 
         Ok(())
+    }
+
+    fn get_session_key(&self) -> Option<String> {
+        self.state
+            .try_read()
+            .ok()
+            .and_then(|g| g.session_key.clone())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
