@@ -54,7 +54,12 @@ async fn build_agent(
     options: BuildTaskOptions,
 ) -> Result<AgentManagerHandle, AppError> {
     let conversation_id = options.conversation_id.clone();
-    let workspace = if options.workspace.is_empty() {
+    // `is_custom_workspace` is the authoritative signal for "user chose
+    // this path" — determined here and plumbed down to the managers
+    // that care (currently `AcpAgentManager`, for first-message
+    // injection). Do NOT re-derive it from the workspace string later:
+    // user paths may incidentally contain "conversations" or "-temp-".
+    let (workspace, is_custom_workspace) = if options.workspace.is_empty() {
         // Fallback workspace path: kept in sync with
         // `ConversationService::create`, which now places auto-
         // provisioned workspaces under `{data_dir}/conversations/{id}/`.
@@ -64,9 +69,9 @@ async fn build_agent(
         let dir = deps.data_dir.join("conversations").join(&conversation_id);
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Internal(format!("Failed to create temp workspace: {e}")))?;
-        dir.to_string_lossy().into_owned()
+        (dir.to_string_lossy().into_owned(), false)
     } else {
-        options.workspace.clone()
+        (options.workspace.clone(), true)
     };
 
     match options.agent_type {
@@ -126,6 +131,7 @@ async fn build_agent(
             let agent = AcpAgentManager::new(
                 conversation_id,
                 workspace.clone(),
+                is_custom_workspace,
                 CommandSpec {
                     command: PathBuf::from(spawn_command),
                     args: spawn_args,
