@@ -26,7 +26,7 @@ fn make_paths(base: &Path) -> SkillPaths {
     SkillPaths {
         data_dir: base.to_path_buf(),
         user_skills_dir: base.join("skills"),
-        builtin_skills_dir: Some(base.join("builtin-skills")),
+        builtin_skills_dir: base.join("builtin-skills"),
         builtin_rules_dir: base.join("builtin-rules"),
         assistant_rules_dir: base.join("assistant-rules"),
         assistant_skills_dir: base.join("assistant-skills"),
@@ -34,10 +34,7 @@ fn make_paths(base: &Path) -> SkillPaths {
 }
 
 fn builtin_dir(paths: &SkillPaths) -> &Path {
-    paths
-        .builtin_skills_dir
-        .as_deref()
-        .expect("disk override must be set for integration tests")
+    &paths.builtin_skills_dir
 }
 
 fn create_skill(base: &Path, name: &str, desc: &str) {
@@ -238,7 +235,8 @@ async fn sm8_scan_for_skills() {
 /// SM-11: Get skill directory paths.
 ///
 /// Production mode: no `AIONUI_BUILTIN_SKILLS_PATH` set — the built-in
-/// corpus is embedded and `builtin_skills_dir` is `None`. The user
+/// skills tree lives at `{data_dir}/builtin-skills/`, populated at
+/// startup by `startup_materialize::materialize_if_needed`. The user
 /// skills directory is derived from `data_dir`, not `resource_dir`.
 #[tokio::test]
 async fn sm11_get_skill_paths() {
@@ -255,9 +253,10 @@ async fn sm11_get_skill_paths() {
     let paths = resolve_skill_paths(resource_dir, data_dir);
 
     assert!(paths.user_skills_dir.to_string_lossy().contains("skills"));
-    assert!(
-        paths.builtin_skills_dir.is_none(),
-        "production mode must yield None (embedded corpus)"
+    assert_eq!(
+        paths.builtin_skills_dir,
+        data_dir.join("builtin-skills"),
+        "production mode must resolve builtin_skills_dir under data_dir"
     );
 }
 

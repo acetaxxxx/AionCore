@@ -31,10 +31,9 @@ struct Fixture {
     _tmp: TempDir,
 }
 
-/// Build an app whose skill state uses the embedded built-in corpus
-/// (no `AIONUI_BUILTIN_SKILLS_PATH` override) and a fresh temp data
-/// directory. `write_skill` can still seed user skills under
-/// `{data_dir}/skills/`.
+/// Build an app whose skill state points at a freshly materialized
+/// builtin-skills tree rooted at a temp `data_dir`. `write_skill` can
+/// still seed user skills under `{data_dir}/skills/`.
 async fn fixture_embedded() -> Fixture {
     // Ensure no env override interferes.
     // SAFETY: tests in this file may mutate this env var across async
@@ -49,6 +48,16 @@ async fn fixture_embedded() -> Fixture {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().to_path_buf();
 
+    // Materialize the embedded corpus onto the temp data dir so the
+    // per-test router can read it just like production would.
+    aionui_extension::materialize_if_needed(
+        &data_dir,
+        aionui_extension::builtin_skills_corpus(),
+        "test-fixture",
+    )
+    .await
+    .expect("failed to materialize embedded builtin skills for test fixture");
+
     let db = init_database_memory().await.unwrap();
     let services =
         aionui_app::AppServices::from_database_with_data_dir(db, "data".to_string(), false)
@@ -62,7 +71,7 @@ async fn fixture_embedded() -> Fixture {
     let skill_paths = SkillPaths {
         data_dir: data_dir.clone(),
         user_skills_dir: data_dir.join("skills"),
-        builtin_skills_dir: None, // embedded corpus
+        builtin_skills_dir: data_dir.join("builtin-skills"),
         builtin_rules_dir: data_dir.join("builtin-rules"),
         assistant_rules_dir: data_dir.join("assistant-rules"),
         assistant_skills_dir: data_dir.join("assistant-skills"),
@@ -263,13 +272,14 @@ async fn list_skills_builtin_entries_carry_relative_location() {
                 assert!(rel.ends_with("/SKILL.md"));
                 let loc = item["location"].as_str().unwrap();
                 assert!(
-                    loc.contains("builtin-skills-view"),
-                    "builtin location should live under view dir: {loc}"
+                    loc.contains("builtin-skills"),
+                    "builtin location should live under builtin-skills dir: {loc}"
                 );
-                // View is materialized lazily; SKILL.md must now exist.
+                // The builtin-skills tree is materialized at startup, so
+                // SKILL.md must already exist on disk.
                 assert!(
                     std::path::Path::new(loc).exists(),
-                    "view file missing on disk: {loc}"
+                    "builtin skill file missing on disk: {loc}"
                 );
             }
             "custom" => {
