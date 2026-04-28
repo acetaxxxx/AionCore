@@ -140,6 +140,22 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Removes all sessions across all users.
+    ///
+    /// Called after settings sync to force sessions to be recreated
+    /// with updated agent/model configuration.
+    pub async fn clear_all_sessions(&self) -> Result<(), ChannelError> {
+        let sessions = self.repo.get_all_sessions().await?;
+        let mut cleared_users = std::collections::HashSet::new();
+        for session in &sessions {
+            if cleared_users.insert(session.user_id.clone()) {
+                self.repo.delete_sessions_by_user(&session.user_id).await?;
+            }
+        }
+        info!(count = sessions.len(), "cleared all channel sessions");
+        Ok(())
+    }
+
     /// Looks up a session by its unique ID.
     pub async fn get_session_by_id(
         &self,

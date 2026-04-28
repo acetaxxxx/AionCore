@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
 use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
-use aionui_common::{AgentType, ConversationSource, ProviderWithModel, generate_id};
+use aionui_common::{AgentType, ConversationSource, generate_id};
 use aionui_conversation::ConversationService;
 use aionui_db::models::AssistantSessionRow;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+use crate::channel_settings::{ChannelSettingsService, resolved_model_to_provider};
 use crate::constants::{STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
 use crate::error::ChannelError;
 use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
@@ -23,7 +24,7 @@ use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoin
 pub struct ChannelMessageService {
     conversation_svc: Arc<ConversationService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
-    default_model: ProviderWithModel,
+    settings: Arc<ChannelSettingsService>,
     owner_user_id: String,
 }
 
@@ -31,13 +32,13 @@ impl ChannelMessageService {
     pub fn new(
         conversation_svc: Arc<ConversationService>,
         task_manager: Arc<dyn IWorkerTaskManager>,
-        default_model: ProviderWithModel,
+        settings: Arc<ChannelSettingsService>,
         owner_user_id: String,
     ) -> Self {
         Self {
             conversation_svc,
             task_manager,
-            default_model,
+            settings,
             owner_user_id,
         }
     }
@@ -118,13 +119,18 @@ impl ChannelMessageService {
         let source = platform_to_source(platform);
         let agent_type = parse_agent_type(&session.agent_type);
 
+        let agent_config = self.settings.get_agent_config(platform).await?;
+        let model_config = self.settings.get_model_config(platform).await?;
+        let model = resolved_model_to_provider(model_config.as_ref());
+        let extra = Self::build_channel_extra(agent_config.backend.as_deref());
+
         let req = CreateConversationRequest {
             r#type: agent_type,
             name: None,
-            model: Some(self.default_model.clone()),
+            model: Some(model),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
-            extra: Self::build_channel_extra(),
+            extra,
         };
 
         let response = self
@@ -263,15 +269,14 @@ impl ChannelMessageService {
     ///
     /// Sets `session_mode` to `"yolo"` so the agent auto-approves tool calls —
     /// channel users have no interactive UI for confirmations.
-    pub fn build_channel_extra_with_backend(backend: &str) -> serde_json::Value {
-        serde_json::json!({
+    pub fn build_channel_extra(backend: Option<&str>) -> serde_json::Value {
+        let mut extra = serde_json::json!({
             "session_mode": "yolo",
-            "backend": backend
-        })
-    }
-
-    pub fn build_channel_extra() -> serde_json::Value {
-        Self::build_channel_extra_with_backend("claude")
+        });
+        if let Some(b) = backend {
+            extra["backend"] = serde_json::Value::String(b.to_owned());
+        }
+        extra
     }
 }
 
@@ -534,7 +539,15 @@ mod tests {
 
     #[test]
     fn yolo_extra_contains_session_mode() {
-        let extra = ChannelMessageService::build_channel_extra();
+        let extra = ChannelMessageService::build_channel_extra(None);
         assert_eq!(extra["session_mode"], "yolo");
+        assert!(extra.get("backend").is_none());
+    }
+
+    #[test]
+    fn yolo_extra_with_backend() {
+        let extra = ChannelMessageService::build_channel_extra(Some("claude"));
+        assert_eq!(extra["session_mode"], "yolo");
+        assert_eq!(extra["backend"], "claude");
     }
 }

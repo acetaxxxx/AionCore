@@ -311,10 +311,18 @@ pub async fn build_channel_state(
     let plugin_factory: Arc<aionui_channel::manager::PluginFactory> =
         Arc::new(Box::new(aionui_channel::plugins::create_plugin));
 
+    // Build channel settings service for per-plugin agent/model configuration
+    let pref_pool = services.database.pool().clone();
+    let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
+        Arc::new(SqliteClientPreferenceRepository::new(pref_pool));
+    let channel_settings =
+        Arc::new(aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo));
+
     // Build orchestrator dependencies
     let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
         Arc::clone(&pairing_service),
         Arc::clone(&session_manager),
+        Arc::clone(&channel_settings),
         "acp",
     ));
 
@@ -333,12 +341,6 @@ pub async fn build_channel_state(
         skill_resolver,
     ));
 
-    let default_model = aionui_common::ProviderWithModel {
-        provider_id: String::new(),
-        model: String::new(),
-        use_model: None,
-    };
-
     let owner_user_id = services
         .user_repo
         .get_primary_webui_user()
@@ -351,7 +353,7 @@ pub async fn build_channel_state(
     let message_service = Arc::new(aionui_channel::message_service::ChannelMessageService::new(
         conversation_svc,
         services.worker_task_manager.clone(),
-        default_model,
+        Arc::clone(&channel_settings),
         owner_user_id,
     ));
 
@@ -368,6 +370,7 @@ pub async fn build_channel_state(
         session_manager,
         repo,
         plugin_factory: Arc::clone(&plugin_factory),
+        settings_service: channel_settings,
     };
 
     let components = ChannelOrchestratorComponents {

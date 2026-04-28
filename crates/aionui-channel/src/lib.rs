@@ -1,5 +1,6 @@
 //! External channel integration: plugin system, pairing handshake, and per-session messaging.
 pub mod action;
+pub mod channel_settings;
 pub mod constants;
 pub mod error;
 pub mod formatter;
