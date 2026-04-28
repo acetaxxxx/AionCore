@@ -15,8 +15,23 @@ use crate::types::{CronJob, CronSchedule};
 // Schedule validation
 // ---------------------------------------------------------------------------
 
+/// Normalize a cron expression so both 5-field (standard Unix) and 6-field
+/// (seconds-prefixed, as required by the `cron` crate) forms are accepted.
+/// A 5-field expression is promoted by prepending `0 ` for the seconds field.
+pub(crate) fn normalize_cron_expr(expr: &str) -> String {
+    let trimmed = expr.trim();
+    let field_count = trimmed.split_whitespace().count();
+    if field_count == 5 {
+        format!("0 {trimmed}")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 pub fn validate_cron_expression(expr: &str) -> Result<Schedule, CronError> {
-    Schedule::from_str(expr).map_err(|e| CronError::InvalidCronExpression(format!("{expr}: {e}")))
+    let normalized = normalize_cron_expr(expr);
+    Schedule::from_str(&normalized)
+        .map_err(|e| CronError::InvalidCronExpression(format!("{expr}: {e}")))
 }
 
 pub fn validate_timezone(tz: &str) -> Result<chrono_tz::Tz, CronError> {
@@ -42,7 +57,8 @@ pub fn compute_next_run(schedule: &CronSchedule, now: TimestampMs) -> Option<Tim
 }
 
 fn compute_cron_next_run(expr: &str, tz: Option<&str>, now: TimestampMs) -> Option<TimestampMs> {
-    let schedule = Schedule::from_str(expr).ok()?;
+    let normalized = normalize_cron_expr(expr);
+    let schedule = Schedule::from_str(&normalized).ok()?;
 
     if let Some(tz_str) = tz {
         let tz_parsed: chrono_tz::Tz = tz_str.parse().ok()?;
@@ -422,9 +438,33 @@ mod tests {
     }
 
     #[test]
+    fn validate_cron_expression_accepts_five_field_unix_form() {
+        // Standard 5-field Unix cron (minute hour day month dow) — must be
+        // auto-normalized to the 6-field form the `cron` crate requires.
+        assert!(validate_cron_expression("0 9 * * *").is_ok());
+        assert!(validate_cron_expression("30 14 * * MON-FRI").is_ok());
+        assert!(validate_cron_expression("0 10 * * WED").is_ok());
+        assert!(validate_cron_expression("0 * * * *").is_ok());
+    }
+
+    #[test]
     fn validate_cron_expression_invalid() {
         assert!(validate_cron_expression("not a cron").is_err());
         assert!(validate_cron_expression("").is_err());
+    }
+
+    #[test]
+    fn normalize_cron_expr_leaves_six_field_alone() {
+        assert_eq!(normalize_cron_expr("0 0 9 * * *"), "0 0 9 * * *");
+    }
+
+    #[test]
+    fn normalize_cron_expr_promotes_five_field() {
+        assert_eq!(normalize_cron_expr("0 9 * * *"), "0 0 9 * * *");
+        assert_eq!(
+            normalize_cron_expr("  30 14 * * MON-FRI  "),
+            "0 30 14 * * MON-FRI"
+        );
     }
 
     #[test]
