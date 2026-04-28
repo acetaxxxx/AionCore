@@ -466,6 +466,29 @@ impl ChannelManager {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::stream_relay::ChannelSender for ChannelManager {
+    async fn send_message(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        message: crate::types::UnifiedOutgoingMessage,
+    ) -> Result<String, crate::error::ChannelError> {
+        self.send_message(plugin_id, chat_id, message).await
+    }
+
+    async fn edit_message(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        message: crate::types::UnifiedOutgoingMessage,
+    ) -> Result<(), crate::error::ChannelError> {
+        self.edit_message(plugin_id, chat_id, message_id, message)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
