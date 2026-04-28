@@ -3,8 +3,8 @@ use tracing::debug;
 
 use super::protocol::{AgentEvent, ApprovalRequestEvent, ChatEvent, ChatEventState, EventFrame};
 use crate::stream_event::{
-    AgentStatusEventData, AgentStreamEvent, ErrorEventData, FinishEventData, StartEventData,
-    TextEventData, ThinkingEventData, ToolCallEventData, ToolCallStatus,
+    AgentStreamEvent, ErrorEventData, FinishEventData, StartEventData, TextEventData,
+    ThinkingEventData, ToolCallEventData, ToolCallStatus,
 };
 
 #[derive(Default)]
@@ -184,17 +184,8 @@ fn map_agent_event(
             }
             vec![]
         }
-        "lifecycle" => {
-            if data.get("phase").and_then(|v| v.as_str()) == Some("start") {
-                return vec![AgentStreamEvent::AgentStatus(AgentStatusEventData {
-                    backend: "openclaw-gateway".into(),
-                    status: "session_active".into(),
-                    agent_name: None,
-                    session_id: agent_evt.session_key,
-                })];
-            }
-            vec![]
-        }
+        // Turn lifecycle is driven by chat.state events (final/aborted/error)
+        "lifecycle" => vec![],
         _ => {
             debug!(stream = stream, "Unhandled agent event stream");
             vec![]
