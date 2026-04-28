@@ -5,6 +5,7 @@ use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
 use aionui_common::{AgentType, ConversationSource, ProviderWithModel, generate_id};
 use aionui_conversation::ConversationService;
 use aionui_db::models::AssistantSessionRow;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::constants::{STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
@@ -79,16 +80,27 @@ impl ChannelMessageService {
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
 
+        // Subscribe to the agent's broadcast channel for the ChannelStreamRelay.
+        // The agent task exists because send_message just called get_or_build_task.
+        // ConversationService spawns agent.send_message in a background task,
+        // so the first events have not been emitted yet — no race condition.
+        let stream_rx = self
+            .task_manager
+            .get_task(&conversation_id)
+            .map(|handle| handle.subscribe());
+
         info!(
             conversation_id = %conversation_id,
             session_id = %session.id,
             msg_id = %msg_id,
+            has_stream = stream_rx.is_some(),
             "message sent to agent"
         );
 
         Ok(SendResult {
             conversation_id,
             msg_id,
+            stream_rx,
         })
     }
 
@@ -110,7 +122,7 @@ impl ChannelMessageService {
             model: Some(self.default_model.clone()),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
-            extra: serde_json::Value::Object(Default::default()),
+            extra: Self::build_channel_extra(),
         };
 
         let user_id = "channel";
@@ -245,13 +257,27 @@ impl ChannelMessageService {
     pub fn confirm_timeout() -> std::time::Duration {
         TOOL_CONFIRM_TIMEOUT
     }
+
+    /// Build the `extra` JSON for channel conversations.
+    ///
+    /// Sets `session_mode` to `"yolo"` so the agent auto-approves tool calls —
+    /// channel users have no interactive UI for confirmations.
+    pub fn build_channel_extra() -> serde_json::Value {
+        serde_json::json!({
+            "session_mode": "yolo"
+        })
+    }
 }
 
 /// Result of sending a message to the agent.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SendResult {
     pub conversation_id: String,
     pub msg_id: String,
+    /// Agent event stream for the ChannelStreamRelay.
+    /// `None` when the agent task could not be found after sending
+    /// (should not happen in normal flow).
+    pub stream_rx: Option<broadcast::Receiver<AgentStreamEvent>>,
 }
 
 /// Actions derived from agent stream events.
@@ -496,5 +522,13 @@ mod tests {
             ChannelMessageService::confirm_timeout(),
             std::time::Duration::from_secs(15)
         );
+    }
+
+    // ── build_channel_extra ───────────────────────────────────────────
+
+    #[test]
+    fn yolo_extra_contains_session_mode() {
+        let extra = ChannelMessageService::build_channel_extra();
+        assert_eq!(extra["session_mode"], "yolo");
     }
 }
