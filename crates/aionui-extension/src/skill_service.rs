@@ -4,9 +4,8 @@ use include_dir::{Dir, include_dir};
 use tracing::{debug, warn};
 
 use crate::constants::{
-    AGENT_SKILLS_SUBDIR, ASSISTANT_RULES_DIR_NAME, ASSISTANT_SKILLS_DIR_NAME,
-    BUILTIN_AUTO_SKILLS_SUBDIR, BUILTIN_RULES_DIR_NAME, COMMON_SKILL_DIRS, SKILL_MANIFEST_FILE,
-    SKILLS_DIR_NAME,
+    ASSISTANT_RULES_DIR_NAME, ASSISTANT_SKILLS_DIR_NAME, BUILTIN_AUTO_SKILLS_SUBDIR,
+    BUILTIN_RULES_DIR_NAME, COMMON_SKILL_DIRS, SKILL_MANIFEST_FILE, SKILLS_DIR_NAME,
 };
 use crate::error::ExtensionError;
 
@@ -69,9 +68,10 @@ pub struct SkillPaths {
 /// unless redirected via [`BUILTIN_SKILLS_ENV_VAR`].
 ///
 /// `data_dir` is the user-level data root (e.g. `~/.aionui/`) and
-/// determines where user skills, assistant resources, the built-in
-/// skills tree (`{data_dir}/builtin-skills/`), and per-agent
-/// materialized skill dirs (`{data_dir}/agent-skills/`) live.
+/// determines where user skills, assistant resources, and the built-in
+/// skills tree (`{data_dir}/builtin-skills/`) live. Per-conversation
+/// agent skills are no longer materialized on disk — see
+/// [`materialize_skills_for_agent`] for the symlink contract.
 pub fn resolve_skill_paths(app_resource_dir: &Path, data_dir: &Path) -> SkillPaths {
     let builtin_skills_dir = std::env::var(BUILTIN_SKILLS_ENV_VAR)
         .ok()
@@ -554,43 +554,50 @@ fn builtin_skill_exists(paths: &SkillPaths, skill_name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// D2. Per-agent skill materialization
+// D2. Per-agent skill resolution
 // ---------------------------------------------------------------------------
 
-/// Materialize the listed skills into a per-conversation directory
-/// under `{data_dir}/agent-skills/{conversation_id}/`.
+/// A resolved skill reference returned by [`materialize_skills_for_agent`].
 ///
-/// Layout is flat: every skill lands at `{target}/{name}/SKILL.md`,
-/// regardless of whether it originated from the `auto-inject/` subtree
-/// or a top-level opt-in folder. The `auto-inject/` intermediate
-/// directory is flattened away because gemini CLI's `--extensions`
-/// loader expects one skill per subdir.
+/// `name` is the skill's requested name; `source_path` is the absolute
+/// on-disk directory containing its `SKILL.md`. The caller is expected
+/// to symlink that directory into the agent CLI's native skills dir
+/// rather than copy it — backend no longer owns per-conversation files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAgentSkill {
+    pub name: String,
+    pub source_path: PathBuf,
+}
+
+/// Resolve each requested skill name to its on-disk source directory.
 ///
-/// Callers pass the fully resolved snapshot — this function does NOT
-/// implicitly include auto-inject; the caller (e.g. the
-/// `ConversationService::create` snapshot) is the source of truth.
-/// Unknown names are silently skipped — a warning is emitted but the
-/// operation still returns success. Returns the absolute path of the
-/// target directory.
+/// Search order per name (first match wins):
+/// 1. `{builtin_skills_dir}/{name}/` — top-level opt-in builtin.
+/// 2. `{builtin_skills_dir}/auto-inject/{name}/` — auto-inject builtin.
+/// 3. `{user_skills_dir}/{name}/` — user-created custom skill.
+///
+/// No files are copied and no per-conversation directory is created —
+/// the backend just hands the absolute source paths back to the caller,
+/// which is responsible for symlinking them where the CLI expects. This
+/// replaces the older "copy into `{data_dir}/agent-skills/{conv_id}/`"
+/// behavior once the frontend moved to a symlink-only contract.
+///
+/// Unknown names are silently skipped (a warning is emitted). Names
+/// containing path separators or `..` are rejected with a warn and
+/// skipped, matching the legacy behavior. Empty names are ignored.
+///
+/// The returned list is sorted by `name` for determinism. The
+/// `conversation_id` is still validated (rejects path-traversal values)
+/// so downstream callers can safely use it in log lines or paths even
+/// though this function no longer touches disk per-conversation.
 pub async fn materialize_skills_for_agent(
     paths: &SkillPaths,
     conversation_id: &str,
     skills: &[String],
-) -> Result<PathBuf, ExtensionError> {
+) -> Result<Vec<ResolvedAgentSkill>, ExtensionError> {
     validate_filename(conversation_id)?;
 
-    let target = paths
-        .data_dir
-        .join(AGENT_SKILLS_SUBDIR)
-        .join(conversation_id);
-
-    // Fresh directory on every call — ensures re-runs don't carry stale
-    // files between retries.
-    if target.exists() {
-        tokio::fs::remove_dir_all(&target).await?;
-    }
-    tokio::fs::create_dir_all(&target).await?;
-
+    let mut resolved = Vec::with_capacity(skills.len());
     for name in skills {
         if name.is_empty() {
             continue;
@@ -599,126 +606,39 @@ pub async fn materialize_skills_for_agent(
             warn!(skill = %name, "skipping skill with invalid name");
             continue;
         }
-        let wrote = write_skill_by_name(paths, name, &target).await?;
-        if !wrote {
-            warn!(skill = %name, "skill not found in any source");
+        match resolve_skill_source_path(paths, name) {
+            Some(source_path) => resolved.push(ResolvedAgentSkill {
+                name: name.clone(),
+                source_path,
+            }),
+            None => warn!(skill = %name, "skill not found in any source"),
         }
     }
 
-    Ok(target)
+    resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(resolved)
 }
 
-/// Write a single named skill into `{target}/{name}/`. Resolves in
-/// order: embedded/disk builtin (top-level + auto-inject) → user
-/// skills dir. Returns `true` if the skill was found and written.
-async fn write_skill_by_name(
-    paths: &SkillPaths,
-    name: &str,
-    target: &Path,
-) -> Result<bool, ExtensionError> {
-    let dest = target.join(name);
-
+/// Resolve a skill name to its on-disk source directory using the same
+/// search order as [`materialize_skills_for_agent`]. Returns `None` if
+/// no matching directory exists in any known source.
+fn resolve_skill_source_path(paths: &SkillPaths, name: &str) -> Option<PathBuf> {
     let top = paths.builtin_skills_dir.join(name);
     if top.is_dir() {
-        if dest.exists() {
-            tokio::fs::remove_dir_all(&dest).await?;
-        }
-        copy_dir_recursive(&top, &dest).await?;
-        return Ok(true);
+        return Some(top);
     }
     let auto = paths
         .builtin_skills_dir
         .join(BUILTIN_AUTO_SKILLS_SUBDIR)
         .join(name);
     if auto.is_dir() {
-        if dest.exists() {
-            tokio::fs::remove_dir_all(&dest).await?;
-        }
-        copy_dir_recursive(&auto, &dest).await?;
-        return Ok(true);
+        return Some(auto);
     }
-
-    // User skill.
     let user = paths.user_skills_dir.join(name);
     if user.is_dir() {
-        if dest.exists() {
-            tokio::fs::remove_dir_all(&dest).await?;
-        }
-        copy_dir_recursive(&user, &dest).await?;
-        return Ok(true);
+        return Some(user);
     }
-
-    Ok(false)
-}
-
-/// Remove the per-conversation agent-skills directory.
-/// Idempotent: missing directory is not an error.
-pub async fn cleanup_agent_skills(
-    paths: &SkillPaths,
-    conversation_id: &str,
-) -> Result<(), ExtensionError> {
-    validate_filename(conversation_id)?;
-    let target = paths
-        .data_dir
-        .join(AGENT_SKILLS_SUBDIR)
-        .join(conversation_id);
-    match tokio::fs::remove_dir_all(&target).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(ExtensionError::Io(e)),
-    }
-}
-
-/// Remove orphan per-conversation agent-skills subdirectories.
-///
-/// Scans `{data_dir}/agent-skills/*` and deletes any entry whose name
-/// is not a currently-live conversation, as reported by the
-/// `is_live_conversation` predicate. The predicate is injected so this
-/// crate does not need to depend on `aionui-conversation` — the
-/// composition layer (`aionui-app`) wires in the real repository
-/// check.
-///
-/// Intended to be called once on startup; logs each removal at debug
-/// level. Non-fatal errors are swallowed (best-effort cleanup).
-pub async fn cleanup_orphan_agent_skills<F>(
-    paths: &SkillPaths,
-    is_live_conversation: F,
-) -> Result<usize, ExtensionError>
-where
-    F: Fn(&str) -> bool,
-{
-    let root = paths.data_dir.join(AGENT_SKILLS_SUBDIR);
-    let mut entries = match tokio::fs::read_dir(&root).await {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(ExtensionError::Io(e)),
-    };
-
-    let mut removed = 0usize;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if is_live_conversation(name) {
-            continue;
-        }
-        match tokio::fs::remove_dir_all(&path).await {
-            Ok(()) => {
-                debug!(conversation_id = %name, "removed orphan agent-skills dir");
-                removed += 1;
-            }
-            Err(e) => warn!(
-                conversation_id = %name,
-                error = %e,
-                "failed to remove orphan agent-skills dir"
-            ),
-        }
-    }
-    Ok(removed)
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1842,91 +1762,129 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Materialize / cleanup
+    // Materialize (symlink contract)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn materialize_creates_fresh_dir_each_call() {
+    async fn materialize_empty_list_returns_empty() {
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
 
-        let dir = materialize_skills_for_agent(&paths, "conv-1", &[])
+        let list = materialize_skills_for_agent(&paths, "conv-empty", &[])
             .await
             .unwrap();
-        assert!(dir.is_dir());
-        // Drop a sentinel file; second call should wipe it.
-        std::fs::write(dir.join("sentinel.txt"), b"stale").unwrap();
-        let dir2 = materialize_skills_for_agent(&paths, "conv-1", &[])
-            .await
-            .unwrap();
-        assert_eq!(dir, dir2);
-        assert!(
-            !dir2.join("sentinel.txt").exists(),
-            "materialize must start fresh"
-        );
+        assert!(list.is_empty());
+        // No per-conversation dir should be created.
+        assert!(!paths.data_dir.join("agent-skills").exists());
+        assert!(!paths.data_dir.join("conversations").exists());
     }
 
     #[tokio::test]
     async fn materialize_resolves_auto_inject_skill_by_name() {
-        // Auto-inject skills are now only materialized when the caller
-        // names them explicitly (see `ConversationService::create`
-        // snapshot). Passing `&[]` yields an empty dir; passing a known
-        // auto-inject name (e.g. "cron") writes it at the flat layout.
+        // Auto-inject skills are resolved only when the caller names
+        // them explicitly (see `ConversationService::create` snapshot).
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
 
-        let empty = materialize_skills_for_agent(&paths, "conv-empty", &[])
+        let resolved = materialize_skills_for_agent(&paths, "conv-named", &["cron".to_owned()])
             .await
             .unwrap();
-        assert!(empty.is_dir());
-        assert!(
-            !empty.join("cron").exists(),
-            "auto-inject must NOT be implicit anymore"
-        );
-
-        let named = materialize_skills_for_agent(&paths, "conv-named", &["cron".to_owned()])
-            .await
-            .unwrap();
-        assert!(
-            named.join("cron").join(SKILL_MANIFEST_FILE).exists(),
-            "named auto-inject skill not materialized"
-        );
-        assert!(
-            !named.join(BUILTIN_AUTO_SKILLS_SUBDIR).exists(),
-            "auto-inject/ wrapper should be flattened away; layout is flat"
-        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "cron");
+        // source_path points at the real on-disk auto-inject directory.
+        let expected = paths
+            .builtin_skills_dir
+            .join(BUILTIN_AUTO_SKILLS_SUBDIR)
+            .join("cron");
+        assert_eq!(resolved[0].source_path, expected);
+        assert!(resolved[0].source_path.is_dir());
+        assert!(resolved[0].source_path.join(SKILL_MANIFEST_FILE).exists());
     }
 
     #[tokio::test]
-    async fn materialize_includes_opt_in() {
+    async fn materialize_resolves_opt_in_top_level_skill() {
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
 
-        let dir = materialize_skills_for_agent(&paths, "conv-opt", &["mermaid".to_string()])
+        let resolved = materialize_skills_for_agent(&paths, "conv-opt", &["mermaid".to_owned()])
             .await
             .unwrap();
-        assert!(
-            dir.join("mermaid").join(SKILL_MANIFEST_FILE).exists(),
-            "mermaid opt-in skill not materialized"
-        );
-        assert!(
-            !dir.join("pdf").exists(),
-            "non-requested opt-in skill must not be materialized"
-        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "mermaid");
+        let expected = paths.builtin_skills_dir.join("mermaid");
+        assert_eq!(resolved[0].source_path, expected);
     }
 
     #[tokio::test]
-    async fn materialize_handles_nonexistent_skill_name() {
+    async fn materialize_resolves_user_skill() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_embedded_paths(tmp.path()).await;
+        create_skill_in_dir(&paths.user_skills_dir, "my-custom", "A user skill");
+
+        let resolved = materialize_skills_for_agent(&paths, "conv-user", &["my-custom".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].source_path, paths.user_skills_dir.join("my-custom"));
+    }
+
+    #[tokio::test]
+    async fn materialize_silently_skips_unknown_skill() {
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
 
-        let dir =
-            materialize_skills_for_agent(&paths, "conv-missing", &["no-such-skill".to_string()])
-                .await
-                .unwrap();
-        // Unknown name is silently skipped; the dir exists but stays empty.
-        assert!(dir.is_dir());
-        assert!(!dir.join("no-such-skill").exists());
+        let resolved = materialize_skills_for_agent(
+            &paths,
+            "conv-missing",
+            &["no-such-skill".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert!(resolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn materialize_skips_invalid_names_but_keeps_valid_ones() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_embedded_paths(tmp.path()).await;
+
+        let resolved = materialize_skills_for_agent(
+            &paths,
+            "conv-mixed",
+            &[
+                "".to_owned(),
+                "../evil".to_owned(),
+                "foo/bar".to_owned(),
+                "cron".to_owned(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "cron");
+    }
+
+    #[tokio::test]
+    async fn materialize_returns_sorted_list_with_source_paths() {
+        // Deterministic ordering — callers rely on it for stable symlink
+        // layouts and for easier debugging / snapshot tests.
+        let tmp = TempDir::new().unwrap();
+        let paths = make_embedded_paths(tmp.path()).await;
+
+        let resolved = materialize_skills_for_agent(
+            &paths,
+            "conv-sorted",
+            &["mermaid".to_owned(), "cron".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "cron");
+        assert_eq!(resolved[1].name, "mermaid");
+        for entry in &resolved {
+            assert!(entry.source_path.is_absolute());
+            assert!(entry.source_path.is_dir());
+        }
     }
 
     #[tokio::test]
@@ -1941,51 +1899,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_is_idempotent() {
+    async fn materialize_does_not_touch_disk_beyond_reads() {
+        // Guardrail: the symlink contract forbids any per-conversation
+        // directory on disk. Verify the function only reads the sources
+        // and never writes.
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
 
-        materialize_skills_for_agent(&paths, "conv-del", &[])
+        let _ = materialize_skills_for_agent(&paths, "conv-pure", &["cron".to_owned()])
             .await
             .unwrap();
-        cleanup_agent_skills(&paths, "conv-del").await.unwrap();
-        // Second call should not error.
-        cleanup_agent_skills(&paths, "conv-del").await.unwrap();
-        assert!(
-            !paths
-                .data_dir
-                .join(AGENT_SKILLS_SUBDIR)
-                .join("conv-del")
-                .exists()
-        );
-    }
-
-    #[tokio::test]
-    async fn orphan_cleanup_removes_stale_but_preserves_live() {
-        let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path()).await;
-
-        // Seed: one live + one orphan conversation dir.
-        let root = paths.data_dir.join(AGENT_SKILLS_SUBDIR);
-        std::fs::create_dir_all(root.join("live-conv")).unwrap();
-        std::fs::create_dir_all(root.join("orphan-conv")).unwrap();
-        std::fs::write(root.join("live-conv/marker"), b"keep").unwrap();
-        std::fs::write(root.join("orphan-conv/marker"), b"drop").unwrap();
-
-        let removed = cleanup_orphan_agent_skills(&paths, |id| id == "live-conv")
-            .await
-            .unwrap();
-        assert_eq!(removed, 1);
-        assert!(root.join("live-conv").exists());
-        assert!(!root.join("orphan-conv").exists());
-    }
-
-    #[tokio::test]
-    async fn orphan_cleanup_missing_root_is_noop() {
-        let tmp = TempDir::new().unwrap();
-        let paths = make_embedded_paths(tmp.path()).await;
-
-        let removed = cleanup_orphan_agent_skills(&paths, |_| true).await.unwrap();
-        assert_eq!(removed, 0);
+        assert!(!paths.data_dir.join("agent-skills").exists());
+        assert!(!paths.data_dir.join("conversations").exists());
     }
 }
