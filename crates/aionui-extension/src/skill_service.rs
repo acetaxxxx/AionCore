@@ -619,6 +619,69 @@ pub async fn materialize_skills_for_agent(
     Ok(resolved)
 }
 
+/// Create symlinks from a set of resolved skills into the agent CLI's
+/// native skills directories inside `workspace`.
+///
+/// For each relative `skills_rel_dir` (e.g. `.claude/skills`):
+/// 1. Ensure `{workspace}/{skills_rel_dir}/` exists.
+/// 2. For each `{ name, source_path }` in `skills`, create a symlink
+///    `{workspace}/{skills_rel_dir}/{name} -> {source_path}`.
+///
+/// Existing symlinks/files at the target name are left untouched
+/// (first-write-wins, matches the frontend's lstat-then-skip behavior
+/// before symlink creation). Individual symlink failures are logged and
+/// skipped — skill discovery degrades gracefully, it is not fatal.
+///
+/// Returns the number of symlinks successfully created across all
+/// target dirs.
+pub async fn link_workspace_skills(
+    workspace: &Path,
+    skills_rel_dirs: &[&str],
+    skills: &[ResolvedAgentSkill],
+) -> Result<usize, ExtensionError> {
+    let mut created = 0usize;
+    for rel in skills_rel_dirs {
+        let target_skills_dir = workspace.join(rel);
+        tokio::fs::create_dir_all(&target_skills_dir).await?;
+
+        for skill in skills {
+            let target = target_skills_dir.join(&skill.name);
+            match tokio::fs::symlink_metadata(&target).await {
+                // Target already exists — leave it alone.
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(
+                        target = %target.display(),
+                        error = %e,
+                        "skipping skill link: failed to stat target"
+                    );
+                    continue;
+                }
+            }
+            match create_symlink(&skill.source_path, &target).await {
+                Ok(()) => {
+                    debug!(
+                        skill = %skill.name,
+                        target = %target.display(),
+                        "linked workspace skill"
+                    );
+                    created += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        skill = %skill.name,
+                        target = %target.display(),
+                        error = %e,
+                        "failed to link workspace skill"
+                    );
+                }
+            }
+        }
+    }
+    Ok(created)
+}
+
 /// Resolve a skill name to its on-disk source directory using the same
 /// search order as [`materialize_skills_for_agent`]. Returns `None` if
 /// no matching directory exists in any known source.
