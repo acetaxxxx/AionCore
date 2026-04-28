@@ -49,6 +49,27 @@ impl AgentType {
         // SAFETY: fnv1a_hex8 only produces ASCII hex digits
         unsafe { std::str::from_utf8_unchecked(&hash) }.into()
     }
+
+    /// Native skill-discovery directories for non-ACP agent types.
+    ///
+    /// ACP backends expose their own skill dirs via
+    /// [`AcpBackend::native_skills_dirs`]; this method covers the few
+    /// non-ACP agent types that still support native skill discovery.
+    /// Returns `None` for agent types that require prompt-injection
+    /// instead of workspace symlinks.
+    ///
+    /// Mirrors the `NON_ACP_SKILLS_DIRS` table in
+    /// `src/common/types/acpTypes.ts`.
+    pub fn native_skills_dirs(&self) -> Option<&'static [&'static str]> {
+        match self {
+            AgentType::Aionrs => Some(&[".aionrs/skills"]),
+            AgentType::Gemini => Some(&[".gemini/skills"]),
+            AgentType::Acp
+            | AgentType::OpenclawGateway
+            | AgentType::Nanobot
+            | AgentType::Remote => None,
+        }
+    }
 }
 
 /// ACP sub-backend identifier.

@@ -1,5 +1,5 @@
 use aion_agent::session::SessionManager;
-use aionui_common::{AgentType, AppError, CommandSpec};
+use aionui_common::{AcpBackend, AgentType, AppError, CommandSpec};
 use aionui_db::{IProviderRepository, IRemoteAgentRepository};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,12 +61,17 @@ async fn build_agent(
     // user paths may incidentally contain "conversations" or "-temp-".
     let (workspace, is_custom_workspace) = if options.workspace.is_empty() {
         // Fallback workspace path: kept in sync with
-        // `ConversationService::create`, which now places auto-
-        // provisioned workspaces under `{data_dir}/conversations/{id}/`.
+        // `ConversationService::create`, which places auto-provisioned
+        // workspaces under `{data_dir}/conversations/{label}-temp-{id}/`.
         // Reaching this branch means the caller did not supply an
-        // `extra.workspace` — the conversation id is the only stable
-        // unique identifier we have here.
-        let dir = deps.data_dir.join("conversations").join(&conversation_id);
+        // `extra.workspace` — construct the same `{label}-temp-{id}`
+        // layout so logs, cleanup scripts, and the frontend's "is this a
+        // managed temp dir?" heuristic all see a single naming scheme.
+        let label = workspace_label(&options.agent_type, options.extra.get("backend"));
+        let dir = deps
+            .data_dir
+            .join("conversations")
+            .join(format!("{label}-temp-{conversation_id}"));
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Internal(format!("Failed to create temp workspace: {e}")))?;
         (dir.to_string_lossy().into_owned(), false)
@@ -302,6 +307,23 @@ fn map_aionrs_provider(platform: &str, model_id: &str, model_protocols: Option<&
         _ => "openai",
     }
     .to_owned()
+}
+
+/// Label used in auto-provisioned temp workspace directory names.
+///
+/// For ACP conversations the label is the sub-backend id
+/// (e.g. `"claude"`, `"gemini"`); otherwise the agent type's serde name
+/// (e.g. `"aionrs"`). Must stay in sync with
+/// `ConversationService::create`'s `conversation_label`.
+fn workspace_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
+    if *agent_type == AgentType::Acp
+        && let Some(v) = backend
+        && let Ok(be) = serde_json::from_value::<AcpBackend>(v.clone())
+        && let Ok(serde_json::Value::String(s)) = serde_json::to_value(be)
+    {
+        return s;
+    }
+    agent_type.serde_name().to_owned()
 }
 
 /// Resolve base_url and compat overrides for the aionrs provider.
