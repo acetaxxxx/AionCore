@@ -103,7 +103,7 @@ pub struct ChannelAgentConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelModelConfig {
     pub id: String,
-    pub use_model: bool,
+    pub use_model: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +405,7 @@ mod tests {
             },
             "model": {
                 "id": "gemini-pro",
-                "use_model": true
+                "use_model": "gemini-2.5-flash"
             }
         });
         let req: SyncChannelSettingsRequest = serde_json::from_value(raw).unwrap();
@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(req.agent.name.as_deref(), Some("My Agent"));
         let model = req.model.unwrap();
         assert_eq!(model.id, "gemini-pro");
-        assert!(model.use_model);
+        assert_eq!(model.use_model, "gemini-2.5-flash");
     }
 
     #[test]

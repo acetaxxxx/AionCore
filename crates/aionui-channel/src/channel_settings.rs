@@ -409,7 +409,7 @@ mod tests {
         };
         let model = ChannelModelConfig {
             id: "provider_1".into(),
-            use_model: true,
+            use_model: "gpt-5".into(),
         };
 
         svc.save_settings(PluginType::Telegram, &agent, Some(&model))
