@@ -5,6 +5,7 @@ pub mod error;
 pub mod formatter;
 pub mod manager;
 pub mod message_service;
+pub mod orchestrator;
 pub mod pairing;
 pub mod plugin;
 pub mod plugins;
