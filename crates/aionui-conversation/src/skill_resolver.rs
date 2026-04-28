@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aionui_extension::ResolvedAgentSkill;
+pub use aionui_extension::ResolvedAgentSkill;
 use async_trait::async_trait;
 
 #[async_trait]
