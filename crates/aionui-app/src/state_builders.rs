@@ -80,8 +80,6 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
     let dispatcher: Arc<dyn AssistantRuleDispatcher> = assistant.service.clone();
     skill_state.assistant_dispatcher = Some(dispatcher);
 
-    run_orphan_agent_skills_cleanup(services, &skill_state.skill_paths).await;
-
     ModuleStates {
         system: build_system_state(services),
         conversation: build_conversation_state(services),
@@ -103,34 +101,6 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
         agent: AgentRouterState {
             agent_registry: services.agent_registry.clone(),
         },
-    }
-}
-
-/// Best-effort orphan sweep of `{data_dir}/agent-skills/`.
-async fn run_orphan_agent_skills_cleanup(
-    services: &AppServices,
-    skill_paths: &aionui_extension::SkillPaths,
-) {
-    let pool = services.database.pool().clone();
-    let repo: Arc<dyn aionui_db::IConversationRepository> =
-        Arc::new(SqliteConversationRepository::new(pool));
-    let handle = tokio::runtime::Handle::current();
-    let is_live = {
-        let repo = repo.clone();
-        move |id: &str| -> bool {
-            let id = id.to_string();
-            let repo = repo.clone();
-            tokio::task::block_in_place(|| {
-                handle.block_on(async move { repo.get(&id).await.ok().flatten().is_some() })
-            })
-        }
-    };
-    match aionui_extension::cleanup_orphan_agent_skills(skill_paths, is_live).await {
-        Ok(removed) if removed > 0 => {
-            tracing::info!(removed, "swept orphan agent-skills dirs on startup")
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "orphan agent-skills sweep failed (non-fatal)"),
     }
 }
 
