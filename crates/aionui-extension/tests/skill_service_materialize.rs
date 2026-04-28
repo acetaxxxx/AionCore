@@ -6,10 +6,11 @@ use tempfile::TempDir;
 /// touch the same env var. Vitest-style serialization inside a single
 /// test is sufficient here.
 #[tokio::test]
-async fn materialize_writes_only_listed_skills() {
+async fn materialize_returns_only_listed_skill_source_paths() {
     let tmp = TempDir::new().unwrap();
     // Stage two builtin auto-inject skills on disk.
-    let auto_dir = tmp.path().join("builtin-skills").join("auto-inject");
+    let builtin_root = tmp.path().join("builtin-skills");
+    let auto_dir = builtin_root.join("auto-inject");
     std::fs::create_dir_all(auto_dir.join("cron")).unwrap();
     std::fs::write(
         auto_dir.join("cron").join("SKILL.md"),
@@ -25,22 +26,25 @@ async fn materialize_writes_only_listed_skills() {
 
     // SAFETY: single-threaded test harness.
     unsafe {
-        std::env::set_var(
-            aionui_extension::BUILTIN_SKILLS_ENV_VAR,
-            tmp.path().join("builtin-skills"),
-        );
+        std::env::set_var(aionui_extension::BUILTIN_SKILLS_ENV_VAR, &builtin_root);
     }
     let paths = resolve_skill_paths(tmp.path(), tmp.path());
 
-    let dir = skill_service::materialize_skills_for_agent(&paths, "conv-1", &["cron".to_owned()])
-        .await
-        .unwrap();
+    let resolved =
+        skill_service::materialize_skills_for_agent(&paths, "conv-1", &["cron".to_owned()])
+            .await
+            .unwrap();
 
-    assert!(dir.join("cron").join("SKILL.md").exists());
-    assert!(
-        !dir.join("todo").exists(),
-        "todo should not be materialized"
-    );
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].name, "cron");
+    assert_eq!(resolved[0].source_path, auto_dir.join("cron"));
+    assert!(resolved[0].source_path.is_dir());
+    assert!(resolved[0].source_path.join("SKILL.md").exists());
+
+    // Guardrail: the new contract forbids any per-conversation dir on
+    // disk. Nothing under data_dir should have been created.
+    assert!(!tmp.path().join("agent-skills").exists());
+    assert!(!tmp.path().join("conversations").exists());
 
     unsafe {
         std::env::remove_var(aionui_extension::BUILTIN_SKILLS_ENV_VAR);
