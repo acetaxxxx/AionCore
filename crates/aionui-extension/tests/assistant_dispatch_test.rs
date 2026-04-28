@@ -142,7 +142,7 @@ async fn router_with_dispatcher(dispatcher: Arc<FakeDispatcher>) -> axum::Router
     let paths = SkillPaths {
         data_dir: root.clone(),
         user_skills_dir: root.join("skills"),
-        builtin_skills_dir: Some(root.join("builtin-skills")),
+        builtin_skills_dir: root.join("builtin-skills"),
         builtin_rules_dir: root.join("builtin-rules"),
         assistant_rules_dir: root.join("assistant-rules"),
         assistant_skills_dir: root.join("assistant-skills"),

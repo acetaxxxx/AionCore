@@ -568,7 +568,7 @@ mod tests {
         let paths = SkillPaths {
             data_dir: tmp.path().to_path_buf(),
             user_skills_dir: tmp.path().join("skills"),
-            builtin_skills_dir: Some(tmp.path().join("builtin-skills")),
+            builtin_skills_dir: tmp.path().join("builtin-skills"),
             builtin_rules_dir: tmp.path().join("builtin-rules"),
             assistant_rules_dir: tmp.path().join("assistant-rules"),
             assistant_skills_dir: tmp.path().join("assistant-skills"),
