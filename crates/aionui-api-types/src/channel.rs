@@ -127,6 +127,11 @@ pub struct PluginStatusResponse {
     pub last_connected: Option<TimestampMs>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    pub connected: bool,
+    pub has_token: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_username: Option<String>,
+    pub active_users: i64,
 }
 
 /// Result of a plugin credential test.
@@ -459,6 +464,10 @@ mod tests {
             last_connected: Some(1700000000000),
             created_at: 1699000000000,
             updated_at: 1700000000000,
+            connected: true,
+            has_token: true,
+            bot_username: Some("my_bot".into()),
+            active_users: 5,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["plugin_id"], "telegram");
@@ -469,6 +478,10 @@ mod tests {
         assert_eq!(json["last_connected"], 1700000000000_i64);
         assert_eq!(json["created_at"], 1699000000000_i64);
         assert_eq!(json["updated_at"], 1700000000000_i64);
+        assert_eq!(json["connected"], true);
+        assert_eq!(json["has_token"], true);
+        assert_eq!(json["bot_username"], "my_bot");
+        assert_eq!(json["active_users"], 5);
     }
 
     #[test]
@@ -482,10 +495,15 @@ mod tests {
             last_connected: None,
             created_at: 1699000000000,
             updated_at: 1699000000000,
+            connected: false,
+            has_token: false,
+            bot_username: None,
+            active_users: 0,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("status").is_none());
         assert!(json.get("last_connected").is_none());
+        assert!(json.get("bot_username").is_none());
     }
 
     // -- E. Test plugin response ----------------------------------------------
@@ -716,6 +734,10 @@ mod tests {
                 last_connected: Some(1700000000000),
                 created_at: 1699000000000,
                 updated_at: 1700000000000,
+                connected: false,
+                has_token: false,
+                bot_username: None,
+                active_users: 0,
             },
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -765,6 +787,10 @@ mod tests {
             last_connected: None,
             created_at: 1699000000000,
             updated_at: 1699000000000,
+            connected: false,
+            has_token: false,
+            bot_username: None,
+            active_users: 0,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: PluginStatusResponse = serde_json::from_str(&json).unwrap();
