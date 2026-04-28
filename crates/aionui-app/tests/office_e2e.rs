@@ -38,7 +38,7 @@ async fn build_office_app() -> (axum::Router, AppServices, tempfile::TempDir) {
     let services = AppServices::from_database_with_data_dir(db, data_dir, false)
         .await
         .unwrap();
-    let mut states = build_module_states(&services).await;
+    let (mut states, _) = build_module_states(&services).await;
 
     states.office = build_test_office_state(tmp.path());
 

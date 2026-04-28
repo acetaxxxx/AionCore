@@ -140,7 +140,7 @@ async fn fixture() -> Fixture {
     // Bring up in-memory DB + services + default module states.
     let db = init_database_memory().await.unwrap();
     let services = AppServices::from_database(db).await.unwrap();
-    let mut states: ModuleStates = build_module_states(&services).await;
+    let (mut states, _): (ModuleStates, _) = build_module_states(&services).await;
 
     // Replace the extension + hub + skill states with freshly-constructed
     // ones rooted at our temp dirs. The defaults built by
