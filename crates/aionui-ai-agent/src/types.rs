@@ -88,8 +88,9 @@ pub struct OpenClawGatewayConfig {
 /// OpenClaw-specific fields extracted from `extra` in [`BuildTaskOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenClawBuildExtra {
-    /// ACP sub-backend identifier.
-    pub backend: AcpBackend,
+    /// Optional downstream AI backend (informational only).
+    #[serde(default)]
+    pub backend: Option<AcpBackend>,
     /// Agent name.
     #[serde(default)]
     pub agent_name: Option<String>,
@@ -105,6 +106,9 @@ pub struct OpenClawBuildExtra {
     /// Associated cron job ID.
     #[serde(default)]
     pub cron_job_id: Option<String>,
+    /// Persisted session key for resume (from conversation.extra.sessionKey).
+    #[serde(default, rename = "sessionKey")]
+    pub session_key: Option<String>,
 }
 
 /// Remote agent-specific fields extracted from `extra` in [`BuildTaskOptions`].

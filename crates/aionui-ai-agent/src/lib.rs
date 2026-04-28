@@ -20,7 +20,7 @@ pub mod first_message_injector;
 pub mod idle_scanner;
 pub mod middleware;
 pub mod nanobot_agent;
-pub mod openclaw_agent;
+pub mod openclaw;
 pub mod remote_agent;
 pub mod remote_agent_routes;
 pub mod remote_agent_service;
@@ -54,7 +54,7 @@ pub use middleware::{
     strip_think_tags,
 };
 pub use nanobot_agent::NanobotAgentManager;
-pub use openclaw_agent::OpenClawAgentManager;
+pub use openclaw::OpenClawAgentManager;
 pub use remote_agent::{RemoteAgentConfig, RemoteAgentManager};
 pub use remote_agent_routes::{RemoteAgentRouterState, remote_agent_routes};
 pub use remote_agent_service::RemoteAgentService;
