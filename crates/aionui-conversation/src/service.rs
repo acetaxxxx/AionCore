@@ -235,7 +235,7 @@ impl ConversationService {
 
         self.repo.create(&row).await?;
 
-        let response = row_to_response(row)?;
+        let response = row_to_response(row, &self.workspace_root)?;
 
         self.broadcast_list_changed(&response.id, "created", response.source.as_ref());
 
@@ -257,7 +257,7 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
             .map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(&row.id, &mut extra).await;
-        row_to_response_with_extra(row, extra)
+        row_to_response_with_extra(row, extra, &self.workspace_root)
     }
 
     /// List conversations with cursor-based pagination and optional filters.
@@ -295,7 +295,7 @@ impl ConversationService {
                 }
             };
             self.backfill_extra_inplace(&row_id, &mut extra).await;
-            match row_to_response_with_extra(row, extra) {
+            match row_to_response_with_extra(row, extra, &self.workspace_root) {
                 Ok(resp) => items.push(resp),
                 Err(err) => warn!(
                     conversation_id = %row_id,
@@ -397,7 +397,7 @@ impl ConversationService {
             .await?
             .ok_or_else(|| AppError::Internal("Conversation vanished after update".into()))?;
 
-        let response = row_to_response(updated)?;
+        let response = row_to_response(updated, &self.workspace_root)?;
 
         self.broadcast_list_changed(id, "updated", response.source.as_ref());
 
@@ -510,7 +510,9 @@ impl ConversationService {
         id: &str,
     ) -> Result<Vec<ConversationResponse>, AppError> {
         let rows = self.repo.list_associated(user_id, id).await?;
-        rows.into_iter().map(row_to_response).collect()
+        rows.into_iter()
+            .map(|row| row_to_response(row, &self.workspace_root))
+            .collect()
     }
 
     /// List conversations spawned by a specific cron job.
@@ -520,7 +522,9 @@ impl ConversationService {
         cron_job_id: &str,
     ) -> Result<Vec<ConversationResponse>, AppError> {
         let rows = self.repo.list_by_cron_job(user_id, cron_job_id).await?;
-        rows.into_iter().map(row_to_response).collect()
+        rows.into_iter()
+            .map(|row| row_to_response(row, &self.workspace_root))
+            .collect()
     }
 
     /// List messages for a conversation with page-based pagination.
