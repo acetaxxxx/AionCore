@@ -30,7 +30,7 @@ pub async fn build_app_with_skill_paths(
 ) -> (axum::Router, AppServices, SkillPaths) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_database(db).await.unwrap();
-    let mut states = build_module_states(&services).await;
+    let (mut states, _) = build_module_states(&services).await;
 
     let builtin_dir = root.join("builtin-skills");
     let paths = SkillPaths {
@@ -67,7 +67,7 @@ pub async fn build_app_with_skill_paths(
 pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_database(db).await.unwrap();
-    let mut states = build_module_states(&services).await;
+    let (mut states, _) = build_module_states(&services).await;
     states.shell.shell_service = std::sync::Arc::new(aionui_shell::ShellService::new(
         std::sync::Arc::new(aionui_shell::NoopSystemOpener),
     ));
@@ -81,7 +81,7 @@ pub async fn build_app_with_mock_version(
 ) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_database(db).await.unwrap();
-    let mut states = build_module_states(&services).await;
+    let (mut states, _) = build_module_states(&services).await;
     states.system.version_check_service = VersionCheckService::with_api_base(
         reqwest::Client::new(),
         current_version.to_owned(),
