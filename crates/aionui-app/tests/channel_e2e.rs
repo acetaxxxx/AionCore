@@ -423,7 +423,7 @@ async fn sync_settings_with_model() {
             "agent": { "backend": "gemini" },
             "model": {
                 "id": "gemini-pro",
-                "use_model": true
+                "use_model": "gemini-2.5-flash"
             }
         }),
         &token,
