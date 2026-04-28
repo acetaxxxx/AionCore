@@ -41,10 +41,7 @@ impl SkillResolver for EmptySkillResolver {
         Vec::new()
     }
 
-    async fn resolve_skills(
-        &self,
-        _names: &[String],
-    ) -> Vec<aionui_extension::ResolvedAgentSkill> {
+    async fn resolve_skills(&self, _names: &[String]) -> Vec<aionui_extension::ResolvedAgentSkill> {
         Vec::new()
     }
 

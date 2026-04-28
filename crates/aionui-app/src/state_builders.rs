@@ -73,6 +73,8 @@ pub(crate) async fn resolve_extension_agents(registry: &ExtensionRegistry) -> Ve
 pub async fn build_module_states(services: &AppServices) -> ModuleStates {
     let (ext_state, hub_state, mut skill_state) = build_extension_states(services).await;
     let assistant = build_assistant_state(services, ext_state.registry.clone());
+    let cron = build_cron_state(services);
+    cron.cron_service.init().await;
 
     let extensions = resolve_extension_agents(&ext_state.registry).await;
     services.agent_registry.initialize(extensions, vec![]).await;
@@ -82,7 +84,7 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
 
     ModuleStates {
         system: build_system_state(services),
-        conversation: build_conversation_state(services),
+        conversation: build_conversation_state(services, Some(cron.cron_service.clone())),
         remote_agent: build_remote_agent_state(services),
         acp: build_acp_state(services),
         connection_test: build_connection_test_state(),
@@ -93,8 +95,8 @@ pub async fn build_module_states(services: &AppServices) -> ModuleStates {
         hub: hub_state,
         skill: skill_state,
         channel: build_channel_state(services),
-        team: build_team_state(services),
-        cron: build_cron_state(services),
+        team: build_team_state(services, Some(cron.cron_service.clone())),
+        cron,
         office: build_office_state(services),
         shell: build_shell_state(services),
         assistant,
@@ -153,7 +155,10 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
 }
 
 /// Build the default `ConversationRouterState` from application services.
-pub fn build_conversation_state(services: &AppServices) -> ConversationRouterState {
+pub fn build_conversation_state(
+    services: &AppServices,
+    cron_service: Option<Arc<aionui_cron::service::CronService>>,
+) -> ConversationRouterState {
     let pool = services.database.pool().clone();
     let repo = Arc::new(SqliteConversationRepository::new(pool));
     let skill_resolver = Arc::new(
@@ -161,13 +166,17 @@ pub fn build_conversation_state(services: &AppServices) -> ConversationRouterSta
             services.skill_paths.clone(),
         ),
     );
+    let conversation_service = ConversationService::new_with_workspace_root(
+        repo,
+        services.event_bus.clone(),
+        std::path::PathBuf::from(&services.data_dir),
+        skill_resolver,
+    );
+    if let Some(cron_service) = cron_service {
+        conversation_service.set_cron_service(Some(cron_service));
+    }
     ConversationRouterState {
-        conversation_service: ConversationService::new_with_workspace_root(
-            repo,
-            services.event_bus.clone(),
-            std::path::PathBuf::from(&services.data_dir),
-            skill_resolver,
-        ),
+        conversation_service,
         worker_task_manager: services.worker_task_manager.clone(),
     }
 }
@@ -292,7 +301,10 @@ pub fn build_channel_state(services: &AppServices) -> ChannelRouterState {
 }
 
 /// Build the default `TeamRouterState` from application services.
-pub fn build_team_state(services: &AppServices) -> TeamRouterState {
+pub fn build_team_state(
+    services: &AppServices,
+    cron_service: Option<Arc<aionui_cron::service::CronService>>,
+) -> TeamRouterState {
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> =
         Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
@@ -309,6 +321,9 @@ pub fn build_team_state(services: &AppServices) -> TeamRouterState {
         std::path::PathBuf::from(&services.data_dir),
         skill_resolver,
     );
+    if let Some(cron_service) = cron_service {
+        conv_service.set_cron_service(Some(cron_service));
+    }
     let service = Arc::new(TeamSessionService::new(
         team_repo,
         conv_service,
@@ -343,6 +358,8 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         conv_repo,
         Arc::new(conv_service.clone()),
         busy_guard,
+        std::path::PathBuf::from(&services.data_dir),
+        services.event_bus.clone(),
     ));
 
     let tick_service_ref: Arc<CronServiceTickRef> = Arc::new(CronServiceTickRef::default());
@@ -360,7 +377,11 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
 
     let emitter = CronEventEmitter::new(services.event_bus.clone());
     let cron_service = Arc::new(aionui_cron::service::CronService::new(
-        cron_repo, scheduler, executor, emitter,
+        cron_repo,
+        scheduler,
+        executor,
+        emitter,
+        std::path::PathBuf::from(&services.data_dir),
     ));
 
     tick_service_ref

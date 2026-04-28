@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::AgentStreamEvent;
+use aionui_ai_agent::{AgentStreamEvent, ICronService, MessageMiddleware, MiddlewareResult};
 use aionui_api_types::WebSocketMessage;
-use aionui_common::{ConversationStatus, generate_id, now_ms};
+use aionui_common::{generate_id, now_ms};
 use aionui_db::IConversationRepository;
 use aionui_db::models::MessageRow;
 use aionui_realtime::EventBroadcaster;
@@ -13,6 +13,12 @@ use tracing::{debug, error, info, warn};
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
 
+/// Result returned after a relay turn has fully drained and finalized.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayOutcome {
+    pub system_responses: Vec<String>,
+}
+
 /// Relays agent stream events to WebSocket and persists messages.
 ///
 /// This struct is created for each `send_message` call and runs as a
@@ -20,27 +26,40 @@ const FLUSH_INTERVAL: u32 = 20;
 pub struct StreamRelay {
     conversation_id: String,
     assistant_msg_id: String,
+    user_id: String,
     repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
+    cron_service: Option<Arc<dyn ICronService>>,
+    complete_turn: bool,
 }
 
 impl StreamRelay {
     pub fn new(
         conversation_id: String,
         assistant_msg_id: String,
+        user_id: String,
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
+        cron_service: Option<Arc<dyn ICronService>>,
     ) -> Self {
         Self {
             conversation_id,
             assistant_msg_id,
+            user_id,
             repo,
             broadcaster,
+            cron_service,
+            complete_turn: true,
         }
     }
 
+    pub fn with_turn_completion(mut self, enabled: bool) -> Self {
+        self.complete_turn = enabled;
+        self
+    }
+
     /// Run the relay loop. Consumes `self` and runs until the agent stream ends.
-    pub async fn run(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
+    pub async fn run(self, mut rx: broadcast::Receiver<AgentStreamEvent>) -> RelayOutcome {
         let started_at = now_ms();
         info!(
             conversation_id = %self.conversation_id,
@@ -97,9 +116,16 @@ impl StreamRelay {
                         }
                         self.persist_thinking(&thinking_buffer, thinking_started_at)
                             .await;
-                        self.finalize(&text_buffer, &record_created, &event).await;
-                        self.send_turn_completed(&event);
-                        break;
+                        let outcome = self.finalize(&text_buffer, &record_created, &event).await;
+                        if self.complete_turn {
+                            Self::complete_conversation(
+                                &self.repo,
+                                &self.broadcaster,
+                                &self.conversation_id,
+                            )
+                            .await;
+                        }
+                        break outcome;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -116,16 +142,24 @@ impl StreamRelay {
                     self.persist_thinking(&thinking_buffer, thinking_started_at)
                         .await;
                     // Channel closed without finish/error — still finalize
-                    self.finalize(
-                        &text_buffer,
-                        &record_created,
-                        &AgentStreamEvent::Finish(
-                            aionui_ai_agent::stream_event::FinishEventData::default(),
-                        ),
-                    )
-                    .await;
-                    self.send_turn_completed_status("finished");
-                    break;
+                    let outcome = self
+                        .finalize(
+                            &text_buffer,
+                            &record_created,
+                            &AgentStreamEvent::Finish(
+                                aionui_ai_agent::stream_event::FinishEventData::default(),
+                            ),
+                        )
+                        .await;
+                    if self.complete_turn {
+                        Self::complete_conversation(
+                            &self.repo,
+                            &self.broadcaster,
+                            &self.conversation_id,
+                        )
+                        .await;
+                    }
+                    break outcome;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(
@@ -156,8 +190,7 @@ impl StreamRelay {
             "hidden": false,
         });
 
-        let msg = WebSocketMessage::new("message.stream", payload);
-        self.broadcaster.broadcast(msg);
+        self.broadcast_stream_payload(payload);
     }
 
     /// Flush accumulated text to the database (create or update).
@@ -201,43 +234,62 @@ impl StreamRelay {
     }
 
     /// Finalize the assistant message on stream end.
-    async fn finalize(&self, text: &str, record_created: &bool, event: &AgentStreamEvent) {
+    async fn finalize(
+        &self,
+        text: &str,
+        record_created: &bool,
+        event: &AgentStreamEvent,
+    ) -> RelayOutcome {
+        let mut outcome = RelayOutcome::default();
         let status = match event {
             AgentStreamEvent::Error(_) => "error",
             _ => "finish",
         };
 
         if !text.is_empty() {
-            let content = json!({ "content": text }).to_string();
-            if *record_created {
-                let update = aionui_db::MessageRowUpdate {
-                    content: Some(content),
-                    status: Some(Some(status.to_owned())),
-                    hidden: None,
-                };
-                if let Err(e) = self
-                    .repo
-                    .update_message(&self.assistant_msg_id, &update)
-                    .await
-                {
-                    error!(error = %e, "Failed to finalize streaming message");
+            let processed = self.process_final_text(text).await;
+            let final_text = processed.message.trim().to_owned();
+            let hidden = final_text.is_empty();
+            let content = json!({ "content": final_text }).to_string();
+
+            if *record_created || !hidden {
+                if *record_created {
+                    let update = aionui_db::MessageRowUpdate {
+                        content: Some(content),
+                        status: Some(Some(status.to_owned())),
+                        hidden: Some(hidden),
+                    };
+                    if let Err(e) = self
+                        .repo
+                        .update_message(&self.assistant_msg_id, &update)
+                        .await
+                    {
+                        error!(error = %e, "Failed to finalize streaming message");
+                    }
+                } else {
+                    let row = MessageRow {
+                        id: self.assistant_msg_id.clone(),
+                        conversation_id: self.conversation_id.clone(),
+                        msg_id: None,
+                        r#type: "text".into(),
+                        content,
+                        position: Some("left".into()),
+                        status: Some(status.to_owned()),
+                        hidden,
+                        created_at: now_ms(),
+                    };
+                    if let Err(e) = self.repo.insert_message(&row).await {
+                        error!(error = %e, "Failed to create final message");
+                    }
                 }
-            } else {
-                let row = MessageRow {
-                    id: self.assistant_msg_id.clone(),
-                    conversation_id: self.conversation_id.clone(),
-                    msg_id: None,
-                    r#type: "text".into(),
-                    content,
-                    position: Some("left".into()),
-                    status: Some(status.to_owned()),
-                    hidden: false,
-                    created_at: now_ms(),
-                };
-                if let Err(e) = self.repo.insert_message(&row).await {
-                    error!(error = %e, "Failed to create final message");
+
+                if processed.message != text || hidden {
+                    self.send_final_text_override(&processed.message, hidden);
                 }
             }
+
+            self.send_system_responses(&processed.system_responses);
+            outcome.system_responses = processed.system_responses;
         } else if let AgentStreamEvent::Error(data) = event {
             // No text accumulated but got an error — store error as tips message
             let content = json!({ "content": data.message, "type": "error" }).to_string();
@@ -257,9 +309,7 @@ impl StreamRelay {
             }
         }
 
-        // Update conversation status — all terminal events resolve to Finished
-        self.update_conversation_status(ConversationStatus::Finished)
-            .await;
+        outcome
     }
 
     /// Persist accumulated thinking content as a message in the database.
@@ -301,46 +351,72 @@ impl StreamRelay {
         self.forward_to_websocket(&thinking_done);
     }
 
-    /// Send a `turn.completed` WebSocket event.
-    fn send_turn_completed(&self, _event: &AgentStreamEvent) {
-        // All terminal events resolve to "finished" status
-        self.send_turn_completed_status("finished");
+    async fn process_final_text(&self, text: &str) -> MiddlewareResult {
+        let middleware = MessageMiddleware::new(self.cron_service.as_ref().map(|service| {
+            Box::new(SharedCronService(Arc::clone(service))) as Box<dyn ICronService>
+        }));
+
+        middleware
+            .process(text, &self.user_id, &self.conversation_id)
+            .await
     }
 
-    fn send_turn_completed_status(&self, status: &str) {
-        let can_send = status == "finished";
-        let payload = json!({
+    fn send_final_text_override(&self, text: &str, hidden: bool) {
+        self.broadcast_stream_payload(json!({
             "conversation_id": self.conversation_id,
-            "session_id": self.conversation_id,
-            "status": status,
-            "canSendMessage": can_send,
+            "msg_id": self.assistant_msg_id,
+            "type": "content",
+            "data": { "content": text },
+            "hidden": hidden,
+            "replace": true,
+        }));
+    }
+
+    fn send_system_responses(&self, responses: &[String]) {
+        for response in responses {
+            self.broadcast_stream_payload(json!({
+                "conversation_id": self.conversation_id,
+                "msg_id": generate_id(),
+                "type": "system",
+                "data": response,
+                "hidden": true,
+            }));
+        }
+    }
+
+    fn broadcast_stream_payload(&self, payload: serde_json::Value) {
+        let msg = WebSocketMessage::new("message.stream", payload);
+        self.broadcaster.broadcast(msg);
+    }
+
+    pub async fn complete_conversation(
+        repo: &Arc<dyn IConversationRepository>,
+        broadcaster: &Arc<dyn EventBroadcaster>,
+        conversation_id: &str,
+    ) {
+        let update = aionui_db::ConversationRowUpdate {
+            status: Some("finished".to_owned()),
+            updated_at: Some(now_ms()),
+            ..Default::default()
+        };
+        if let Err(e) = repo.update(conversation_id, &update).await {
+            error!(error = %e, "Failed to update conversation status");
+        }
+
+        let payload = json!({
+            "conversation_id": conversation_id,
+            "session_id": conversation_id,
+            "status": "finished",
+            "canSendMessage": true,
         });
         let msg = WebSocketMessage::new("turn.completed", payload);
-        self.broadcaster.broadcast(msg);
+        broadcaster.broadcast(msg);
 
         debug!(
-            conversation_id = %self.conversation_id,
-            status,
+            conversation_id,
+            status = "finished",
             "Turn completed"
         );
-    }
-
-    /// Update the conversation status in the database.
-    async fn update_conversation_status(&self, status: ConversationStatus) {
-        let status_str = serde_json::to_value(status)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s.to_owned()));
-
-        if let Some(status_str) = status_str {
-            let update = aionui_db::ConversationRowUpdate {
-                status: Some(status_str),
-                updated_at: Some(now_ms()),
-                ..Default::default()
-            };
-            if let Err(e) = self.repo.update(&self.conversation_id, &update).await {
-                error!(error = %e, "Failed to update conversation status");
-            }
-        }
     }
 
     fn is_terminal(&self, event: &AgentStreamEvent) -> bool {
@@ -348,6 +424,41 @@ impl StreamRelay {
             event,
             AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)
         )
+    }
+}
+
+struct SharedCronService(Arc<dyn ICronService>);
+
+#[async_trait::async_trait]
+impl ICronService for SharedCronService {
+    async fn create_job(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        params: &aionui_ai_agent::CronCreateParams,
+    ) -> aionui_ai_agent::CronCommandResult {
+        self.0.create_job(user_id, conversation_id, params).await
+    }
+
+    async fn update_job(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        params: &aionui_ai_agent::CronUpdateParams,
+    ) -> aionui_ai_agent::CronCommandResult {
+        self.0.update_job(user_id, conversation_id, params).await
+    }
+
+    async fn list_jobs(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> aionui_ai_agent::CronCommandResult {
+        self.0.list_jobs(user_id, conversation_id).await
+    }
+
+    async fn delete_job(&self, user_id: &str, job_id: &str) -> aionui_ai_agent::CronCommandResult {
+        self.0.delete_job(user_id, job_id).await
     }
 }
 
@@ -403,7 +514,14 @@ mod tests {
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
         let (tx, _) = broadcast::channel(64);
 
-        let relay = StreamRelay::new("conv-1".into(), "asst-1".into(), repo.clone(), bus.clone());
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
 
         let rx = tx.subscribe();
 
@@ -419,7 +537,8 @@ mod tests {
         tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
             .unwrap();
 
-        relay.run(rx).await;
+        let outcome = relay.run(rx).await;
+        assert!(outcome.system_responses.is_empty());
 
         // Should have inserted a message with accumulated text
         let inserts = repo.take_inserts();
@@ -440,7 +559,14 @@ mod tests {
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
         let (tx, _) = broadcast::channel(64);
 
-        let relay = StreamRelay::new("conv-1".into(), "asst-1".into(), repo.clone(), bus.clone());
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
 
         let rx = tx.subscribe();
 
@@ -450,7 +576,8 @@ mod tests {
         }))
         .unwrap();
 
-        relay.run(rx).await;
+        let outcome = relay.run(rx).await;
+        assert!(outcome.system_responses.is_empty());
 
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1);
@@ -469,7 +596,14 @@ mod tests {
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
         let (tx, _) = broadcast::channel(64);
 
-        let relay = StreamRelay::new("conv-1".into(), "asst-1".into(), repo.clone(), bus.clone());
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
 
         let rx = tx.subscribe();
 
@@ -480,7 +614,8 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        relay.run(rx).await;
+        let outcome = relay.run(rx).await;
+        assert!(outcome.system_responses.is_empty());
 
         // Should still persist the partial text
         let inserts = repo.take_inserts();
@@ -495,7 +630,14 @@ mod tests {
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
         let (tx, _) = broadcast::channel(64);
 
-        let relay = StreamRelay::new("conv-1".into(), "asst-1".into(), repo.clone(), bus.clone());
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
 
         // Subscribe to the bus before relay runs
         let mut ws_rx = bus.subscribe();
@@ -504,7 +646,8 @@ mod tests {
         tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
             .unwrap();
 
-        relay.run(rx).await;
+        let outcome = relay.run(rx).await;
+        assert!(outcome.system_responses.is_empty());
 
         // Collect WebSocket events
         let mut ws_events = vec![];
@@ -522,15 +665,118 @@ mod tests {
         assert_eq!(data["canSendMessage"], true);
     }
 
+    #[tokio::test]
+    async fn run_finalizes_with_cleaned_replacement_event() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            Some(Arc::new(MockCronService)),
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "Hello [CRON_LIST]".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let outcome = relay.run(rx).await;
+        assert_eq!(outcome.system_responses, vec!["[System: listed]".to_string()]);
+
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1);
+        let content: serde_json::Value = serde_json::from_str(&inserts[0].content).unwrap();
+        assert_eq!(content["content"].as_str().map(str::trim), Some("Hello"));
+
+        let mut ws_events = vec![];
+        while let Ok(evt) = ws_rx.try_recv() {
+            ws_events.push(evt);
+        }
+
+        let replacement = ws_events.iter().find(|evt| {
+            evt.name == "message.stream"
+                && evt.data["type"] == "content"
+                && evt.data["replace"] == true
+        });
+        assert!(replacement.is_some());
+        assert_eq!(
+            replacement.unwrap().data["data"]["content"]
+                .as_str()
+                .map(str::trim),
+            Some("Hello")
+        );
+    }
+
     // ── Helpers ──────────────────────────────────────────────────
 
     fn make_relay() -> StreamRelay {
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
-        StreamRelay {
-            conversation_id: "conv-1".into(),
-            assistant_msg_id: "msg-1".into(),
-            repo: Arc::new(NoopRepo),
-            broadcaster: bus,
+        StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "user-1".into(),
+            Arc::new(NoopRepo),
+            bus,
+            None,
+        )
+    }
+
+    struct MockCronService;
+
+    #[async_trait::async_trait]
+    impl ICronService for MockCronService {
+        async fn create_job(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _params: &aionui_ai_agent::CronCreateParams,
+        ) -> aionui_ai_agent::CronCommandResult {
+            aionui_ai_agent::CronCommandResult {
+                success: true,
+                message: "created".into(),
+            }
+        }
+
+        async fn update_job(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _params: &aionui_ai_agent::CronUpdateParams,
+        ) -> aionui_ai_agent::CronCommandResult {
+            aionui_ai_agent::CronCommandResult {
+                success: true,
+                message: "updated".into(),
+            }
+        }
+
+        async fn list_jobs(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+        ) -> aionui_ai_agent::CronCommandResult {
+            aionui_ai_agent::CronCommandResult {
+                success: true,
+                message: "listed".into(),
+            }
+        }
+
+        async fn delete_job(
+            &self,
+            _user_id: &str,
+            _job_id: &str,
+        ) -> aionui_ai_agent::CronCommandResult {
+            aionui_ai_agent::CronCommandResult {
+                success: true,
+                message: "deleted".into(),
+            }
         }
     }
 

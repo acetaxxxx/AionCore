@@ -92,6 +92,8 @@ pub struct AcpAgentManager {
     backend: AcpBackend,
     /// Build configuration (preset context, enabled/excluded skills, session mode, …).
     config: AcpBuildExtra,
+    /// Preferred session mode to apply on the next session initialization.
+    preferred_mode: RwLock<Option<String>>,
     /// Underlying CLI process (for lifecycle management: kill, is_running).
     process: Arc<CliAgentProcess>,
     /// ACP protocol handle (SDK connection).
@@ -122,6 +124,50 @@ impl AcpAgentManager {
     pub async fn modes(&self) -> Option<SessionModeState> {
         let snapshot = self.runtime_snapshot.read().await;
         snapshot.modes().cloned()
+    }
+
+    async fn preferred_mode(&self) -> Option<String> {
+        self.preferred_mode
+            .read()
+            .await
+            .clone()
+            .filter(|mode| !mode.is_empty())
+    }
+
+    async fn update_cached_mode(&self, mode: &str) {
+        let mut snapshot = self.runtime_snapshot.write().await;
+        if let Some(modes) = snapshot.modes().cloned() {
+            snapshot.set_modes(SessionModeState::new(
+                mode.to_owned(),
+                modes.available_modes,
+            ));
+        }
+    }
+
+    async fn apply_preferred_mode(&self, session_id: &str) -> Result<(), AppError> {
+        let Some(mode) = self.preferred_mode().await else {
+            return Ok(());
+        };
+
+        let current_mode = {
+            let snapshot = self.runtime_snapshot.read().await;
+            snapshot.current_mode_id()
+        };
+
+        if current_mode.as_deref() == Some(mode.as_str()) {
+            return Ok(());
+        }
+
+        self.protocol
+            .set_mode(SetSessionModeRequest::new(
+                SessionId::new(session_id),
+                mode.clone(),
+            ))
+            .await
+            .map_err(AppError::from)?;
+
+        self.update_cached_mode(&mode).await;
+        Ok(())
     }
 
     async fn _set_modes(&self, mode: &str) -> Result<(), AppError> {
@@ -264,6 +310,7 @@ impl AcpAgentManager {
             workspace,
             is_custom_workspace,
             backend,
+            preferred_mode: RwLock::new(config.session_mode.clone()),
             config,
             process: Arc::new(process),
             protocol,
@@ -403,6 +450,8 @@ impl AcpAgentManager {
             let mut state = self.state.write().await;
             state.session_id = Some(sid.clone());
         }
+
+        self.apply_preferred_mode(&sid).await?;
 
         // Inject first-message prefix (preset context + skills index).
         // Backends with native skill discovery (e.g. Claude via .claude/skills/)
@@ -725,27 +774,35 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
     }
 
     async fn get_mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
+        let preferred_mode = self.preferred_mode().await;
         Ok(aionui_api_types::AgentModeResponse {
             mode: self
                 .modes()
                 .await
                 .map(|modes| modes.current_mode_id.to_string())
-                .or_else(|| self.config.session_mode.clone())
+                .or(preferred_mode)
                 .unwrap_or_else(|| "default".to_owned()),
             initialized: self.session_id().await.is_some(),
         })
     }
 
     async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
-        let sid = self.require_session_id().await?;
-        self.protocol
-            .set_mode(SetSessionModeRequest::new(
-                SessionId::new(sid),
-                mode.to_owned(),
-            ))
-            .await
-            .map_err(AppError::from)
-            .map(|_| ())
+        let session_id = self.state.read().await.session_id.clone();
+
+        if let Some(sid) = session_id {
+            self.protocol
+                .set_mode(SetSessionModeRequest::new(
+                    SessionId::new(sid),
+                    mode.to_owned(),
+                ))
+                .await
+                .map_err(AppError::from)?;
+            self.update_cached_mode(mode).await;
+        }
+
+        let mut preferred_mode = self.preferred_mode.write().await;
+        *preferred_mode = Some(mode.to_owned());
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

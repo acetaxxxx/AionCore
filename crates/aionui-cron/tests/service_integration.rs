@@ -7,10 +7,11 @@
 //! Covers test-plan items: CJ-1..CJ-12, SK-1..SK-7, SC-1..SC-8,
 //! OC-1, SR-1, ICronService trait integration.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::agent_manager::AgentManagerHandle;
-use aionui_ai_agent::middleware::CronCreateParams;
+use aionui_ai_agent::middleware::{CronCreateParams, CronUpdateParams};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_api_types::{
     CreateCronJobRequest, CronScheduleDto, ListCronJobsQuery, SaveCronSkillRequest,
@@ -21,6 +22,7 @@ use aionui_conversation::ConversationService;
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IConversationRepository, ICronRepository,
     MessageRowUpdate, MessageSearchRow, SortOrder, SqliteCronRepository, init_database_memory,
+    models::MessageRow,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -29,6 +31,7 @@ use aionui_cron::events::CronEventEmitter;
 use aionui_cron::executor::JobExecutor;
 use aionui_cron::scheduler::CronScheduler;
 use aionui_cron::service::CronService;
+use aionui_cron::types::JobStatus;
 
 // ── Test infrastructure ────────────────────────────────────────────
 
@@ -84,41 +87,130 @@ impl aionui_ai_agent::task_manager::IWorkerTaskManager for StubTaskManager {
     }
 }
 
-struct StubConvRepo;
+struct StubConvRepo {
+    messages: Mutex<Vec<MessageRow>>,
+    rows: Mutex<HashMap<String, aionui_db::models::ConversationRow>>,
+}
+
+impl StubConvRepo {
+    fn new() -> Self {
+        Self {
+            messages: Mutex::new(Vec::new()),
+            rows: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn take_messages(&self) -> Vec<MessageRow> {
+        let mut guard = self.messages.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+}
 
 #[async_trait::async_trait]
 impl IConversationRepository for StubConvRepo {
     async fn get(
         &self,
-        _id: &str,
+        id: &str,
     ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
-        Ok(Some(aionui_db::models::ConversationRow {
-            id: "conv_stub".into(),
-            user_id: "u1".into(),
-            name: "stub".into(),
-            r#type: "default".into(),
-            model: None,
-            status: Some("active".into()),
-            source: None,
-            channel_chat_id: None,
-            extra: "{}".into(),
-            pinned: false,
-            pinned_at: None,
-            created_at: 1000,
-            updated_at: 1000,
-        }))
+        let mut rows = self.rows.lock().unwrap();
+
+        if let Some(existing) = rows.get(id) {
+            return Ok(Some(existing.clone()));
+        }
+        if id.starts_with("missing") {
+            return Ok(None);
+        }
+
+        let row = if id == "conv_mode" {
+            aionui_db::models::ConversationRow {
+                id: id.into(),
+                user_id: "u1".into(),
+                name: "Gemini Chat".into(),
+                r#type: "acp".into(),
+                model: Some(
+                    serde_json::json!({
+                        "provider_id": "gemini",
+                        "model": "gemini-2.5-pro",
+                        "use_model": "gemini-2.5-pro"
+                    })
+                    .to_string(),
+                ),
+                status: Some("active".into()),
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({
+                    "backend": "gemini",
+                    "agent_name": "Gemini",
+                    "workspace": "/tmp/gemini-workspace",
+                    "session_mode": "yolo",
+                    "current_model_id": "gemini-2.5-pro"
+                })
+                .to_string(),
+                pinned: false,
+                pinned_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            }
+        } else {
+            aionui_db::models::ConversationRow {
+                id: id.into(),
+                user_id: "u1".into(),
+                name: "stub".into(),
+                r#type: "default".into(),
+                model: None,
+                status: Some("active".into()),
+                source: None,
+                channel_chat_id: None,
+                extra: "{}".into(),
+                pinned: false,
+                pinned_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            }
+        };
+
+        rows.insert(id.to_owned(), row.clone());
+        Ok(Some(row))
     }
     async fn create(
         &self,
-        _row: &aionui_db::models::ConversationRow,
+        row: &aionui_db::models::ConversationRow,
     ) -> Result<(), aionui_db::DbError> {
+        self.rows
+            .lock()
+            .unwrap()
+            .insert(row.id.clone(), row.clone());
         Ok(())
     }
     async fn update(
         &self,
-        _id: &str,
-        _updates: &ConversationRowUpdate,
+        id: &str,
+        updates: &ConversationRowUpdate,
     ) -> Result<(), aionui_db::DbError> {
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows
+            .entry(id.to_owned())
+            .or_insert_with(|| aionui_db::models::ConversationRow {
+                id: id.to_owned(),
+                user_id: "u1".into(),
+                name: "stub".into(),
+                r#type: "default".into(),
+                model: None,
+                status: Some("active".into()),
+                source: None,
+                channel_chat_id: None,
+                extra: "{}".into(),
+                pinned: false,
+                pinned_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            });
+        if let Some(extra) = &updates.extra {
+            row.extra = extra.clone();
+        }
+        if let Some(updated_at) = updates.updated_at {
+            row.updated_at = updated_at;
+        }
         Ok(())
     }
     async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
@@ -147,9 +239,23 @@ impl IConversationRepository for StubConvRepo {
     async fn list_by_cron_job(
         &self,
         _user_id: &str,
-        _cron_job_id: &str,
+        cron_job_id: &str,
     ) -> Result<Vec<aionui_db::models::ConversationRow>, aionui_db::DbError> {
-        Ok(vec![])
+        let rows = self.rows.lock().unwrap();
+        Ok(rows
+            .values()
+            .filter(|row| {
+                let parsed = serde_json::from_str::<serde_json::Value>(&row.extra).ok();
+                let bound = parsed.as_ref().and_then(|extra| {
+                    extra
+                        .get("cron_job_id")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| extra.get("cronJobId").and_then(|value| value.as_str()))
+                });
+                bound == Some(cron_job_id)
+            })
+            .cloned()
+            .collect())
     }
     async fn list_associated(
         &self,
@@ -173,8 +279,9 @@ impl IConversationRepository for StubConvRepo {
     }
     async fn insert_message(
         &self,
-        _message: &aionui_db::models::MessageRow,
+        message: &aionui_db::models::MessageRow,
     ) -> Result<(), aionui_db::DbError> {
+        self.messages.lock().unwrap().push(message.clone());
         Ok(())
     }
     async fn update_message(
@@ -214,10 +321,22 @@ impl IConversationRepository for StubConvRepo {
 }
 
 async fn setup() -> (CronService, Arc<dyn ICronRepository>, Arc<MockBroadcaster>) {
+    let (svc, repo, bc, _) = setup_with_conv_repo().await;
+    (svc, repo, bc)
+}
+
+async fn setup_with_conv_repo() -> (
+    CronService,
+    Arc<dyn ICronRepository>,
+    Arc<MockBroadcaster>,
+    Arc<StubConvRepo>,
+) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
     let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool));
     let bc = Arc::new(MockBroadcaster::new());
+    let data_dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", now_ms()));
+    std::fs::create_dir_all(&data_dir).unwrap();
 
     struct StubSkillResolver;
     #[async_trait::async_trait]
@@ -243,9 +362,10 @@ async fn setup() -> (CronService, Arc<dyn ICronRepository>, Arc<MockBroadcaster>
         }
     }
 
-    let stub_conv_repo: Arc<dyn IConversationRepository> = Arc::new(StubConvRepo);
+    let stub_conv_repo = Arc::new(StubConvRepo::new());
+    let stub_conv_repo_trait: Arc<dyn IConversationRepository> = stub_conv_repo.clone();
     let conv_service = Arc::new(ConversationService::new_with_workspace_root(
-        Arc::clone(&stub_conv_repo),
+        Arc::clone(&stub_conv_repo_trait),
         bc.clone() as Arc<dyn EventBroadcaster>,
         std::env::temp_dir(),
         Arc::new(StubSkillResolver),
@@ -253,23 +373,26 @@ async fn setup() -> (CronService, Arc<dyn ICronRepository>, Arc<MockBroadcaster>
     let busy_guard = Arc::new(CronBusyGuard::new());
     let executor = Arc::new(JobExecutor::new(
         Arc::new(StubTaskManager),
-        stub_conv_repo,
+        stub_conv_repo_trait,
         conv_service,
         busy_guard,
+        data_dir.clone(),
+        bc.clone() as Arc<dyn EventBroadcaster>,
     ));
 
     let scheduler = Arc::new(CronScheduler::new(Arc::new(|_| {})));
 
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
-    let svc = CronService::new(cron_repo.clone(), scheduler, executor, emitter);
+    let svc = CronService::new(cron_repo.clone(), scheduler, executor, emitter, data_dir);
 
     std::mem::forget(db);
-    (svc, cron_repo, bc)
+    (svc, cron_repo, bc, stub_conv_repo)
 }
 
 fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobRequest {
     CreateCronJobRequest {
         name: name.into(),
+        description: Some("test description".into()),
         schedule,
         prompt: None,
         message: Some("test message".into()),
@@ -321,7 +444,7 @@ async fn cj1_create_cron_job() {
 
     let events = bc.take_events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].name, "cron.jobCreated");
+    assert_eq!(events[0].name, "cron.job-created");
 }
 
 // ── CJ-2: Create three schedule types ──────────────────────────────
@@ -415,6 +538,25 @@ async fn cj7_list_by_conversation() {
     assert_eq!(jobs.len(), 2);
 }
 
+#[tokio::test]
+async fn cj7b_add_job_binds_existing_conversation_to_job() {
+    let (svc, _, _, conv_repo) = setup_with_conv_repo().await;
+
+    let mut req = make_create_req("Bound Existing Conversation", every_60s());
+    req.conversation_id = "conv_existing_bind".into();
+
+    let job = svc.add_job(req).await.unwrap();
+
+    let bound = conv_repo.get("conv_existing_bind").await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
+    assert_eq!(extra["cron_job_id"], job.id);
+    assert_eq!(extra["cronJobId"], job.id);
+
+    let linked = conv_repo.list_by_cron_job("user_1", &job.id).await.unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].id, "conv_existing_bind");
+}
+
 // ── CJ-8: Update job ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -428,6 +570,7 @@ async fn cj8_update_job() {
 
     let req = UpdateCronJobRequest {
         name: Some("Updated Name".into()),
+        description: Some("Updated description".into()),
         enabled: Some(false),
         schedule: None,
         message: None,
@@ -439,12 +582,13 @@ async fn cj8_update_job() {
 
     let updated = svc.update_job(&created.id, req).await.unwrap();
     assert_eq!(updated.name, "Updated Name");
+    assert_eq!(updated.description.as_deref(), Some("Updated description"));
     assert!(!updated.enabled);
     assert!(updated.updated_at >= created.created_at);
 
     let events = bc.take_events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].name, "cron.jobUpdated");
+    assert_eq!(events[0].name, "cron.job-updated");
 }
 
 // ── CJ-9: Update schedule type ────────────────────────────────────
@@ -459,6 +603,7 @@ async fn cj9_update_schedule_type() {
 
     let req = UpdateCronJobRequest {
         name: None,
+        description: None,
         enabled: None,
         schedule: Some(cron_every_5min()),
         message: None,
@@ -483,6 +628,7 @@ async fn cj10_update_nonexistent() {
     let (svc, _, _) = setup().await;
     let req = UpdateCronJobRequest {
         name: Some("x".into()),
+        description: None,
         enabled: None,
         schedule: None,
         message: None,
@@ -513,7 +659,7 @@ async fn cj11_delete_job() {
 
     let events = bc.take_events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].name, "cron.jobRemoved");
+    assert_eq!(events[0].name, "cron.job-removed");
 }
 
 // ── CJ-12: Delete nonexistent ─────────────────────────────────────
@@ -781,6 +927,27 @@ async fn oc1_init_cleans_orphans() {
     assert!(found.is_ok());
 }
 
+#[tokio::test]
+async fn oc2_init_cleans_jobs_with_missing_conversation() {
+    let (svc, _repo, _) = setup().await;
+
+    let mut missing_req = make_create_req("Missing Conversation", every_60s());
+    missing_req.conversation_id = "missing-conv-1".into();
+    let missing = svc.add_job(missing_req).await.unwrap();
+
+    let mut normal_req = make_create_req("Existing Conversation", every_60s());
+    normal_req.conversation_id = "conv-existing".into();
+    let normal = svc.add_job(normal_req).await.unwrap();
+
+    svc.init().await;
+
+    let err = svc.get_job(&missing.id).await;
+    assert!(err.is_err());
+
+    let found = svc.get_job(&normal.id).await;
+    assert!(found.is_ok());
+}
+
 // ── Delete skill explicitly ───────────────────────────────────────
 
 #[tokio::test]
@@ -809,7 +976,7 @@ async fn delete_skill_clears_content() {
 
 #[tokio::test]
 async fn icron_service_create_job() {
-    let (svc, _, _) = setup().await;
+    let (svc, _, _, conv_repo) = setup_with_conv_repo().await;
 
     use aionui_ai_agent::middleware::ICronService;
 
@@ -823,6 +990,52 @@ async fn icron_service_create_job() {
     let result = ICronService::create_job(&svc, "user_1", "conv_1", &params).await;
     assert!(result.success);
     assert!(result.message.contains("Agent Job"));
+
+    let bound = conv_repo.get("conv_1").await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
+    let bound_job_id = extra
+        .get("cron_job_id")
+        .and_then(|value| value.as_str())
+        .or_else(|| extra.get("cronJobId").and_then(|value| value.as_str()));
+    assert!(bound_job_id.is_some());
+}
+
+#[tokio::test]
+async fn icron_service_create_job_inherits_conversation_mode_and_backend() {
+    let (svc, _, _) = setup().await;
+
+    use aionui_ai_agent::middleware::ICronService;
+
+    let params = CronCreateParams {
+        name: "Agent Job".into(),
+        schedule: "0 */10 * * * *".into(),
+        schedule_description: "every 10 min".into(),
+        message: "do agent work".into(),
+    };
+
+    let result = ICronService::create_job(&svc, "user_1", "conv_mode", &params).await;
+    assert!(result.success);
+
+    let jobs = svc
+        .list_jobs(&ListCronJobsQuery {
+            conversation_id: Some("conv_mode".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+
+    let job = &jobs[0];
+    let config = job
+        .agent_config
+        .as_ref()
+        .expect("agent config should be copied");
+    assert_eq!(job.agent_type, "acp");
+    assert_eq!(job.conversation_title.as_deref(), Some("Gemini Chat"));
+    assert_eq!(config.backend, "gemini");
+    assert_eq!(config.name, "Gemini");
+    assert_eq!(config.mode.as_deref(), Some("yolo"));
+    assert_eq!(config.model_id.as_deref(), Some("gemini-2.5-pro"));
+    assert_eq!(config.workspace.as_deref(), Some("/tmp/gemini-workspace"));
 }
 
 // ── ICronService trait: list ───────────────────────────────────────
@@ -833,18 +1046,61 @@ async fn icron_service_list_jobs() {
 
     use aionui_ai_agent::middleware::ICronService;
 
-    let result = ICronService::list_jobs(&svc, "user_1").await;
+    let result = ICronService::list_jobs(&svc, "user_1", "conv_1").await;
     assert!(result.success);
-    assert!(result.message.contains("No cron jobs found"));
+    assert!(
+        result
+            .message
+            .contains("No cron jobs found for conversation 'conv_1'")
+    );
 
-    svc.add_job(make_create_req("Listed Job", every_60s()))
+    let mut req = make_create_req("Listed Job", every_60s());
+    req.conversation_id = "conv_1".into();
+    svc.add_job(req).await.unwrap();
+
+    let result = ICronService::list_jobs(&svc, "user_1", "conv_1").await;
+    assert!(result.success);
+    assert!(
+        result
+            .message
+            .contains("1 cron job(s) for conversation 'conv_1'")
+    );
+    assert!(result.message.contains("Listed Job"));
+}
+
+// ── ICronService trait: update ─────────────────────────────────────
+
+#[tokio::test]
+async fn icron_service_update_job() {
+    let (svc, _, _, conv_repo) = setup_with_conv_repo().await;
+
+    use aionui_ai_agent::middleware::ICronService;
+
+    let job = svc
+        .add_job(make_create_req("Update Via Trait", every_60s()))
         .await
         .unwrap();
 
-    let result = ICronService::list_jobs(&svc, "user_1").await;
+    let params = CronUpdateParams {
+        job_id: job.id.clone(),
+        name: "Updated Via Trait".into(),
+        schedule: "0 */10 * * * *".into(),
+        schedule_description: "every 10 min".into(),
+        message: "do updated work".into(),
+    };
+
+    let result = ICronService::update_job(&svc, "user_1", "conv_1", &params).await;
     assert!(result.success);
-    assert!(result.message.contains("1 cron job(s)"));
-    assert!(result.message.contains("Listed Job"));
+    assert!(result.message.contains("Updated Via Trait"));
+
+    let bound = conv_repo.get("conv_1").await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
+    assert_eq!(extra["cron_job_id"], job.id);
+    assert_eq!(extra["cronJobId"], job.id);
+
+    let linked = conv_repo.list_by_cron_job("user_1", &job.id).await.unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].id, "conv_1");
 }
 
 // ── ICronService trait: delete ─────────────────────────────────────
@@ -880,6 +1136,7 @@ async fn update_max_retries() {
 
     let req = UpdateCronJobRequest {
         name: None,
+        description: None,
         enabled: None,
         schedule: None,
         message: None,
@@ -930,7 +1187,7 @@ async fn sc2_at_type_past_timestamp() {
 
 #[tokio::test]
 async fn sr1_system_resume_missed_job() {
-    let (svc, repo, bc) = setup().await;
+    let (svc, repo, bc, conv_repo) = setup_with_conv_repo().await;
 
     let req = make_create_req("Resume Job", every_60s());
     let job = svc.add_job(req).await.unwrap();
@@ -947,16 +1204,39 @@ async fn sr1_system_resume_missed_job() {
 
     let updated = svc.get_job(&job.id).await.unwrap();
     assert!(
-        updated.last_run_at.is_some(),
-        "missed job should have been executed (last_run_at set)"
+        updated.last_run_at.is_none(),
+        "missed job should not be auto-executed on resume"
     );
+    assert_eq!(updated.last_status, Some(JobStatus::Missed));
     assert!(
         updated.next_run_at.is_some(),
-        "job should be rescheduled after execution"
+        "job should be rescheduled after being marked missed"
     );
     assert!(
         updated.next_run_at.unwrap() > now_ms() - 2000,
         "next_run_at should be in the future"
+    );
+
+    let messages = conv_repo.take_messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].r#type, "tips");
+    assert!(messages[0].content.contains("Resume Job"));
+    assert!(messages[0].content.contains("not run automatically"));
+
+    let events = bc.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.name == "cron.job-executed" && event.data["status"] == "missed" }),
+        "resume should emit a missed execution event"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.name == "message.stream"
+                && event.data["type"] == "tips"
+                && event.data["conversation_id"] == "conv_1"
+        }),
+        "resume should emit a tips websocket message"
     );
 }
 
@@ -991,7 +1271,7 @@ async fn cd1_cascade_delete_by_conversation() {
     let events = bc.take_events();
     let removed_events: Vec<_> = events
         .iter()
-        .filter(|e| e.name == "cron.jobRemoved")
+        .filter(|e| e.name == "cron.job-removed")
         .collect();
     assert_eq!(removed_events.len(), 2, "should emit 2 removed events");
 }
@@ -1038,5 +1318,5 @@ async fn cd3_on_conversation_delete_trait() {
 
     let events = bc.take_events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].name, "cron.jobRemoved");
+    assert_eq!(events[0].name, "cron.job-removed");
 }

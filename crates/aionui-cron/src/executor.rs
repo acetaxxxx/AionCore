@@ -1,19 +1,36 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aionui_ai_agent::task_manager::IWorkerTaskManager;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_api_types::CreateConversationRequest;
-use aionui_common::{AgentType, ProviderWithModel, generate_id};
+use aionui_ai_agent::{AgentStreamEvent, IAgentManager};
+use aionui_api_types::{CreateConversationRequest, SendMessageRequest, WebSocketMessage};
+use aionui_common::{AgentType, ProviderWithModel, generate_id, now_ms};
 use aionui_conversation::ConversationService;
-use aionui_db::IConversationRepository;
+use aionui_db::models::MessageRow;
+use aionui_db::{ConversationRowUpdate, IConversationRepository};
+use aionui_realtime::EventBroadcaster;
+use tokio::sync::broadcast;
+use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use crate::busy_guard::CronBusyGuard;
 use crate::error::CronError;
+use crate::prompt::{
+    build_existing_conversation_prompt, build_new_conversation_prompt_with_skill_suggest,
+    build_new_conversation_with_skill_prompt, build_skill_suggest_prompt,
+};
+use crate::skill_file::{
+    cron_skill_name, read_skill_content, write_raw_skill_file, write_skill_file,
+};
+use crate::skill_suggest::SkillSuggestDetector;
 use crate::types::{CronJob, ExecutionMode};
 
 pub const RETRY_INTERVAL_MS: u64 = 30_000;
 pub const MAX_RETRIES_DEFAULT: i64 = 3;
+const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
+const SKILL_SUGGEST_TERMINAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
@@ -23,11 +40,20 @@ pub enum ExecutionResult {
     Error { message: String },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedExecution {
+    pub conversation_id: String,
+    saved_skill: Option<SavedSkillContext>,
+}
+
 pub struct JobExecutor {
     task_manager: Arc<dyn IWorkerTaskManager>,
     conversation_repo: Arc<dyn IConversationRepository>,
     conversation_service: Arc<ConversationService>,
     busy_guard: Arc<CronBusyGuard>,
+    data_dir: PathBuf,
+    broadcaster: Arc<dyn EventBroadcaster>,
+    skill_suggest_detector: SkillSuggestDetector,
 }
 
 impl JobExecutor {
@@ -36,12 +62,22 @@ impl JobExecutor {
         conversation_repo: Arc<dyn IConversationRepository>,
         conversation_service: Arc<ConversationService>,
         busy_guard: Arc<CronBusyGuard>,
+        data_dir: PathBuf,
+        broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
+        let skill_suggest_detector = SkillSuggestDetector::new(
+            Arc::clone(&broadcaster),
+            conversation_repo.clone(),
+            data_dir.clone(),
+        );
         Self {
             task_manager,
             conversation_repo,
             conversation_service,
             busy_guard,
+            data_dir,
+            broadcaster,
+            skill_suggest_detector,
         }
     }
 
@@ -52,20 +88,33 @@ impl JobExecutor {
             return self.handle_busy(job);
         }
 
-        let target_conversation_id = match self.resolve_conversation(job).await {
-            Ok(id) => id,
+        let saved_skill = match self.prepare_saved_skill(job).await {
+            Ok(skill) => skill,
             Err(e) => {
-                error!(job_id = %job.id, error = %e, "Failed to resolve conversation");
+                error!(job_id = %job.id, error = %e, "Failed to prepare saved cron skill");
                 return ExecutionResult::Error {
                     message: e.to_string(),
                 };
             }
         };
 
+        let target_conversation_id =
+            match self.resolve_conversation(job, saved_skill.as_ref()).await {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(job_id = %job.id, error = %e, "Failed to resolve conversation");
+                    return ExecutionResult::Error {
+                        message: e.to_string(),
+                    };
+                }
+            };
+
         self.busy_guard
             .set_processing(&target_conversation_id, true);
 
-        let result = self.execute_inner(job, &target_conversation_id).await;
+        let result = self
+            .execute_inner(job, &target_conversation_id, saved_skill.as_ref())
+            .await;
 
         self.busy_guard
             .set_processing(&target_conversation_id, false);
@@ -73,30 +122,223 @@ impl JobExecutor {
         result
     }
 
-    pub async fn execute_run_now(&self, job: &CronJob) -> ExecutionResult {
-        let target_conversation_id = match self.resolve_conversation(job).await {
-            Ok(id) => id,
-            Err(e) => {
-                error!(job_id = %job.id, error = %e, "Failed to resolve conversation for run-now");
-                return ExecutionResult::Error {
-                    message: e.to_string(),
-                };
+    pub(crate) async fn prepare_run_now(
+        &self,
+        job: &CronJob,
+    ) -> Result<PreparedExecution, CronError> {
+        let saved_skill = match self.prepare_saved_skill(job).await {
+            Ok(skill) => skill,
+            Err(err) => {
+                error!(
+                    job_id = %job.id,
+                    error = %err,
+                    "Failed to prepare saved cron skill for run-now"
+                );
+                return Err(err);
             }
         };
 
-        self.busy_guard
-            .set_processing(&target_conversation_id, true);
+        let conversation_id = self.resolve_conversation(job, saved_skill.as_ref()).await?;
 
-        let result = self.execute_inner(job, &target_conversation_id).await;
+        Ok(PreparedExecution {
+            conversation_id,
+            saved_skill,
+        })
+    }
+
+    pub(crate) async fn execute_prepared(
+        &self,
+        job: &CronJob,
+        prepared: PreparedExecution,
+    ) -> ExecutionResult {
+        self.busy_guard
+            .set_processing(&prepared.conversation_id, true);
+
+        let result = self
+            .execute_inner(
+                job,
+                &prepared.conversation_id,
+                prepared.saved_skill.as_ref(),
+            )
+            .await;
 
         self.busy_guard
-            .set_processing(&target_conversation_id, false);
+            .set_processing(&prepared.conversation_id, false);
 
         result
     }
 
     pub fn busy_guard(&self) -> &CronBusyGuard {
         &self.busy_guard
+    }
+
+    pub async fn conversation_exists(&self, conversation_id: &str) -> Result<bool, CronError> {
+        let row = self
+            .conversation_repo
+            .get(conversation_id)
+            .await
+            .map_err(CronError::Database)?;
+        Ok(row.is_some())
+    }
+
+    pub async fn get_conversation_row(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<aionui_db::models::ConversationRow>, CronError> {
+        self.conversation_repo
+            .get(conversation_id)
+            .await
+            .map_err(CronError::Database)
+    }
+
+    pub async fn insert_tips_message(
+        &self,
+        conversation_id: &str,
+        content: &str,
+        tip_type: &str,
+    ) -> Result<(), CronError> {
+        let row = MessageRow {
+            id: generate_id(),
+            conversation_id: conversation_id.to_owned(),
+            msg_id: None,
+            r#type: "tips".into(),
+            content: serde_json::json!({
+                "content": content,
+                "type": tip_type,
+            })
+            .to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: aionui_common::now_ms(),
+        };
+
+        self.conversation_repo
+            .insert_message(&row)
+            .await
+            .map_err(CronError::Database)
+    }
+
+    pub async fn bind_cron_job_to_conversation(
+        &self,
+        conversation_id: &str,
+        cron_job_id: &str,
+    ) -> Result<(), CronError> {
+        let Some(row) = self.get_conversation_row(conversation_id).await? else {
+            return Ok(());
+        };
+
+        let mut extra: serde_json::Value =
+            serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let Some(obj) = extra.as_object_mut() else {
+            extra = serde_json::json!({});
+            extra.as_object_mut().expect("json object").insert(
+                "cron_job_id".to_owned(),
+                serde_json::Value::String(cron_job_id.to_owned()),
+            );
+            extra.as_object_mut().expect("json object").insert(
+                "cronJobId".to_owned(),
+                serde_json::Value::String(cron_job_id.to_owned()),
+            );
+            let update = ConversationRowUpdate {
+                extra: Some(extra.to_string()),
+                updated_at: Some(now_ms()),
+                ..Default::default()
+            };
+            return self
+                .conversation_repo
+                .update(conversation_id, &update)
+                .await
+                .map_err(CronError::Database);
+        };
+
+        let current = obj
+            .get("cron_job_id")
+            .and_then(|value| value.as_str())
+            .or_else(|| obj.get("cronJobId").and_then(|value| value.as_str()));
+
+        if current == Some(cron_job_id) {
+            return Ok(());
+        }
+
+        obj.insert(
+            "cron_job_id".to_owned(),
+            serde_json::Value::String(cron_job_id.to_owned()),
+        );
+        obj.insert(
+            "cronJobId".to_owned(),
+            serde_json::Value::String(cron_job_id.to_owned()),
+        );
+
+        let update = ConversationRowUpdate {
+            extra: Some(extra.to_string()),
+            updated_at: Some(now_ms()),
+            ..Default::default()
+        };
+        self.conversation_repo
+            .update(conversation_id, &update)
+            .await
+            .map_err(CronError::Database)
+    }
+
+    pub async fn persist_workspace_if_missing(
+        &self,
+        conversation_id: &str,
+        resolved_workspace: &str,
+    ) -> Result<(), CronError> {
+        let resolved_workspace = resolved_workspace.trim();
+        if resolved_workspace.is_empty() {
+            return Ok(());
+        }
+
+        let Some(row) = self.get_conversation_row(conversation_id).await? else {
+            return Ok(());
+        };
+
+        let mut extra: serde_json::Value =
+            serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let Some(obj) = extra.as_object_mut() else {
+            extra = serde_json::json!({});
+            extra.as_object_mut().expect("json object").insert(
+                "workspace".to_owned(),
+                serde_json::Value::String(resolved_workspace.to_owned()),
+            );
+            let update = ConversationRowUpdate {
+                extra: Some(extra.to_string()),
+                updated_at: Some(now_ms()),
+                ..Default::default()
+            };
+            return self
+                .conversation_repo
+                .update(conversation_id, &update)
+                .await
+                .map_err(CronError::Database);
+        };
+
+        let current_workspace = obj
+            .get("workspace")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+
+        if !current_workspace.is_empty() {
+            return Ok(());
+        }
+
+        obj.insert(
+            "workspace".to_owned(),
+            serde_json::Value::String(resolved_workspace.to_owned()),
+        );
+
+        let update = ConversationRowUpdate {
+            extra: Some(extra.to_string()),
+            updated_at: Some(now_ms()),
+            ..Default::default()
+        };
+        self.conversation_repo
+            .update(conversation_id, &update)
+            .await
+            .map_err(CronError::Database)
     }
 }
 
@@ -124,24 +366,23 @@ impl JobExecutor {
         ExecutionResult::Retrying { attempt }
     }
 
-    async fn resolve_conversation(&self, job: &CronJob) -> Result<String, CronError> {
+    async fn resolve_conversation(
+        &self,
+        job: &CronJob,
+        saved_skill: Option<&SavedSkillContext>,
+    ) -> Result<String, CronError> {
         match job.execution_mode {
             ExecutionMode::Existing => {
                 self.verify_conversation_exists(&job.conversation_id)
                     .await?;
                 Ok(job.conversation_id.clone())
             }
-            ExecutionMode::NewConversation => self.create_new_conversation(job).await,
+            ExecutionMode::NewConversation => self.create_new_conversation(job, saved_skill).await,
         }
     }
 
     async fn verify_conversation_exists(&self, conversation_id: &str) -> Result<(), CronError> {
-        let exists = self
-            .conversation_repo
-            .get(conversation_id)
-            .await
-            .map_err(CronError::Database)?;
-        if exists.is_none() {
+        if !self.conversation_exists(conversation_id).await? {
             return Err(CronError::Scheduler(format!(
                 "conversation {conversation_id} not found"
             )));
@@ -149,13 +390,16 @@ impl JobExecutor {
         Ok(())
     }
 
-    async fn create_new_conversation(&self, job: &CronJob) -> Result<String, CronError> {
+    async fn create_new_conversation(
+        &self,
+        job: &CronJob,
+        saved_skill: Option<&SavedSkillContext>,
+    ) -> Result<String, CronError> {
         let agent_type = parse_agent_type(&job.agent_type);
         let model = resolve_model(job);
+        let user_id = self.resolve_conversation_owner_user_id(job).await?;
 
-        let extra = serde_json::json!({
-            "cronJobId": job.id,
-        });
+        let extra = build_conversation_extra(job, saved_skill);
 
         let req = CreateConversationRequest {
             r#type: agent_type,
@@ -168,9 +412,29 @@ impl JobExecutor {
 
         let response = self
             .conversation_service
-            .create("cron", req)
+            .create(&user_id, req)
             .await
             .map_err(|e| CronError::Scheduler(format!("create conversation: {e}")))?;
+
+        let response_workspace = response
+            .extra
+            .get("workspace")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+
+        if response_workspace.is_empty() {
+            let fallback_workspace =
+                default_temp_workspace_path(&self.data_dir, &agent_type, job, &response.id);
+            std::fs::create_dir_all(&fallback_workspace).map_err(|err| {
+                CronError::Scheduler(format!(
+                    "create fallback cron workspace {}: {err}",
+                    fallback_workspace.display()
+                ))
+            })?;
+            self.persist_workspace_if_missing(&response.id, &fallback_workspace.to_string_lossy())
+                .await?;
+        }
 
         info!(
             job_id = %job.id,
@@ -181,16 +445,54 @@ impl JobExecutor {
         Ok(response.id)
     }
 
-    async fn execute_inner(&self, job: &CronJob, conversation_id: &str) -> ExecutionResult {
+    async fn resolve_conversation_owner_user_id(&self, job: &CronJob) -> Result<String, CronError> {
+        if !job.conversation_id.trim().is_empty()
+            && let Some(row) = self.get_conversation_row(&job.conversation_id).await?
+            && !row.user_id.trim().is_empty()
+        {
+            return Ok(row.user_id);
+        }
+
+        Ok(SYSTEM_DEFAULT_USER_ID.to_owned())
+    }
+
+    async fn execute_inner(
+        &self,
+        job: &CronJob,
+        conversation_id: &str,
+        saved_skill: Option<&SavedSkillContext>,
+    ) -> ExecutionResult {
         let agent_type = parse_agent_type(&job.agent_type);
         let model = resolve_model(job);
-        let workspace = job
-            .agent_config
-            .as_ref()
-            .and_then(|c| c.workspace.clone())
-            .unwrap_or_default();
+        let workspace = match self.resolve_execution_workspace(job, conversation_id).await {
+            Ok(workspace) => workspace,
+            Err(e) => {
+                error!(
+                    job_id = %job.id,
+                    conversation_id,
+                    error = %e,
+                    "Failed to resolve cron execution workspace"
+                );
+                return ExecutionResult::Error {
+                    message: e.to_string(),
+                };
+            }
+        };
 
-        let build_extra = build_task_extra(job);
+        let skill_names = match self
+            .resolve_task_skill_names(job, conversation_id, saved_skill)
+            .await
+        {
+            Ok(names) => names,
+            Err(e) => {
+                error!(job_id = %job.id, error = %e, "Failed to resolve task skills");
+                return ExecutionResult::Error {
+                    message: e.to_string(),
+                };
+            }
+        };
+        let build_extra = build_task_extra(job, &skill_names);
+        let requested_workspace_missing = workspace.trim().is_empty();
 
         let options = BuildTaskOptions {
             agent_type,
@@ -217,18 +519,87 @@ impl JobExecutor {
             }
         };
 
-        let prompt = build_prompt(job);
-        let msg_id = generate_id();
+        if requested_workspace_missing
+            && let Err(e) = self
+                .persist_workspace_if_missing(conversation_id, agent.workspace())
+                .await
+        {
+            error!(
+                job_id = %job.id,
+                conversation_id,
+                error = %e,
+                "Failed to persist resolved cron workspace back to conversation"
+            );
+            return ExecutionResult::Error {
+                message: e.to_string(),
+            };
+        }
 
-        let send_data = SendMessageData {
+        if let Err(e) = self.ensure_agent_session_mode(job, &agent).await {
+            error!(
+                job_id = %job.id,
+                conversation_id,
+                error = %e,
+                "Failed to apply cron session mode"
+            );
+            return ExecutionResult::Error {
+                message: e.to_string(),
+            };
+        }
+
+        let prompt = build_prompt(job, saved_skill);
+        let msg_id = generate_id();
+        let terminal_rx = agent.subscribe();
+        let user_id = match self
+            .resolve_target_conversation_user_id(conversation_id)
+            .await
+        {
+            Ok(user_id) => user_id,
+            Err(e) => {
+                error!(
+                    job_id = %job.id,
+                    conversation_id,
+                    error = %e,
+                    "Failed to resolve cron conversation owner before dispatch"
+                );
+                return ExecutionResult::Error {
+                    message: e.to_string(),
+                };
+            }
+        };
+        let send_req = SendMessageRequest {
             content: prompt,
             msg_id,
             files: vec![],
-            inject_skills: vec![],
+            inject_skills: skill_names.clone(),
         };
 
-        match agent.send_message(send_data).await {
+        match self
+            .conversation_service
+            .send_message(&user_id, conversation_id, send_req, &self.task_manager)
+            .await
+        {
             Ok(()) => {
+                if let Err(e) = self.insert_cron_trigger_message(conversation_id, job).await {
+                    warn!(
+                        job_id = %job.id,
+                        conversation_id,
+                        error = %e,
+                        "Failed to persist/broadcast cron trigger message"
+                    );
+                }
+                if saved_skill.is_none() {
+                    self.spawn_skill_suggest_flow(
+                        Arc::clone(&agent),
+                        terminal_rx,
+                        conversation_id.to_owned(),
+                        job.id.clone(),
+                        job.name.clone(),
+                        agent.workspace().to_owned(),
+                        matches!(job.execution_mode, ExecutionMode::Existing),
+                        skill_names.clone(),
+                    );
+                }
                 info!(
                     job_id = %job.id,
                     conversation_id,
@@ -251,9 +622,301 @@ impl JobExecutor {
             }
         }
     }
+
+    async fn resolve_target_conversation_user_id(
+        &self,
+        conversation_id: &str,
+    ) -> Result<String, CronError> {
+        let Some(row) = self.get_conversation_row(conversation_id).await? else {
+            return Err(CronError::Scheduler(format!(
+                "conversation {conversation_id} not found"
+            )));
+        };
+
+        if row.user_id.trim().is_empty() {
+            return Ok(SYSTEM_DEFAULT_USER_ID.to_owned());
+        }
+
+        Ok(row.user_id)
+    }
+
+    async fn insert_cron_trigger_message(
+        &self,
+        conversation_id: &str,
+        job: &CronJob,
+    ) -> Result<(), CronError> {
+        let created_at = now_ms();
+        let msg_id = generate_id();
+        let content = serde_json::json!({
+            "cron_job_id": job.id,
+            "cron_job_name": job.name,
+            "triggered_at": created_at,
+        });
+
+        let row = MessageRow {
+            id: generate_id(),
+            conversation_id: conversation_id.to_owned(),
+            msg_id: Some(msg_id.clone()),
+            r#type: "cron_trigger".into(),
+            content: content.to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at,
+        };
+
+        self.conversation_repo
+            .insert_message(&row)
+            .await
+            .map_err(CronError::Database)?;
+
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "message.stream",
+            serde_json::json!({
+                "conversation_id": conversation_id,
+                "msg_id": msg_id,
+                "type": "cron_trigger",
+                "data": content,
+                "hidden": false,
+            }),
+        ));
+
+        Ok(())
+    }
+
+    async fn resolve_execution_workspace(
+        &self,
+        job: &CronJob,
+        conversation_id: &str,
+    ) -> Result<String, CronError> {
+        if let Some(workspace) = job
+            .agent_config
+            .as_ref()
+            .and_then(|config| config.workspace.as_deref())
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+        {
+            return Ok(workspace.to_owned());
+        }
+
+        let Some(row) = self.get_conversation_row(conversation_id).await? else {
+            return Ok(String::new());
+        };
+
+        let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
+        Ok(extra
+            .get("workspace")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+            .unwrap_or_default()
+            .to_owned())
+    }
+
+    fn spawn_skill_suggest_flow(
+        &self,
+        agent: Arc<dyn aionui_ai_agent::IAgentManager>,
+        main_rx: broadcast::Receiver<AgentStreamEvent>,
+        conversation_id: String,
+        job_id: String,
+        job_name: String,
+        workspace: String,
+        needs_follow_up: bool,
+        skill_names: Vec<String>,
+    ) {
+        let detector = self.skill_suggest_detector.clone();
+
+        tokio::spawn(async move {
+            if !wait_for_terminal_event(main_rx).await {
+                warn!(
+                    conversation_id,
+                    job_id,
+                    "Timed out waiting for cron turn completion before skill suggestion check"
+                );
+                return;
+            }
+
+            if needs_follow_up {
+                let follow_up_rx = agent.subscribe();
+                let follow_up = SendMessageData {
+                    content: build_skill_suggest_prompt(&job_name),
+                    msg_id: generate_id(),
+                    files: vec![],
+                    inject_skills: skill_names,
+                };
+
+                if let Err(err) = agent.send_message(follow_up).await {
+                    warn!(
+                        conversation_id,
+                        job_id,
+                        error = %err,
+                        "Failed to send cron skill suggestion follow-up prompt"
+                    );
+                    return;
+                }
+
+                if !wait_for_terminal_event(follow_up_rx).await {
+                    warn!(
+                        conversation_id,
+                        job_id, "Timed out waiting for cron skill suggestion follow-up completion"
+                    );
+                    return;
+                }
+            }
+
+            detector.schedule_check(conversation_id, job_id, workspace);
+        });
+    }
+
+    async fn prepare_saved_skill(
+        &self,
+        job: &CronJob,
+    ) -> Result<Option<SavedSkillContext>, CronError> {
+        if let Some(raw_content) = read_skill_content(&self.data_dir, &job.id).await?
+            && !raw_content.trim().is_empty()
+        {
+            return Ok(Some(SavedSkillContext {
+                name: cron_skill_name(&job.id)?,
+                raw_content,
+            }));
+        }
+
+        let legacy_content = job
+            .skill_content
+            .as_deref()
+            .map(str::trim)
+            .filter(|content| !content.is_empty());
+
+        let Some(legacy_content) = legacy_content else {
+            return Ok(None);
+        };
+
+        persist_legacy_skill_file(&self.data_dir, job, legacy_content).await?;
+        let raw_content = read_skill_content(&self.data_dir, &job.id)
+            .await?
+            .unwrap_or_else(|| legacy_content.to_owned());
+
+        Ok(Some(SavedSkillContext {
+            name: cron_skill_name(&job.id)?,
+            raw_content,
+        }))
+    }
+
+    async fn resolve_task_skill_names(
+        &self,
+        job: &CronJob,
+        conversation_id: &str,
+        saved_skill: Option<&SavedSkillContext>,
+    ) -> Result<Vec<String>, CronError> {
+        let mut skills = match job.execution_mode {
+            ExecutionMode::Existing => self.load_conversation_skill_names(conversation_id).await?,
+            ExecutionMode::NewConversation => Vec::new(),
+        };
+
+        if let Some(saved_skill) = saved_skill
+            && !skills.iter().any(|name| name == &saved_skill.name)
+        {
+            skills.push(saved_skill.name.clone());
+        }
+
+        Ok(skills)
+    }
+
+    async fn ensure_agent_session_mode(
+        &self,
+        job: &CronJob,
+        agent: &Arc<dyn IAgentManager>,
+    ) -> Result<(), CronError> {
+        let Some(desired_mode) = job
+            .agent_config
+            .as_ref()
+            .and_then(|config| config.mode.as_deref())
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+        else {
+            return Ok(());
+        };
+
+        let current_mode = agent
+            .get_mode()
+            .await
+            .map_err(|e| CronError::Scheduler(format!("get session mode: {e}")))?;
+
+        if current_mode.mode == desired_mode {
+            return Ok(());
+        }
+
+        agent.set_mode(desired_mode).await.map_err(|e| {
+            CronError::Scheduler(format!("set session mode to {desired_mode}: {e}"))
+        })?;
+
+        info!(
+            conversation_id = %agent.conversation_id(),
+            from_mode = %current_mode.mode,
+            to_mode = desired_mode,
+            initialized = current_mode.initialized,
+            "Applied cron session mode before execution"
+        );
+
+        Ok(())
+    }
+
+    async fn load_conversation_skill_names(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<String>, CronError> {
+        let Some(row) = self
+            .conversation_repo
+            .get(conversation_id)
+            .await
+            .map_err(CronError::Database)?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let Ok(extra) = serde_json::from_str::<serde_json::Value>(&row.extra) else {
+            return Ok(Vec::new());
+        };
+
+        Ok(extra
+            .get("skills")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+}
+
+async fn wait_for_terminal_event(mut rx: broadcast::Receiver<AgentStreamEvent>) -> bool {
+    let fut = async move {
+        loop {
+            match rx.recv().await {
+                Ok(AgentStreamEvent::Finish(_)) | Ok(AgentStreamEvent::Error(_)) => return true,
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Closed) => return true,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    };
+
+    timeout(SKILL_SUGGEST_TERMINAL_TIMEOUT, fut)
+        .await
+        .unwrap_or(false)
 }
 
 fn parse_agent_type(agent_type_str: &str) -> AgentType {
+    if serde_json::from_value::<aionui_common::AcpBackend>(serde_json::Value::String(
+        agent_type_str.to_owned(),
+    ))
+    .is_ok()
+    {
+        return AgentType::Acp;
+    }
+
     serde_json::from_value(serde_json::Value::String(agent_type_str.to_owned()))
         .unwrap_or(AgentType::Acp)
 }
@@ -277,12 +940,28 @@ fn resolve_model(job: &CronJob) -> ProviderWithModel {
     }
 }
 
-fn build_task_extra(job: &CronJob) -> serde_json::Value {
+fn build_task_extra(job: &CronJob, skills: &[String]) -> serde_json::Value {
     let mut extra = serde_json::Map::new();
+    extra.insert(
+        "cron_job_id".to_owned(),
+        serde_json::Value::String(job.id.clone()),
+    );
     extra.insert(
         "cronJobId".to_owned(),
         serde_json::Value::String(job.id.clone()),
     );
+    if !skills.is_empty() {
+        extra.insert(
+            "skills".to_owned(),
+            serde_json::Value::Array(
+                skills
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
 
     if let Some(config) = &job.agent_config {
         extra.insert(
@@ -291,25 +970,31 @@ fn build_task_extra(job: &CronJob) -> serde_json::Value {
         );
         if let Some(cli_path) = &config.cli_path {
             extra.insert(
-                "cliPath".to_owned(),
+                "cli_path".to_owned(),
                 serde_json::Value::String(cli_path.clone()),
             );
         }
         if !config.name.is_empty() {
             extra.insert(
-                "agentName".to_owned(),
+                "agent_name".to_owned(),
                 serde_json::Value::String(config.name.clone()),
             );
         }
         if let Some(custom_agent_id) = &config.custom_agent_id {
             extra.insert(
-                "customAgentId".to_owned(),
+                "custom_agent_id".to_owned(),
                 serde_json::Value::String(custom_agent_id.clone()),
             );
+            if config.is_preset.unwrap_or(false) {
+                extra.insert(
+                    "preset_assistant_id".to_owned(),
+                    serde_json::Value::String(custom_agent_id.clone()),
+                );
+            }
         }
         if let Some(mode) = &config.mode {
             extra.insert(
-                "sessionMode".to_owned(),
+                "session_mode".to_owned(),
                 serde_json::Value::String(mode.clone()),
             );
         }
@@ -318,15 +1003,188 @@ fn build_task_extra(job: &CronJob) -> serde_json::Value {
     serde_json::Value::Object(extra)
 }
 
-fn build_prompt(job: &CronJob) -> String {
-    match (&job.execution_mode, &job.skill_content) {
-        (ExecutionMode::NewConversation, Some(skill)) if !skill.is_empty() => {
-            format!(
-                "{}\n\n---\n\n## Skill Instructions\n\n{}",
-                job.message, skill
-            )
+fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> String {
+    let schedule_desc = schedule_description_text(&job.schedule);
+
+    match job.execution_mode {
+        ExecutionMode::Existing => {
+            let mut prompt =
+                build_existing_conversation_prompt(&job.name, &schedule_desc, &job.message);
+            if let Some(saved_skill) = saved_skill {
+                prompt.push_str("\n\n---\n\n## Skill Instructions\n\n");
+                prompt.push_str(&saved_skill.raw_content);
+            }
+            prompt
         }
-        _ => job.message.clone(),
+        ExecutionMode::NewConversation => {
+            if saved_skill.is_some() {
+                build_new_conversation_with_skill_prompt(&job.name, &job.message)
+            } else {
+                build_new_conversation_prompt_with_skill_suggest(
+                    &job.name,
+                    &schedule_desc,
+                    &job.message,
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SavedSkillContext {
+    name: String,
+    raw_content: String,
+}
+
+fn build_conversation_extra(
+    job: &CronJob,
+    saved_skill: Option<&SavedSkillContext>,
+) -> serde_json::Value {
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "cron_job_id".to_owned(),
+        serde_json::Value::String(job.id.clone()),
+    );
+    extra.insert(
+        "cronJobId".to_owned(),
+        serde_json::Value::String(job.id.clone()),
+    );
+    extra.insert(
+        "exclude_auto_inject_skills".to_owned(),
+        serde_json::Value::Array(vec![serde_json::Value::String("cron".to_owned())]),
+    );
+
+    if let Some(saved_skill) = saved_skill {
+        extra.insert(
+            "preset_enabled_skills".to_owned(),
+            serde_json::Value::Array(vec![serde_json::Value::String(saved_skill.name.clone())]),
+        );
+    }
+
+    if let Some(config) = &job.agent_config {
+        extra.insert(
+            "backend".to_owned(),
+            serde_json::Value::String(config.backend.clone()),
+        );
+        if let Some(cli_path) = &config.cli_path {
+            extra.insert(
+                "cli_path".to_owned(),
+                serde_json::Value::String(cli_path.clone()),
+            );
+        }
+        if !config.name.is_empty() {
+            extra.insert(
+                "agent_name".to_owned(),
+                serde_json::Value::String(config.name.clone()),
+            );
+        }
+        if let Some(custom_agent_id) = &config.custom_agent_id {
+            extra.insert(
+                "custom_agent_id".to_owned(),
+                serde_json::Value::String(custom_agent_id.clone()),
+            );
+            if config.is_preset.unwrap_or(false) {
+                extra.insert(
+                    "preset_assistant_id".to_owned(),
+                    serde_json::Value::String(custom_agent_id.clone()),
+                );
+            }
+        }
+        if let Some(mode) = &config.mode {
+            extra.insert(
+                "session_mode".to_owned(),
+                serde_json::Value::String(mode.clone()),
+            );
+        }
+        if let Some(workspace) = &config.workspace
+            && !workspace.trim().is_empty()
+        {
+            extra.insert(
+                "workspace".to_owned(),
+                serde_json::Value::String(workspace.clone()),
+            );
+        }
+    }
+
+    serde_json::Value::Object(extra)
+}
+
+fn schedule_description_text(schedule: &crate::types::CronSchedule) -> String {
+    match schedule {
+        crate::types::CronSchedule::At { at_ms, description } => {
+            description.clone().unwrap_or_else(|| format!("At {at_ms}"))
+        }
+        crate::types::CronSchedule::Every {
+            every_ms,
+            description,
+        } => description
+            .clone()
+            .unwrap_or_else(|| format!("Every {every_ms} ms")),
+        crate::types::CronSchedule::Cron {
+            expr,
+            tz,
+            description,
+        } => description.clone().unwrap_or_else(|| match tz {
+            Some(tz) => format!("{expr} ({tz})"),
+            None => expr.clone(),
+        }),
+    }
+}
+
+fn default_temp_workspace_path(
+    data_dir: &std::path::Path,
+    agent_type: &AgentType,
+    job: &CronJob,
+    conversation_id: &str,
+) -> std::path::PathBuf {
+    let label = if *agent_type == AgentType::Acp {
+        job.agent_config
+            .as_ref()
+            .map(|config| config.backend.trim())
+            .filter(|backend| !backend.is_empty())
+            .unwrap_or("acp")
+            .to_owned()
+    } else {
+        agent_type.serde_name().to_owned()
+    };
+
+    data_dir
+        .join("conversations")
+        .join(format!("{label}-temp-{conversation_id}"))
+}
+
+fn schedule_description_ref(schedule: &crate::types::CronSchedule) -> Option<&str> {
+    match schedule {
+        crate::types::CronSchedule::At { description, .. }
+        | crate::types::CronSchedule::Every { description, .. }
+        | crate::types::CronSchedule::Cron { description, .. } => description.as_deref(),
+    }
+}
+
+async fn persist_legacy_skill_file(
+    data_dir: &PathBuf,
+    job: &CronJob,
+    raw_content: &str,
+) -> Result<(), CronError> {
+    match write_raw_skill_file(data_dir, &job.id, raw_content).await {
+        Ok(_) => Ok(()),
+        Err(CronError::InvalidSkillContent(_)) => {
+            let description = job
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("Saved cron skill for {}", job.name));
+            write_skill_file(
+                data_dir,
+                &job.id,
+                &job.name,
+                &description,
+                raw_content.trim(),
+                schedule_description_ref(&job.schedule),
+            )
+            .await
+            .map(|_| ())
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -334,6 +1192,17 @@ fn build_prompt(job: &CronJob) -> String {
 mod tests {
     use super::*;
     use crate::types::{CreatedBy, CronAgentConfig, CronSchedule};
+    use aionui_ai_agent::agent_manager::AgentManagerHandle;
+    use aionui_api_types::{AgentModeResponse, WebSocketMessage};
+    use aionui_common::{
+        AgentKillReason, Confirmation, ConversationStatus, PaginatedResult, TimestampMs,
+    };
+    use aionui_db::{
+        ConversationFilters, ConversationRowUpdate, MessageRowUpdate, MessageSearchRow, SortOrder,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{RwLock, broadcast};
 
     fn sample_job() -> CronJob {
         CronJob {
@@ -374,6 +1243,19 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
         }
+    }
+
+    async fn wait_for_agent_send(agent: &RecordingAgent, expected_calls: usize) {
+        timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if agent.send_calls() >= expected_calls {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("agent send should complete");
     }
 
     // -- handle_busy tests ---------------------------------------------------
@@ -439,31 +1321,41 @@ mod tests {
     #[test]
     fn build_prompt_existing_mode_no_skill() {
         let job = sample_job();
-        let prompt = build_prompt(&job);
-        assert_eq!(prompt, "do something");
+        let prompt = build_prompt(&job, None);
+        assert!(prompt.contains("[Scheduled Task Execution]"));
+        assert!(prompt.contains("Task instruction:\ndo something"));
     }
 
     #[test]
-    fn build_prompt_existing_mode_with_skill_ignores_skill() {
-        let job = CronJob {
-            skill_content: Some("skill content".into()),
-            ..sample_job()
-        };
-        let prompt = build_prompt(&job);
-        assert_eq!(prompt, "do something");
+    fn build_prompt_existing_mode_with_skill_appends_inline_instructions() {
+        let job = sample_job();
+        let prompt = build_prompt(
+            &job,
+            Some(&SavedSkillContext {
+                name: "cron-cron_test1".into(),
+                raw_content: "---\nname: test\ndescription: desc\n---\nDo X".into(),
+            }),
+        );
+        assert!(prompt.contains("[Scheduled Task Execution]"));
+        assert!(prompt.contains("## Skill Instructions"));
+        assert!(prompt.contains("Do X"));
     }
 
     #[test]
     fn build_prompt_new_conv_with_skill() {
         let job = CronJob {
             execution_mode: ExecutionMode::NewConversation,
-            skill_content: Some("---\nname: test\n---\nDo X".into()),
             ..sample_job()
         };
-        let prompt = build_prompt(&job);
+        let prompt = build_prompt(
+            &job,
+            Some(&SavedSkillContext {
+                name: "cron-cron_test1".into(),
+                raw_content: "---\nname: test\ndescription: desc\n---\nDo X".into(),
+            }),
+        );
+        assert!(prompt.contains("A skill file with detailed instructions has been loaded"));
         assert!(prompt.contains("do something"));
-        assert!(prompt.contains("Skill Instructions"));
-        assert!(prompt.contains("Do X"));
     }
 
     #[test]
@@ -472,19 +1364,18 @@ mod tests {
             execution_mode: ExecutionMode::NewConversation,
             ..sample_job()
         };
-        let prompt = build_prompt(&job);
-        assert_eq!(prompt, "do something");
+        let prompt = build_prompt(&job, None);
+        assert!(prompt.contains("create a file named \"SKILL_SUGGEST.md\""));
     }
 
     #[test]
     fn build_prompt_new_conv_empty_skill() {
         let job = CronJob {
             execution_mode: ExecutionMode::NewConversation,
-            skill_content: Some(String::new()),
             ..sample_job()
         };
-        let prompt = build_prompt(&job);
-        assert_eq!(prompt, "do something");
+        let prompt = build_prompt(&job, None);
+        assert!(prompt.contains("SKILL_SUGGEST.md"));
     }
 
     // -- parse_agent_type tests -----------------------------------------------
@@ -493,6 +1384,14 @@ mod tests {
     fn parse_agent_type_known_types() {
         assert_eq!(parse_agent_type("acp"), AgentType::Acp);
         assert_eq!(parse_agent_type("nanobot"), AgentType::Nanobot);
+    }
+
+    #[test]
+    fn parse_agent_type_acp_backend_aliases_to_acp() {
+        assert_eq!(parse_agent_type("claude"), AgentType::Acp);
+        assert_eq!(parse_agent_type("gemini"), AgentType::Acp);
+        assert_eq!(parse_agent_type("qwen"), AgentType::Acp);
+        assert_eq!(parse_agent_type("codex"), AgentType::Acp);
     }
 
     #[test]
@@ -548,17 +1447,18 @@ mod tests {
     #[test]
     fn build_task_extra_includes_cron_job_id() {
         let job = sample_job();
-        let extra = build_task_extra(&job);
-        assert_eq!(extra["cronJobId"], "cron_test1");
+        let extra = build_task_extra(&job, &[]);
+        assert_eq!(extra["cron_job_id"], "cron_test1");
     }
 
     #[test]
     fn build_task_extra_with_config_fields() {
         let job = sample_job();
-        let extra = build_task_extra(&job);
+        let extra = build_task_extra(&job, &["cron-cron_test1".into()]);
         assert_eq!(extra["backend"], "acp");
-        assert_eq!(extra["cliPath"], "/usr/bin/claude");
-        assert_eq!(extra["agentName"], "Claude");
+        assert_eq!(extra["cli_path"], "/usr/bin/claude");
+        assert_eq!(extra["agent_name"], "Claude");
+        assert_eq!(extra["skills"], serde_json::json!(["cron-cron_test1"]));
     }
 
     #[test]
@@ -567,9 +1467,61 @@ mod tests {
             agent_config: None,
             ..sample_job()
         };
-        let extra = build_task_extra(&job);
-        assert_eq!(extra["cronJobId"], "cron_test1");
+        let extra = build_task_extra(&job, &[]);
+        assert_eq!(extra["cron_job_id"], "cron_test1");
         assert!(extra.get("backend").is_none());
+    }
+
+    #[test]
+    fn build_conversation_extra_without_saved_skill_excludes_cron_auto_inject_only() {
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let extra = build_conversation_extra(&job, None);
+
+        assert_eq!(extra["cron_job_id"], "cron_test1");
+        assert_eq!(
+            extra["exclude_auto_inject_skills"],
+            serde_json::json!(["cron"])
+        );
+        assert!(extra.get("preset_enabled_skills").is_none());
+    }
+
+    #[test]
+    fn build_conversation_extra_with_saved_skill_enables_preset_skill() {
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+        let saved_skill = SavedSkillContext {
+            name: "cron-cron_test1".into(),
+            raw_content: "---\nname: test\ndescription: desc\n---\nDo X".into(),
+        };
+
+        let extra = build_conversation_extra(&job, Some(&saved_skill));
+
+        assert_eq!(
+            extra["exclude_auto_inject_skills"],
+            serde_json::json!(["cron"])
+        );
+        assert_eq!(
+            extra["preset_enabled_skills"],
+            serde_json::json!(["cron-cron_test1"])
+        );
+    }
+
+    #[test]
+    fn build_conversation_extra_preserves_agent_workspace() {
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let extra = build_conversation_extra(&job, None);
+
+        assert_eq!(extra["workspace"], "/home/user/project");
     }
 
     // -- execution_result display ---------------------------------------------
@@ -602,17 +1554,331 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn execute_inner_applies_desired_session_mode_before_sending() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let executor = make_executor_with_agent(agent.clone() as AgentManagerHandle);
+        let mut job = sample_job();
+        job.agent_config.as_mut().unwrap().mode = Some("yolo".into());
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        assert_eq!(agent.mode().await, "yolo");
+        assert_eq!(agent.set_mode_calls(), 1);
+        assert_eq!(agent.send_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_inner_applies_mode_even_for_uninitialized_agent() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", false));
+        let executor = make_executor_with_agent(agent.clone() as AgentManagerHandle);
+        let mut job = sample_job();
+        job.agent_config.as_mut().unwrap().mode = Some("yolo".into());
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        assert_eq!(agent.mode().await, "yolo");
+        assert_eq!(agent.set_mode_calls(), 1);
+        assert_eq!(agent.send_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_inner_skips_mode_update_when_already_matching() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "yolo", true));
+        let executor = make_executor_with_agent(agent.clone() as AgentManagerHandle);
+        let mut job = sample_job();
+        job.agent_config.as_mut().unwrap().mode = Some("yolo".into());
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        assert_eq!(agent.mode().await, "yolo");
+        assert_eq!(agent.set_mode_calls(), 0);
+        assert_eq!(agent.send_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_inner_new_conversation_without_saved_skill_requests_skill_suggest() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let task_manager = Arc::new(RecordingTaskManager::new(
+            agent.clone() as AgentManagerHandle
+        ));
+        let executor = make_executor_with_task_manager(task_manager.clone());
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        let sent_messages = agent.sent_messages().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(
+            sent_messages[0]
+                .content
+                .contains("create a file named \"SKILL_SUGGEST.md\"")
+        );
+        assert!(sent_messages[0].inject_skills.is_empty());
+
+        let options = task_manager
+            .last_options()
+            .expect("task manager should capture build options");
+        assert!(
+            options
+                .extra
+                .get("skills")
+                .and_then(|value| value.as_array())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_inner_new_conversation_with_saved_skill_injects_saved_skill() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let task_manager = Arc::new(RecordingTaskManager::new(
+            agent.clone() as AgentManagerHandle
+        ));
+        let executor = make_executor_with_task_manager(task_manager.clone());
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+        let saved_skill = SavedSkillContext {
+            name: "cron-cron_test1".into(),
+            raw_content: "---\nname: test\ndescription: desc\n---\nDo X".into(),
+        };
+
+        let result = executor
+            .execute_inner(&job, "conv_1", Some(&saved_skill))
+            .await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        let sent_messages = agent.sent_messages().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(
+            sent_messages[0]
+                .content
+                .contains("A skill file with detailed instructions has been loaded")
+        );
+        assert!(!sent_messages[0].content.contains("SKILL_SUGGEST.md"));
+        assert_eq!(
+            sent_messages[0].inject_skills,
+            vec!["cron-cron_test1".to_owned()]
+        );
+
+        let options = task_manager
+            .recorded_options()
+            .into_iter()
+            .next()
+            .expect("task manager should capture build options");
+        assert_eq!(
+            options.extra["skills"],
+            serde_json::json!(["cron-cron_test1"])
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_inner_uses_conversation_workspace_when_job_workspace_missing() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let task_manager = Arc::new(RecordingTaskManager::new(
+            agent.clone() as AgentManagerHandle
+        ));
+        let executor = make_executor_with_task_manager(task_manager.clone());
+        let mut job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+        job.agent_config.as_mut().unwrap().workspace = None;
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        let options = task_manager
+            .last_options()
+            .expect("task manager should capture build options");
+        assert_eq!(options.workspace, "/tmp/existing-conversation-workspace");
+    }
+
+    #[tokio::test]
+    async fn execute_inner_persists_agent_workspace_when_conversation_workspace_missing() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let task_manager = Arc::new(RecordingTaskManager::new(
+            agent.clone() as AgentManagerHandle
+        ));
+        let repo = Arc::new(MissingWorkspaceConversationRepo::new(
+            "conv_1",
+            serde_json::json!({}),
+        ));
+        let executor = make_executor_with_task_manager_and_repo(task_manager.clone(), repo.clone());
+        let mut job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+        job.agent_config.as_mut().unwrap().workspace = None;
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        let options = task_manager
+            .last_options()
+            .expect("task manager should capture build options");
+        assert_eq!(options.workspace, "");
+
+        let update = repo
+            .last_update_with_extra()
+            .expect("conversation workspace should be persisted");
+        let extra = update.extra.expect("workspace update should write extra");
+        let value: serde_json::Value = serde_json::from_str(&extra).expect("valid extra json");
+        assert_eq!(value["workspace"], "/tmp/cron-test");
+    }
+
+    #[tokio::test]
+    async fn execute_inner_inserts_right_side_user_message_for_cron_prompt() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let task_manager = Arc::new(RecordingTaskManager::new(
+            agent.clone() as AgentManagerHandle
+        ));
+        let repo = Arc::new(MissingWorkspaceConversationRepo::new(
+            "conv_1",
+            serde_json::json!({ "workspace": "/tmp/existing-conversation-workspace" }),
+        ));
+        let executor = make_executor_with_task_manager_and_repo(task_manager, repo.clone());
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+
+        let messages = repo.inserted_messages();
+        assert!(
+            !messages.is_empty(),
+            "cron execution should insert a user message"
+        );
+        let right_message = messages
+            .iter()
+            .find(|message| message.position.as_deref() == Some("right"))
+            .expect("cron execution should insert a right-side prompt message");
+        assert_eq!(right_message.r#type, "text");
+        assert!(right_message.content.contains("SKILL_SUGGEST.md"));
+    }
+
+    #[tokio::test]
+    async fn execute_inner_inserts_cron_trigger_message_and_broadcasts_event() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let task_manager = Arc::new(RecordingTaskManager::new(
+            agent.clone() as AgentManagerHandle
+        ));
+        let repo = Arc::new(MissingWorkspaceConversationRepo::new(
+            "conv_1",
+            serde_json::json!({ "workspace": "/tmp/existing-conversation-workspace" }),
+        ));
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let executor = make_executor_with_task_manager_repo_and_broadcaster(
+            task_manager,
+            repo.clone(),
+            broadcaster.clone(),
+        );
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+
+        let messages = repo.inserted_messages();
+        let trigger_message = messages
+            .iter()
+            .find(|message| message.r#type == "cron_trigger")
+            .expect("cron execution should insert a cron trigger message");
+        assert_eq!(trigger_message.position.as_deref(), Some("center"));
+        let trigger_content: serde_json::Value =
+            serde_json::from_str(&trigger_message.content).expect("valid trigger payload");
+        assert_eq!(trigger_content["cron_job_id"], "cron_test1");
+        assert_eq!(trigger_content["cron_job_name"], "Test Job");
+        assert!(trigger_content["triggered_at"].as_i64().is_some());
+
+        let events = broadcaster.events();
+        let trigger_event = events
+            .iter()
+            .find(|event| {
+                event["name"] == "message.stream" && event["data"]["type"] == "cron_trigger"
+            })
+            .expect("cron execution should broadcast cron trigger event");
+        assert_eq!(trigger_event["data"]["conversation_id"], "conv_1");
+        assert_eq!(trigger_event["data"]["data"]["cron_job_id"], "cron_test1");
+        assert_eq!(trigger_event["data"]["data"]["cron_job_name"], "Test Job");
+        assert!(
+            trigger_event["data"]["data"]["triggered_at"]
+                .as_i64()
+                .is_some()
+        );
+    }
+
     // -- helper ---------------------------------------------------------------
 
     fn make_executor_for_busy_tests(guard: Arc<CronBusyGuard>) -> JobExecutor {
-        use aionui_ai_agent::agent_manager::AgentManagerHandle;
-        use aionui_api_types::WebSocketMessage;
-        use aionui_common::PaginatedResult;
-        use aionui_db::{
-            ConversationFilters, ConversationRowUpdate, MessageRowUpdate, MessageSearchRow,
-            SortOrder,
-        };
-
         struct StubTaskManager;
         impl IWorkerTaskManager for StubTaskManager {
             fn get_task(&self, _: &str) -> Option<AgentManagerHandle> {
@@ -799,6 +2065,649 @@ mod tests {
             Arc::new(StubSkillResolver),
         ));
 
-        JobExecutor::new(Arc::new(StubTaskManager), stub_repo, conv_service, guard)
+        JobExecutor::new(
+            Arc::new(StubTaskManager),
+            stub_repo,
+            conv_service,
+            guard,
+            std::env::temp_dir(),
+            Arc::new(StubBroadcaster),
+        )
+    }
+
+    struct RecordingAgent {
+        conversation_id: String,
+        workspace: String,
+        event_tx: broadcast::Sender<AgentStreamEvent>,
+        mode: RwLock<String>,
+        sent_messages: RwLock<Vec<SendMessageData>>,
+        initialized: bool,
+        set_mode_calls: AtomicUsize,
+        send_calls: AtomicUsize,
+    }
+
+    impl RecordingAgent {
+        fn new(conversation_id: &str, mode: &str, initialized: bool) -> Self {
+            let (event_tx, _) = broadcast::channel(16);
+            Self {
+                conversation_id: conversation_id.to_owned(),
+                workspace: "/tmp/cron-test".to_owned(),
+                event_tx,
+                mode: RwLock::new(mode.to_owned()),
+                sent_messages: RwLock::new(Vec::new()),
+                initialized,
+                set_mode_calls: AtomicUsize::new(0),
+                send_calls: AtomicUsize::new(0),
+            }
+        }
+
+        async fn mode(&self) -> String {
+            self.mode.read().await.clone()
+        }
+
+        fn set_mode_calls(&self) -> usize {
+            self.set_mode_calls.load(Ordering::Relaxed)
+        }
+
+        fn send_calls(&self) -> usize {
+            self.send_calls.load(Ordering::Relaxed)
+        }
+
+        async fn sent_messages(&self) -> Vec<SendMessageData> {
+            self.sent_messages.read().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IAgentManager for RecordingAgent {
+        fn agent_type(&self) -> AgentType {
+            AgentType::Acp
+        }
+
+        fn status(&self) -> Option<ConversationStatus> {
+            Some(ConversationStatus::Pending)
+        }
+
+        fn workspace(&self) -> &str {
+            &self.workspace
+        }
+
+        fn conversation_id(&self) -> &str {
+            &self.conversation_id
+        }
+
+        fn last_activity_at(&self) -> TimestampMs {
+            0
+        }
+
+        fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+            self.event_tx.subscribe()
+        }
+
+        async fn send_message(&self, data: SendMessageData) -> Result<(), aionui_common::AppError> {
+            self.send_calls.fetch_add(1, Ordering::Relaxed);
+            self.sent_messages.write().await.push(data);
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), aionui_common::AppError> {
+            Ok(())
+        }
+
+        fn confirm(
+            &self,
+            _msg_id: &str,
+            _call_id: &str,
+            _data: serde_json::Value,
+            _always_allow: bool,
+        ) -> Result<(), aionui_common::AppError> {
+            Ok(())
+        }
+
+        fn get_confirmations(&self) -> Vec<Confirmation> {
+            Vec::new()
+        }
+
+        fn check_approval(&self, _action: &str, _command_type: Option<&str>) -> bool {
+            false
+        }
+
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_common::AppError> {
+            Ok(())
+        }
+
+        async fn get_mode(&self) -> Result<AgentModeResponse, aionui_common::AppError> {
+            Ok(AgentModeResponse {
+                mode: self.mode().await,
+                initialized: self.initialized,
+            })
+        }
+
+        async fn set_mode(&self, mode: &str) -> Result<(), aionui_common::AppError> {
+            self.set_mode_calls.fetch_add(1, Ordering::Relaxed);
+            let mut guard = self.mode.write().await;
+            *guard = mode.to_owned();
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct FixedTaskManager {
+        agent: AgentManagerHandle,
+    }
+
+    impl IWorkerTaskManager for FixedTaskManager {
+        fn get_task(&self, _conversation_id: &str) -> Option<AgentManagerHandle> {
+            Some(Arc::clone(&self.agent))
+        }
+
+        fn get_or_build_task(
+            &self,
+            _conversation_id: &str,
+            _options: BuildTaskOptions,
+        ) -> Result<AgentManagerHandle, aionui_common::AppError> {
+            Ok(Arc::clone(&self.agent))
+        }
+
+        fn kill(
+            &self,
+            _conversation_id: &str,
+            _reason: Option<AgentKillReason>,
+        ) -> Result<(), aionui_common::AppError> {
+            Ok(())
+        }
+
+        fn clear(&self) {}
+
+        fn active_count(&self) -> usize {
+            1
+        }
+
+        fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    struct RecordingTaskManager {
+        agent: AgentManagerHandle,
+        options: Mutex<Vec<BuildTaskOptions>>,
+    }
+
+    impl RecordingTaskManager {
+        fn new(agent: AgentManagerHandle) -> Self {
+            Self {
+                agent,
+                options: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn last_options(&self) -> Option<BuildTaskOptions> {
+            self.options
+                .lock()
+                .ok()
+                .and_then(|items| items.last().cloned())
+        }
+
+        fn recorded_options(&self) -> Vec<BuildTaskOptions> {
+            self.options
+                .lock()
+                .map(|items| items.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl IWorkerTaskManager for RecordingTaskManager {
+        fn get_task(&self, _conversation_id: &str) -> Option<AgentManagerHandle> {
+            Some(Arc::clone(&self.agent))
+        }
+
+        fn get_or_build_task(
+            &self,
+            _conversation_id: &str,
+            options: BuildTaskOptions,
+        ) -> Result<AgentManagerHandle, aionui_common::AppError> {
+            self.options.lock().unwrap().push(options);
+            Ok(Arc::clone(&self.agent))
+        }
+
+        fn kill(
+            &self,
+            _conversation_id: &str,
+            _reason: Option<AgentKillReason>,
+        ) -> Result<(), aionui_common::AppError> {
+            Ok(())
+        }
+
+        fn clear(&self) {}
+
+        fn active_count(&self) -> usize {
+            1
+        }
+
+        fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    struct ExistingConversationRepo;
+
+    #[async_trait::async_trait]
+    impl IConversationRepository for ExistingConversationRepo {
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            Ok(Some(aionui_db::models::ConversationRow {
+                id: id.to_owned(),
+                user_id: "cron".into(),
+                name: "Cron Conversation".into(),
+                r#type: "acp".into(),
+                extra: serde_json::json!({
+                    "workspace": "/tmp/existing-conversation-workspace"
+                })
+                .to_string(),
+                model: None,
+                status: Some("finished".into()),
+                source: None,
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: 0,
+                updated_at: 0,
+            }))
+        }
+
+        async fn create(
+            &self,
+            _row: &aionui_db::models::ConversationRow,
+        ) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn update(
+            &self,
+            _id: &str,
+            _updates: &ConversationRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn list_paginated(
+            &self,
+            _user_id: &str,
+            _filters: &ConversationFilters,
+        ) -> Result<PaginatedResult<aionui_db::models::ConversationRow>, aionui_db::DbError>
+        {
+            Ok(PaginatedResult {
+                items: vec![],
+                total: 0,
+                has_more: false,
+            })
+        }
+
+        async fn find_by_source_and_chat(
+            &self,
+            _user_id: &str,
+            _source: &str,
+            _chat_id: &str,
+            _agent_type: &str,
+        ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            Ok(None)
+        }
+
+        async fn list_by_cron_job(
+            &self,
+            _user_id: &str,
+            _cron_job_id: &str,
+        ) -> Result<Vec<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            Ok(vec![])
+        }
+
+        async fn list_associated(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+        ) -> Result<Vec<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            Ok(vec![])
+        }
+
+        async fn get_messages(
+            &self,
+            _conv_id: &str,
+            _page: u32,
+            _page_size: u32,
+            _order: SortOrder,
+        ) -> Result<PaginatedResult<aionui_db::models::MessageRow>, aionui_db::DbError> {
+            Ok(PaginatedResult {
+                items: vec![],
+                total: 0,
+                has_more: false,
+            })
+        }
+
+        async fn insert_message(
+            &self,
+            _message: &aionui_db::models::MessageRow,
+        ) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn update_message(
+            &self,
+            _id: &str,
+            _updates: &MessageRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn delete_messages_by_conversation(
+            &self,
+            _conv_id: &str,
+        ) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn get_message_by_msg_id(
+            &self,
+            _conv_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<aionui_db::models::MessageRow>, aionui_db::DbError> {
+            Ok(None)
+        }
+
+        async fn search_messages(
+            &self,
+            _user_id: &str,
+            _keyword: &str,
+            _page: u32,
+            _page_size: u32,
+        ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
+            Ok(PaginatedResult {
+                items: vec![],
+                total: 0,
+                has_more: false,
+            })
+        }
+    }
+
+    struct MissingWorkspaceConversationRepo {
+        row: aionui_db::models::ConversationRow,
+        updates: Mutex<Vec<ConversationRowUpdate>>,
+        inserted_messages: Mutex<Vec<aionui_db::models::MessageRow>>,
+    }
+
+    impl MissingWorkspaceConversationRepo {
+        fn new(conversation_id: &str, extra: serde_json::Value) -> Self {
+            Self {
+                row: aionui_db::models::ConversationRow {
+                    id: conversation_id.to_owned(),
+                    user_id: "cron".into(),
+                    name: "Cron Conversation".into(),
+                    r#type: "acp".into(),
+                    extra: extra.to_string(),
+                    model: None,
+                    status: Some("finished".into()),
+                    source: None,
+                    channel_chat_id: None,
+                    pinned: false,
+                    pinned_at: None,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                updates: Mutex::new(Vec::new()),
+                inserted_messages: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn last_update_with_extra(&self) -> Option<ConversationRowUpdate> {
+            self.updates.lock().ok().and_then(|items| {
+                items
+                    .iter()
+                    .rev()
+                    .find(|update| update.extra.is_some())
+                    .cloned()
+            })
+        }
+
+        fn inserted_messages(&self) -> Vec<aionui_db::models::MessageRow> {
+            self.inserted_messages
+                .lock()
+                .map(|items| items.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    struct RecordingBroadcaster {
+        events: Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl RecordingBroadcaster {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<serde_json::Value> {
+            self.events
+                .lock()
+                .map(|items| items.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl aionui_realtime::EventBroadcaster for RecordingBroadcaster {
+        fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+            self.events.lock().unwrap().push(serde_json::json!({
+                "name": event.name,
+                "data": event.data,
+            }));
+        }
+    }
+
+    struct StubBroadcaster;
+
+    impl aionui_realtime::EventBroadcaster for StubBroadcaster {
+        fn broadcast(&self, _: WebSocketMessage<serde_json::Value>) {}
+    }
+
+    #[async_trait::async_trait]
+    impl IConversationRepository for MissingWorkspaceConversationRepo {
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            Ok(Some(self.row.clone()))
+        }
+
+        async fn create(
+            &self,
+            _row: &aionui_db::models::ConversationRow,
+        ) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn update(
+            &self,
+            _id: &str,
+            updates: &ConversationRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
+            self.updates.lock().unwrap().push(updates.clone());
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn list_paginated(
+            &self,
+            _user_id: &str,
+            _filters: &ConversationFilters,
+        ) -> Result<PaginatedResult<aionui_db::models::ConversationRow>, aionui_db::DbError>
+        {
+            Ok(PaginatedResult {
+                items: vec![],
+                total: 0,
+                has_more: false,
+            })
+        }
+
+        async fn find_by_source_and_chat(
+            &self,
+            _user_id: &str,
+            _source: &str,
+            _chat_id: &str,
+            _agent_type: &str,
+        ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            Ok(None)
+        }
+
+        async fn list_by_cron_job(
+            &self,
+            _user_id: &str,
+            _cron_job_id: &str,
+        ) -> Result<Vec<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            Ok(vec![])
+        }
+
+        async fn list_associated(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+        ) -> Result<Vec<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            Ok(vec![])
+        }
+
+        async fn get_messages(
+            &self,
+            _conv_id: &str,
+            _page: u32,
+            _page_size: u32,
+            _order: SortOrder,
+        ) -> Result<PaginatedResult<aionui_db::models::MessageRow>, aionui_db::DbError> {
+            Ok(PaginatedResult {
+                items: vec![],
+                total: 0,
+                has_more: false,
+            })
+        }
+
+        async fn insert_message(
+            &self,
+            message: &aionui_db::models::MessageRow,
+        ) -> Result<(), aionui_db::DbError> {
+            self.inserted_messages.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        async fn update_message(
+            &self,
+            _id: &str,
+            _updates: &MessageRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn delete_messages_by_conversation(
+            &self,
+            _conv_id: &str,
+        ) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn get_message_by_msg_id(
+            &self,
+            _conv_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<aionui_db::models::MessageRow>, aionui_db::DbError> {
+            Ok(None)
+        }
+
+        async fn search_messages(
+            &self,
+            _user_id: &str,
+            _keyword: &str,
+            _page: u32,
+            _page_size: u32,
+        ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
+            Ok(PaginatedResult {
+                items: vec![],
+                total: 0,
+                has_more: false,
+            })
+        }
+    }
+
+    fn make_executor_with_agent(agent: AgentManagerHandle) -> JobExecutor {
+        make_executor_with_task_manager(Arc::new(FixedTaskManager { agent }))
+    }
+
+    fn make_executor_with_task_manager(task_manager: Arc<dyn IWorkerTaskManager>) -> JobExecutor {
+        make_executor_with_task_manager_and_repo(task_manager, Arc::new(ExistingConversationRepo))
+    }
+
+    fn make_executor_with_task_manager_and_repo(
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        repo: Arc<dyn IConversationRepository>,
+    ) -> JobExecutor {
+        let broadcaster: Arc<dyn aionui_realtime::EventBroadcaster> = Arc::new(StubBroadcaster);
+        make_executor_with_task_manager_repo_and_broadcaster(task_manager, repo, broadcaster)
+    }
+
+    fn make_executor_with_task_manager_repo_and_broadcaster(
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        repo: Arc<dyn IConversationRepository>,
+        broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
+    ) -> JobExecutor {
+        struct StubSkillResolver;
+
+        #[async_trait::async_trait]
+        impl aionui_conversation::skill_resolver::SkillResolver for StubSkillResolver {
+            async fn auto_inject_names(&self) -> Vec<String> {
+                Vec::new()
+            }
+
+            async fn resolve_skills(
+                &self,
+                _names: &[String],
+            ) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
+                Vec::new()
+            }
+
+            async fn link_workspace_skills(
+                &self,
+                _workspace: &std::path::Path,
+                _rel_dirs: &[&str],
+                _skills: &[aionui_conversation::skill_resolver::ResolvedAgentSkill],
+            ) -> usize {
+                0
+            }
+        }
+
+        let conversation_service = Arc::new(ConversationService::new_with_workspace_root(
+            Arc::clone(&repo),
+            Arc::clone(&broadcaster),
+            std::env::temp_dir(),
+            Arc::new(StubSkillResolver),
+        ));
+
+        JobExecutor::new(
+            task_manager,
+            repo,
+            conversation_service,
+            Arc::new(CronBusyGuard::new()),
+            std::env::temp_dir(),
+            broadcaster,
+        )
     }
 }

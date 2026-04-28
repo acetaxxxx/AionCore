@@ -29,6 +29,12 @@ static CRON_CREATE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)\[CRON_CREATE\]\s*(.*?)\s*\[/CRON_CREATE\]").expect("valid cron-create regex")
 });
 
+/// Regex for `[CRON_UPDATE: <id>]...[/CRON_UPDATE]` blocks (dot-all).
+static CRON_UPDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)\[CRON_UPDATE:\s*([^\]]+)\]\s*(.*?)\s*\[/CRON_UPDATE\]")
+        .expect("valid cron-update regex")
+});
+
 /// Regex for `[CRON_LIST]`.
 static CRON_LIST_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[CRON_LIST\]").expect("valid cron-list regex"));
@@ -41,6 +47,7 @@ static CRON_DELETE_RE: LazyLock<Regex> =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CronCommand {
     Create(CronCreateParams),
+    Update(CronUpdateParams),
     List,
     Delete(String),
 }
@@ -48,6 +55,16 @@ pub enum CronCommand {
 /// Parameters for a cron-create command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronCreateParams {
+    pub name: String,
+    pub schedule: String,
+    pub schedule_description: String,
+    pub message: String,
+}
+
+/// Parameters for a cron-update command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronUpdateParams {
+    pub job_id: String,
     pub name: String,
     pub schedule: String,
     pub schedule_description: String,
@@ -63,6 +80,15 @@ pub fn detect_cron_commands(text: &str) -> Vec<CronCommand> {
             && let Some(params) = parse_cron_create_body(body.as_str())
         {
             commands.push(CronCommand::Create(params));
+        }
+    }
+
+    for cap in CRON_UPDATE_RE.captures_iter(text) {
+        if let (Some(job_id_match), Some(body)) = (cap.get(1), cap.get(2))
+            && let Some(params) =
+                parse_cron_update_body(job_id_match.as_str().trim(), body.as_str())
+        {
+            commands.push(CronCommand::Update(params));
         }
     }
 
@@ -84,15 +110,27 @@ pub fn detect_cron_commands(text: &str) -> Vec<CronCommand> {
 
 /// Quick check: does the text contain any cron commands?
 pub fn has_cron_commands(text: &str) -> bool {
-    CRON_CREATE_RE.is_match(text) || CRON_LIST_RE.is_match(text) || CRON_DELETE_RE.is_match(text)
+    CRON_CREATE_RE.is_match(text)
+        || CRON_UPDATE_RE.is_match(text)
+        || CRON_LIST_RE.is_match(text)
+        || CRON_DELETE_RE.is_match(text)
 }
 
 /// Strip all cron command tags from text, returning cleaned content.
 pub fn strip_cron_commands(text: &str) -> String {
     let result = CRON_CREATE_RE.replace_all(text, "");
+    let result = CRON_UPDATE_RE.replace_all(&result, "");
     let result = CRON_LIST_RE.replace_all(&result, "");
     let result = CRON_DELETE_RE.replace_all(&result, "");
     result.into_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CronCommandFields {
+    name: Option<String>,
+    schedule: Option<String>,
+    schedule_description: Option<String>,
+    message: Option<String>,
 }
 
 /// Parse the body of a `[CRON_CREATE]...[/CRON_CREATE]` block.
@@ -104,7 +142,7 @@ pub fn strip_cron_commands(text: &str) -> String {
 /// schedule_description: <human-readable>
 /// message: <prompt text>
 /// ```
-fn parse_cron_create_body(body: &str) -> Option<CronCreateParams> {
+fn parse_cron_command_body(body: &str) -> Option<CronCommandFields> {
     let mut name = None;
     let mut schedule = None;
     let mut schedule_description = None;
@@ -123,11 +161,36 @@ fn parse_cron_create_body(body: &str) -> Option<CronCreateParams> {
         }
     }
 
+    Some(CronCommandFields {
+        name,
+        schedule,
+        schedule_description,
+        message,
+    })
+}
+
+fn parse_cron_create_body(body: &str) -> Option<CronCreateParams> {
+    let fields = parse_cron_command_body(body)?;
     Some(CronCreateParams {
-        name: name.unwrap_or_default(),
-        schedule: schedule?,
-        schedule_description: schedule_description.unwrap_or_default(),
-        message: message.unwrap_or_default(),
+        name: fields.name.unwrap_or_default(),
+        schedule: fields.schedule?,
+        schedule_description: fields.schedule_description.unwrap_or_default(),
+        message: fields.message.unwrap_or_default(),
+    })
+}
+
+fn parse_cron_update_body(job_id: &str, body: &str) -> Option<CronUpdateParams> {
+    if job_id.is_empty() {
+        return None;
+    }
+
+    let fields = parse_cron_command_body(body)?;
+    Some(CronUpdateParams {
+        job_id: job_id.to_string(),
+        name: fields.name?,
+        schedule: fields.schedule?,
+        schedule_description: fields.schedule_description?,
+        message: fields.message?,
     })
 }
 
@@ -156,8 +219,17 @@ pub trait ICronService: Send + Sync {
         params: &CronCreateParams,
     ) -> CronCommandResult;
 
-    /// List cron jobs. Returns a formatted text response.
-    async fn list_jobs(&self, user_id: &str) -> CronCommandResult;
+    /// Update an existing cron job.
+    async fn update_job(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        params: &CronUpdateParams,
+    ) -> CronCommandResult;
+
+    /// List cron jobs for the current conversation scope.
+    /// Returns a formatted text response.
+    async fn list_jobs(&self, user_id: &str, conversation_id: &str) -> CronCommandResult;
 
     /// Delete a cron job by ID.
     async fn delete_job(&self, user_id: &str, job_id: &str) -> CronCommandResult;
@@ -252,7 +324,12 @@ impl MessageMiddleware {
                         .create_job(user_id, conversation_id, params)
                         .await
                 }
-                CronCommand::List => cron_service.list_jobs(user_id).await,
+                CronCommand::Update(params) => {
+                    cron_service
+                        .update_job(user_id, conversation_id, params)
+                        .await
+                }
+                CronCommand::List => cron_service.list_jobs(user_id, conversation_id).await,
                 CronCommand::Delete(id) => cron_service.delete_job(user_id, id).await,
             };
 
@@ -364,6 +441,23 @@ mod tests {
     }
 
     #[test]
+    fn detect_cron_update_command() {
+        let input = "[CRON_UPDATE: job-123]\nname: Updated Job\nschedule: 0 10 * * *\nschedule_description: Daily at 10am\nmessage: Updated instructions\n[/CRON_UPDATE]";
+        let commands = detect_cron_commands(input);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            CronCommand::Update(params) => {
+                assert_eq!(params.job_id, "job-123");
+                assert_eq!(params.name, "Updated Job");
+                assert_eq!(params.schedule, "0 10 * * *");
+                assert_eq!(params.schedule_description, "Daily at 10am");
+                assert_eq!(params.message, "Updated instructions");
+            }
+            _ => panic!("Expected CronCommand::Update"),
+        }
+    }
+
+    #[test]
     fn detect_cron_delete_command() {
         let input = "[CRON_DELETE: job-123]";
         let commands = detect_cron_commands(input);
@@ -373,12 +467,13 @@ mod tests {
 
     #[test]
     fn detect_mixed_cron_commands() {
-        let input = "I'll manage your crons.\n[CRON_CREATE]\nname: test\nschedule: * * * * *\nschedule_description: every minute\nmessage: ping\n[/CRON_CREATE]\nAlso listing: [CRON_LIST]\nAnd deleting: [CRON_DELETE: old-job]";
+        let input = "I'll manage your crons.\n[CRON_CREATE]\nname: test\nschedule: * * * * *\nschedule_description: every minute\nmessage: ping\n[/CRON_CREATE]\nUpdate too: [CRON_UPDATE: existing-job]\nname: updated\nschedule: 0 * * * *\nschedule_description: hourly\nmessage: pong\n[/CRON_UPDATE]\nAlso listing: [CRON_LIST]\nAnd deleting: [CRON_DELETE: old-job]";
         let commands = detect_cron_commands(input);
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 4);
         assert!(matches!(&commands[0], CronCommand::Create(_)));
-        assert_eq!(commands[1], CronCommand::List);
-        assert_eq!(commands[2], CronCommand::Delete("old-job".to_string()));
+        assert!(matches!(&commands[1], CronCommand::Update(_)));
+        assert_eq!(commands[2], CronCommand::List);
+        assert_eq!(commands[3], CronCommand::Delete("old-job".to_string()));
     }
 
     #[test]
@@ -404,6 +499,9 @@ mod tests {
         assert!(has_cron_commands("[CRON_LIST]"));
         assert!(has_cron_commands("[CRON_DELETE: x]"));
         assert!(has_cron_commands(
+            "[CRON_UPDATE: x]\nschedule: *\n[/CRON_UPDATE]"
+        ));
+        assert!(has_cron_commands(
             "[CRON_CREATE]\nschedule: *\n[/CRON_CREATE]"
         ));
     }
@@ -420,7 +518,7 @@ mod tests {
 
     #[test]
     fn strip_cron_commands_all_types() {
-        let input = "Before [CRON_LIST] middle [CRON_DELETE: abc] after [CRON_CREATE]\nname: t\nschedule: *\n[/CRON_CREATE] end";
+        let input = "Before [CRON_LIST] middle [CRON_DELETE: abc] after [CRON_CREATE]\nname: t\nschedule: *\n[/CRON_CREATE] and [CRON_UPDATE: abc]\nname: t2\nschedule: 0 * * * *\n[/CRON_UPDATE] end";
         let stripped = strip_cron_commands(input);
         assert!(!stripped.contains("[CRON_"));
         assert!(stripped.contains("Before"));
@@ -464,6 +562,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_cron_update_body_full() {
+        let body = "name: Updated\nschedule: 0 9 * * *\nschedule_description: Daily 9am\nmessage: Run tests";
+        let params = parse_cron_update_body("job-7", body).unwrap();
+        assert_eq!(params.job_id, "job-7");
+        assert_eq!(params.name, "Updated");
+        assert_eq!(params.schedule, "0 9 * * *");
+        assert_eq!(params.schedule_description, "Daily 9am");
+        assert_eq!(params.message, "Run tests");
+    }
+
+    #[test]
+    fn parse_cron_update_body_requires_job_id() {
+        let body = "name: Updated\nschedule: 0 9 * * *";
+        assert!(parse_cron_update_body("", body).is_none());
+    }
+
+    #[test]
+    fn parse_cron_update_body_requires_all_fields() {
+        let body = "name: Updated\nschedule: 0 9 * * *\nmessage: Run tests";
+        assert!(parse_cron_update_body("job-7", body).is_none());
+    }
+
+    #[test]
     fn parse_cron_create_body_schedule_description_before_schedule() {
         // schedule_description should match before schedule due to prefix ordering
         let body = "schedule_description: desc first\nschedule: 0 * * * *\nname: test";
@@ -492,7 +613,19 @@ mod tests {
             }
         }
 
-        async fn list_jobs(&self, _user_id: &str) -> CronCommandResult {
+        async fn update_job(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            params: &CronUpdateParams,
+        ) -> CronCommandResult {
+            CronCommandResult {
+                success: true,
+                message: format!("Updated cron job '{}'", params.job_id),
+            }
+        }
+
+        async fn list_jobs(&self, _user_id: &str, _conversation_id: &str) -> CronCommandResult {
             CronCommandResult {
                 success: true,
                 message: "No cron jobs found".to_string(),
@@ -531,6 +664,17 @@ mod tests {
         assert!(result.display_message.is_some());
         assert_eq!(result.system_responses.len(), 1);
         assert!(result.system_responses[0].contains("Created cron job"));
+    }
+
+    #[tokio::test]
+    async fn middleware_processes_cron_update() {
+        let mw = MessageMiddleware::new(Some(Box::new(MockCronService)));
+        let input = "Updated it. [CRON_UPDATE: job-99]\nname: daily\nschedule: 0 10 * * *\nschedule_description: Daily\nmessage: run\n[/CRON_UPDATE]";
+        let result = mw.process(input, "user1", "conv1").await;
+        assert!(!result.message.contains("[CRON_UPDATE"));
+        assert!(result.display_message.is_some());
+        assert_eq!(result.system_responses.len(), 1);
+        assert!(result.system_responses[0].contains("Updated cron job 'job-99'"));
     }
 
     #[tokio::test]

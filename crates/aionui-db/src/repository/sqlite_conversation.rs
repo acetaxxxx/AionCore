@@ -224,10 +224,12 @@ impl IConversationRepository for SqliteConversationRepository {
     ) -> Result<Vec<ConversationRow>, DbError> {
         let rows = sqlx::query_as::<_, ConversationRow>(
             "SELECT * FROM conversations \
-             WHERE user_id = ? AND json_extract(extra, '$.cronJobId') = ? \
+             WHERE user_id = ? \
+             AND (json_extract(extra, '$.cronJobId') = ? OR json_extract(extra, '$.cron_job_id') = ?) \
              ORDER BY updated_at DESC",
         )
         .bind(user_id)
+        .bind(cron_job_id)
         .bind(cron_job_id)
         .fetch_all(&self.pool)
         .await?;
@@ -531,7 +533,11 @@ fn append_filter_conditions(
         binds.push(BindValue::Str(source.clone()));
     }
     if let Some(ref cron_job_id) = filters.cron_job_id {
-        where_parts.push("json_extract(c.extra, '$.cronJobId') = ?".to_string());
+        where_parts.push(
+            "(json_extract(c.extra, '$.cronJobId') = ? OR json_extract(c.extra, '$.cron_job_id') = ?)"
+                .to_string(),
+        );
+        binds.push(BindValue::Str(cron_job_id.clone()));
         binds.push(BindValue::Str(cron_job_id.clone()));
     }
     if let Some(pinned) = filters.pinned {
