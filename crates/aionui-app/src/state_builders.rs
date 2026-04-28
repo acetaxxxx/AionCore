@@ -96,7 +96,7 @@ pub async fn build_module_states(
     let dispatcher: Arc<dyn AssistantRuleDispatcher> = assistant.service.clone();
     skill_state.assistant_dispatcher = Some(dispatcher);
 
-    let (channel_state, channel_components) = build_channel_state(services);
+    let (channel_state, channel_components) = build_channel_state(services).await;
 
     let states = ModuleStates {
         system: build_system_state(services),
@@ -282,7 +282,7 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
 }
 
 /// Build the default `ChannelRouterState` and orchestrator components.
-pub fn build_channel_state(
+pub async fn build_channel_state(
     services: &AppServices,
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
@@ -339,10 +339,20 @@ pub fn build_channel_state(
         use_model: None,
     };
 
+    let owner_user_id = services
+        .user_repo
+        .get_primary_webui_user()
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.id)
+        .unwrap_or_else(|| "system_default_user".to_string());
+
     let message_service = Arc::new(aionui_channel::message_service::ChannelMessageService::new(
         conversation_svc,
         services.worker_task_manager.clone(),
         default_model,
+        owner_user_id,
     ));
 
     let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
