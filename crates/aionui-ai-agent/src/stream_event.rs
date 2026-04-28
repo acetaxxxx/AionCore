@@ -115,6 +115,12 @@ pub struct ToolCallEventData {
     #[serde(default)]
     pub args: serde_json::Value,
     pub status: ToolCallStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -692,11 +698,49 @@ mod tests {
             name: "read_file".into(),
             args: json!({ "path": "/tmp/a.txt" }),
             status: ToolCallStatus::Running,
+            input: None,
+            output: None,
+            description: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tool_call");
         assert_eq!(json["data"]["call_id"], "call-1");
         assert_eq!(json["data"]["status"], "running");
+    }
+
+    #[test]
+    fn tool_call_event_includes_enriched_fields() {
+        let event = AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "call-1".into(),
+            name: "Glob".into(),
+            args: json!({}),
+            status: ToolCallStatus::Completed,
+            input: Some(json!({ "pattern": "**/*.rs" })),
+            output: Some("src/main.rs\nsrc/lib.rs".into()),
+            description: Some("Search for Rust files".into()),
+        });
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "tool_call");
+        assert_eq!(json["data"]["input"]["pattern"], "**/*.rs");
+        assert_eq!(json["data"]["output"], "src/main.rs\nsrc/lib.rs");
+        assert_eq!(json["data"]["description"], "Search for Rust files");
+    }
+
+    #[test]
+    fn tool_call_event_omits_none_fields() {
+        let event = AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "call-1".into(),
+            name: "Glob".into(),
+            args: json!({}),
+            status: ToolCallStatus::Running,
+            input: None,
+            output: None,
+            description: None,
+        });
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json["data"].get("input").is_none());
+        assert!(json["data"].get("output").is_none());
+        assert!(json["data"].get("description").is_none());
     }
 
     #[test]

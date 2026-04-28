@@ -223,6 +223,9 @@ fn map_tool_event(data: &Value) -> Vec<AgentStreamEvent> {
         name,
         args,
         status,
+        input: None,
+        output: None,
+        description: None,
     })]
 }
 
