@@ -4,22 +4,26 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+use crate::acp_protocol::{AcpProtocol, PermissionDecision, PermissionRequest};
+
+use crate::acp_runtime_snapshot::AcpRuntimeSnapshot;
+use agent_client_protocol::schema::{
+    AgentCapabilities, CancelNotification, ContentBlock, LoadSessionRequest, NewSessionRequest,
+    PromptRequest, SessionConfigOption, SessionId, SessionModeState, SessionModelState,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
+};
+
+use crate::cli_process::CliAgentProcess;
+use crate::stream_event::{AgentStreamEvent, permission_request_to_event_data};
+use crate::types::{AcpBuildExtra, SendMessageData};
+
 use aionui_common::{
     AcpBackend, AgentKillReason, AgentType, AppError, CommandSpec, Confirmation,
     ConversationStatus, TimestampMs, now_ms,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tracing::{debug, error, info};
-
-use crate::acp_protocol::{
-    AcpProtocol, CancelNotification, ContentBlock, LoadSessionRequest, NewSessionRequest,
-    PermissionDecision, PermissionRequest, PromptRequest, SessionId, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, SetSessionModelRequest,
-};
-use crate::cli_process::CliAgentProcess;
-use crate::stream_event::{AgentStreamEvent, permission_request_to_event_data};
-use crate::types::{AcpBuildExtra, AcpModelInfo, SendMessageData};
 
 /// Grace period before force-killing an ACP process (ms).
 const ACP_KILL_GRACE_MS: u64 = 500;
@@ -61,8 +65,6 @@ struct AcpState {
     status: Option<ConversationStatus>,
     /// Active session ID (set after session/new or session/load).
     session_id: Option<String>,
-    /// Model info from ACP backend.
-    model_info: Option<AcpModelInfo>,
     /// Whether this session has sent at least one message.
     has_messages: bool,
 }
@@ -105,10 +107,100 @@ pub struct AcpAgentManager {
     permission_rx: Mutex<mpsc::Receiver<PermissionRequest>>,
     /// Pending ACP permission responders keyed by tool call ID.
     pending_permissions: StdMutex<HashMap<String, oneshot::Sender<PermissionDecision>>>,
+    /// Runtime ACP session snapshot used by getters.
+    runtime_snapshot: RwLock<AcpRuntimeSnapshot>,
     /// Whether a graceful shutdown is in progress.
     closing: std::sync::atomic::AtomicBool,
     /// Shared skill manager — used to discover skills for first-message injection.
     skill_manager: Arc<crate::skill_manager::AcpSkillManager>,
+}
+
+impl AcpAgentManager {
+    /// Current session mode id. Falls back to the configured session mode,
+    /// then to `"default"`. Reading a cached snapshot is infallible.
+    pub async fn modes(&self) -> Option<SessionModeState> {
+        let snapshot = self.runtime_snapshot.read().await;
+        snapshot.modes().cloned()
+    }
+
+    async fn _set_modes(&self, mode: &str) -> Result<(), AppError> {
+        let sid = self.require_session_id().await?;
+        self.protocol
+            .set_mode(SetSessionModeRequest::new(
+                SessionId::new(sid),
+                mode.to_owned(),
+            ))
+            .await
+            .map_err(AppError::from)
+            .map(|_| ())
+    }
+
+    /// Cached model info from the ACP backend, if any has been received.
+    pub async fn model_info(&self) -> Option<SessionModelState> {
+        let snapshot = self.runtime_snapshot.read().await;
+        snapshot.model_info().cloned()
+    }
+
+    /// Set the model for the current session.
+    pub async fn set_model_info(&self, model_id: &str) -> Result<(), AppError> {
+        let sid = self.require_session_id().await?;
+
+        self.protocol
+            .set_model(SetSessionModelRequest::new(
+                SessionId::new(sid),
+                model_id.to_owned(),
+            ))
+            .await
+            .map_err(AppError::from)?;
+
+        // Update the snapshot immediately since SDK does not send a
+        // CurrentModelUpdate notification for model changes.
+        {
+            let mut snapshot = self.runtime_snapshot.write().await;
+            if let Some(info) = snapshot.model_info().cloned() {
+                let updated = SessionModelState::new(model_id.to_owned(), info.available_models);
+                snapshot.set_model_info(updated);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cached session configuration options.
+    pub async fn config_options(&self) -> Vec<SessionConfigOption> {
+        let snapshot = self.runtime_snapshot.read().await;
+        snapshot
+            .config_options()
+            .map(<[SessionConfigOption]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// Set a session configuration option.
+    pub async fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), AppError> {
+        let sid = self.require_session_id().await?;
+
+        self.protocol
+            .set_config_option(SetSessionConfigOptionRequest::new(
+                SessionId::new(sid),
+                config_id.to_owned(),
+                value.to_owned(),
+            ))
+            .await
+            .map_err(AppError::from)
+            .map(|_| ())
+    }
+
+    /// Agent capabilities captured during the ACP initialize handshake.
+    pub async fn agent_capabilities(&self) -> Option<AgentCapabilities> {
+        let snapshot = self.runtime_snapshot.read().await;
+        snapshot.agent_capabilities().cloned()
+    }
+
+    /// Cached context usage info from the ACP backend.
+    pub async fn usage(&self) -> Option<UsageUpdate> {
+        let snapshot = self.runtime_snapshot.read().await;
+        snapshot.context_usage().cloned()
+    }
 }
 
 impl AcpAgentManager {
@@ -152,6 +244,11 @@ impl AcpAgentManager {
                 AppError::from(e)
             })?;
 
+        let mut runtime_snapshot = AcpRuntimeSnapshot::default();
+        if let Some(agent_capabilities) = protocol.agent_capabilities() {
+            runtime_snapshot.set_agent_capabilities(agent_capabilities);
+        }
+
         let manager = Self {
             conversation_id,
             workspace,
@@ -164,13 +261,13 @@ impl AcpAgentManager {
             state: RwLock::new(AcpState {
                 status: None,
                 session_id: None,
-                model_info: None,
                 has_messages: false,
             }),
             last_activity: AtomicI64::new(now_ms()),
             session_lock: Mutex::new(()),
             permission_rx: Mutex::new(permission_rx),
             pending_permissions: StdMutex::new(HashMap::new()),
+            runtime_snapshot: RwLock::new(runtime_snapshot),
             closing: std::sync::atomic::AtomicBool::new(false),
             skill_manager,
         };
@@ -186,35 +283,51 @@ impl AcpAgentManager {
     /// responses routed through the `confirm()` method.
     pub fn start_permission_handler(self: &Arc<Self>) {
         let this = Arc::clone(self);
-        tokio::spawn(async move { this.run_permission_handler().await });
+        tokio::spawn(async move {
+            let mut rx = this.permission_rx.lock().await;
+
+            while let Some(perm_req) = rx.recv().await {
+                this.last_activity.store(now_ms(), Ordering::Relaxed);
+
+                let call_id = perm_req.request.tool_call.tool_call_id.to_string();
+
+                let mut pending = this.pending_permissions.lock().unwrap();
+                if let Some(previous) = pending.insert(call_id.clone(), perm_req.response_tx) {
+                    let _ = previous.send(PermissionDecision::Cancelled);
+                }
+                drop(pending);
+
+                let permission_event = permission_request_to_event_data(&perm_req.request);
+
+                if this
+                    .event_tx
+                    .send(AgentStreamEvent::AcpPermission(permission_event))
+                    .is_err()
+                    && let Some(response_tx) =
+                        this.pending_permissions.lock().unwrap().remove(&call_id)
+                {
+                    let _ = response_tx.send(PermissionDecision::Cancelled);
+                }
+            }
+        });
     }
 
-    /// Run the permission handler loop.
-    async fn run_permission_handler(self: Arc<Self>) {
-        let mut rx = self.permission_rx.lock().await;
-
-        while let Some(perm_req) = rx.recv().await {
-            self.last_activity.store(now_ms(), Ordering::Relaxed);
-
-            let call_id = perm_req.request.tool_call.tool_call_id.to_string();
-
-            let mut pending = self.pending_permissions.lock().unwrap();
-            if let Some(previous) = pending.insert(call_id.clone(), perm_req.response_tx) {
-                let _ = previous.send(PermissionDecision::Cancelled);
+    /// Start the runtime snapshot tracker loop.
+    pub fn start_runtime_snapshot_tracker(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut rx = this.event_tx.subscribe();
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let mut snapshot = this.runtime_snapshot.write().await;
+                        snapshot.apply_event(&event);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
             }
-            drop(pending);
-
-            let permission_event = permission_request_to_event_data(&perm_req.request);
-
-            if self
-                .event_tx
-                .send(AgentStreamEvent::AcpPermission(permission_event))
-                .is_err()
-                && let Some(response_tx) = self.pending_permissions.lock().unwrap().remove(&call_id)
-            {
-                let _ = response_tx.send(PermissionDecision::Cancelled);
-            }
-        }
+        });
     }
 
     /// Initialize or resume a session, then send the user message.
@@ -254,13 +367,28 @@ impl AcpAgentManager {
             crate::stream_event::StartEventData { session_id: None },
         ));
 
-        let session_id = self
+        let session_response = self
             .protocol
             .new_session(NewSessionRequest::new(&self.workspace))
             .await
             .map_err(AppError::from)?;
 
-        let sid = session_id.to_string();
+        let sid = session_response.session_id.to_string();
+
+        // Populate the runtime snapshot from the session response
+        {
+            let mut snapshot = self.runtime_snapshot.write().await;
+            if let Some(models) = session_response.models {
+                snapshot.set_model_info(models);
+            }
+            if let Some(modes) = session_response.modes {
+                snapshot.set_modes(modes);
+            }
+            if let Some(config_options) = session_response.config_options {
+                snapshot.set_config_options(config_options);
+            }
+        }
+        self.emit_snapshot_events().await;
         {
             let mut state = self.state.write().await;
             state.session_id = Some(sid.clone());
@@ -317,14 +445,28 @@ impl AcpAgentManager {
         if strategy == SessionResumeStrategy::SessionLoad
             && let Some(sid) = session_id
         {
-            self.protocol
+            let resp = self
+                .protocol
                 .load_session(LoadSessionRequest::new(
                     SessionId::new(sid),
                     &self.workspace,
                 ))
                 .await
                 .map_err(AppError::from)?;
+
+            let mut snapshot = self.runtime_snapshot.write().await;
+            if let Some(models) = resp.models {
+                snapshot.set_model_info(models);
+            }
+            if let Some(modes) = resp.modes {
+                snapshot.set_modes(modes);
+            }
+            if let Some(config_options) = resp.config_options {
+                snapshot.set_config_options(config_options);
+            }
         }
+
+        self.emit_snapshot_events().await;
 
         self.prompt_existing_session(data, session_id).await
     }
@@ -363,100 +505,74 @@ impl AcpAgentManager {
         Ok(())
     }
 
-    // -- ACP-specific extended methods (beyond IAgentManager) --
+    /// Emit model/mode/config events from the current snapshot so the frontend
+    /// receives the initial session state via WebSocket immediately after
+    /// session creation or load.
+    async fn emit_snapshot_events(&self) {
+        use aionui_api_types::{ModelInfoEntry, ModelInfoPayload};
 
-    /// Query the ACP backend for current session mode.
-    pub async fn acp_get_mode(&self) -> Result<Value, AppError> {
-        // With the SDK, mode info arrives via session update events.
-        // We return a placeholder — the actual mode is tracked internally.
-        Ok(json!({ "sent": true }))
+        let snapshot = self.runtime_snapshot.read().await;
+        if let Some(models) = snapshot.model_info() {
+            let current_id = models.current_model_id.to_string();
+            let available: Vec<ModelInfoEntry> = models
+                .available_models
+                .iter()
+                .map(|am| ModelInfoEntry {
+                    id: am.model_id.to_string(),
+                    label: am.name.clone(),
+                })
+                .collect();
+            let current_label = available
+                .iter()
+                .find(|e| e.id == current_id)
+                .map(|e| e.label.clone())
+                .unwrap_or_else(|| current_id.clone());
+            let payload = ModelInfoPayload {
+                current_model_id: Some(current_id),
+                current_model_label: Some(current_label),
+                available_models: available,
+            };
+            if let Ok(v) = serde_json::to_value(&payload) {
+                let _ = self.event_tx.send(AgentStreamEvent::AcpModelInfo(v));
+            }
+        }
+        if let Some(modes) = snapshot.modes()
+            && let Ok(v) = serde_json::to_value(modes)
+        {
+            let _ = self.event_tx.send(AgentStreamEvent::AcpModeInfo(v));
+        }
+        if let Some(config_options) = snapshot.config_options()
+            && let Ok(v) = serde_json::to_value(config_options)
+        {
+            let _ = self.event_tx.send(AgentStreamEvent::AcpConfigOption(v));
+        }
     }
 
-    /// Set the session mode via ACP protocol.
-    pub async fn acp_set_mode(&self, mode: &str) -> Result<(), AppError> {
-        let sid = self
-            .state
-            .read()
-            .await
-            .session_id
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("No active session".into()))?;
-
-        self.protocol
-            .set_mode(SetSessionModeRequest::new(
-                SessionId::new(sid),
-                mode.to_owned(),
-            ))
-            .await
-            .map_err(AppError::from)
-    }
-
-    /// Get model info from the ACP backend.
-    pub async fn get_model_info(&self) -> Option<AcpModelInfo> {
-        let state = self.state.read().await;
-        state.model_info.clone()
-    }
-
-    /// Set the model for the current session.
-    pub async fn set_model(&self, model_id: &str) -> Result<(), AppError> {
-        let sid = self
-            .state
-            .read()
-            .await
-            .session_id
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("No active session".into()))?;
-
-        self.protocol
-            .set_model(SetSessionModelRequest::new(
-                SessionId::new(sid),
-                model_id.to_owned(),
-            ))
-            .await
-            .map_err(AppError::from)
-    }
-
-    /// Get the session configuration options.
-    pub async fn get_config_options(&self) -> Result<(), AppError> {
-        // Config options arrive via session update events.
-        Ok(())
-    }
-
-    /// Set a session configuration option.
-    pub async fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), AppError> {
-        let sid = self
-            .state
-            .read()
-            .await
-            .session_id
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("No active session".into()))?;
-
-        self.protocol
-            .set_config_option(SetSessionConfigOptionRequest::new(
-                SessionId::new(sid),
-                config_id.to_owned(),
-                value.to_owned(),
-            ))
-            .await
-            .map_err(AppError::from)
-    }
-
-    /// Load available slash commands from the ACP backend.
+    /// Request the ACP backend to load available slash commands.
+    ///
+    /// Results arrive asynchronously via `AvailableCommandsUpdate` events.
     pub async fn load_slash_commands(&self) -> Result<(), AppError> {
-        // Slash commands arrive via AvailableCommandsUpdate events.
         Ok(())
     }
 
-    /// Get the session ID.
+    /// Current ACP session ID, if a session has been established.
     pub async fn session_id(&self) -> Option<String> {
-        let state = self.state.read().await;
-        state.session_id.clone()
+        self.state.read().await.session_id.clone()
     }
 
-    /// Get the ACP backend type.
+    /// ACP sub-backend (Claude, Codex, …).
     pub fn backend(&self) -> AcpBackend {
         self.backend
+    }
+
+    /// Return the active session id or a `BadRequest` error.
+    async fn require_session_id(&self) -> Result<String, AppError> {
+        self.state
+            .read()
+            .await
+            .session_id
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("No active session".into()))
     }
 }
 
@@ -582,15 +698,27 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
     }
 
     async fn get_mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
-        self.acp_get_mode().await?;
         Ok(aionui_api_types::AgentModeResponse {
-            mode: String::new(),
+            mode: self
+                .modes()
+                .await
+                .map(|modes| modes.current_mode_id.to_string())
+                .or_else(|| self.config.session_mode.clone())
+                .unwrap_or_else(|| "default".to_owned()),
             initialized: self.session_id().await.is_some(),
         })
     }
 
     async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
-        self.acp_set_mode(mode).await
+        let sid = self.require_session_id().await?;
+        self.protocol
+            .set_mode(SetSessionModeRequest::new(
+                SessionId::new(sid),
+                mode.to_owned(),
+            ))
+            .await
+            .map_err(AppError::from)
+            .map(|_| ())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -601,6 +729,7 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn session_resume_strategy_for_backends() {

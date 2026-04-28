@@ -58,6 +58,30 @@ pub struct SetModelRequest {
     pub model_id: String,
 }
 
+/// A single available model entry in the frontend-facing model info response.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfoEntry {
+    pub id: String,
+    pub label: String,
+}
+
+/// Frontend-compatible model info response.
+///
+/// Maps from the SDK's camelCase `SessionModelState` to the snake_case
+/// `AcpModelInfo` format the renderer expects.
+#[derive(Debug, Serialize)]
+pub struct GetModelInfoResponse {
+    pub model_info: Option<ModelInfoPayload>,
+}
+
+/// Inner model info payload matching the frontend's `AcpModelInfo` type.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfoPayload {
+    pub current_model_id: Option<String>,
+    pub current_model_label: Option<String>,
+    pub available_models: Vec<ModelInfoEntry>,
+}
+
 /// Request body for probing model information.
 #[derive(Debug, Deserialize)]
 pub struct ProbeModelRequest {
@@ -68,6 +92,20 @@ pub struct ProbeModelRequest {
 #[derive(Debug, Deserialize)]
 pub struct SetConfigOptionRequest {
     pub value: String,
+}
+
+/// A single session config option update.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SessionConfigOptionUpdate {
+    pub config_id: String,
+    pub value: String,
+}
+
+/// Request body for setting multiple ACP config options.
+#[derive(Debug, Deserialize)]
+pub struct SetConfigOptionsRequest {
+    #[serde(default)]
+    pub config_options: Vec<SessionConfigOptionUpdate>,
 }
 
 /// Request body for testing a custom ACP agent.
@@ -84,6 +122,36 @@ pub struct TestCustomAgentRequest {
 #[derive(Debug, Serialize)]
 pub struct TestCustomAgentResponse {
     pub step: String,
+}
+
+/// Query parameters for workspace browse.
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceBrowseQuery {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+}
+
+/// A file or directory entry in the workspace browse response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub entry_type: String,
+}
+
+/// Request body for side question.
+#[derive(Debug, Deserialize)]
+pub struct SideQuestionRequest {
+    pub question: String,
+}
+
+/// Response for side question.
+#[derive(Debug, Serialize)]
+pub struct SideQuestionResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
 }
 
 #[cfg(test)]
@@ -158,6 +226,20 @@ mod tests {
         let json = json!({ "value": "dark" });
         let req: SetConfigOptionRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.value, "dark");
+    }
+
+    #[test]
+    fn set_config_options_request_serde() {
+        let json = json!({
+            "config_options": [
+                { "config_id": "model", "value": "claude-sonnet-4" },
+                { "config_id": "reasoning", "value": "high" }
+            ]
+        });
+        let req: SetConfigOptionsRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.config_options.len(), 2);
+        assert_eq!(req.config_options[0].config_id, "model");
+        assert_eq!(req.config_options[1].value, "high");
     }
 
     #[test]
