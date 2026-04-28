@@ -68,10 +68,6 @@ pub const BUILTIN_RULES_DIR_NAME: &str = "builtin-rules";
 /// `include_dir!`).
 pub const BUILTIN_AUTO_SKILLS_SUBDIR: &str = "auto-inject";
 
-/// Subdirectory under `data_dir` where per-conversation materialized
-/// skill directories are written for the gemini agent.
-pub const AGENT_SKILLS_SUBDIR: &str = "agent-skills";
-
 /// Default subdirectory name for assistant-level rules.
 pub const ASSISTANT_RULES_DIR_NAME: &str = "assistant-rules";
 
