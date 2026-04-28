@@ -1825,7 +1825,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].source_path, paths.user_skills_dir.join("my-custom"));
+        assert_eq!(
+            resolved[0].source_path,
+            paths.user_skills_dir.join("my-custom")
+        );
     }
 
     #[tokio::test]
@@ -1833,13 +1836,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
 
-        let resolved = materialize_skills_for_agent(
-            &paths,
-            "conv-missing",
-            &["no-such-skill".to_owned()],
-        )
-        .await
-        .unwrap();
+        let resolved =
+            materialize_skills_for_agent(&paths, "conv-missing", &["no-such-skill".to_owned()])
+                .await
+                .unwrap();
         assert!(resolved.is_empty());
     }
 

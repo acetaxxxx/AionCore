@@ -1,6 +1,6 @@
 //! HTTP integration tests for the built-in skills migration surface:
 //! `/api/skills/builtin-auto`, `/api/skills/builtin-skill`, `/api/skills`,
-//! and the new `/api/skills/materialize-for-agent` (POST + DELETE).
+//! and the symlink-contract `/api/skills/materialize-for-agent` (POST).
 //!
 //! Covers the spec's §9.2 scenarios end-to-end through
 //! `aionui_app::create_router_with_states` against an in-memory DB.
@@ -329,7 +329,10 @@ async fn materialize_for_agent_returns_source_path_for_auto_inject_skill() {
     assert_eq!(skills[0]["name"], "cron");
     let source_path = skills[0]["source_path"].as_str().unwrap();
     let path = std::path::Path::new(source_path);
-    assert!(path.is_absolute(), "source_path must be absolute: {source_path}");
+    assert!(
+        path.is_absolute(),
+        "source_path must be absolute: {source_path}"
+    );
     assert!(path.is_dir(), "source_path must exist: {source_path}");
     assert!(
         path.join("SKILL.md").exists(),
