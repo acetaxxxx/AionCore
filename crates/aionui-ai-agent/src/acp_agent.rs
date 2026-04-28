@@ -78,6 +78,13 @@ pub struct AcpAgentManager {
     conversation_id: String,
     /// Working directory.
     workspace: String,
+    /// Whether the workspace was explicitly chosen by the user rather
+    /// than auto-provisioned (e.g. the default
+    /// `{data_dir}/conversations/{id}/` path). Determined at agent
+    /// construction time — do NOT re-derive from the workspace string,
+    /// which is fragile (user paths may happen to contain
+    /// `"conversations"` or `"-temp-"`).
+    is_custom_workspace: bool,
     /// ACP sub-backend.
     backend: AcpBackend,
     /// Build configuration (preset context, enabled/excluded skills, session mode, …).
@@ -114,6 +121,7 @@ impl AcpAgentManager {
     pub async fn new(
         conversation_id: String,
         workspace: String,
+        is_custom_workspace: bool,
         command_spec: CommandSpec,
         config: AcpBuildExtra,
         skill_manager: Arc<crate::skill_manager::AcpSkillManager>,
@@ -147,6 +155,7 @@ impl AcpAgentManager {
         let manager = Self {
             conversation_id,
             workspace,
+            is_custom_workspace,
             backend,
             config,
             process: Arc::new(process),
@@ -268,15 +277,12 @@ impl AcpAgentManager {
                 preset_context: self.config.preset_context.as_deref(),
                 skills: &self.config.skills,
                 native_skill_support: self.backend.native_skills_dirs().is_some(),
-                // Workspace is "custom" (user-chosen) when it does NOT
-                // look like an auto-provisioned temp path. Historically
-                // those looked like `{label}-temp-{ms}/` under data_dir;
-                // post-migration they live under `/conversations/`.
-                // Both patterns are treated as non-custom here so the
-                // first-message injector keeps the same behavior across
-                // the migration window.
-                custom_workspace: !self.workspace.contains("/conversations/")
-                    && !self.workspace.contains("-temp-"),
+                // Whether the user chose this workspace — determined at
+                // factory-time and stored on the manager. Do NOT derive
+                // from `self.workspace`; path heuristics are fragile
+                // (user paths may incidentally contain "conversations"
+                // or "-temp-").
+                custom_workspace: self.is_custom_workspace,
             },
         )
         .await;

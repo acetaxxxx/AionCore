@@ -77,6 +77,9 @@ async fn make_mock_agent(
     let manager = AcpAgentManager::new(
         "test-conv-1".into(),
         "/tmp".into(),
+        // This fixture uses an explicit workspace path, matching the
+        // production case where the caller supplied `extra.workspace`.
+        true,
         aionui_common::CommandSpec {
             command: script_path.into(),
             args: vec![],
