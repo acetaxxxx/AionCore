@@ -318,10 +318,9 @@ pub fn build_channel_state(
         "acp",
     ));
 
-    let conv_repo: Arc<dyn aionui_db::IConversationRepository> =
-        Arc::new(aionui_db::SqliteConversationRepository::new(
-            services.database.pool().clone(),
-        ));
+    let conv_repo: Arc<dyn aionui_db::IConversationRepository> = Arc::new(
+        aionui_db::SqliteConversationRepository::new(services.database.pool().clone()),
+    );
     let skill_resolver = Arc::new(
         aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
             services.skill_paths.clone(),
@@ -340,13 +339,11 @@ pub fn build_channel_state(
         use_model: None,
     };
 
-    let message_service = Arc::new(
-        aionui_channel::message_service::ChannelMessageService::new(
-            conversation_svc,
-            services.worker_task_manager.clone(),
-            default_model,
-        ),
-    );
+    let message_service = Arc::new(aionui_channel::message_service::ChannelMessageService::new(
+        conversation_svc,
+        services.worker_task_manager.clone(),
+        default_model,
+    ));
 
     let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
         action_executor,

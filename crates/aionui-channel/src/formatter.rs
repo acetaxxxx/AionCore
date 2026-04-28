@@ -23,18 +23,12 @@ pub fn format_text_for_platform(text: &str, platform: PluginType) -> String {
 
 static RE_CODE_BLOCK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"```(?:\w*)\n?([\s\S]*?)```").unwrap());
-static RE_INLINE_CODE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
-static RE_BOLD_STAR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\*\*(.+?)\*\*").unwrap());
-static RE_BOLD_UNDER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"__(.+?)__").unwrap());
-static RE_ITALIC_STAR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\*(.+?)\*").unwrap());
-static RE_ITALIC_UNDER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"_(.+?)_").unwrap());
-static RE_LINK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+static RE_INLINE_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
+static RE_BOLD_STAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*(.+?)\*\*").unwrap());
+static RE_BOLD_UNDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"__(.+?)__").unwrap());
+static RE_ITALIC_STAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*(.+?)\*").unwrap());
+static RE_ITALIC_UNDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"_(.+?)_").unwrap());
+static RE_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
 
 fn markdown_to_telegram_html(text: &str) -> String {
     let s = escape_html(text);
@@ -54,19 +48,15 @@ static RE_PRE_CODE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<pre><code[^>]*>([\s\S]*?)</code></pre>").unwrap());
 static RE_HTML_CODE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<code>([^<]+)</code>").unwrap());
-static RE_HTML_B: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<b>([\s\S]*?)</b>").unwrap());
+static RE_HTML_B: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<b>([\s\S]*?)</b>").unwrap());
 static RE_HTML_STRONG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<strong>([\s\S]*?)</strong>").unwrap());
-static RE_HTML_I: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<i>([\s\S]*?)</i>").unwrap());
-static RE_HTML_EM: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<em>([\s\S]*?)</em>").unwrap());
+static RE_HTML_I: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<i>([\s\S]*?)</i>").unwrap());
+static RE_HTML_EM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<em>([\s\S]*?)</em>").unwrap());
 static RE_HTML_SAFE_LINK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<a\s+href="((?:https?://|mailto:|/)[^"]*)"[^>]*>([^<]*)</a>"#).unwrap()
 });
-static RE_HTML_TAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
+static RE_HTML_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
 
 fn html_to_markdown(text: &str) -> String {
     let s = decode_safe_entities(text);
@@ -111,10 +101,8 @@ fn strip_tags_loop(text: &str) -> String {
 /// Decode only safe entities (quotes, numeric). Never decode &lt;/&gt;/&amp;
 /// to prevent tag injection in Lark/DingTalk output.
 fn decode_safe_entities(text: &str) -> String {
-    static RE_HEX: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"&#x([0-9a-fA-F]+);").unwrap());
-    static RE_DEC: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"&#(\d+);").unwrap());
+    static RE_HEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"&#x([0-9a-fA-F]+);").unwrap());
+    static RE_DEC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"&#(\d+);").unwrap());
 
     let s = text.replace("&quot;", "\"");
     let s = s.replace("&#39;", "'");
