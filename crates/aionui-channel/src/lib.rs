@@ -2,6 +2,7 @@
 pub mod action;
 pub mod constants;
 pub mod error;
+pub mod formatter;
 pub mod manager;
 pub mod message_service;
 pub mod pairing;
