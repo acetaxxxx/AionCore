@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use aionui_api_types::{TeamMcpPhase, TeamMcpStatusPayload, WebSocketMessage};
 use aionui_realtime::EventBroadcaster;
@@ -10,6 +10,8 @@ use tracing::{debug, error, warn};
 
 use crate::error::TeamError;
 use crate::scheduler::TeammateManager;
+use crate::service::TeamSessionService;
+use crate::session::SpawnAgentRequest;
 use crate::types::TeammateRole;
 
 use super::protocol::{
@@ -38,6 +40,7 @@ impl TeamMcpServer {
         scheduler: Arc<TeammateManager>,
         team_id: String,
         broadcaster: Arc<dyn EventBroadcaster>,
+        service: Weak<TeamSessionService>,
     ) -> Result<Self, TeamError> {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
@@ -76,7 +79,16 @@ impl TeamMcpServer {
 
         let token = auth_token.clone();
         let sched_for_tcp = scheduler.clone();
-        tokio::spawn(accept_loop(listener, token, sched_for_tcp, shutdown_rx.clone()));
+        let service_for_tcp = service.clone();
+        let team_id_for_tcp = team_id.clone();
+        tokio::spawn(accept_loop(
+            listener,
+            token,
+            sched_for_tcp,
+            service_for_tcp,
+            team_id_for_tcp,
+            shutdown_rx.clone(),
+        ));
 
         // HTTP MCP endpoint for agents that prefer http transport.
         let http_listener = TcpListener::bind("127.0.0.1:0")
@@ -88,7 +100,16 @@ impl TeamMcpServer {
 
         let http_token = auth_token.clone();
         let http_sched = scheduler.clone();
-        tokio::spawn(http_mcp_loop(http_listener, http_token, http_sched, shutdown_rx));
+        let http_service = service.clone();
+        let http_team_id = team_id.clone();
+        tokio::spawn(http_mcp_loop(
+            http_listener,
+            http_token,
+            http_sched,
+            http_service,
+            http_team_id,
+            shutdown_rx,
+        ));
 
         debug!(
             tcp_port = addr.port(),
@@ -144,6 +165,8 @@ async fn accept_loop(
     listener: TcpListener,
     auth_token: String,
     scheduler: Arc<TeammateManager>,
+    service: Weak<TeamSessionService>,
+    team_id: String,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -154,7 +177,9 @@ async fn accept_loop(
                         debug!(?peer, "New MCP connection");
                         let token = auth_token.clone();
                         let sched = Arc::clone(&scheduler);
-                        tokio::spawn(handle_connection(stream, token, sched));
+                        let svc = service.clone();
+                        let tid = team_id.clone();
+                        tokio::spawn(handle_connection(stream, token, sched, svc, tid));
                     }
                     Err(e) => {
                         error!("Accept error: {e}");
@@ -175,7 +200,13 @@ async fn accept_loop(
 // Connection handler
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(stream: TcpStream, auth_token: String, scheduler: Arc<TeammateManager>) {
+async fn handle_connection(
+    stream: TcpStream,
+    auth_token: String,
+    scheduler: Arc<TeammateManager>,
+    service: Weak<TeamSessionService>,
+    team_id: String,
+) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let mut authenticated = false;
@@ -205,7 +236,14 @@ async fn handle_connection(stream: TcpStream, auth_token: String, scheduler: Arc
                 InitResult::Response(resp) => resp,
             }
         } else {
-            handle_method(&request, &scheduler, caller_slot_id.as_deref().unwrap_or("unknown")).await
+            handle_method(
+                &request,
+                &scheduler,
+                &service,
+                &team_id,
+                caller_slot_id.as_deref().unwrap_or("unknown"),
+            )
+            .await
         };
 
         if write_response(&mut writer, &response).await.is_err() {
@@ -279,12 +317,14 @@ fn handle_initialize(request: &super::protocol::JsonRpcRequest, auth_token: &str
 async fn handle_method(
     request: &super::protocol::JsonRpcRequest,
     scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
     caller_slot_id: &str,
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "notifications/initialized" => JsonRpcResponse::success(request.id, json!({})),
         "tools/list" => handle_tools_list(request.id),
-        "tools/call" => handle_tools_call(request, scheduler, caller_slot_id).await,
+        "tools/call" => handle_tools_call(request, scheduler, service, team_id, caller_slot_id).await,
         _ => JsonRpcResponse::error(
             request.id,
             METHOD_NOT_FOUND,
@@ -305,6 +345,8 @@ fn handle_tools_list(id: Option<u64>) -> JsonRpcResponse {
 async fn handle_tools_call(
     request: &super::protocol::JsonRpcRequest,
     scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
     caller_slot_id: &str,
 ) -> JsonRpcResponse {
     let params = match request.params.as_ref() {
@@ -328,7 +370,16 @@ async fn handle_tools_call(
         Err(_) => TeammateRole::Teammate,
     };
 
-    let result = dispatch_tool(tool_name, &arguments, scheduler, caller_slot_id, caller_role).await;
+    let result = dispatch_tool(
+        tool_name,
+        &arguments,
+        scheduler,
+        service,
+        team_id,
+        caller_slot_id,
+        caller_role,
+    )
+    .await;
 
     match result {
         Ok(content) => JsonRpcResponse::success(
@@ -355,12 +406,14 @@ async fn dispatch_tool(
     tool_name: &str,
     arguments: &Value,
     scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
     caller_slot_id: &str,
     caller_role: TeammateRole,
 ) -> Result<String, String> {
     match tool_name {
         "team_send_message" => exec_send_message(arguments, scheduler, caller_slot_id).await,
-        "team_spawn_agent" => exec_spawn_agent(arguments, scheduler, caller_role).await,
+        "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
         "team_task_create" => exec_task_create(arguments, scheduler).await,
         "team_task_update" => exec_task_update(arguments, scheduler).await,
         "team_task_list" => exec_task_list(scheduler).await,
@@ -423,32 +476,56 @@ async fn exec_send_message(args: &Value, scheduler: &TeammateManager, caller_slo
 
 async fn exec_spawn_agent(
     args: &Value,
-    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_slot_id: &str,
     caller_role: TeammateRole,
 ) -> Result<String, String> {
+    // Lead-only at the MCP dispatch layer. `TeamSession::spawn_agent` also
+    // re-checks via `TeamError::LeaderOnly`, but the dispatch-level string
+    // keeps the user-visible "Only Lead ..." phrasing that the MCP client
+    // (and existing protocol tests) expect.
     if caller_role != TeammateRole::Lead {
         return Err("Only Lead can spawn agents".into());
     }
     let input: SpawnAgentInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
-    if !is_whitelisted_backend(&input.backend) {
-        return Err(format!(
-            "Backend '{}' not allowed. Whitelist: claude, codex",
-            input.backend
-        ));
+    // Requested name — normalization / emptiness / uniqueness live in
+    // `TeamSession::spawn_agent` so we do not double-validate here.
+    let requested_name = input.name.clone();
+
+    // `agent_type` is the AionUi-spec field name; `backend` is the legacy
+    // phase-1 alias. Either (or neither — session then inherits from the
+    // caller) is accepted.
+    let agent_type = input.agent_type.or(input.backend);
+
+    // Dispatch-layer whitelist gate for explicitly provided backends. Keeps
+    // the "not allowed" user-visible phrasing that existing clients depend
+    // on and avoids a pointless round-trip into the session for obvious
+    // bad input. `TeamSession::spawn_agent` re-checks (including the
+    // empty/unset-inherits-from-caller path) so this is pure defense-in-depth.
+    if let Some(bk) = agent_type.as_deref()
+        && !is_whitelisted_backend(bk)
+    {
+        return Err(format!("Backend '{bk}' not allowed. Whitelist: claude, codex"));
     }
 
-    let action = crate::scheduler::SchedulerAction::SpawnAgent {
-        name: input.name.clone(),
-        role: input.role.unwrap_or_else(|| "teammate".into()),
-        backend: input.backend,
+    let req = SpawnAgentRequest {
+        name: requested_name.clone(),
+        agent_type,
+        custom_agent_id: input.custom_agent_id,
+        model: input.model,
     };
-    scheduler
-        .execute_action("lead", &action)
-        .await
-        .map_err(|e| e.to_string())?;
 
-    Ok(format!("Agent '{}' spawn requested", input.name))
+    let service = service
+        .upgrade()
+        .ok_or_else(|| "Team service not available; cannot spawn agent".to_string())?;
+
+    service
+        .spawn_agent_in_session(team_id, caller_slot_id, req)
+        .await
+        .map(|agent| format!("Agent '{}' spawned (slot_id={})", agent.name, agent.slot_id))
+        .map_err(|e| e.to_string())
 }
 
 async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<String, String> {
@@ -565,6 +642,8 @@ async fn http_mcp_loop(
     listener: TcpListener,
     auth_token: String,
     scheduler: Arc<TeammateManager>,
+    service: Weak<TeamSessionService>,
+    team_id: String,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -573,8 +652,10 @@ async fn http_mcp_loop(
         tokio::select! {
             accept = listener.accept() => {
                 let Ok((mut stream, _)) = accept else { continue };
-                let token = auth_token.clone();
+                let _token = auth_token.clone();
                 let sched = scheduler.clone();
+                let svc = service.clone();
+                let tid = team_id.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
                     let n = match stream.read(&mut buf).await {
@@ -628,8 +709,17 @@ async fn http_mcp_loop(
                                 .find(|l| l.to_lowercase().starts_with("authorization:"))
                                 .and_then(|l| l.split_whitespace().last())
                                 .unwrap_or("");
-                            let slot_id = auth_header; // Will use header as slot_id for now
-                            match dispatch_tool(tool_name, &arguments, &sched, auth_header, TeammateRole::Lead).await {
+                            match dispatch_tool(
+                                tool_name,
+                                &arguments,
+                                &sched,
+                                &svc,
+                                &tid,
+                                auth_header,
+                                TeammateRole::Lead,
+                            )
+                            .await
+                            {
                                 Ok(text) => json!({ "content": [{"type": "text", "text": text}] }),
                                 Err(text) => json!({ "content": [{"type": "text", "text": text}], "isError": true }),
                             }
@@ -657,5 +747,83 @@ async fn http_mcp_loop(
                 if *shutdown_rx.borrow() { break; }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — exec_spawn_agent dispatch-layer unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Non-Lead callers are rejected at the dispatch layer with the
+    /// "Only Lead ..." phrasing. Service weak is never upgraded because
+    /// the early role gate short-circuits.
+    #[tokio::test]
+    async fn exec_spawn_agent_rejects_non_lead() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        let args = json!({ "name": "Helper", "agent_type": "claude" });
+        let result = exec_spawn_agent(&args, &service, "team-1", "worker-1", TeammateRole::Teammate).await;
+        let err = result.expect_err("non-Lead caller must be rejected");
+        assert!(
+            err.contains("Only Lead"),
+            "error must keep legacy 'Only Lead' phrasing, got {err:?}"
+        );
+    }
+
+    /// Malformed JSON body is rejected before the service is consulted.
+    #[tokio::test]
+    async fn exec_spawn_agent_rejects_malformed_args() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        // `name` missing entirely — SpawnAgentInput requires it.
+        let args = json!({ "agent_type": "claude" });
+        let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
+        let err = result.expect_err("malformed args must be rejected");
+        assert!(
+            err.contains("Invalid params"),
+            "must surface Invalid params for JSON deserialize failure, got {err:?}"
+        );
+    }
+
+    /// Lead caller with a well-formed request but no live service (Weak
+    /// cannot upgrade) surfaces the service-unavailable error rather than
+    /// silently returning a fake success. This is the path exercised in
+    /// tests where the MCP server is spun up without a real
+    /// `TeamSessionService` — in production the Weak always upgrades.
+    #[tokio::test]
+    async fn exec_spawn_agent_reports_service_unavailable_when_weak_dead() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        let args = json!({
+            "name": "Helper",
+            "agent_type": "claude",
+            "model": "claude-sonnet-4"
+        });
+        let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
+        let err = result.expect_err("dead Weak<TeamSessionService> must not succeed");
+        assert!(
+            err.contains("Team service not available"),
+            "dead service weak must surface the unavailable message, got {err:?}"
+        );
+    }
+
+    /// The dispatch layer must accept both the new `agent_type` field and
+    /// the legacy `backend` alias so existing phase-1 callers (that still
+    /// send `backend`) do not regress.
+    #[tokio::test]
+    async fn exec_spawn_agent_accepts_legacy_backend_alias() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        // Use `backend` (legacy) instead of `agent_type` — parsing must succeed
+        // and we must reach the service-upgrade step (and then fail because
+        // Weak::new cannot upgrade). If `backend` were rejected at parse time
+        // the error would be "Invalid params".
+        let args = json!({ "name": "Helper", "backend": "claude" });
+        let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
+        let err = result.expect_err("dead Weak<TeamSessionService> must not succeed");
+        assert!(
+            err.contains("Team service not available"),
+            "legacy 'backend' alias must parse through to service-upgrade step, got {err:?}"
+        );
     }
 }

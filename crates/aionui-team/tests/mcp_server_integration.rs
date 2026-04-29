@@ -90,9 +90,19 @@ async fn setup() -> TestEnv {
         broadcaster.clone(),
     ));
 
-    let server = TeamMcpServer::start("test-token-123".into(), scheduler, "team-1".into(), broadcaster)
-        .await
-        .unwrap();
+    // W5-D29e: standalone MCP server without a live TeamSessionService —
+    // the Weak cannot upgrade, so `team_spawn_agent` will surface the
+    // service-unavailable error. Non-spawn tools still exercise scheduler
+    // flows directly and do not hit this path.
+    let server = TeamMcpServer::start(
+        "test-token-123".into(),
+        scheduler,
+        "team-1".into(),
+        broadcaster,
+        std::sync::Weak::new(),
+    )
+    .await
+    .unwrap();
 
     TestEnv {
         server,
@@ -394,7 +404,12 @@ async fn ts_regular_message_not_intercepted() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn sp1_lead_spawns_whitelisted_agent() {
+async fn sp1_lead_spawn_requires_live_session_service() {
+    // W5-D29e: this standalone test env spins up TeamMcpServer with
+    // `Weak::new()` (no live TeamSessionService), so a well-formed Lead
+    // spawn now surfaces the service-unavailable error. Real session-level
+    // spawn success is covered by `tests/e2e_smoke.rs` scenario 2 and by
+    // lib unit tests in `src/session.rs` that wire a TeamSessionService.
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
@@ -406,10 +421,12 @@ async fn sp1_lead_spawns_whitelisted_agent() {
     )
     .await;
 
-    assert!(!is_error_response(&resp));
+    assert!(is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("Helper"));
-    assert!(text.contains("spawn"));
+    assert!(
+        text.contains("Team service not available"),
+        "expected service-unavailable error, got {text:?}"
+    );
 
     env.server.stop();
 }

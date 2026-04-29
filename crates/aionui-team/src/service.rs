@@ -612,6 +612,26 @@ impl TeamSessionService {
         entry.session.send_message_to_agent(slot_id, content, files).await
     }
 
+    /// Route an MCP `team_spawn_agent` call into the live [`TeamSession`].
+    ///
+    /// Looks up the session for `team_id` (errors with [`TeamError::SessionNotFound`]
+    /// when absent) and delegates to [`TeamSession::spawn_agent`]. The MCP
+    /// dispatch layer holds a [`Weak<TeamSessionService>`] and calls this to
+    /// avoid wiring a direct `Arc<TeamSession>` into the MCP server — the
+    /// session is owned by the service's `sessions` map.
+    pub async fn spawn_agent_in_session(
+        &self,
+        team_id: &str,
+        caller_slot_id: &str,
+        req: crate::session::SpawnAgentRequest,
+    ) -> Result<TeamAgent, TeamError> {
+        let entry = self
+            .sessions
+            .get(team_id)
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        entry.session.spawn_agent(caller_slot_id, req).await
+    }
+
     pub fn dispose_all(&self) {
         let keys: Vec<String> = self.sessions.iter().map(|entry| entry.key().clone()).collect();
         for key in keys {
