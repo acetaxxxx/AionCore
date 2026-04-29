@@ -79,31 +79,12 @@ pub struct RevokeUserRequest {
 
 /// Request body for `POST /api/channel/settings/sync`.
 ///
-/// Synchronizes agent and model configuration for a specific IM platform
-/// to the running plugin instance.
+/// Invalidates all channel sessions for the given platform so they
+/// are recreated with the latest agent/model configuration from
+/// `client_preferences` on the next incoming message.
 #[derive(Debug, Deserialize)]
 pub struct SyncChannelSettingsRequest {
     pub platform: String,
-    pub agent: ChannelAgentConfig,
-    #[serde(default)]
-    pub model: Option<ChannelModelConfig>,
-}
-
-/// Agent configuration within a channel settings sync request.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChannelAgentConfig {
-    pub backend: String,
-    #[serde(default)]
-    pub custom_agent_id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-/// Model configuration within a channel settings sync request.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChannelModelConfig {
-    pub id: String,
-    pub use_model: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -400,53 +381,15 @@ mod tests {
     // -- D. Settings requests -------------------------------------------------
 
     #[test]
-    fn test_sync_settings_request_full() {
-        let raw = json!({
-            "platform": "telegram",
-            "agent": {
-                "backend": "acp",
-                "custom_agent_id": "agent-x",
-                "name": "My Agent"
-            },
-            "model": {
-                "id": "gemini-pro",
-                "use_model": "gemini-2.5-flash"
-            }
-        });
+    fn test_sync_settings_request_deserialize() {
+        let raw = json!({ "platform": "telegram" });
         let req: SyncChannelSettingsRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.platform, "telegram");
-        assert_eq!(req.agent.backend, "acp");
-        assert_eq!(req.agent.custom_agent_id.as_deref(), Some("agent-x"));
-        assert_eq!(req.agent.name.as_deref(), Some("My Agent"));
-        let model = req.model.unwrap();
-        assert_eq!(model.id, "gemini-pro");
-        assert_eq!(model.use_model, "gemini-2.5-flash");
-    }
-
-    #[test]
-    fn test_sync_settings_request_minimal() {
-        let raw = json!({
-            "platform": "lark",
-            "agent": { "backend": "gemini" }
-        });
-        let req: SyncChannelSettingsRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.platform, "lark");
-        assert_eq!(req.agent.backend, "gemini");
-        assert!(req.agent.custom_agent_id.is_none());
-        assert!(req.agent.name.is_none());
-        assert!(req.model.is_none());
     }
 
     #[test]
     fn test_sync_settings_request_missing_platform() {
-        let raw = json!({ "agent": { "backend": "acp" } });
-        let result = serde_json::from_value::<SyncChannelSettingsRequest>(raw);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_sync_settings_request_missing_agent() {
-        let raw = json!({ "platform": "telegram" });
+        let raw = json!({});
         let result = serde_json::from_value::<SyncChannelSettingsRequest>(raw);
         assert!(result.is_err());
     }
