@@ -45,6 +45,13 @@ impl ChannelSettingsService {
     /// Reads the agent configuration for a platform from `client_preferences`.
     ///
     /// Falls back to `agent_type=aionrs, backend=None` when no config exists.
+    /// Reads the agent configuration for a platform from `client_preferences`.
+    ///
+    /// Supports two data formats:
+    /// - **New:** `{"agent_type":"acp","backend":"claude","name":"Claude"}`
+    /// - **Legacy:** `{"backend":"claude","name":"Claude"}` (no agent_type field)
+    ///
+    /// Falls back to `agent_type=aionrs, backend=None` when no config exists.
     pub async fn get_agent_config(
         &self,
         platform: PluginType,
@@ -57,25 +64,36 @@ impl ChannelSettingsService {
         };
 
         let parsed: serde_json::Value = serde_json::from_str(&pref.value).unwrap_or_default();
+
+        if let Some(at) = parsed["agent_type"].as_str() {
+            let backend = if at == "acp" {
+                parsed["backend"].as_str().map(|s| s.to_owned())
+            } else {
+                None
+            };
+
+            debug!(platform = %platform, agent_type = %at, backend = ?backend, "resolved channel agent config (new format)");
+
+            return Ok(ResolvedAgentConfig {
+                agent_type: at.to_owned(),
+                backend,
+            });
+        }
+
         let raw_backend = parsed["backend"]
             .as_str()
             .unwrap_or(DEFAULT_BACKEND)
             .to_owned();
         let agent_type = backend_to_agent_type(&raw_backend);
-
-        // Only ACP agents need a backend identifier.
         let backend = if agent_type == "acp" {
-            Some(raw_backend.clone())
+            Some(raw_backend)
         } else {
             None
         };
 
-        debug!(platform = %platform, agent_type = %agent_type, backend = ?backend, "resolved channel agent config");
+        debug!(platform = %platform, agent_type = %agent_type, backend = ?backend, "resolved channel agent config (legacy format)");
 
-        Ok(ResolvedAgentConfig {
-            agent_type,
-            backend,
-        })
+        Ok(ResolvedAgentConfig { agent_type, backend })
     }
 
     /// Reads the model configuration for a platform from `client_preferences`.
@@ -312,6 +330,47 @@ mod tests {
 
         let config = svc.get_agent_config(PluginType::Lark).await.unwrap();
         assert_eq!(config.agent_type, "aionrs");
+        assert!(config.backend.is_none());
+    }
+
+    // ── get_agent_config (new format) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn agent_config_reads_new_format_acp() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.telegram.agent",
+            r#"{"agent_type":"acp","backend":"claude","name":"Claude"}"#,
+        )]));
+        let svc = ChannelSettingsService::new(repo);
+
+        let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
+        assert_eq!(config.agent_type, "acp");
+        assert_eq!(config.backend.as_deref(), Some("claude"));
+    }
+
+    #[tokio::test]
+    async fn agent_config_reads_new_format_aionrs() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.lark.agent",
+            r#"{"agent_type":"aionrs","name":"Aion CLI"}"#,
+        )]));
+        let svc = ChannelSettingsService::new(repo);
+
+        let config = svc.get_agent_config(PluginType::Lark).await.unwrap();
+        assert_eq!(config.agent_type, "aionrs");
+        assert!(config.backend.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_config_reads_new_format_openclaw() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.weixin.agent",
+            r#"{"agent_type":"openclaw-gateway","name":"OpenClaw"}"#,
+        )]));
+        let svc = ChannelSettingsService::new(repo);
+
+        let config = svc.get_agent_config(PluginType::Weixin).await.unwrap();
+        assert_eq!(config.agent_type, "openclaw-gateway");
         assert!(config.backend.is_none());
     }
 
