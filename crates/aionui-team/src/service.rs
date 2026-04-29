@@ -140,6 +140,14 @@ impl TeamSessionService {
         };
 
         info!(team_id = %team.id, "Team created");
+
+        // Auto-start session so MCP is injected immediately after team creation.
+        // Failure only logs — the team is persisted and frontend can retry
+        // via POST /api/teams/{id}/session if needed.
+        if let Err(e) = self.ensure_session(&team.id).await {
+            warn!(team_id = %team.id, error = %e, "auto ensure_session after create_team failed");
+        }
+
         Ok(team.to_response())
     }
 
