@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    AddAgentRequest, CreateConversationRequest, CreateTeamRequest, TeamAgentResponse, TeamResponse,
+    AddAgentRequest, CreateConversationRequest, CreateTeamRequest, TeamAgentResponse, TeamMcpPhase,
+    TeamMcpStatusPayload, TeamResponse, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id, now_ms};
 use aionui_conversation::ConversationService;
@@ -395,25 +396,49 @@ impl TeamSessionService {
             return Ok(());
         }
 
-        let row = self
-            .repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        let row = match self.repo.get_team(team_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::LoadFailed, None, |p| {
+                    p.error = Some(format!("team not found: {team_id}"));
+                });
+                return Err(TeamError::TeamNotFound(team_id.into()));
+            }
+            Err(e) => {
+                self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::LoadFailed, None, |p| {
+                    p.error = Some(e.to_string());
+                });
+                return Err(e.into());
+            }
+        };
         let user_id = row.user_id.clone();
         let team = Team::from_row(&row)?;
         let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
 
-        let session = TeamSession::start(
+        let session = match TeamSession::start(
             team,
             self.repo.clone(),
             self.broadcaster.clone(),
             self.backend_binary_path.clone(),
             self.task_manager.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(session) => session,
+            Err(e) => {
+                self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionError, None, |p| {
+                    p.error = Some(e.to_string());
+                });
+                return Err(e);
+            }
+        };
 
-        if let Err(e) = self.rebuild_agent_processes(&session, &user_id, &agents_snapshot).await {
+        self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionInjecting, None, |_| {});
+
+        if let Err(e) = self
+            .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot)
+            .await
+        {
             session.stop();
             return Err(e);
         }
@@ -426,11 +451,36 @@ impl TeamSessionService {
         };
         self.sessions.insert(team_id.to_owned(), entry);
 
+        self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionReady, None, |p| {
+            p.server_count = Some(agents_snapshot.len());
+        });
+
         Ok(())
+    }
+
+    fn broadcast_mcp_phase<F>(&self, team_id: &str, slot_id: &str, phase: TeamMcpPhase, port: Option<u16>, customize: F)
+    where
+        F: FnOnce(&mut TeamMcpStatusPayload),
+    {
+        let mut payload = TeamMcpStatusPayload {
+            team_id: team_id.to_owned(),
+            slot_id: slot_id.to_owned(),
+            phase,
+            port,
+            server_count: None,
+            error: None,
+        };
+        customize(&mut payload);
+        let event = WebSocketMessage::new(
+            "team.mcpStatus",
+            serde_json::to_value(payload).expect("serialize mcp status payload"),
+        );
+        self.broadcaster.broadcast(event);
     }
 
     async fn rebuild_agent_processes(
         &self,
+        team_id: &str,
         session: &TeamSession,
         user_id: &str,
         agents: &[TeamAgent],
@@ -439,28 +489,40 @@ impl TeamSessionService {
             let cfg = session.mcp_stdio_config(&agent.slot_id);
             let patch = serde_json::json!({ "team_mcp_stdio_config": cfg });
 
-            self.conversation_service
+            if let Err(e) = self
+                .conversation_service
                 .update_extra(&agent.conversation_id, patch)
                 .await
-                .map_err(|e| {
-                    TeamError::InvalidRequest(format!(
-                        "failed to persist team_mcp_stdio_config for {}: {e}",
-                        agent.slot_id
-                    ))
-                })?;
+            {
+                let msg = format!("failed to persist team_mcp_stdio_config for {}: {e}", agent.slot_id);
+                self.broadcast_mcp_phase(team_id, &agent.slot_id, TeamMcpPhase::ConfigWriteFailed, None, |p| {
+                    p.error = Some(msg.clone());
+                });
+                return Err(TeamError::InvalidRequest(msg));
+            }
 
-            self.task_manager
+            if let Err(e) = self
+                .task_manager
                 .kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
-                .map_err(|e| {
-                    TeamError::InvalidRequest(format!("failed to kill agent task {}: {e}", agent.conversation_id))
-                })?;
+            {
+                let msg = format!("failed to kill agent task {}: {e}", agent.conversation_id);
+                self.broadcast_mcp_phase(team_id, &agent.slot_id, TeamMcpPhase::SessionError, None, |p| {
+                    p.error = Some(msg.clone());
+                });
+                return Err(TeamError::InvalidRequest(msg));
+            }
 
-            self.conversation_service
+            if let Err(e) = self
+                .conversation_service
                 .warmup(user_id, &agent.conversation_id, &self.task_manager)
                 .await
-                .map_err(|e| {
-                    TeamError::InvalidRequest(format!("failed to rebuild agent task {}: {e}", agent.conversation_id))
-                })?;
+            {
+                let msg = format!("failed to rebuild agent task {}: {e}", agent.conversation_id);
+                self.broadcast_mcp_phase(team_id, &agent.slot_id, TeamMcpPhase::SessionError, None, |p| {
+                    p.error = Some(msg.clone());
+                });
+                return Err(TeamError::InvalidRequest(msg));
+            }
         }
         Ok(())
     }
