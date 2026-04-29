@@ -3,6 +3,7 @@ mod assistant;
 mod channel;
 mod client_preference;
 mod conversation;
+mod conversation_artifact;
 mod cron_job;
 mod mcp_server;
 mod message;
@@ -21,6 +22,7 @@ pub use assistant::{
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;
 pub use conversation::ConversationRow;
+pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;

@@ -47,6 +47,27 @@ impl SessionResumeStrategy {
     }
 }
 
+fn normalize_requested_mode(backend: AcpBackend, mode: &str) -> String {
+    let trimmed = mode.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    match backend {
+        // Codex ACP now reports native mode ids (`read-only`, `auto`,
+        // `full-access`) while existing AionUi flows still persist the legacy
+        // semantic ids (`default`, `autoEdit`, `yolo`, `yoloNoSandbox`).
+        // Cron reuses the persisted value directly, so normalize it before
+        // comparing or calling `session/set_mode`.
+        AcpBackend::Codex => match trimmed {
+            "default" | "autoEdit" => "auto".to_owned(),
+            "yolo" | "yoloNoSandbox" => "full-access".to_owned(),
+            other => other.to_owned(),
+        },
+        _ => trimmed.to_owned(),
+    }
+}
+
 fn confirm_option_id(data: &Value) -> Option<String> {
     match data {
         Value::String(v) => Some(v.clone()),
@@ -148,25 +169,31 @@ impl AcpAgentManager {
         let Some(mode) = self.preferred_mode().await else {
             return Ok(());
         };
+        let normalized_mode = normalize_requested_mode(self.backend, &mode);
+        if normalized_mode.is_empty() {
+            return Ok(());
+        }
 
         let current_mode = {
             let snapshot = self.runtime_snapshot.read().await;
             snapshot.current_mode_id()
         };
 
-        if current_mode.as_deref() == Some(mode.as_str()) {
+        if current_mode.as_deref() == Some(normalized_mode.as_str()) {
             return Ok(());
         }
 
         self.protocol
             .set_mode(SetSessionModeRequest::new(
                 SessionId::new(session_id),
-                mode.clone(),
+                normalized_mode.clone(),
             ))
             .await
             .map_err(AppError::from)?;
 
-        self.update_cached_mode(&mode).await;
+        self.update_cached_mode(&normalized_mode).await;
+        let mut preferred_mode = self.preferred_mode.write().await;
+        *preferred_mode = Some(normalized_mode);
         Ok(())
     }
 
@@ -774,34 +801,42 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
     }
 
     async fn get_mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
-        let preferred_mode = self.preferred_mode().await;
+        let preferred_mode = self
+            .preferred_mode()
+            .await
+            .map(|mode| normalize_requested_mode(self.backend, &mode))
+            .filter(|mode| !mode.is_empty());
         Ok(aionui_api_types::AgentModeResponse {
             mode: self
                 .modes()
                 .await
                 .map(|modes| modes.current_mode_id.to_string())
                 .or(preferred_mode)
-                .unwrap_or_else(|| "default".to_owned()),
+                .unwrap_or_else(|| normalize_requested_mode(self.backend, "default")),
             initialized: self.session_id().await.is_some(),
         })
     }
 
     async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
+        let normalized_mode = normalize_requested_mode(self.backend, mode);
+        if normalized_mode.is_empty() {
+            return Ok(());
+        }
         let session_id = self.state.read().await.session_id.clone();
 
         if let Some(sid) = session_id {
             self.protocol
                 .set_mode(SetSessionModeRequest::new(
                     SessionId::new(sid),
-                    mode.to_owned(),
+                    normalized_mode.clone(),
                 ))
                 .await
                 .map_err(AppError::from)?;
-            self.update_cached_mode(mode).await;
+            self.update_cached_mode(&normalized_mode).await;
         }
 
         let mut preferred_mode = self.preferred_mode.write().await;
-        *preferred_mode = Some(mode.to_owned());
+        *preferred_mode = Some(normalized_mode);
         Ok(())
     }
 
@@ -852,6 +887,34 @@ mod tests {
         assert_eq!(
             confirm_option_id(&json!({ "value": "allow_always" })).as_deref(),
             Some("allow_always")
+        );
+    }
+
+    #[test]
+    fn normalize_requested_mode_maps_legacy_codex_modes() {
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "default"),
+            "auto"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "autoEdit"),
+            "auto"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "yolo"),
+            "full-access"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "yoloNoSandbox"),
+            "full-access"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "read-only"),
+            "read-only"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Claude, "bypassPermissions"),
+            "bypassPermissions"
         );
     }
 }

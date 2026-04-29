@@ -69,6 +69,7 @@ impl ChannelMessageService {
             msg_id: msg_id.clone(),
             files: vec![],
             inject_skills: vec![],
+            hidden: false,
         };
 
         // Use a fixed user_id for channel messages (they're system-level)

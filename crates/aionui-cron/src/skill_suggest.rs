@@ -3,16 +3,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aionui_api_types::WebSocketMessage;
-use aionui_common::{generate_id, now_ms};
+use aionui_common::now_ms;
 use aionui_db::IConversationRepository;
-use aionui_db::models::MessageRow;
 use aionui_realtime::EventBroadcaster;
-use serde_json::json;
 use tokio::fs;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
+use crate::artifacts::{broadcast_artifact, build_skill_suggest_artifact};
 use crate::error::CronError;
 use crate::prompt::SKILL_SUGGEST_FILENAME;
 use crate::skill_file::{content_hash, has_skill_file, validate_skill_content};
@@ -129,16 +127,8 @@ impl SkillSuggestDetector {
         description: &str,
         skill_content: &str,
     ) {
-        let msg_id = generate_id();
-        self.persist_and_broadcast(
-            conversation_id,
-            job_id,
-            name,
-            description,
-            skill_content,
-            &msg_id,
-        )
-        .await;
+        self.persist_and_broadcast(conversation_id, job_id, name, description, skill_content)
+            .await;
     }
 
     async fn persist_and_broadcast(
@@ -148,52 +138,42 @@ impl SkillSuggestDetector {
         name: &str,
         description: &str,
         skill_content: &str,
-        msg_id: &str,
     ) {
-        let content = json!({
-            "cron_job_id": job_id,
-            "name": name,
-            "description": description,
-            "skillContent": skill_content,
-        });
+        let row = build_skill_suggest_artifact(
+            conversation_id,
+            job_id,
+            name,
+            description,
+            skill_content,
+            now_ms(),
+        );
 
-        let row = MessageRow {
-            id: generate_id(),
-            conversation_id: conversation_id.to_owned(),
-            msg_id: Some(msg_id.to_owned()),
-            r#type: "skill_suggest".into(),
-            content: content.to_string(),
-            position: Some("center".into()),
-            status: Some("finish".into()),
-            hidden: false,
-            created_at: now_ms(),
+        let row = match self.conversation_repo.upsert_artifact(&row).await {
+            Ok(row) => row,
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    job_id,
+                    error = %err,
+                    "Failed persisting cron skill suggestion artifact"
+                );
+                return;
+            }
         };
 
-        if let Err(err) = self.conversation_repo.insert_message(&row).await {
+        if let Err(err) = broadcast_artifact(&self.broadcaster, &row) {
             warn!(
                 conversation_id,
                 job_id,
                 error = %err,
-                "Failed persisting cron skill suggestion message"
+                "Failed broadcasting cron skill suggestion artifact"
             );
+            return;
         }
-
-        let payload = json!({
-            "conversation_id": conversation_id,
-            "msg_id": msg_id,
-            "type": "skill_suggest",
-            "data": {
-                "cron_job_id": job_id,
-                "name": name,
-                "description": description,
-                "skill_content": skill_content,
-            },
-            "hidden": false,
-        });
-
-        self.broadcaster
-            .broadcast(WebSocketMessage::new("message.stream", payload));
-        debug!(conversation_id, job_id, "Broadcasted cron skill suggestion");
+        debug!(
+            conversation_id,
+            job_id, "Broadcasted cron skill suggestion artifact"
+        );
     }
 
     fn last_hash(&self, job_id: &str) -> Option<String> {
@@ -220,7 +200,7 @@ impl SkillSuggestDetector {
 mod tests {
     use super::*;
     use aionui_db::models::ConversationRow;
-    use aionui_db::{SortOrder, SqliteConversationRepository, init_database_memory};
+    use aionui_db::{SqliteConversationRepository, init_database_memory};
     use aionui_realtime::BroadcastEventBus;
     use tempfile::tempdir;
 
@@ -271,19 +251,17 @@ mod tests {
 
         assert!(emitted);
         let msg = rx.try_recv().unwrap();
-        assert_eq!(msg.name, "message.stream");
-        assert_eq!(msg.data["type"], "skill_suggest");
-        assert_eq!(msg.data["data"]["cron_job_id"], "cron-1");
-        assert_eq!(msg.data["data"]["name"], "daily-report");
+        assert_eq!(msg.name, "conversation.artifact");
+        assert_eq!(msg.data["kind"], "skill_suggest");
+        assert_eq!(msg.data["status"], "pending");
+        assert_eq!(msg.data["payload"]["cron_job_id"], "cron-1");
+        assert_eq!(msg.data["payload"]["name"], "daily-report");
 
-        let rows = repo
-            .get_messages("conv-1", 1, 50, SortOrder::Asc)
-            .await
-            .unwrap();
-        assert_eq!(rows.items.len(), 1);
-        assert_eq!(rows.items[0].r#type, "skill_suggest");
-        assert_eq!(rows.items[0].position.as_deref(), Some("center"));
-        assert!(rows.items[0].content.contains("\"skillContent\""));
+        let rows = repo.list_artifacts("conv-1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "skill_suggest");
+        assert_eq!(rows[0].status, "pending");
+        assert!(rows[0].payload.contains("\"skillContent\""));
     }
 
     #[tokio::test]

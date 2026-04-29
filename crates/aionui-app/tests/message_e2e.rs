@@ -62,6 +62,16 @@ async fn insert_message(
         .unwrap();
 }
 
+async fn upsert_artifact(
+    services: &aionui_app::AppServices,
+    artifact: aionui_db::ConversationArtifactRow,
+) {
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    aionui_db::IConversationRepository::upsert_artifact(&repo, &artifact)
+        .await
+        .unwrap();
+}
+
 // ── T8: Message list ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -199,6 +209,126 @@ async fn t8_6_messages_requires_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn t8_7_messages_exclude_legacy_cron_rows() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Legacy Filter").await;
+
+    insert_message(&services, &conv_id, "msg-text", "Visible", 1000).await;
+
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    for (id, ty, content) in [
+        (
+            "legacy-cron",
+            "cron_trigger",
+            json!({
+                "cron_job_id": "cron_1",
+                "cron_job_name": "Daily",
+                "triggered_at": 2000
+            }),
+        ),
+        (
+            "legacy-skill",
+            "skill_suggest",
+            json!({
+                "cron_job_id": "cron_1",
+                "name": "daily-report",
+                "description": "Daily report",
+                "skillContent": "---\nname: daily-report\n---\nUse it."
+            }),
+        ),
+    ] {
+        let msg = aionui_db::models::MessageRow {
+            id: id.into(),
+            conversation_id: conv_id.clone(),
+            msg_id: None,
+            r#type: ty.into(),
+            content: content.to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 2000,
+        };
+        aionui_db::IConversationRepository::insert_message(&repo, &msg)
+            .await
+            .unwrap();
+    }
+
+    let resp = app
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/messages"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let items = json["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(json["data"]["total"], 1);
+    assert_eq!(items[0]["type"], "text");
+    assert_eq!(items[0]["content"]["content"], "Visible");
+}
+
+#[tokio::test]
+async fn t8_8_artifacts_list_and_patch_status() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Artifacts").await;
+    let artifact_id = format!("{conv_id}:skill_suggest:cron_1");
+
+    upsert_artifact(
+        &services,
+        aionui_db::ConversationArtifactRow {
+            id: artifact_id.clone(),
+            conversation_id: conv_id.clone(),
+            cron_job_id: Some("cron_1".into()),
+            kind: "skill_suggest".into(),
+            status: "active".into(),
+            payload: json!({
+                "cron_job_id": "cron_1",
+                "name": "daily-report",
+                "description": "Daily report",
+                "skillContent": "---\nname: daily-report\n---\nUse it."
+            })
+            .to_string(),
+            created_at: 1000,
+            updated_at: 1000,
+        },
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/artifacts"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["data"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], artifact_id);
+    assert_eq!(items[0]["kind"], "skill_suggest");
+    assert_eq!(items[0]["status"], "active");
+
+    let patch_req = common::json_with_token(
+        "PATCH",
+        &format!("/api/conversations/{conv_id}/artifacts/{artifact_id}"),
+        json!({ "status": "dismissed" }),
+        &token,
+        &csrf,
+    );
+    let patch_resp = app.oneshot(patch_req).await.unwrap();
+    assert_eq!(patch_resp.status(), StatusCode::OK);
+    let patch_json = body_json(patch_resp).await;
+    assert_eq!(patch_json["data"]["status"], "dismissed");
 }
 
 // ── T9: Message search ────────────────────────────────────────────────

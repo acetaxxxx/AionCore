@@ -89,6 +89,7 @@ impl aionui_ai_agent::task_manager::IWorkerTaskManager for StubTaskManager {
 
 struct StubConvRepo {
     messages: Mutex<Vec<MessageRow>>,
+    artifacts: Mutex<Vec<aionui_db::ConversationArtifactRow>>,
     rows: Mutex<HashMap<String, aionui_db::models::ConversationRow>>,
 }
 
@@ -96,6 +97,7 @@ impl StubConvRepo {
     fn new() -> Self {
         Self {
             messages: Mutex::new(Vec::new()),
+            artifacts: Mutex::new(Vec::new()),
             rows: Mutex::new(HashMap::new()),
         }
     }
@@ -103,6 +105,19 @@ impl StubConvRepo {
     fn take_messages(&self) -> Vec<MessageRow> {
         let mut guard = self.messages.lock().unwrap();
         std::mem::take(&mut *guard)
+    }
+
+    fn upsert_artifact_row(&self, artifact: aionui_db::ConversationArtifactRow) {
+        let mut guard = self.artifacts.lock().unwrap();
+        if let Some(existing) = guard.iter_mut().find(|row| row.id == artifact.id) {
+            *existing = artifact;
+        } else {
+            guard.push(artifact);
+        }
+    }
+
+    fn artifacts(&self) -> Vec<aionui_db::ConversationArtifactRow> {
+        self.artifacts.lock().unwrap().clone()
     }
 }
 
@@ -317,6 +332,75 @@ impl IConversationRepository for StubConvRepo {
             total: 0,
             has_more: false,
         })
+    }
+    async fn list_artifacts(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<aionui_db::ConversationArtifactRow>, aionui_db::DbError> {
+        Ok(self
+            .artifacts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.conversation_id == conversation_id)
+            .cloned()
+            .collect())
+    }
+    async fn get_artifact(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+    ) -> Result<Option<aionui_db::ConversationArtifactRow>, aionui_db::DbError> {
+        Ok(self
+            .artifacts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.conversation_id == conversation_id && row.id == artifact_id)
+            .cloned())
+    }
+    async fn upsert_artifact(
+        &self,
+        artifact: &aionui_db::ConversationArtifactRow,
+    ) -> Result<aionui_db::ConversationArtifactRow, aionui_db::DbError> {
+        self.upsert_artifact_row(artifact.clone());
+        Ok(artifact.clone())
+    }
+    async fn update_artifact_status(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+        status: &str,
+        updated_at: TimestampMs,
+    ) -> Result<Option<aionui_db::ConversationArtifactRow>, aionui_db::DbError> {
+        let mut guard = self.artifacts.lock().unwrap();
+        let Some(existing) = guard
+            .iter_mut()
+            .find(|row| row.conversation_id == conversation_id && row.id == artifact_id)
+        else {
+            return Ok(None);
+        };
+        existing.status = status.to_string();
+        existing.updated_at = updated_at;
+        Ok(Some(existing.clone()))
+    }
+    async fn mark_skill_suggest_artifacts_saved(
+        &self,
+        cron_job_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<Vec<aionui_db::ConversationArtifactRow>, aionui_db::DbError> {
+        let mut guard = self.artifacts.lock().unwrap();
+        let mut updated = Vec::new();
+        for artifact in guard.iter_mut() {
+            if artifact.kind == "skill_suggest"
+                && artifact.cron_job_id.as_deref() == Some(cron_job_id)
+            {
+                artifact.status = "saved".into();
+                artifact.updated_at = updated_at;
+                updated.push(artifact.clone());
+            }
+        }
+        Ok(updated)
     }
 }
 
@@ -688,6 +772,56 @@ async fn sk1_save_skill() {
         content: "---\nname: test\ndescription: test skill\n---\nDo something".into(),
     };
     svc.save_skill(&job.id, req).await.unwrap();
+}
+
+#[tokio::test]
+async fn sk1_1_save_skill_marks_related_skill_suggest_artifacts_saved() {
+    let (svc, _, bc, conv_repo) = setup_with_conv_repo().await;
+    let job = svc
+        .add_job(make_create_req("Skill Artifact Job", every_60s()))
+        .await
+        .unwrap();
+
+    conv_repo.upsert_artifact_row(aionui_db::ConversationArtifactRow {
+        id: format!("conv_1:skill_suggest:{}", job.id),
+        conversation_id: "conv_1".into(),
+        cron_job_id: Some(job.id.clone()),
+        kind: "skill_suggest".into(),
+        status: "active".into(),
+        payload: serde_json::json!({
+            "cron_job_id": job.id,
+            "name": "daily-report",
+            "description": "Daily report",
+            "skillContent": "---\nname: daily-report\n---\nUse it."
+        })
+        .to_string(),
+        created_at: 1000,
+        updated_at: 1000,
+    });
+
+    svc.save_skill(
+        &job.id,
+        SaveCronSkillRequest {
+            content: "---\nname: daily-report\ndescription: Daily report\n---\nUse it.".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let artifacts = conv_repo.artifacts();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].status, "saved");
+
+    let events = bc.take_events();
+    let saved_event = events
+        .iter()
+        .find(|event| {
+            event.name == "conversation.artifact"
+                && event.data["id"] == artifacts[0].id
+                && event.data["status"] == "saved"
+        })
+        .expect("save_skill should broadcast saved artifact upsert");
+    assert_eq!(saved_event.data["conversation_id"], "conv_1");
 }
 
 // ── SK-2: Has skill (true) ────────────────────────────────────────

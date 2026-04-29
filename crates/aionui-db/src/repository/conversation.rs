@@ -2,7 +2,7 @@ use aionui_common::{PaginatedResult, TimestampMs};
 use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
-use crate::models::{ConversationRow, MessageRow};
+use crate::models::{ConversationArtifactRow, ConversationRow, MessageRow};
 
 /// Conversation + message data access abstraction.
 ///
@@ -97,6 +97,68 @@ pub trait IConversationRepository: Send + Sync {
         page: u32,
         page_size: u32,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError>;
+
+    /// Returns persisted conversation artifacts ordered by `created_at`.
+    async fn list_artifacts(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Vec<ConversationArtifactRow>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Returns a conversation artifact by ID scoped to a conversation.
+    async fn get_artifact(
+        &self,
+        _conversation_id: &str,
+        _artifact_id: &str,
+    ) -> Result<Option<ConversationArtifactRow>, DbError> {
+        Ok(None)
+    }
+
+    /// Inserts or updates a conversation artifact by primary key.
+    async fn upsert_artifact(
+        &self,
+        artifact: &ConversationArtifactRow,
+    ) -> Result<ConversationArtifactRow, DbError> {
+        Ok(artifact.clone())
+    }
+
+    /// Updates artifact status and returns the updated row if found.
+    async fn update_artifact_status(
+        &self,
+        _conversation_id: &str,
+        _artifact_id: &str,
+        _status: &str,
+        _updated_at: TimestampMs,
+    ) -> Result<Option<ConversationArtifactRow>, DbError> {
+        Ok(None)
+    }
+
+    /// Marks all skill suggestion artifacts for a cron job as saved.
+    async fn mark_skill_suggest_artifacts_saved(
+        &self,
+        _cron_job_id: &str,
+        _updated_at: TimestampMs,
+    ) -> Result<Vec<ConversationArtifactRow>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Deletes all artifacts belonging to a conversation.
+    async fn delete_artifacts_by_conversation(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    /// Returns legacy persisted cron trigger rows so callers can synthesize
+    /// artifact cards for historical conversations created before artifact migration.
+    async fn list_legacy_cron_trigger_messages(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Vec<MessageRow>, DbError> {
+        Ok(Vec::new())
+    }
 }
 
 // ── Supporting types ────────────────────────────────────────────────

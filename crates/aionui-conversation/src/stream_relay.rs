@@ -412,11 +412,7 @@ impl StreamRelay {
         let msg = WebSocketMessage::new("turn.completed", payload);
         broadcaster.broadcast(msg);
 
-        debug!(
-            conversation_id,
-            status = "finished",
-            "Turn completed"
-        );
+        debug!(conversation_id, status = "finished", "Turn completed");
     }
 
     fn is_terminal(&self, event: &AgentStreamEvent) -> bool {
@@ -689,7 +685,10 @@ mod tests {
             .unwrap();
 
         let outcome = relay.run(rx).await;
-        assert_eq!(outcome.system_responses, vec!["[System: listed]".to_string()]);
+        assert_eq!(
+            outcome.system_responses,
+            vec!["[System: listed]".to_string()]
+        );
 
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1);

@@ -3,22 +3,24 @@ use std::sync::Arc;
 use aionui_ai_agent::{BuildTaskOptions, ICronService, IWorkerTaskManager, SendMessageData};
 use aionui_api_types::{
     ApprovalCheckResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationListResponse, ConversationResponse, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, UpdateConversationRequest,
-    WebSocketMessage,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationResponse,
+    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse,
+    MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AcpBackend, AgentType, AppError, ConversationSource, ConversationStatus, PaginatedResult,
     generate_id, generate_short_id, now_ms,
 };
+use aionui_db::models::MessageRow;
 use aionui_db::{ConversationFilters, ConversationRowUpdate, IConversationRepository, SortOrder};
 use aionui_realtime::EventBroadcaster;
 use tracing::{debug, info, warn};
 
 use crate::convert::{
-    row_to_message_response, row_to_response, row_to_response_with_extra, search_row_to_item,
-    string_to_enum,
+    row_to_artifact_response, row_to_message_response, row_to_response, row_to_response_with_extra,
+    search_row_to_item, string_to_enum,
 };
 use crate::skill_resolver::SkillResolver;
 use crate::stream_relay::StreamRelay;
@@ -516,6 +518,7 @@ impl ConversationService {
 
         // Delete all messages
         self.repo.delete_messages_by_conversation(id).await?;
+        self.repo.delete_artifacts_by_conversation(id).await?;
 
         // Reset status to pending
         let now = now_ms();
@@ -592,6 +595,84 @@ impl ConversationService {
             total: result.total,
             has_more: result.has_more,
         })
+    }
+
+    /// List artifacts for a conversation with durable status state.
+    pub async fn list_artifacts(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationArtifactListResponse, AppError> {
+        self.repo
+            .get(conversation_id)
+            .await?
+            .filter(|r| r.user_id == user_id)
+            .ok_or_else(|| {
+                AppError::NotFound(format!("Conversation {conversation_id} not found"))
+            })?;
+
+        let mut items = self
+            .repo
+            .list_artifacts(conversation_id)
+            .await?
+            .into_iter()
+            .map(row_to_artifact_response)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut legacy_items = self
+            .repo
+            .list_legacy_cron_trigger_messages(conversation_id)
+            .await?
+            .into_iter()
+            .filter_map(|row| legacy_cron_trigger_to_artifact(row).ok())
+            .collect::<Vec<_>>();
+
+        items.append(&mut legacy_items);
+        items.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        Ok(items)
+    }
+
+    /// Update the durable status of a conversation artifact and broadcast the upsert.
+    pub async fn update_artifact(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        artifact_id: &str,
+        req: UpdateConversationArtifactRequest,
+    ) -> Result<ConversationArtifactResponse, AppError> {
+        self.repo
+            .get(conversation_id)
+            .await?
+            .filter(|r| r.user_id == user_id)
+            .ok_or_else(|| {
+                AppError::NotFound(format!("Conversation {conversation_id} not found"))
+            })?;
+
+        let status = serde_json::to_value(req.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| AppError::Internal("Failed to serialize artifact status".into()))?;
+
+        let row = self
+            .repo
+            .update_artifact_status(conversation_id, artifact_id, &status, now_ms())
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Artifact {artifact_id} not found")))?;
+
+        let response = row_to_artifact_response(row)?;
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "conversation.artifact",
+            serde_json::to_value(&response).map_err(|e| {
+                AppError::Internal(format!("Failed to serialize artifact event: {e}"))
+            })?,
+        ));
+
+        Ok(response)
     }
 
     /// Search messages across all conversations for the user.
@@ -781,7 +862,7 @@ impl ConversationService {
             content: serde_json::json!({ "content": req.content }).to_string(),
             position: Some("right".into()),
             status: Some("finish".into()),
-            hidden: false,
+            hidden: req.hidden,
             created_at: now_ms(),
         };
         self.repo.insert_message(&user_msg).await?;
@@ -840,7 +921,8 @@ impl ConversationService {
 
                 let rx = agent.subscribe();
                 let send_agent = Arc::clone(&agent);
-                let send_task = tokio::spawn(async move { send_agent.send_message(current_send).await });
+                let send_task =
+                    tokio::spawn(async move { send_agent.send_message(current_send).await });
                 let outcome = relay.run(rx).await;
 
                 match send_task.await {
@@ -1210,6 +1292,30 @@ async fn persist_session_key(
             "Persisted session key to conversation.extra"
         );
     }
+}
+
+fn legacy_cron_trigger_to_artifact(
+    row: MessageRow,
+) -> Result<ConversationArtifactResponse, AppError> {
+    let payload: serde_json::Value = serde_json::from_str(&row.content).map_err(|e| {
+        AppError::Internal(format!("Invalid legacy cron trigger payload JSON: {e}"))
+    })?;
+    let cron_job_id = payload
+        .get("cron_job_id")
+        .or_else(|| payload.get("cronJobId"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+
+    Ok(ConversationArtifactResponse {
+        id: format!("legacy-cron-trigger:{}", row.id),
+        conversation_id: row.conversation_id,
+        cron_job_id,
+        kind: ConversationArtifactKind::CronTrigger,
+        status: ConversationArtifactStatus::Active,
+        payload,
+        created_at: row.created_at,
+        updated_at: row.created_at,
+    })
 }
 
 /// Merge `patch` into `base` (top-level key overwrite).
