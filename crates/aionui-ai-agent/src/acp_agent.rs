@@ -13,6 +13,7 @@ use crate::agent_registry::CatalogSender;
 use crate::cli_process::CliAgentProcess;
 use crate::skill_manager::AcpSkillManager;
 use crate::stream_event::{AgentStreamEvent, permission_request_to_event_data};
+use crate::team_guide_prompt;
 use crate::types::{AcpBuildExtra, AgentStreamChunk, SendMessageData, SlashCommandItem};
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, CancelNotification, ContentBlock, HttpHeader, LoadSessionRequest, McpServer,
@@ -86,6 +87,48 @@ fn confirm_option_id(data: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         _ => None,
+    }
+}
+
+/// Compose the first-message preset context for a solo ACP agent, optionally
+/// prepending the Team Guide prompt (W5-D28b).
+///
+/// The guide is injected iff **both** conditions hold:
+/// 1. The session is not already part of a team (`team_mcp_stdio_config`
+///    absent on [`AcpBuildExtra`]) — in-team agents receive a different
+///    coordination prompt via their team MCP bridge, and must not be told to
+///    propose a fresh team from inside one.
+/// 2. The backend is on the solo-guide whitelist (see
+///    [`team_guide_prompt::is_solo_team_guide_backend`]). Unknown backends
+///    receive no guide, matching AionUi's `opts.backend`-gated solo
+///    injection.
+///
+/// When the guide is added it is appended after any pre-existing
+/// `preset_context` so user-configured rules still take precedence at the
+/// top of the `[Assistant Rules]` block assembled by
+/// [`crate::first_message_injector::inject_first_message_prefix`].
+fn compose_preset_context_with_team_guide(
+    base_preset_context: Option<&str>,
+    backend: Option<&str>,
+    has_team_session: bool,
+) -> Option<String> {
+    let base = base_preset_context
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    if has_team_session {
+        return base;
+    }
+    let backend_key = backend.unwrap_or_default();
+    if !team_guide_prompt::is_solo_team_guide_backend(backend_key) {
+        return base;
+    }
+
+    let guide = team_guide_prompt::build_solo_team_guide_prompt(backend_key);
+    match base {
+        Some(ctx) => Some(format!("{ctx}\n\n{guide}")),
+        None => Some(guide),
     }
 }
 
@@ -710,11 +753,23 @@ impl AcpAgentManager {
         // Backends with native skill discovery (e.g. Claude via .claude/skills/)
         // only need preset_context here; others get the full [Assistant Rules]
         // block with a skills index.
+        //
+        // Before handing off, (W5-D28b) prepend the solo Team Guide prompt to
+        // `preset_context` when this agent is *not* part of a team and the
+        // backend is on the solo-guide whitelist. Agents inside a team
+        // (non-empty `team_mcp_stdio_config`) are deliberately excluded —
+        // they coordinate through the team MCP bridge and must not receive
+        // the "propose a team" prompt.
+        let composed_preset_context = compose_preset_context_with_team_guide(
+            self.config.preset_context.as_deref(),
+            self.backend(),
+            self.config.team_mcp_stdio_config.is_some(),
+        );
         let injected_content = crate::first_message_injector::inject_first_message_prefix(
             &data.content,
             &self.skill_manager,
             crate::first_message_injector::InjectionConfig {
-                preset_context: self.config.preset_context.as_deref(),
+                preset_context: composed_preset_context.as_deref(),
                 skills: &self.config.skills,
                 native_skill_support: self.native_skill_support(),
                 // Whether the user chose this workspace — determined at
@@ -1331,6 +1386,67 @@ mod tests {
     fn normalize_requested_mode_trims_and_returns_empty_for_blank() {
         let meta = metadata_with_yolo_id(Some("full-access"));
         assert_eq!(normalize_requested_mode(&meta, "   "), "");
+    }
+
+    const TEAM_GUIDE_MARKER: &str = "## Team Mode";
+
+    #[test]
+    fn compose_preset_context_injects_team_guide_for_solo_whitelisted_backend() {
+        let out = compose_preset_context_with_team_guide(None, Some("claude"), false).expect("guide must be injected");
+        assert!(
+            out.contains(TEAM_GUIDE_MARKER),
+            "solo whitelisted backend must receive Team Guide prompt, got: {out}"
+        );
+    }
+
+    #[test]
+    fn compose_preset_context_preserves_base_context_before_team_guide() {
+        let base = "User rule: always respond in English.";
+        let out =
+            compose_preset_context_with_team_guide(Some(base), Some("gemini"), false).expect("guide must be injected");
+        let guide_idx = out.find(TEAM_GUIDE_MARKER).expect("team guide present");
+        let base_idx = out.find(base).expect("base rule present");
+        assert!(
+            base_idx < guide_idx,
+            "base preset_context must come before the Team Guide so user rules stay at the top of [Assistant Rules]"
+        );
+    }
+
+    #[test]
+    fn compose_preset_context_skips_team_guide_when_already_in_team() {
+        // Agent bound to a team: `team_mcp_stdio_config` present ⇒
+        // `has_team_session = true`. Must NOT inject the Team Guide prompt.
+        let out = compose_preset_context_with_team_guide(None, Some("claude"), true);
+        assert!(out.is_none(), "in-team agent must not receive Team Guide, got: {out:?}");
+
+        let with_base = compose_preset_context_with_team_guide(Some("Keep responses short."), Some("claude"), true)
+            .expect("base context must pass through");
+        assert!(
+            !with_base.contains(TEAM_GUIDE_MARKER),
+            "in-team agent must not receive Team Guide even when base context exists"
+        );
+        assert!(with_base.contains("Keep responses short."));
+    }
+
+    #[test]
+    fn compose_preset_context_skips_team_guide_for_unknown_backend() {
+        // Solo agent, but backend not on the whitelist: pass base context
+        // through (possibly `None`) without adding the Team Guide.
+        assert!(compose_preset_context_with_team_guide(None, Some("qwen"), false).is_none());
+        assert!(compose_preset_context_with_team_guide(None, None, false).is_none());
+
+        let with_base = compose_preset_context_with_team_guide(Some("Existing rule."), Some("qwen"), false)
+            .expect("base context must pass through unchanged");
+        assert_eq!(with_base, "Existing rule.");
+    }
+
+    #[test]
+    fn compose_preset_context_treats_blank_base_as_absent() {
+        // Whitespace-only base context should be treated as "none" so we
+        // don't leak "\n\n" prefixes into the injected Team Guide.
+        let out = compose_preset_context_with_team_guide(Some("   \n\t"), Some("claude"), false)
+            .expect("guide must still be injected");
+        assert!(out.starts_with("## Team Mode"));
     }
 
     /// Each session-driven event projects onto exactly one handshake
