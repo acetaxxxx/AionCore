@@ -44,9 +44,6 @@ impl ChannelSettingsService {
 
     /// Reads the agent configuration for a platform from `client_preferences`.
     ///
-    /// Falls back to `agent_type=aionrs, backend=None` when no config exists.
-    /// Reads the agent configuration for a platform from `client_preferences`.
-    ///
     /// Supports two data formats:
     /// - **New:** `{"agent_type":"acp","backend":"claude","name":"Claude"}`
     /// - **Legacy:** `{"backend":"claude","name":"Claude"}` (no agent_type field)
@@ -93,7 +90,10 @@ impl ChannelSettingsService {
 
         debug!(platform = %platform, agent_type = %agent_type, backend = ?backend, "resolved channel agent config (legacy format)");
 
-        Ok(ResolvedAgentConfig { agent_type, backend })
+        Ok(ResolvedAgentConfig {
+            agent_type,
+            backend,
+        })
     }
 
     /// Reads the model configuration for a platform from `client_preferences`.
@@ -127,7 +127,6 @@ impl ChannelSettingsService {
             use_model,
         }))
     }
-
 }
 
 fn agent_key(platform: PluginType) -> String {
