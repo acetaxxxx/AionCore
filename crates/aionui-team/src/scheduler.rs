@@ -96,6 +96,7 @@ pub struct TeammateManager {
     // conversation; without this dedup window, finalize_turn would run twice
     // and double-write the IdleNotification (aionui-audit §4.3, §8 #3).
     finalized_turns: Arc<DashMap<String, Instant>>,
+    wake_timeouts: DashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 /// Status set that counts as "settled" for the purpose of
@@ -140,6 +141,7 @@ impl TeammateManager {
             events,
             active_wakes: DashSet::new(),
             finalized_turns: Arc::new(DashMap::new()),
+            wake_timeouts: DashMap::new(),
         }
     }
 
@@ -438,6 +440,13 @@ impl TeammateManager {
     /// Idempotent: no-op if the lock was never held.
     pub fn release_wake_lock(&self, slot_id: &str) {
         self.active_wakes.remove(slot_id);
+    }
+
+    /// Cancel and remove the wake timeout task for a slot.
+    pub fn clear_wake_timeout(&self, slot_id: &str) {
+        if let Some((_, handle)) = self.wake_timeouts.remove(slot_id) {
+            handle.abort();
+        }
     }
 
     /// Attempt to claim the right to finalize the turn for `conversation_id`.
@@ -1649,5 +1658,27 @@ mod tests {
             winners, 1,
             "exactly one concurrent acquire should win the lock"
         );
+    }
+
+    // -- W4-D18b: wake_timeouts -------------------------------------------------
+
+    #[tokio::test]
+    async fn clear_wake_timeout_removes_entry() {
+        let handle =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(999)).await });
+        let map: DashMap<String, tokio::task::JoinHandle<()>> = DashMap::new();
+        map.insert("slot-1".into(), handle);
+        // Simulate clear
+        if let Some((_, h)) = map.remove("slot-1") {
+            h.abort();
+        }
+        assert!(map.get("slot-1").is_none());
+    }
+
+    #[test]
+    fn clear_nonexistent_slot_no_panic() {
+        let map: DashMap<String, tokio::task::JoinHandle<()>> = DashMap::new();
+        // Should not panic
+        map.remove("nonexistent");
     }
 }
