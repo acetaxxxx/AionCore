@@ -118,18 +118,20 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut lines = BufReader::new(stdin).lines();
-    eprintln!("[mcp-bridge] stdin loop started, waiting for messages...");
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|e| format!("stdin read error: {e}"))?
-    {
-        if line.trim().is_empty() {
-            continue;
-        }
-        eprintln!("[mcp-bridge] stdin received: {}", &line[..line.len().min(200)]);
-        let mut value: Value = serde_json::from_str(&line)
+    let mut reader = BufReader::new(stdin);
+    eprintln!("[mcp-bridge] stdin loop started (Content-Length framing)");
+    loop {
+        let body = match read_mcp_stdio_message(&mut reader).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                eprintln!("[mcp-bridge] stdin EOF");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        eprintln!("[mcp-bridge] stdin received: {} bytes", body.len());
+        let mut value: Value = serde_json::from_slice(&body)
             .map_err(|e| format!("stdin payload is not valid JSON: {e}"))?;
 
         if value.get("method").and_then(Value::as_str) == Some("initialize") {
@@ -143,8 +145,6 @@ where
             .map_err(|e| format!("tcp write error: {e}"))?;
         eprintln!("[mcp-bridge] forwarded to TCP ({} bytes)", bytes.len());
     }
-    eprintln!("[mcp-bridge] stdin EOF");
-    Ok(())
 }
 
 /// Read one MCP stdio message (Content-Length framing).
@@ -218,12 +218,14 @@ where
             Err(e) => return Err(format!("tcp read error: {e}")),
         };
         eprintln!("[mcp-bridge] TCP→stdout: {} bytes", frame.len());
+        // Content-Length framing for stdout (MCP stdio transport)
+        let header = format!("Content-Length: {}\r\n\r\n", frame.len());
         stdout
-            .write_all(&frame)
+            .write_all(header.as_bytes())
             .await
             .map_err(|e| format!("stdout write error: {e}"))?;
         stdout
-            .write_all(b"\n")
+            .write_all(&frame)
             .await
             .map_err(|e| format!("stdout write error: {e}"))?;
         stdout
