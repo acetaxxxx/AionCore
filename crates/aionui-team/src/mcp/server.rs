@@ -348,6 +348,18 @@ async fn exec_describe_assistant(args: &Value) -> Result<String, String> {
 async fn exec_send_message(args: &Value, scheduler: &TeammateManager, caller_slot_id: &str) -> Result<String, String> {
     let input: SendMessageInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
+    let trimmed = input.message.trim();
+    if trimmed == "shutdown_approved" {
+        // W5-D30a-2 will wire the real approval handling; this stub intercepts the sentinel so it never reaches the recipient.
+        debug!(from = caller_slot_id, "shutdown_approved intercepted");
+        return Ok(json!({"status": "shutdown_approved_received"}).to_string());
+    }
+    if trimmed.starts_with("shutdown_rejected:") {
+        // W5-D30b will wire the real rejection handling; this stub intercepts the sentinel so it never reaches the recipient.
+        debug!(from = caller_slot_id, "shutdown_rejected intercepted");
+        return Ok(json!({"status": "shutdown_rejected_received"}).to_string());
+    }
+
     let action = crate::scheduler::SchedulerAction::SendMessage {
         to: input.to.clone(),
         message: input.message,

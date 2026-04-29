@@ -313,6 +313,70 @@ async fn ts3_send_message_to_nonexistent_agent() {
     env.server.stop();
 }
 
+#[tokio::test]
+async fn ts_shutdown_approved_intercepted() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_send_message",
+        json!({"to": "lead-1", "message": "shutdown_approved"}),
+    )
+    .await;
+
+    assert!(!is_error_response(&resp));
+    let text = extract_text(&resp);
+    let payload: Value = serde_json::from_str(&text).expect("interception payload is JSON");
+    assert_eq!(payload["status"], "shutdown_approved_received");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn ts_shutdown_rejected_intercepted() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_send_message",
+        json!({"to": "lead-1", "message": "shutdown_rejected: still finishing task"}),
+    )
+    .await;
+
+    assert!(!is_error_response(&resp));
+    let text = extract_text(&resp);
+    let payload: Value = serde_json::from_str(&text).expect("interception payload is JSON");
+    assert_eq!(payload["status"], "shutdown_rejected_received");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn ts_regular_message_not_intercepted() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_send_message",
+        json!({"to": "lead-1", "message": "just a normal update"}),
+    )
+    .await;
+
+    assert!(!is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(text.contains("lead-1"));
+    assert!(!text.contains("shutdown_approved_received"));
+    assert!(!text.contains("shutdown_rejected_received"));
+
+    env.server.stop();
+}
+
 // ---------------------------------------------------------------------------
 // Tests: team_spawn_agent (SP-1, SP-2, SP-3)
 // ---------------------------------------------------------------------------
