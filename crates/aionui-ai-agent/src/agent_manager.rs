@@ -8,7 +8,7 @@ use aionui_common::{
 use tokio::sync::broadcast;
 
 use crate::stream_event::AgentStreamEvent;
-use crate::types::SendMessageData;
+use crate::types::{AgentStreamChunk, SendMessageData};
 
 /// Core trait for managing a single Agent instance.
 ///
@@ -38,6 +38,15 @@ pub trait IAgentManager: Send + Sync {
     /// Returns a broadcast receiver that yields [`AgentStreamEvent`] values
     /// as the agent processes a message turn.
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent>;
+
+    /// Subscribe to the raw stream chunk channel (used by team scheduler for watchdogs).
+    ///
+    /// Returns a broadcast receiver yielding [`AgentStreamChunk`] values.
+    /// Default implementation returns a receiver that immediately closes (for non-ACP agents).
+    fn subscribe_stream(&self) -> broadcast::Receiver<AgentStreamChunk> {
+        let (tx, _) = broadcast::channel(1);
+        tx.subscribe()
+    }
 
     /// Send a user message to the agent.
     ///
@@ -120,5 +129,16 @@ pub fn approval_key(action: Option<&str>, command_type: Option<&str>) -> String 
         (Some(a), Some(ct)) => format!("{a}:{ct}"),
         (Some(a), None) => a.to_owned(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscribe_stream_receiver_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<broadcast::Receiver<crate::types::AgentStreamChunk>>();
     }
 }
