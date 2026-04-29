@@ -51,5 +51,5 @@ flamegraph.svg
 # Runtime data (never commit DBs)
 data/
 
-# Docs — authoritative copies live in the frontend repo
-docs/
+# OS files in docs
+docs/**/.DS_Store
