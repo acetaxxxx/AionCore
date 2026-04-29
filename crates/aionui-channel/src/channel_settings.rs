@@ -14,7 +14,7 @@ const DEFAULT_AGENT_TYPE: &str = "aionrs";
 ///
 /// Keys follow the pattern established by the old Electron frontend:
 /// - `assistant.{platform}.agent`       → JSON `{"backend":"claude","name":"Claude"}`
-/// - `assistant.{platform}.defaultModel` → JSON `{"id":"provider_id","useModel":"model_name"}`
+/// - `assistant.{platform}.defaultModel` → JSON `{"id":"provider_id","use_model":"model_name"}`
 pub struct ChannelSettingsService {
     pref_repo: Arc<dyn IClientPreferenceRepository>,
 }
@@ -113,7 +113,7 @@ impl ChannelSettingsService {
         let parsed: serde_json::Value = serde_json::from_str(&pref.value).unwrap_or_default();
 
         let provider_id = parsed["id"].as_str().unwrap_or_default().to_owned();
-        let use_model = parsed["useModel"].as_str().map(|s| s.to_owned());
+        let use_model = parsed["use_model"].as_str().map(|s| s.to_owned());
 
         if provider_id.is_empty() && use_model.is_none() {
             return Ok(None);
@@ -388,7 +388,7 @@ mod tests {
     async fn model_config_reads_from_preferences() {
         let repo = Arc::new(MockPrefRepo::with_data(vec![(
             "assistant.weixin.defaultModel",
-            r#"{"id":"490fdb4e","useModel":"global.anthropic.claude-opus-4-6-v1"}"#,
+            r#"{"id":"490fdb4e","use_model":"global.anthropic.claude-opus-4-6-v1"}"#,
         )]));
         let svc = ChannelSettingsService::new(repo);
 
@@ -408,7 +408,7 @@ mod tests {
     async fn model_config_returns_none_for_empty_values() {
         let repo = Arc::new(MockPrefRepo::with_data(vec![(
             "assistant.telegram.defaultModel",
-            r#"{"id":"","useModel":null}"#,
+            r#"{"id":"","use_model":null}"#,
         )]));
         let svc = ChannelSettingsService::new(repo);
 

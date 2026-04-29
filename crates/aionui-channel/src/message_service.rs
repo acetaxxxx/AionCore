@@ -360,10 +360,10 @@ fn channel_conversation_name(
     if !agent_type.is_empty() {
         parts.push(agent_type.to_owned());
     }
-    if agent_type == "acp" {
-        if let Some(b) = backend {
-            parts.push(b.to_owned());
-        }
+    if agent_type == "acp"
+        && let Some(b) = backend
+    {
+        parts.push(b.to_owned());
     }
     if let Some(cid) = chat_id {
         let end = cid.len().min(8);

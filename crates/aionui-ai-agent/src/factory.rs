@@ -153,10 +153,20 @@ async fn build_agent(
             Ok(arc as AgentManagerHandle)
         }
         AgentType::OpenclawGateway => {
-            let config: OpenClawBuildExtra =
+            let mut config: OpenClawBuildExtra =
                 serde_json::from_value(options.extra).map_err(|e| {
                     AppError::BadRequest(format!("Invalid OpenClaw build options: {e}"))
                 })?;
+
+            if config.gateway.cli_path.is_none()
+                && let Some(detected) = deps
+                    .agent_registry
+                    .get_by_id(&AgentType::OpenclawGateway.id())
+                    .await
+            {
+                config.gateway.cli_path = detected.command;
+            }
+
             let resume_session_key = config.session_key.clone();
             let agent =
                 OpenClawAgentManager::new(conversation_id, workspace, config, resume_session_key)
@@ -166,9 +176,14 @@ async fn build_agent(
             Ok(arc as AgentManagerHandle)
         }
         AgentType::Nanobot => {
-            let cli_path = which::which("nanobot")
-                .map(|p| p.to_string_lossy().into_owned())
-                .map_err(|_| AppError::BadRequest("Nanobot CLI not found in PATH".into()))?;
+            let cli_path = deps
+                .agent_registry
+                .get_by_id(&AgentType::Nanobot.id())
+                .await
+                .and_then(|d| d.command)
+                .ok_or_else(|| {
+                    AppError::BadRequest("Nanobot CLI not found in agent registry".into())
+                })?;
             let agent = NanobotAgentManager::new(conversation_id, workspace, cli_path).await?;
             Ok(Arc::new(agent) as AgentManagerHandle)
         }
