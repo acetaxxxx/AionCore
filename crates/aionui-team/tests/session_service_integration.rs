@@ -490,7 +490,7 @@ fn success_factory() -> AgentFactory {
     })
 }
 
-fn setup_with_factory(factory: AgentFactory) -> (TeamSessionService, Arc<CountingTaskManager>) {
+fn setup_with_factory(factory: AgentFactory) -> (Arc<TeamSessionService>, Arc<CountingTaskManager>) {
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(FullMockTeamRepo::new());
     let conv_repo: Arc<dyn IConversationRepository> = Arc::new(MockConversationRepo::new());
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
@@ -517,7 +517,7 @@ fn setup_with_factory(factory: AgentFactory) -> (TeamSessionService, Arc<Countin
     (svc, task_manager)
 }
 
-fn setup() -> TeamSessionService {
+fn setup() -> Arc<TeamSessionService> {
     setup_with_factory(success_factory()).0
 }
 

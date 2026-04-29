@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
@@ -36,6 +36,12 @@ pub struct TeamSessionService {
     /// read-modify-write the `agents` JSON with stale state (last-writer-wins
     /// would otherwise drop entries).
     add_agent_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
+    /// orchestration without threading the service through every session method.
+    /// Stored as `Weak` so the session map does not create a strong cycle with
+    /// the service that owns it. Set once during [`TeamSessionService::new`]
+    /// via [`Arc::new_cyclic`].
+    self_ref: Weak<TeamSessionService>,
 }
 
 impl TeamSessionService {
@@ -45,8 +51,8 @@ impl TeamSessionService {
         broadcaster: Arc<dyn EventBroadcaster>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         backend_binary_path: Arc<PathBuf>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self {
             repo,
             conversation_service,
             broadcaster,
@@ -54,7 +60,8 @@ impl TeamSessionService {
             backend_binary_path,
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
-        }
+            self_ref: weak.clone(),
+        })
     }
 
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
@@ -410,6 +417,8 @@ impl TeamSessionService {
             self.broadcaster.clone(),
             self.backend_binary_path.clone(),
             self.task_manager.clone(),
+            user_id.clone(),
+            self.self_ref.clone(),
         )
         .await?;
 
@@ -547,6 +556,95 @@ impl TeamSessionService {
             self.stop_session(&key);
         }
         info!("All team sessions disposed");
+    }
+
+    /// Accessor used by [`TeamSession::spawn_agent`] to reach the conversation
+    /// service without threading it through every call site.
+    pub(crate) fn conversation_service_ref(&self) -> &ConversationService {
+        &self.conversation_service
+    }
+
+    /// Create the conversation + persist the new agent slot for a spawn.
+    ///
+    /// Holds the per-team `add_agent` lock for the entirety of the
+    /// read-modify-write on `teams.agents`, matching [`TeamSessionService::add_agent`]
+    /// (W4-D23) so concurrent spawns cannot race and drop slots.
+    ///
+    /// The lock is *not* held across the process warmup step — callers
+    /// (`TeamSession::spawn_agent`) wire that up separately so a slow
+    /// `warmup` never stalls other spawns against the same team.
+    pub(crate) async fn persist_spawned_agent(
+        &self,
+        team_id: &str,
+        user_id: &str,
+        name: String,
+        backend: String,
+        model: String,
+        custom_agent_id: Option<String>,
+    ) -> Result<TeamAgent, TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let row = self
+            .repo
+            .get_team(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        let mut team = Team::from_row(&row)?;
+
+        let agent_type = parse_agent_type(&backend)?;
+        let conv_req = CreateConversationRequest {
+            r#type: agent_type,
+            name: Some(name.clone()),
+            model: Some(ProviderWithModel {
+                provider_id: backend.clone(),
+                model: model.clone(),
+                use_model: None,
+            }),
+            source: None,
+            channel_chat_id: None,
+            extra: serde_json::json!({
+                "teamId": team_id,
+                "backend": backend,
+            }),
+        };
+        let conv = self
+            .conversation_service
+            .create(user_id, conv_req)
+            .await
+            .map_err(|e| TeamError::InvalidRequest(format!("failed to create conversation: {e}")))?;
+
+        let agent = TeamAgent {
+            slot_id: generate_id(),
+            name,
+            role: TeammateRole::Teammate,
+            conversation_id: conv.id,
+            backend,
+            model,
+            custom_agent_id,
+            status: None,
+            conversation_type: None,
+            cli_path: None,
+        };
+
+        team.agents.push(agent.clone());
+        let agents_json = serde_json::to_string(&team.agents)?;
+        self.repo
+            .update_team(
+                team_id,
+                &UpdateTeamParams {
+                    name: None,
+                    agents: Some(agents_json),
+                    lead_agent_id: None,
+                },
+            )
+            .await?;
+
+        Ok(agent)
     }
 }
 
