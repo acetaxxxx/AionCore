@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use aionui_api_types::TeamMcpStdioConfig;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 const CONNECT_ADDR_HOST: &str = "127.0.0.1";
@@ -118,16 +118,16 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut lines = BufReader::new(stdin).lines();
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|e| format!("stdin read error: {e}"))?
-    {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut value: Value = serde_json::from_str(&line)
+    let mut reader = BufReader::new(stdin);
+    loop {
+        // MCP stdio transport: Content-Length header + \r\n\r\n + body
+        let body = match read_mcp_stdio_message(&mut reader).await {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(()), // EOF
+            Err(e) => return Err(e),
+        };
+
+        let mut value: Value = serde_json::from_slice(&body)
             .map_err(|e| format!("stdin payload is not valid JSON: {e}"))?;
 
         if value.get("method").and_then(Value::as_str) == Some("initialize") {
@@ -140,7 +140,46 @@ where
             .await
             .map_err(|e| format!("tcp write error: {e}"))?;
     }
-    Ok(())
+}
+
+/// Read one MCP stdio message (Content-Length framing).
+/// Returns None on clean EOF.
+async fn read_mcp_stdio_message<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut content_length: Option<usize> = None;
+    let mut header_line = String::new();
+    loop {
+        header_line.clear();
+        let n = reader
+            .read_line(&mut header_line)
+            .await
+            .map_err(|e| format!("stdin header read error: {e}"))?;
+        if n == 0 {
+            return Ok(None); // EOF
+        }
+        let trimmed = header_line.trim();
+        if trimmed.is_empty() {
+            // Empty line = end of headers
+            break;
+        }
+        if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(
+                len_str
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid Content-Length: {e}"))?,
+            );
+        }
+        // Ignore other headers
+    }
+    let len = content_length.ok_or("missing Content-Length header")?;
+    let mut body = vec![0u8; len];
+    reader
+        .read_exact(&mut body)
+        .await
+        .map_err(|e| format!("stdin body read error: {e}"))?;
+    Ok(Some(body))
 }
 
 fn inject_auth(value: &mut Value, env: &BridgeEnv) {
@@ -170,12 +209,14 @@ where
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(format!("tcp read error: {e}")),
         };
+        // MCP stdio transport: Content-Length header + \r\n\r\n + body
+        let header = format!("Content-Length: {}\r\n\r\n", frame.len());
         stdout
-            .write_all(&frame)
+            .write_all(header.as_bytes())
             .await
             .map_err(|e| format!("stdout write error: {e}"))?;
         stdout
-            .write_all(b"\n")
+            .write_all(&frame)
             .await
             .map_err(|e| format!("stdout write error: {e}"))?;
         stdout
