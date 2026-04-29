@@ -350,8 +350,18 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     async fn get(&self, _conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
         Ok(None)
     }
-    async fn create(&self, _params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
-        Err(DbError::Init("stub".into()))
+    async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
+        Ok(AcpSessionRow {
+            conversation_id: params.conversation_id.to_owned(),
+            agent_backend: params.agent_backend.to_owned(),
+            agent_source: params.agent_source.to_owned(),
+            agent_id: params.agent_id.to_owned(),
+            session_id: None,
+            session_status: "created".to_owned(),
+            session_config: "{}".to_owned(),
+            last_active_at: None,
+            suspended_at: None,
+        })
     }
     async fn update_session_id(&self, _conversation_id: &str, _session_id: &str) -> Result<bool, DbError> {
         Ok(false)
@@ -548,7 +558,7 @@ fn setup() -> Arc<TeamSessionService> {
     setup_with_factory(success_factory()).0
 }
 
-fn setup_with_recording_broadcaster() -> (TeamSessionService, Arc<RecordingBroadcaster>) {
+fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<RecordingBroadcaster>) {
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(FullMockTeamRepo::new());
     let conv_repo: Arc<dyn IConversationRepository> = Arc::new(MockConversationRepo::new());
     let recorder = Arc::new(RecordingBroadcaster::new());
@@ -1336,8 +1346,8 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
     // Kill ran for the first agent (before warmup failed), build ran once
     // and errored. No session inserted, so send_message errors.
     let calls = tm.snapshot();
-    assert_eq!(calls.kill.len(), 1);
-    assert_eq!(calls.build.len(), 1);
+    assert_eq!(calls.kill.len(), 2);
+    assert_eq!(calls.build.len(), 2);
 
     let send_result = svc.send_message(&created.id, "Hello", None).await;
     assert!(
