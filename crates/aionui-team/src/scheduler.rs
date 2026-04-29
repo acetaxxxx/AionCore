@@ -510,6 +510,68 @@ impl TeammateManager {
         self.finalized_turns.remove(conversation_id);
     }
 
+    /// Handle a teammate crash: notify lead, update status, drop locks/timeouts.
+    ///
+    /// Runs the five-step recovery sequence for a non-lead agent that the
+    /// scheduler has detected as crashed (W4-D20a `detect_crash` classifier):
+    ///
+    /// 1. Write a crash testament to the lead's mailbox
+    ///    (via [`Self::write_crash_testament`]). The testament carries the
+    ///    reason and optional last message so the lead can decide how to
+    ///    recover.
+    /// 2. Transition the crashed slot to [`TeammateStatus::Error`] — the
+    ///    enum's terminal failure state. `"failed"` is serde-aliased to
+    ///    `Error`, matching the frontend contract.
+    /// 3. Release the wake lock in case one was held — otherwise a future
+    ///    wake for the same slot would be blocked forever.
+    /// 4. Cancel any pending wake timeout — the crashed slot will never
+    ///    answer, so keeping the timeout alive wastes a handle and risks a
+    ///    late spurious callback.
+    /// 5. Return the lead slot_id so the caller (session layer) can wake
+    ///    the lead. Mirrors [`Self::mark_idle`]'s contract: the scheduler
+    ///    does not invoke agent managers directly; it hands the wake target
+    ///    back to the session, which owns the `compute_wake_input` +
+    ///    `send_message` plumbing.
+    ///
+    /// Leader crash (W4-D20c): there is no higher-ranked agent to notify or
+    /// wake, so steps 1 and 5 degrade to no-ops — no self-addressed testament,
+    /// no self-wake. Steps 2-4 still run so status, wake lock, and wake
+    /// timeout do not leak. The leader slot stays in the roster so downstream
+    /// session code can still emit an error event for it.
+    pub async fn handle_agent_crash(
+        &self,
+        slot_id: &str,
+        reason: CrashReason,
+        last_message: Option<&str>,
+    ) -> Result<Option<String>, TeamError> {
+        let (agent_name, is_lead) = {
+            let slots = self.slots.lock().await;
+            let slot = slots
+                .get(slot_id)
+                .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+            (slot.agent.name.clone(), slot.agent.role == TeammateRole::Lead)
+        };
+
+        // Step 1: testament to lead (no-op when crasher is the lead or no lead exists).
+        self.write_crash_testament(slot_id, &agent_name, &reason, last_message)
+            .await?;
+
+        // Step 2: mark the slot as terminally failed.
+        self.set_status(slot_id, TeammateStatus::Error).await?;
+
+        // Step 3/4: release wake lock and cancel pending wake timeout.
+        self.release_wake_lock(slot_id);
+        self.clear_wake_timeout(slot_id);
+
+        // Step 5: hand the lead slot back to the caller to wake, but only
+        // when the crasher is a teammate. On leader crash there is no
+        // higher-ranked agent to escalate to — return None (W4-D20c).
+        if is_lead {
+            return Ok(None);
+        }
+        Ok(self.find_lead_slot_id().await)
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -1656,5 +1718,196 @@ mod tests {
 
         let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
         assert!(lead_msgs.is_empty());
+    }
+
+    // -- W4-D20b-2: handle_agent_crash -----------------------------------------
+
+    #[tokio::test]
+    async fn handle_agent_crash_marks_slot_as_error() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
+
+        let wake_target = mgr
+            .handle_agent_crash("worker-1", CrashReason::ProcessExited, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mgr.get_status("worker-1").await.unwrap(),
+            TeammateStatus::Error,
+            "crashed slot must end in Error (aka Failed)"
+        );
+        assert_eq!(wake_target, Some("lead-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn handle_agent_crash_releases_wake_lock() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        assert!(mgr.acquire_wake_lock("worker-1"));
+
+        mgr.handle_agent_crash("worker-1", CrashReason::SessionNotFound, Some("last words"))
+            .await
+            .unwrap();
+
+        assert!(
+            mgr.acquire_wake_lock("worker-1"),
+            "wake lock must be released after crash so the slot is reusable"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_agent_crash_writes_testament_to_lead() {
+        let agents = make_team_agents();
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Arc::new(Mailbox::new(repo.clone()));
+        let task_board = Arc::new(TaskBoard::new(repo));
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
+        let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+
+        mgr.handle_agent_crash("worker-1", CrashReason::Unknown("segfault".into()), Some("cleaning up"))
+            .await
+            .unwrap();
+
+        let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(lead_msgs.len(), 1);
+        assert_eq!(lead_msgs[0].from_agent_id, "worker-1");
+        assert!(lead_msgs[0].content.contains("Worker1"));
+        assert!(lead_msgs[0].content.contains("segfault"));
+        assert!(lead_msgs[0].content.contains("cleaning up"));
+    }
+
+    #[tokio::test]
+    async fn handle_agent_crash_returns_lead_slot_for_teammate_crash() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        let wake_target = mgr
+            .handle_agent_crash("worker-2", CrashReason::ProcessExited, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wake_target,
+            Some("lead-1".to_string()),
+            "caller needs the lead slot id to trigger a wake"
+        );
+    }
+
+    // -- W4-D20c: handle_agent_crash leader branch -----------------------------
+
+    #[tokio::test]
+    async fn handle_agent_crash_leader_branch_returns_none() {
+        // Leader crash has no higher-ranked agent to wake. handle_agent_crash
+        // must not self-wake and must not remove the leader slot — downstream
+        // session code inspects the leader entry to emit the error event.
+        // Local state (status/locks) still gets cleaned so nothing leaks.
+        let agents = make_team_agents();
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Arc::new(Mailbox::new(repo.clone()));
+        let task_board = Arc::new(TaskBoard::new(repo));
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
+        let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+
+        mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
+        assert!(mgr.acquire_wake_lock("lead-1"));
+
+        let wake_target = mgr
+            .handle_agent_crash("lead-1", CrashReason::ProcessExited, Some("last words"))
+            .await
+            .unwrap();
+
+        assert_eq!(wake_target, None, "leader crash must not self-wake");
+        assert_eq!(mgr.get_status("lead-1").await.unwrap(), TeammateStatus::Error);
+        assert!(
+            mgr.acquire_wake_lock("lead-1"),
+            "lock must be released even for the leader branch"
+        );
+
+        // Leader cannot write a testament to itself — the mailbox must be
+        // empty, otherwise the leader would read its own death notice on a
+        // future resume.
+        let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
+        assert!(
+            lead_msgs.is_empty(),
+            "leader crash must not produce a self-addressed testament"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_agent_crash_leader_keeps_agents_list_intact() {
+        // Leader crash must not remove slots from the roster — the session
+        // layer still needs to enumerate teammates to emit finalization /
+        // error events.
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        let before: Vec<String> = mgr.list_agents().await.into_iter().map(|a| a.slot_id).collect();
+
+        mgr.handle_agent_crash("lead-1", CrashReason::SessionNotFound, None)
+            .await
+            .unwrap();
+
+        let after: Vec<String> = mgr.list_agents().await.into_iter().map(|a| a.slot_id).collect();
+
+        assert_eq!(before, after, "leader crash must preserve the agents list");
+    }
+
+    #[tokio::test]
+    async fn handle_agent_crash_leader_clears_wake_timeout() {
+        // Pending wake timeouts for the leader must be cancelled on crash —
+        // the slot will never answer, so a lingering timer only risks a late
+        // spurious callback.
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(999)).await;
+        });
+        mgr.wake_timeouts.insert("lead-1".into(), handle);
+
+        mgr.handle_agent_crash("lead-1", CrashReason::ProcessExited, None)
+            .await
+            .unwrap();
+
+        assert!(
+            mgr.wake_timeouts.get("lead-1").is_none(),
+            "wake timeout entry must be removed after leader crash"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_agent_crash_clears_wake_timeout() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        // Install a long-running dummy timeout so we can observe that it was
+        // cancelled once the crash handler ran.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(999)).await;
+        });
+        mgr.wake_timeouts.insert("worker-1".into(), handle);
+
+        mgr.handle_agent_crash("worker-1", CrashReason::ProcessExited, None)
+            .await
+            .unwrap();
+
+        assert!(
+            mgr.wake_timeouts.get("worker-1").is_none(),
+            "wake timeout entry must be removed after crash"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_agent_crash_unknown_slot_errors() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        let result = mgr.handle_agent_crash("ghost", CrashReason::ProcessExited, None).await;
+
+        assert!(matches!(result, Err(TeamError::AgentNotFound(_))));
     }
 }
