@@ -26,6 +26,7 @@ use super::tools::{
 
 pub struct TeamMcpServer {
     addr: SocketAddr,
+    http_addr: SocketAddr,
     auth_token: String,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -45,12 +46,26 @@ impl TeamMcpServer {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let token = auth_token.clone();
-        tokio::spawn(accept_loop(listener, token, scheduler, shutdown_rx));
+        let sched_for_tcp = scheduler.clone();
+        tokio::spawn(accept_loop(listener, token, sched_for_tcp, shutdown_rx.clone()));
 
-        debug!(port = addr.port(), "Team MCP Server started");
+        // HTTP MCP endpoint for agents that prefer http transport.
+        let http_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| TeamError::InvalidRequest(format!("Failed to bind HTTP: {e}")))?;
+        let http_addr = http_listener
+            .local_addr()
+            .map_err(|e| TeamError::InvalidRequest(format!("Failed to get HTTP addr: {e}")))?;
+
+        let http_token = auth_token.clone();
+        let http_sched = scheduler.clone();
+        tokio::spawn(http_mcp_loop(http_listener, http_token, http_sched, shutdown_rx));
+
+        debug!(tcp_port = addr.port(), http_port = http_addr.port(), "Team MCP Server started");
 
         Ok(Self {
             addr,
+            http_addr,
             auth_token,
             shutdown_tx,
         })
@@ -58,6 +73,10 @@ impl TeamMcpServer {
 
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    pub fn http_port(&self) -> u16 {
+        self.http_addr.port()
     }
 
     pub fn auth_token(&self) -> &str {
@@ -513,4 +532,107 @@ async fn exec_shutdown_agent(
         "Shutdown request sent to agent '{}'",
         input.slot_id
     ))
+}
+
+// ---------------------------------------------------------------------------
+// HTTP MCP endpoint (Streamable HTTP transport for MCP)
+// ---------------------------------------------------------------------------
+
+async fn http_mcp_loop(
+    listener: TcpListener,
+    auth_token: String,
+    scheduler: Arc<TeammateManager>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    loop {
+        tokio::select! {
+            accept = listener.accept() => {
+                let Ok((mut stream, _)) = accept else { continue };
+                let token = auth_token.clone();
+                let sched = scheduler.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]);
+
+                    // Extract JSON body (after \r\n\r\n)
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let Ok(value): Result<Value, _> = serde_json::from_str(body) else {
+                        let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        return;
+                    };
+
+                    // Handle JSON-RPC request
+                    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                    let id = value.get("id").cloned();
+
+                    let result = match method {
+                        "initialize" => {
+                            json!({
+                                "capabilities": { "tools": {} },
+                                "protocolVersion": PROTOCOL_VERSION,
+                                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+                            })
+                        }
+                        "notifications/initialized" => {
+                            let resp = "HTTP/1.1 204 No Content\r\n\r\n";
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            return;
+                        }
+                        "tools/list" => {
+                            let tools: Vec<Value> = all_tool_descriptors()
+                                .iter()
+                                .map(|d| json!({
+                                    "name": d.name,
+                                    "description": d.description,
+                                    "inputSchema": d.input_schema,
+                                }))
+                                .collect();
+                            json!({ "tools": tools })
+                        }
+                        "tools/call" => {
+                            let params = value.get("params").cloned().unwrap_or(json!({}));
+                            let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                            // Extract slot_id from auth header or use empty
+                            let auth_header = request.lines()
+                                .find(|l| l.to_lowercase().starts_with("authorization:"))
+                                .and_then(|l| l.split_whitespace().last())
+                                .unwrap_or("");
+                            let slot_id = auth_header; // Will use header as slot_id for now
+                            match dispatch_tool(tool_name, &arguments, &sched, auth_header, TeammateRole::Lead).await {
+                                Ok(text) => json!({ "content": [{"type": "text", "text": text}] }),
+                                Err(text) => json!({ "content": [{"type": "text", "text": text}], "isError": true }),
+                            }
+                        }
+                        _ => {
+                            json!({"error": {"code": -32601, "message": "Method not found"}})
+                        }
+                    };
+
+                    let response_body = if result.get("error").is_some() {
+                        json!({"jsonrpc": "2.0", "id": id, "error": result["error"]})
+                    } else {
+                        json!({"jsonrpc": "2.0", "id": id, "result": result})
+                    };
+                    let body_bytes = serde_json::to_vec(&response_body).unwrap_or_default();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body_bytes).await;
+                });
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { break; }
+            }
+        }
+    }
 }
