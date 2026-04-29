@@ -21,7 +21,9 @@ pub use mailbox::Mailbox;
 pub use mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 pub use routes::{TeamRouterState, team_routes};
-pub use scheduler::{SchedulerAction, TeammateManager, WAKE_TIMEOUT_MS, WakePayload};
+pub use scheduler::{
+    SchedulerAction, TeammateManager, WAKE_TIMEOUT_MS, WakePayload, format_crash_testament,
+};
 pub use service::TeamSessionService;
 pub use session::{TeamSession, WakeInput};
 pub use task_board::{TaskBoard, TaskUpdate};
