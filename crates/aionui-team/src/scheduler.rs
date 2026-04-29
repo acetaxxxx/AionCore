@@ -406,15 +406,38 @@ impl TeammateManager {
     }
 
     /// Remove an agent slot at runtime.
+    ///
+    /// Also clears any scheduler-side state tied to the slot so a later
+    /// re-spawn (or a stale callback from the killed agent task) cannot be
+    /// blocked by leftover wake locks, wake timeouts, or finalize-dedup
+    /// entries. See [`Self::clear_agent_state`] for the state inventory.
     pub async fn remove_agent(&self, slot_id: &str) -> Result<(), TeamError> {
         let mut slots = self.slots.lock().await;
-        slots
+        let removed = slots
             .remove(slot_id)
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
         drop(slots);
+        self.clear_agent_state(slot_id, &removed.agent.conversation_id);
         self.events.broadcast_agent_removed(slot_id);
         debug!(team_id = %self.team_id, slot_id, "agent removed from scheduler");
         Ok(())
+    }
+
+    /// Clear all scheduler-side state associated with a removed agent.
+    ///
+    /// Drops three independent entries so nothing survives to affect the
+    /// slot's next life (re-spawn with the same id, or a sibling slot that
+    /// shares the same conversation):
+    /// * `active_wakes` — W4-D18a wake-in-flight lock
+    /// * `wake_timeouts` — W4-D18b-1 per-slot wake watchdog task
+    /// * `finalized_turns` — W4-D19a Finish/Error dedup window (keyed by
+    ///   `conversation_id`, not `slot_id`)
+    ///
+    /// Idempotent: every underlying call tolerates missing entries.
+    pub fn clear_agent_state(&self, slot_id: &str, conversation_id: &str) {
+        self.active_wakes.remove(slot_id);
+        self.clear_wake_timeout(slot_id);
+        self.finalized_turns.remove(conversation_id);
     }
 
     /// Rename an agent slot.
@@ -1013,6 +1036,48 @@ mod tests {
 
         let result = mgr.remove_agent("ghost").await;
         assert!(matches!(result, Err(TeamError::AgentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn remove_agent_clears_wake_lock_timeout_and_finalize_dedup() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+        let conv_id = "conv-worker-2"; // matches make_agent("worker-2")
+
+        // Populate all three state stores for worker-2.
+        assert!(mgr.acquire_wake_lock("worker-2"));
+        let handle = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(999)).await });
+        mgr.wake_timeouts.insert("worker-2".into(), handle);
+        assert!(mgr.begin_finalize(conv_id));
+
+        mgr.remove_agent("worker-2").await.unwrap();
+
+        assert!(
+            !mgr.active_wakes.contains("worker-2"),
+            "active_wakes must not retain a removed slot"
+        );
+        assert!(
+            mgr.wake_timeouts.get("worker-2").is_none(),
+            "wake_timeouts must not retain a removed slot"
+        );
+        assert!(
+            mgr.finalized_turns.get(conv_id).is_none(),
+            "finalized_turns must not retain the removed slot's conversation_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_agent_clear_state_is_idempotent() {
+        // clear_agent_state tolerates missing entries — calling it on a slot
+        // that never populated any of the three stores is a no-op, not a panic.
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        mgr.remove_agent("worker-1").await.unwrap();
+
+        assert!(!mgr.active_wakes.contains("worker-1"));
+        assert!(mgr.wake_timeouts.get("worker-1").is_none());
+        assert!(mgr.finalized_turns.get("conv-worker-1").is_none());
     }
 
     #[tokio::test]
