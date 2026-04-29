@@ -11,7 +11,7 @@ use crate::error::TeamError;
 use crate::mailbox::Mailbox;
 use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
-use crate::scheduler::TeammateManager;
+use crate::scheduler::{TeammateManager, normalize_name};
 use crate::task_board::TaskBoard;
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 
@@ -328,8 +328,21 @@ impl TeamSession {
             return Err(TeamError::LeaderOnly("spawn_agent".into()));
         }
 
+        // Step 2: normalize the requested name + uniqueness check against
+        // existing agents. See interface-contracts §15.1 for the rules.
+        let normalized = normalize_name(&req.name);
+        if normalized.is_empty() {
+            return Err(TeamError::InvalidRequest(
+                "agent name cannot be empty after normalization".into(),
+            ));
+        }
+        let existing = self.scheduler.list_agents().await;
+        if existing.iter().any(|a| normalize_name(&a.name) == normalized) {
+            return Err(TeamError::InvalidRequest(format!("agent name conflict: {normalized}")));
+        }
+
         let _ = req;
-        todo!("W5-D29a-3..D29d will fill in the remaining spawn steps")
+        todo!("W5-D29a-4..D29d will fill in the remaining spawn steps")
     }
 
     pub fn stop(&self) {
@@ -713,14 +726,59 @@ mod tests {
         session.stop();
     }
 
-    // Lead caller is expected to pass the guard and hit the todo!() for
-    // subsequent slices (W5-D29a-3..D29d). This pins that the guard does not
-    // over-reject a legitimate Lead caller.
+    // Lead caller is expected to pass the caller guard and the name check
+    // (sample_spawn_req uses "Helper", which does not collide) and hit the
+    // todo!() for subsequent slices (W5-D29a-4..D29d). This pins that the
+    // guards do not over-reject a legitimate Lead caller.
     #[tokio::test]
-    #[should_panic(expected = "W5-D29a-3..D29d")]
+    #[should_panic(expected = "W5-D29a-4..D29d")]
     async fn spawn_agent_lead_caller_passes_guard() {
         let session = start_session().await;
         let _ = session.spawn_agent("lead-1", sample_spawn_req()).await;
+    }
+
+    // -- W5-D29a-3: spawn_agent name normalize + uniqueness ------------------
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_empty_name_after_normalization() {
+        let session = start_session().await;
+        // All-whitespace + control chars normalizes to empty.
+        let req = SpawnAgentRequest {
+            name: "  \t\n  ".into(),
+            agent_type: None,
+            custom_agent_id: None,
+            model: None,
+        };
+        let result = session.spawn_agent("lead-1", req).await;
+        match result {
+            Err(TeamError::InvalidRequest(msg)) => {
+                assert!(msg.contains("empty"), "unexpected message: {msg}");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_name_colliding_with_existing_agent() {
+        let session = start_session().await;
+        // `make_team()` already seeded an agent named "Worker". Any variant
+        // that normalizes to "worker" must be rejected.
+        let req = SpawnAgentRequest {
+            name: "  WORKER\t".into(),
+            agent_type: None,
+            custom_agent_id: None,
+            model: None,
+        };
+        let result = session.spawn_agent("lead-1", req).await;
+        match result {
+            Err(TeamError::InvalidRequest(msg)) => {
+                assert!(msg.contains("conflict"), "unexpected message: {msg}");
+                assert!(msg.contains("worker"), "expected normalized name in message: {msg}");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+        session.stop();
     }
 
     // -- D7a new method tests ------------------------------------------------
