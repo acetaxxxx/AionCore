@@ -10,7 +10,7 @@ use crate::acp_protocol::{AcpProtocol, PermissionDecision, PermissionRequest};
 use crate::acp_runtime_snapshot::AcpRuntimeSnapshot;
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, CancelNotification, ContentBlock, EnvVariable,
-    LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
+    HttpHeader, LoadSessionRequest, McpServer, McpServerHttp, NewSessionRequest, PromptRequest,
     SessionConfigOption, SessionId, SessionModeState, SessionModelState,
     SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
 };
@@ -116,25 +116,20 @@ fn build_new_session_request(
 /// logic is inlined here rather than reused because `aionui-team` already
 /// depends on this crate, so importing the spec would cycle. Both sides
 /// derive `name` from `cfg.team_id` (phase1 interface-contracts §3).
-fn team_mcp_server(cfg: &TeamMcpStdioConfig, backend_binary_path: &std::path::Path) -> McpServer {
-    let env = vec![
-        EnvVariable::new(
-            TeamMcpStdioConfig::ENV_PORT.to_owned(),
-            cfg.port.to_string(),
-        ),
-        EnvVariable::new(TeamMcpStdioConfig::ENV_TOKEN.to_owned(), cfg.token.clone()),
-        EnvVariable::new(
-            TeamMcpStdioConfig::ENV_SLOT_ID.to_owned(),
-            cfg.slot_id.clone(),
-        ),
+fn team_mcp_server(cfg: &TeamMcpStdioConfig, _backend_binary_path: &std::path::Path) -> McpServer {
+    // Use HTTP transport — claude-agent-acp supports http and actively
+    // connects to it (unlike stdio which has spawn/init timing issues).
+    let url = format!("http://127.0.0.1:{}", cfg.port);
+    let headers = vec![
+        HttpHeader::new("Authorization".to_owned(), format!("Bearer {}", cfg.token)),
+        HttpHeader::new("X-Slot-Id".to_owned(), cfg.slot_id.clone()),
     ];
-    let stdio = McpServerStdio::new(
+    let http = McpServerHttp::new(
         format!("aionui-team-{}", cfg.team_id),
-        backend_binary_path.to_path_buf(),
+        url,
     )
-    .args(vec!["mcp-bridge".to_owned()])
-    .env(env);
-    McpServer::Stdio(stdio)
+    .headers(headers);
+    McpServer::Http(http)
 }
 
 /// Internal state that changes at runtime.
@@ -517,6 +512,11 @@ impl AcpAgentManager {
             &self.workspace,
             &self.config,
             self.backend_binary_path.as_path(),
+        );
+        tracing::info!(
+            has_team_mcp = self.config.team_mcp_stdio_config.is_some(),
+            mcp_servers_count = req.mcp_servers.len(),
+            "session_new_and_prompt: sending session/new"
         );
         let session_response = self
             .protocol

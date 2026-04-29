@@ -87,7 +87,7 @@ impl TeamSession {
     pub fn mcp_stdio_config(&self, slot_id: &str) -> TeamMcpStdioConfig {
         TeamMcpStdioConfig {
             team_id: self.team.id.clone(),
-            port: self.mcp_server.port(),
+            port: self.mcp_server.http_port(),
             token: self.mcp_server.auth_token().to_owned(),
             slot_id: slot_id.to_owned(),
         }
