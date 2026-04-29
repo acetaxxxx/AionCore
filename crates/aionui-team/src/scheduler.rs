@@ -690,6 +690,68 @@ impl TeammateManager {
         Ok(self.find_lead_slot_id().await)
     }
 
+    /// Handle a teammate that went silent for longer than the wake-timeout
+    /// window (see [`WAKE_TIMEOUT_MS`]).
+    ///
+    /// This is invoked by the inactivity watchdog spawned in W4-D18b-2: when
+    /// no stream chunk arrives for the slot within the timeout window, the
+    /// watchdog calls this handler to recover local state. It mirrors the
+    /// bookkeeping performed by crash recovery (status + locks + timeouts)
+    /// but does not emit a crash testament — the diagnosis is different
+    /// (inactivity, not process death) and the message routes through the
+    /// normal mailbox channel so the lead sees it like any other teammate
+    /// update.
+    ///
+    /// Flow:
+    /// 1. Transition the slot to [`TeammateStatus::Error`] — mirrors how
+    ///    crash recovery marks terminal failure. A stuck agent is useless
+    ///    to the team until the lead intervenes.
+    /// 2. Release the wake lock — the watchdog itself acquired it when
+    ///    starting the turn, and nothing else will release it now.
+    /// 3. Clear the wake timeout entry — this handler is the timer's own
+    ///    body, so the stored `JoinHandle` is already about to complete,
+    ///    but removing it keeps the map bounded.
+    /// 4. If the stuck slot is a teammate, write a diagnostic message to
+    ///    the lead mailbox and return the lead slot id so the caller can
+    ///    wake the lead. If the stuck slot is the lead itself, there is
+    ///    nobody to notify or wake — return `None` and stop.
+    pub async fn handle_inactivity_timeout(&self, slot_id: &str) -> Result<Option<String>, TeamError> {
+        let (agent_name, is_lead) = {
+            let slots = self.slots.lock().await;
+            let slot = slots
+                .get(slot_id)
+                .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+            (slot.agent.name.clone(), slot.agent.role == TeammateRole::Lead)
+        };
+
+        self.set_status(slot_id, TeammateStatus::Error).await?;
+        self.release_wake_lock(slot_id);
+        self.clear_wake_timeout(slot_id);
+
+        if is_lead {
+            return Ok(None);
+        }
+
+        let Some(lead_slot_id) = self.find_lead_slot_id().await else {
+            return Ok(None);
+        };
+        let message = format!(
+            "Teammate '{}' timed out after 60s of inactivity. Please investigate.",
+            agent_name
+        );
+        self.mailbox
+            .write(
+                &self.team_id,
+                &lead_slot_id,
+                slot_id,
+                MailboxMessageType::Message,
+                &message,
+                None,
+            )
+            .await?;
+        Ok(Some(lead_slot_id))
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -2309,5 +2371,130 @@ mod tests {
         let result = mgr.handle_agent_crash("ghost", CrashReason::ProcessExited, None).await;
 
         assert!(matches!(result, Err(TeamError::AgentNotFound(_))));
+    }
+
+    // -- W4-D22: handle_inactivity_timeout -------------------------------------
+
+    #[tokio::test]
+    async fn handle_inactivity_timeout_teammate_marks_error_and_wakes_lead() {
+        let agents = make_team_agents();
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Arc::new(Mailbox::new(repo.clone()));
+        let task_board = Arc::new(TaskBoard::new(repo));
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
+        let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+
+        mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
+
+        let wake_target = mgr.handle_inactivity_timeout("worker-1").await.unwrap();
+
+        assert_eq!(
+            mgr.get_status("worker-1").await.unwrap(),
+            TeammateStatus::Error,
+            "stuck slot must end in Error"
+        );
+        assert_eq!(wake_target, Some("lead-1".to_string()));
+
+        let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(lead_msgs.len(), 1);
+        assert_eq!(lead_msgs[0].from_agent_id, "worker-1");
+        assert_eq!(lead_msgs[0].msg_type, MailboxMessageType::Message);
+        assert!(lead_msgs[0].content.contains("Worker1"));
+        assert!(lead_msgs[0].content.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn handle_inactivity_timeout_leader_returns_none_no_mailbox_write() {
+        let agents = make_team_agents();
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Arc::new(Mailbox::new(repo.clone()));
+        let task_board = Arc::new(TaskBoard::new(repo));
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
+        let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+
+        mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
+        assert!(mgr.acquire_wake_lock("lead-1"));
+
+        let wake_target = mgr.handle_inactivity_timeout("lead-1").await.unwrap();
+
+        assert_eq!(wake_target, None, "leader inactivity must not self-wake");
+        assert_eq!(mgr.get_status("lead-1").await.unwrap(), TeammateStatus::Error);
+        assert!(
+            mgr.acquire_wake_lock("lead-1"),
+            "lock must be released even when leader stuck"
+        );
+
+        let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
+        assert!(
+            lead_msgs.is_empty(),
+            "leader must not receive a self-addressed timeout message"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_inactivity_timeout_releases_wake_lock() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        assert!(mgr.acquire_wake_lock("worker-1"));
+
+        mgr.handle_inactivity_timeout("worker-1").await.unwrap();
+
+        assert!(
+            mgr.acquire_wake_lock("worker-1"),
+            "wake lock must be released after inactivity timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_inactivity_timeout_clears_wake_timeout_entry() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(999)).await;
+        });
+        mgr.wake_timeouts.insert("worker-1".into(), handle);
+
+        mgr.handle_inactivity_timeout("worker-1").await.unwrap();
+
+        assert!(
+            mgr.wake_timeouts.get("worker-1").is_none(),
+            "wake timeout entry must be removed after inactivity recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_inactivity_timeout_unknown_slot_errors() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+
+        let result = mgr.handle_inactivity_timeout("ghost").await;
+
+        assert!(matches!(result, Err(TeamError::AgentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn handle_inactivity_timeout_no_lead_returns_none() {
+        // Team with no lead: a stuck teammate has nowhere to route the
+        // diagnostic message. The handler must still clean local state
+        // and must not panic or return an error.
+        let agents = vec![
+            make_agent("worker-1", "Worker1", TeammateRole::Teammate),
+            make_agent("worker-2", "Worker2", TeammateRole::Teammate),
+        ];
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Arc::new(Mailbox::new(repo.clone()));
+        let task_board = Arc::new(TaskBoard::new(repo));
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
+        let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+
+        let wake_target = mgr.handle_inactivity_timeout("worker-1").await.unwrap();
+
+        assert_eq!(wake_target, None);
+        assert_eq!(mgr.get_status("worker-1").await.unwrap(), TeammateStatus::Error);
+
+        let msgs2 = mailbox.read_unread("t1", "worker-2").await.unwrap();
+        assert!(msgs2.is_empty());
     }
 }
