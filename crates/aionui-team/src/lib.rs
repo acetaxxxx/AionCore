@@ -2,6 +2,7 @@
 pub mod crash_detection;
 pub mod error;
 pub mod events;
+pub mod guide;
 pub mod mailbox;
 pub mod mcp;
 pub mod prompts;
