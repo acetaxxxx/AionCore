@@ -18,6 +18,7 @@ pub mod types;
 pub use crash_detection::{CrashReason, detect_crash, is_rate_limited};
 pub use error::TeamError;
 pub use events::TeamEventEmitter;
+pub use guide::GuideMcpServer;
 pub use mailbox::Mailbox;
 pub use mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
