@@ -27,6 +27,16 @@ pub struct WakeInput {
     pub should_send: bool,
 }
 
+/// Input for [`TeamSession::spawn_agent`]. Populated by the lead agent when
+/// it calls the `spawn_agent` MCP tool.
+#[derive(Debug, Clone)]
+pub struct SpawnAgentRequest {
+    pub name: String,
+    pub agent_type: Option<String>,
+    pub custom_agent_id: Option<String>,
+    pub model: Option<String>,
+}
+
 pub struct TeamSession {
     team: Team,
     scheduler: Arc<TeammateManager>,
@@ -307,6 +317,10 @@ impl TeamSession {
 
     pub async fn rename_agent(&self, slot_id: &str, new_name: &str) -> Result<(), TeamError> {
         self.scheduler.rename_agent(slot_id, new_name).await
+    }
+
+    pub async fn spawn_agent(&self, _caller_slot_id: &str, _req: SpawnAgentRequest) -> Result<TeamAgent, TeamError> {
+        todo!("W5-D29a-2..D29d will fill in the implementation")
     }
 
     pub fn stop(&self) {
