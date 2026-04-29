@@ -118,16 +118,18 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut reader = BufReader::new(stdin);
-    loop {
-        // MCP stdio transport: Content-Length header + \r\n\r\n + body
-        let body = match read_mcp_stdio_message(&mut reader).await {
-            Ok(Some(b)) => b,
-            Ok(None) => return Ok(()), // EOF
-            Err(e) => return Err(e),
-        };
-
-        let mut value: Value = serde_json::from_slice(&body)
+    let mut lines = BufReader::new(stdin).lines();
+    eprintln!("[mcp-bridge] stdin loop started, waiting for messages...");
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("stdin read error: {e}"))?
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        eprintln!("[mcp-bridge] stdin received: {}", &line[..line.len().min(200)]);
+        let mut value: Value = serde_json::from_str(&line)
             .map_err(|e| format!("stdin payload is not valid JSON: {e}"))?;
 
         if value.get("method").and_then(Value::as_str) == Some("initialize") {
@@ -139,7 +141,10 @@ where
         write_frame(&mut tcp_writer, &bytes)
             .await
             .map_err(|e| format!("tcp write error: {e}"))?;
+        eprintln!("[mcp-bridge] forwarded to TCP ({} bytes)", bytes.len());
     }
+    eprintln!("[mcp-bridge] stdin EOF");
+    Ok(())
 }
 
 /// Read one MCP stdio message (Content-Length framing).
@@ -206,17 +211,19 @@ where
     loop {
         let frame = match read_frame(&mut tcp_reader).await {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                eprintln!("[mcp-bridge] TCP EOF");
+                return Ok(());
+            }
             Err(e) => return Err(format!("tcp read error: {e}")),
         };
-        // MCP stdio transport: Content-Length header + \r\n\r\n + body
-        let header = format!("Content-Length: {}\r\n\r\n", frame.len());
+        eprintln!("[mcp-bridge] TCP→stdout: {} bytes", frame.len());
         stdout
-            .write_all(header.as_bytes())
+            .write_all(&frame)
             .await
             .map_err(|e| format!("stdout write error: {e}"))?;
         stdout
-            .write_all(&frame)
+            .write_all(b"\n")
             .await
             .map_err(|e| format!("stdout write error: {e}"))?;
         stdout
