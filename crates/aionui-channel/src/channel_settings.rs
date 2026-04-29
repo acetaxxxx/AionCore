@@ -110,42 +110,6 @@ impl ChannelSettingsService {
         }))
     }
 
-    /// Persists agent and model configuration for a platform.
-    ///
-    /// Writes to `client_preferences` using the same key format as the frontend.
-    pub async fn save_settings(
-        &self,
-        platform: PluginType,
-        agent: &aionui_api_types::ChannelAgentConfig,
-        model: Option<&aionui_api_types::ChannelModelConfig>,
-    ) -> Result<(), ChannelError> {
-        let mut entries: Vec<(String, String)> = Vec::new();
-
-        let agent_value = serde_json::json!({
-            "backend": agent.backend,
-            "name": agent.name,
-            "customAgentId": agent.custom_agent_id,
-        });
-        entries.push((agent_key(platform), agent_value.to_string()));
-
-        if let Some(m) = model {
-            let model_value = serde_json::json!({
-                "id": m.id,
-                "useModel": m.use_model,
-            });
-            entries.push((model_key(platform), model_value.to_string()));
-        }
-
-        let refs: Vec<(&str, &str)> = entries
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        self.pref_repo.upsert_batch(&refs).await?;
-
-        debug!(platform = %platform, "channel settings saved");
-        Ok(())
-    }
 }
 
 fn agent_key(platform: PluginType) -> String {
@@ -200,7 +164,6 @@ pub fn resolved_model_to_provider(model: Option<&ResolvedModelConfig>) -> Provid
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_api_types::{ChannelAgentConfig, ChannelModelConfig};
     use aionui_db::DbError;
     use aionui_db::models::ClientPreference;
     use std::sync::Mutex;
@@ -393,56 +356,6 @@ mod tests {
 
         let config = svc.get_model_config(PluginType::Telegram).await.unwrap();
         assert!(config.is_none());
-    }
-
-    // ── save_settings ─────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn save_settings_persists_agent_and_model() {
-        let repo = Arc::new(MockPrefRepo::new());
-        let svc = ChannelSettingsService::new(repo.clone());
-
-        let agent = ChannelAgentConfig {
-            backend: "gemini".into(),
-            custom_agent_id: None,
-            name: Some("Gemini".into()),
-        };
-        let model = ChannelModelConfig {
-            id: "provider_1".into(),
-            use_model: "gpt-5".into(),
-        };
-
-        svc.save_settings(PluginType::Telegram, &agent, Some(&model))
-            .await
-            .unwrap();
-
-        let data = repo.data.lock().unwrap();
-        assert_eq!(data.len(), 2);
-        assert!(data.iter().any(|(k, _)| k == "assistant.telegram.agent"));
-        assert!(
-            data.iter()
-                .any(|(k, _)| k == "assistant.telegram.defaultModel")
-        );
-    }
-
-    #[tokio::test]
-    async fn save_settings_agent_only() {
-        let repo = Arc::new(MockPrefRepo::new());
-        let svc = ChannelSettingsService::new(repo.clone());
-
-        let agent = ChannelAgentConfig {
-            backend: "claude".into(),
-            custom_agent_id: None,
-            name: Some("Claude".into()),
-        };
-
-        svc.save_settings(PluginType::Lark, &agent, None)
-            .await
-            .unwrap();
-
-        let data = repo.data.lock().unwrap();
-        assert_eq!(data.len(), 1);
-        assert!(data.iter().any(|(k, _)| k == "assistant.lark.agent"));
     }
 
     // ── resolved_model_to_provider ────────────────────────────────────

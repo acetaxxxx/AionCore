@@ -299,32 +299,25 @@ async fn get_active_sessions(
 // Settings sync handler
 // ---------------------------------------------------------------------------
 
-/// `POST /api/channel/settings/sync` — sync agent/model config to a plugin.
+/// `POST /api/channel/settings/sync` — invalidate channel sessions.
 ///
-/// Writes agent/model configuration to `client_preferences` and clears
-/// existing sessions for the platform so new sessions pick up the config.
+/// Clears all sessions so they are recreated with the latest
+/// agent/model configuration on the next incoming message.
+/// Agent/model config is persisted separately via `PUT /api/settings/client`.
 async fn sync_channel_settings(
     State(state): State<ChannelRouterState>,
     body: Result<Json<SyncChannelSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
 
-    let platform = PluginType::from_str_opt(&req.platform)
+    let _platform = PluginType::from_str_opt(&req.platform)
         .ok_or_else(|| AppError::BadRequest(format!("Invalid platform: {}", req.platform)))?;
 
-    state
-        .settings_service
-        .save_settings(platform, &req.agent, req.model.as_ref())
-        .await
-        .map_err(AppError::from)?;
-
-    // Clear all sessions so they pick up the new agent/model on next message.
-    // Sessions are lazily recreated with the updated config.
     state.session_manager.clear_all_sessions().await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
-        message: Some(format!("Settings synced for {}", req.platform)),
+        message: Some(format!("Sessions cleared for {}", req.platform)),
         error: None,
     })))
 }
