@@ -26,6 +26,9 @@ pub enum TeamError {
     #[error("Backend not allowed: {0}")]
     BackendNotAllowed(String),
 
+    #[error("Agent name already taken: {0}")]
+    DuplicateAgentName(String),
+
     #[error("{0}")]
     Database(#[from] aionui_db::DbError),
 
@@ -44,6 +47,7 @@ impl From<TeamError> for AppError {
             TeamError::SessionNotFound(msg) => AppError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => AppError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => AppError::BadRequest(msg),
+            TeamError::DuplicateAgentName(msg) => AppError::BadRequest(format!("Agent name already taken: {msg}")),
             TeamError::Database(db_err) => AppError::from(db_err),
             TeamError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
         }
@@ -100,6 +104,12 @@ mod tests {
     fn backend_not_allowed_maps_to_bad_request() {
         let err: AppError = TeamError::BackendNotAllowed("gemini".into()).into();
         assert!(matches!(err, AppError::BadRequest(msg) if msg == "gemini"));
+    }
+
+    #[test]
+    fn duplicate_agent_name_maps_to_bad_request() {
+        let err: AppError = TeamError::DuplicateAgentName("alice".into()).into();
+        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("alice")));
     }
 
     #[test]

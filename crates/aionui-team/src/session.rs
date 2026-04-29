@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::{IWorkerTaskManager, SendMessageData};
 use aionui_common::{AgentKillReason, generate_id};
@@ -12,6 +12,7 @@ use crate::mailbox::Mailbox;
 use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use crate::scheduler::{TeammateManager, normalize_name};
+use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 
@@ -45,6 +46,14 @@ pub struct TeamSession {
     mcp_server: TeamMcpServer,
     backend_binary_path: Arc<PathBuf>,
     task_manager: Arc<dyn IWorkerTaskManager>,
+    /// Owner user_id for this team — needed when spawn_agent creates a
+    /// new conversation (conversations are scoped per user).
+    user_id: String,
+    /// Weak upward ref so `spawn_agent` can reach the DB-facing orchestration
+    /// in `TeamSessionService` (conversation creation, persisted agent list)
+    /// without creating a strong cycle with the session map that owns `self`.
+    /// `None` in unit tests that don't exercise the DB path.
+    service: Weak<TeamSessionService>,
 }
 
 impl TeamSession {
@@ -54,6 +63,8 @@ impl TeamSession {
         broadcaster: Arc<dyn EventBroadcaster>,
         backend_binary_path: Arc<PathBuf>,
         task_manager: Arc<dyn IWorkerTaskManager>,
+        user_id: String,
+        service: Weak<TeamSessionService>,
     ) -> Result<Self, TeamError> {
         let mailbox = Arc::new(Mailbox::new(repo.clone()));
         let task_board = Arc::new(TaskBoard::new(repo));
@@ -83,6 +94,8 @@ impl TeamSession {
             mcp_server,
             backend_binary_path,
             task_manager,
+            user_id,
+            service,
         })
     }
 
@@ -331,42 +344,150 @@ impl TeamSession {
         self.scheduler.rename_agent(slot_id, new_name).await
     }
 
+    /// Spawn a new teammate at the Lead's request (backing of `team_spawn_agent`).
+    ///
+    /// Validation chain mirrors the phase1 interface contract:
+    /// 1. Caller must exist and carry `TeammateRole::Lead`.
+    /// 2. `name` is normalized and must not collide with any live agent.
+    /// 3. `agent_type` (falling back to the caller's backend when unset) must
+    ///    be in the spawn whitelist.
+    ///
+    /// On success, a new conversation is created, the agent slot is persisted
+    /// into the team row, the MCP stdio config is written into the conversation
+    /// extras, the agent task is launched, and a welcome message is dropped
+    /// into the new mailbox so the first wake reaches the spawned teammate
+    /// with its role prompt.
     pub async fn spawn_agent(&self, caller_slot_id: &str, req: SpawnAgentRequest) -> Result<TeamAgent, TeamError> {
-        // Step 1: caller must be a Lead. The MCP dispatch layer also gates
-        // this, but spawn_agent is exposed on TeamSession so any call site
-        // (including future direct service callers) must re-check.
+        // Step 1: caller must be a Lead. MCP dispatch already gates by role,
+        // but this method is exposed on TeamSession so every entry point
+        // (including future direct service callers) re-checks.
         let caller = self.scheduler.get_agent(caller_slot_id).await?;
         if caller.role != TeammateRole::Lead {
             return Err(TeamError::LeaderOnly("spawn_agent".into()));
         }
 
-        // Step 2: normalize the requested name + uniqueness check against
-        // existing agents. See interface-contracts §15.1 for the rules.
-        let normalized = normalize_name(&req.name);
+        // Step 2: normalize + uniqueness check against live scheduler state.
+        let requested_name = req.name.trim().to_owned();
+        if requested_name.is_empty() {
+            return Err(TeamError::InvalidRequest("spawn_agent.name must not be empty".into()));
+        }
+        let normalized = normalize_name(&requested_name);
         if normalized.is_empty() {
             return Err(TeamError::InvalidRequest(
-                "agent name cannot be empty after normalization".into(),
+                "spawn_agent.name is empty after normalization".into(),
             ));
         }
         let existing = self.scheduler.list_agents().await;
         if existing.iter().any(|a| normalize_name(&a.name) == normalized) {
-            return Err(TeamError::InvalidRequest(format!("agent name conflict: {normalized}")));
+            return Err(TeamError::DuplicateAgentName(requested_name));
         }
 
-        // Step 3: backend whitelist — inherit caller's backend when the
-        // request does not specify, otherwise validate against the allowed set.
+        // Step 3: backend whitelist. Empty/missing agent_type inherits from
+        // the caller. The whitelist is intentionally narrow to match the
+        // phase1 spawn scope — widen only via a contract change.
         const SPAWN_BACKEND_WHITELIST: &[&str] = &["claude", "codex"];
         let backend = req
             .agent_type
             .as_deref()
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(caller.backend.as_str());
-        if !SPAWN_BACKEND_WHITELIST.contains(&backend) {
-            return Err(TeamError::BackendNotAllowed(backend.to_owned()));
+            .unwrap_or(caller.backend.as_str())
+            .to_owned();
+        if !SPAWN_BACKEND_WHITELIST.contains(&backend.as_str()) {
+            return Err(TeamError::BackendNotAllowed(backend));
         }
 
-        let _ = req;
-        todo!("W5-D29a-4..D29d will fill in the remaining spawn steps")
+        // Step 4: DB side-effects (new conversation + persisted agent slot)
+        // happen inside TeamSessionService where the conversation service and
+        // the per-team add_agent lock live. Unit tests with no service wire
+        // cannot reach this path.
+        let service = self
+            .service
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("spawn_agent requires a live TeamSessionService".into()))?;
+
+        let model = req.model.as_deref().unwrap_or(&caller.model).to_owned();
+        let new_agent = service
+            .persist_spawned_agent(
+                &self.team.id,
+                &self.user_id,
+                requested_name,
+                backend,
+                model,
+                req.custom_agent_id.clone(),
+            )
+            .await?;
+
+        // Step 5: attach to the in-memory scheduler so wake-from-lead finds
+        // the new slot immediately.
+        self.scheduler.add_agent(&new_agent).await;
+
+        // Step 6: push the team MCP stdio config into the new conversation's
+        // extras, then kill + rebuild the agent task so the freshly spawned
+        // process boots with the MCP handshake pointing at our session.
+        if let Err(err) = self.attach_spawned_agent_process(&service, &new_agent).await {
+            warn!(
+                team_id = %self.team.id,
+                slot_id = %new_agent.slot_id,
+                error = %err,
+                "failed to attach spawned agent process; agent is persisted but not yet running"
+            );
+        }
+
+        // Step 7: welcome message. The mailbox write is the source of truth —
+        // if the wake never fires (e.g. warmup raced), the next caller-triggered
+        // wake will still drain this entry.
+        self.mailbox
+            .write(
+                &self.team.id,
+                &new_agent.slot_id,
+                caller_slot_id,
+                MailboxMessageType::Message,
+                "You have been spawned as a teammate. Read your mailbox and wait for instructions.",
+                None,
+            )
+            .await?;
+
+        Ok(new_agent)
+    }
+
+    /// Persist the team MCP stdio config into the spawned agent's conversation
+    /// row, then kill any pre-existing task and warm up the new one.
+    async fn attach_spawned_agent_process(
+        &self,
+        service: &TeamSessionService,
+        agent: &TeamAgent,
+    ) -> Result<(), TeamError> {
+        let cfg = self.mcp_stdio_config(&agent.slot_id);
+        let patch = serde_json::json!({ "team_mcp_stdio_config": cfg });
+
+        service
+            .conversation_service_ref()
+            .update_extra(&agent.conversation_id, patch)
+            .await
+            .map_err(|e| {
+                TeamError::InvalidRequest(format!(
+                    "failed to persist team_mcp_stdio_config for {}: {e}",
+                    agent.slot_id
+                ))
+            })?;
+
+        let _ = self
+            .task_manager
+            .kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild));
+
+        service
+            .conversation_service_ref()
+            .warmup(&self.user_id, &agent.conversation_id, &self.task_manager)
+            .await
+            .map_err(|e| {
+                TeamError::InvalidRequest(format!(
+                    "failed to warm up spawned agent {}: {e}",
+                    agent.conversation_id
+                ))
+            })?;
+
+        Ok(())
     }
 
     pub fn stop(&self) {
@@ -615,9 +736,17 @@ mod tests {
     async fn start_session() -> TeamSession {
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        TeamSession::start(make_team(), repo, broadcaster, backend_path(), empty_task_manager())
-            .await
-            .unwrap()
+        TeamSession::start(
+            make_team(),
+            repo,
+            broadcaster,
+            backend_path(),
+            empty_task_manager(),
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -654,9 +783,17 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let repo_dyn: Arc<dyn ITeamRepository> = repo.clone();
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        let session = TeamSession::start(make_team(), repo_dyn, broadcaster, backend_path(), empty_task_manager())
-            .await
-            .unwrap();
+        let session = TeamSession::start(
+            make_team(),
+            repo_dyn,
+            broadcaster,
+            backend_path(),
+            empty_task_manager(),
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap();
         session.send_message("Hello team", None).await.unwrap();
 
         let state = repo.state.lock().unwrap();
@@ -672,9 +809,17 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let repo_dyn: Arc<dyn ITeamRepository> = repo.clone();
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        let session = TeamSession::start(make_team(), repo_dyn, broadcaster, backend_path(), empty_task_manager())
-            .await
-            .unwrap();
+        let session = TeamSession::start(
+            make_team(),
+            repo_dyn,
+            broadcaster,
+            backend_path(),
+            empty_task_manager(),
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap();
         session
             .send_message_to_agent("worker-1", "Do this task", None)
             .await
@@ -731,9 +876,17 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         let stub = Arc::new(StubTaskManager::new());
         let stub_dyn: Arc<dyn IWorkerTaskManager> = stub.clone();
-        let session = TeamSession::start(make_team(), repo, broadcaster, backend_path(), stub_dyn)
-            .await
-            .unwrap();
+        let session = TeamSession::start(
+            make_team(),
+            repo,
+            broadcaster,
+            backend_path(),
+            stub_dyn,
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap();
 
         session.remove_agent("worker-1").await.unwrap();
 
@@ -753,9 +906,17 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         let stub = Arc::new(StubTaskManager::with_kill_error("task not found"));
         let stub_dyn: Arc<dyn IWorkerTaskManager> = stub.clone();
-        let session = TeamSession::start(make_team(), repo, broadcaster, backend_path(), stub_dyn)
-            .await
-            .unwrap();
+        let session = TeamSession::start(
+            make_team(),
+            repo,
+            broadcaster,
+            backend_path(),
+            stub_dyn,
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap();
 
         // kill returns Err(AppError::NotFound) but remove_agent must still
         // succeed — NotFound means the worker already died, which is OK.
@@ -786,7 +947,7 @@ mod tests {
         session.stop();
     }
 
-    // -- W5-D29a-2: spawn_agent caller guard --------------------------------
+    // -- spawn_agent helpers + guard tests -----------------------------------
 
     fn sample_spawn_req() -> SpawnAgentRequest {
         SpawnAgentRequest {
@@ -798,17 +959,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_rejects_non_lead_caller() {
-        let session = start_session().await;
-        let result = session.spawn_agent("worker-1", sample_spawn_req()).await;
-        assert!(
-            matches!(&result, Err(TeamError::LeaderOnly(msg)) if msg == "spawn_agent"),
-            "non-lead caller must be rejected with LeaderOnly, got {result:?}"
-        );
-        session.stop();
-    }
-
-    #[tokio::test]
     async fn spawn_agent_rejects_unknown_caller() {
         let session = start_session().await;
         let result = session.spawn_agent("nonexistent", sample_spawn_req()).await;
@@ -816,61 +966,6 @@ mod tests {
             matches!(&result, Err(TeamError::AgentNotFound(_))),
             "unknown caller must surface AgentNotFound, got {result:?}"
         );
-        session.stop();
-    }
-
-    // Lead caller is expected to pass the caller guard and the name check
-    // (sample_spawn_req uses "Helper", which does not collide) and hit the
-    // todo!() for subsequent slices (W5-D29a-4..D29d). This pins that the
-    // guards do not over-reject a legitimate Lead caller.
-    #[tokio::test]
-    #[should_panic(expected = "W5-D29a-4..D29d")]
-    async fn spawn_agent_lead_caller_passes_guard() {
-        let session = start_session().await;
-        let _ = session.spawn_agent("lead-1", sample_spawn_req()).await;
-    }
-
-    // -- W5-D29a-3: spawn_agent name normalize + uniqueness ------------------
-
-    #[tokio::test]
-    async fn spawn_agent_rejects_empty_name_after_normalization() {
-        let session = start_session().await;
-        // All-whitespace + control chars normalizes to empty.
-        let req = SpawnAgentRequest {
-            name: "  \t\n  ".into(),
-            agent_type: None,
-            custom_agent_id: None,
-            model: None,
-        };
-        let result = session.spawn_agent("lead-1", req).await;
-        match result {
-            Err(TeamError::InvalidRequest(msg)) => {
-                assert!(msg.contains("empty"), "unexpected message: {msg}");
-            }
-            other => panic!("expected InvalidRequest, got {other:?}"),
-        }
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_rejects_name_colliding_with_existing_agent() {
-        let session = start_session().await;
-        // `make_team()` already seeded an agent named "Worker". Any variant
-        // that normalizes to "worker" must be rejected.
-        let req = SpawnAgentRequest {
-            name: "  WORKER\t".into(),
-            agent_type: None,
-            custom_agent_id: None,
-            model: None,
-        };
-        let result = session.spawn_agent("lead-1", req).await;
-        match result {
-            Err(TeamError::InvalidRequest(msg)) => {
-                assert!(msg.contains("conflict"), "unexpected message: {msg}");
-                assert!(msg.contains("worker"), "expected normalized name in message: {msg}");
-            }
-            other => panic!("expected InvalidRequest, got {other:?}"),
-        }
         session.stop();
     }
 
@@ -1012,9 +1107,17 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let repo_dyn: Arc<dyn ITeamRepository> = repo.clone();
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        let session = TeamSession::start(make_team(), repo_dyn, broadcaster, backend_path(), task_manager)
-            .await
-            .unwrap();
+        let session = TeamSession::start(
+            make_team(),
+            repo_dyn,
+            broadcaster,
+            backend_path(),
+            task_manager,
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap();
         (session, repo)
     }
 
@@ -1107,9 +1210,17 @@ mod tests {
         team.agents[0].backend = backend.to_string();
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        TeamSession::start(team, repo, broadcaster, backend_path(), empty_task_manager())
-            .await
-            .unwrap()
+        TeamSession::start(
+            team,
+            repo,
+            broadcaster,
+            backend_path(),
+            empty_task_manager(),
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap()
     }
 
     fn spawn_req(agent_type: Option<&str>) -> SpawnAgentRequest {
@@ -1121,18 +1232,37 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[should_panic(expected = "W5-D29a")]
-    async fn spawn_agent_accepts_claude_backend() {
-        let session = start_session_with_lead_backend("claude").await;
-        let _ = session.spawn_agent("lead-1", spawn_req(Some("claude"))).await;
+    /// After all guards pass, the unit-test sessions have a null `service`
+    /// Weak — so the spawn path must bail with InvalidRequest instead of
+    /// panicking. This is the "validation passed, DB step not reachable"
+    /// shape exercised below.
+    fn assert_reached_db_step(err: TeamError) {
+        match err {
+            TeamError::InvalidRequest(msg) if msg.contains("live TeamSessionService") => {}
+            other => panic!("expected service-unavailable error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    #[should_panic(expected = "W5-D29a")]
+    async fn spawn_agent_accepts_claude_backend() {
+        let session = start_session_with_lead_backend("claude").await;
+        let err = session
+            .spawn_agent("lead-1", spawn_req(Some("claude")))
+            .await
+            .expect_err("unit test has no service wire; spawn stops at DB step");
+        assert_reached_db_step(err);
+        session.stop();
+    }
+
+    #[tokio::test]
     async fn spawn_agent_accepts_codex_backend() {
         let session = start_session_with_lead_backend("claude").await;
-        let _ = session.spawn_agent("lead-1", spawn_req(Some("codex"))).await;
+        let err = session
+            .spawn_agent("lead-1", spawn_req(Some("codex")))
+            .await
+            .expect_err("unit test has no service wire; spawn stops at DB step");
+        assert_reached_db_step(err);
+        session.stop();
     }
 
     #[tokio::test]
@@ -1150,12 +1280,16 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "W5-D29a")]
     async fn spawn_agent_inherits_caller_backend_when_unspecified() {
         // No agent_type on the request -> must fall back to the caller's
-        // backend ("claude"), which passes the whitelist and reaches todo!().
+        // backend ("claude"), which passes the whitelist.
         let session = start_session_with_lead_backend("claude").await;
-        let _ = session.spawn_agent("lead-1", spawn_req(None)).await;
+        let err = session
+            .spawn_agent("lead-1", spawn_req(None))
+            .await
+            .expect_err("unit test has no service wire; spawn stops at DB step");
+        assert_reached_db_step(err);
+        session.stop();
     }
 
     #[tokio::test]
@@ -1170,6 +1304,54 @@ mod tests {
         assert!(
             matches!(&err, TeamError::BackendNotAllowed(b) if b == "acp"),
             "expected BackendNotAllowed(\"acp\"), got {err:?}"
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_non_lead_caller() {
+        let session = start_session_with_lead_backend("claude").await;
+        let err = session
+            .spawn_agent("worker-1", spawn_req(Some("claude")))
+            .await
+            .expect_err("non-lead caller must be rejected");
+        assert!(
+            matches!(&err, TeamError::LeaderOnly(what) if what == "spawn_agent"),
+            "expected LeaderOnly(\"spawn_agent\"), got {err:?}"
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_duplicate_name() {
+        let session = start_session_with_lead_backend("claude").await;
+        // The seeded team already has an agent named "Worker". Case + trim
+        // normalization means "  worker " collides.
+        let mut req = spawn_req(Some("claude"));
+        req.name = "  worker ".into();
+        let err = session
+            .spawn_agent("lead-1", req)
+            .await
+            .expect_err("duplicate name must be rejected");
+        assert!(
+            matches!(&err, TeamError::DuplicateAgentName(_)),
+            "expected DuplicateAgentName, got {err:?}"
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_empty_name() {
+        let session = start_session_with_lead_backend("claude").await;
+        let mut req = spawn_req(Some("claude"));
+        req.name = "   ".into();
+        let err = session
+            .spawn_agent("lead-1", req)
+            .await
+            .expect_err("empty name must be rejected");
+        assert!(
+            matches!(&err, TeamError::InvalidRequest(msg) if msg.contains("empty")),
+            "expected InvalidRequest about empty name, got {err:?}"
         );
         session.stop();
     }
