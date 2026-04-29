@@ -442,16 +442,24 @@ impl TeammateManager {
     /// re-spawn (or a stale callback from the killed agent task) cannot be
     /// blocked by leftover wake locks, wake timeouts, or finalize-dedup
     /// entries. See [`Self::clear_agent_state`] for the state inventory.
-    pub async fn remove_agent(&self, slot_id: &str) -> Result<(), TeamError> {
+    ///
+    /// Returns the removed slot's `conversation_id` so the session layer can
+    /// terminate the underlying worker process via
+    /// `IWorkerTaskManager::kill` (W5-D30d-1). The scheduler does not own the
+    /// task manager, mirroring the delegation pattern used by
+    /// [`Self::handle_agent_crash`]: cross-crate side effects are handed back
+    /// to the session.
+    pub async fn remove_agent(&self, slot_id: &str) -> Result<Option<String>, TeamError> {
         let mut slots = self.slots.lock().await;
         let removed = slots
             .remove(slot_id)
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        let conversation_id = removed.agent.conversation_id.clone();
         drop(slots);
-        self.clear_agent_state(slot_id, &removed.agent.conversation_id);
+        self.clear_agent_state(slot_id, &conversation_id);
         self.events.broadcast_agent_removed(slot_id);
         debug!(team_id = %self.team_id, slot_id, "agent removed from scheduler");
-        Ok(())
+        Ok(Some(conversation_id))
     }
 
     /// Clear all scheduler-side state associated with a removed agent.
@@ -1201,7 +1209,8 @@ mod tests {
         let agents = make_team_agents();
         let (mgr, bc) = make_manager(&agents);
 
-        mgr.remove_agent("worker-2").await.unwrap();
+        let conv_id = mgr.remove_agent("worker-2").await.unwrap();
+        assert_eq!(conv_id.as_deref(), Some("conv-worker-2"));
 
         let all = mgr.list_agents().await;
         assert_eq!(all.len(), 2);
