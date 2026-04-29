@@ -123,10 +123,16 @@ impl ChannelMessageService {
         let model_config = self.settings.get_model_config(platform).await?;
         let model = resolved_model_to_provider(model_config.as_ref());
         let extra = Self::build_channel_extra(agent_config.backend.as_deref());
+        let name = channel_conversation_name(
+            platform,
+            &session.agent_type,
+            agent_config.backend.as_deref(),
+            session.chat_id.as_deref(),
+        );
 
         let req = CreateConversationRequest {
             r#type: agent_type,
-            name: None,
+            name: Some(name),
             model: Some(model),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
@@ -333,6 +339,37 @@ fn parse_agent_type(s: &str) -> AgentType {
             AgentType::Acp
         }
     }
+}
+
+fn channel_conversation_name(
+    platform: PluginType,
+    agent_type: &str,
+    backend: Option<&str>,
+    chat_id: Option<&str>,
+) -> String {
+    let short = match platform {
+        PluginType::Telegram => "tg",
+        PluginType::Lark => "lark",
+        PluginType::Dingtalk => "ding",
+        PluginType::Weixin => "wx",
+        PluginType::Slack => "slack",
+        PluginType::Discord => "discord",
+    };
+
+    let mut parts = vec![short.to_owned()];
+    if !agent_type.is_empty() {
+        parts.push(agent_type.to_owned());
+    }
+    if agent_type == "acp" {
+        if let Some(b) = backend {
+            parts.push(b.to_owned());
+        }
+    }
+    if let Some(cid) = chat_id {
+        let end = cid.len().min(8);
+        parts.push(cid[..end].to_owned());
+    }
+    parts.join("-")
 }
 
 #[cfg(test)]
@@ -549,5 +586,55 @@ mod tests {
         let extra = ChannelMessageService::build_channel_extra(Some("claude"));
         assert_eq!(extra["session_mode"], "yolo");
         assert_eq!(extra["backend"], "claude");
+    }
+
+    // ── channel_conversation_name ─────────────────────────────────────
+
+    #[test]
+    fn conv_name_telegram_acp_with_backend() {
+        let name =
+            channel_conversation_name(PluginType::Telegram, "acp", Some("claude"), Some("70880480"));
+        assert_eq!(name, "tg-acp-claude-70880480");
+    }
+
+    #[test]
+    fn conv_name_telegram_aionrs() {
+        let name =
+            channel_conversation_name(PluginType::Telegram, "aionrs", None, Some("70880480"));
+        assert_eq!(name, "tg-aionrs-70880480");
+    }
+
+    #[test]
+    fn conv_name_lark_acp_no_backend() {
+        let name = channel_conversation_name(PluginType::Lark, "acp", None, Some("abcdef12"));
+        assert_eq!(name, "lark-acp-abcdef12");
+    }
+
+    #[test]
+    fn conv_name_dingtalk_truncates_long_chat_id() {
+        let name = channel_conversation_name(
+            PluginType::Dingtalk,
+            "acp",
+            Some("vertex"),
+            Some("123456789abcdef"),
+        );
+        assert_eq!(name, "ding-acp-vertex-12345678");
+    }
+
+    #[test]
+    fn conv_name_weixin_no_chat_id() {
+        let name = channel_conversation_name(PluginType::Weixin, "acp", Some("gemini"), None);
+        assert_eq!(name, "wx-acp-gemini");
+    }
+
+    #[test]
+    fn conv_name_non_acp_ignores_backend() {
+        let name = channel_conversation_name(
+            PluginType::Telegram,
+            "aionrs",
+            Some("claude"),
+            Some("70880480"),
+        );
+        assert_eq!(name, "tg-aionrs-70880480");
     }
 }
