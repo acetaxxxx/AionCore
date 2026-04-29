@@ -132,26 +132,51 @@ fn compose_preset_context_with_team_guide(
     }
 }
 
+/// Backends for which solo conversations receive the Guide MCP server
+/// (W5 team-capable whitelist). Duplicated locally rather than imported
+/// from `aionui_team::guide::capability` because `aionui-team` already
+/// depends on this crate (see `team_mcp_server` below for the same
+/// rationale). The two lists must stay in sync until one side is hoisted
+/// into a shared crate.
+const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs"];
+
 /// Build a `NewSessionRequest` for `session/new`, injecting the team MCP
-/// stdio server when `config.team_mcp_stdio_config` is present.
+/// stdio server when `config.team_mcp_stdio_config` is present, or the
+/// Guide MCP server when the conversation is solo but the backend is
+/// team-capable.
 ///
-/// When the config is absent the returned payload is identical to the
-/// legacy single-chat path (`mcp_servers` empty), so solo conversations
-/// are unaffected.
+/// The two injections are mutually exclusive: a team session already has
+/// its own MCP server and does not need the Guide. A solo session on a
+/// non-team-capable backend gets neither, matching the legacy single-chat
+/// payload byte-for-byte.
 ///
 /// The stdio server follows the phase1 interface-contracts §3 shape:
 /// `command = backend_binary_path`, `args = ["mcp-bridge"]`, `env` =
 /// the three `TEAM_MCP_*` pairs defined on `TeamMcpStdioConfig`.
+///
+/// W5-D28c ships the guard only — the Guide MCP server itself (config
+/// type, port/token resolution) lands with D26a/D27, after which the
+/// `// TODO(D26a)` branch here will push an `McpServer::Http` onto
+/// `mcp_servers` instead of falling through.
 fn build_new_session_request(
     workspace: &str,
     config: &AcpBuildExtra,
     backend_binary_path: &std::path::Path,
 ) -> NewSessionRequest {
     let req = NewSessionRequest::new(workspace);
-    let Some(cfg) = config.team_mcp_stdio_config.as_ref() else {
+    if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
+        return req.mcp_servers(vec![team_mcp_server(cfg, backend_binary_path)]);
+    }
+    // Solo session: inject Guide only when the backend is team-capable.
+    if let Some(backend) = config.backend.as_deref()
+        && TEAM_CAPABLE_BACKENDS.contains(&backend)
+    {
+        // TODO(D26a): push `McpServer::Http` for the Guide server here,
+        // using the `GuideMcpConfig` (port + auth token) sourced from
+        // `AcpBuildExtra` once the Guide server lands.
         return req;
-    };
-    req.mcp_servers(vec![team_mcp_server(cfg, backend_binary_path)])
+    }
+    req
 }
 
 /// Translate a `TeamMcpStdioConfig` into the ACP SDK wire type expected by
@@ -1342,8 +1367,10 @@ mod tests {
 
     #[test]
     fn build_new_session_request_skips_mcp_servers_without_team_config() {
-        // Solo-chat path: no `team_mcp_stdio_config` → payload must stay
-        // byte-for-byte identical to the legacy `NewSessionRequest::new(cwd)`.
+        // Solo-chat path on a team-capable backend: no
+        // `team_mcp_stdio_config` and Guide injection is still pending
+        // D26a, so `mcp_servers` remains empty (matches the legacy
+        // single-chat payload byte-for-byte).
         let req = build_new_session_request(
             "/workspace",
             &build_extra_without_team(),
@@ -1353,6 +1380,61 @@ mod tests {
             req.mcp_servers.is_empty(),
             "solo chat must not inject any MCP servers, got {:?}",
             req.mcp_servers
+        );
+    }
+
+    #[test]
+    fn build_new_session_request_solo_non_capable_backend_yields_empty_mcp_servers() {
+        // Non-whitelisted backend: Guide must not be injected even once
+        // D26a lands. This test pins the guard shape — it becomes
+        // load-bearing when the D26a follow-up starts pushing
+        // `McpServer::Http` onto the list.
+        let extra: AcpBuildExtra = serde_json::from_value(json!({ "backend": "custom" })).unwrap();
+        let req = build_new_session_request(
+            "/workspace",
+            &extra,
+            std::path::Path::new("/usr/bin/aionui-backend"),
+        );
+        assert!(
+            req.mcp_servers.is_empty(),
+            "non-capable backend must not inject Guide MCP, got {:?}",
+            req.mcp_servers
+        );
+    }
+
+    #[test]
+    fn build_new_session_request_solo_missing_backend_yields_empty_mcp_servers() {
+        // Defensive: `extra.backend` is optional and historically may be
+        // absent on legacy conversations. Guard must handle `None`.
+        let extra: AcpBuildExtra = serde_json::from_value(json!({})).unwrap();
+        let req = build_new_session_request(
+            "/workspace",
+            &extra,
+            std::path::Path::new("/usr/bin/aionui-backend"),
+        );
+        assert!(
+            req.mcp_servers.is_empty(),
+            "missing backend must not inject Guide MCP, got {:?}",
+            req.mcp_servers
+        );
+    }
+
+    #[test]
+    fn build_new_session_request_team_session_takes_priority_over_guide() {
+        // Mutual exclusion: a team session injects the team MCP server
+        // and must not also receive the Guide server once D26a lands.
+        // Today this reduces to "team path still yields exactly one
+        // server" — the assertion will tighten when the Guide branch
+        // starts pushing servers.
+        let req = build_new_session_request(
+            "/workspace",
+            &build_extra_with_team(),
+            std::path::Path::new("/usr/bin/aionui-backend"),
+        );
+        assert_eq!(
+            req.mcp_servers.len(),
+            1,
+            "team session must inject exactly the team MCP server, not the Guide",
         );
     }
 
