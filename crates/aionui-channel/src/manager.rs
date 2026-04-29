@@ -441,6 +441,8 @@ impl ChannelManager {
         row: &ChannelPluginRow,
         live_status: Option<String>,
     ) -> PluginStatusResponse {
+        let is_running = self.plugins.contains_key(&row.id);
+        let has_token = !row.config.is_empty();
         PluginStatusResponse {
             plugin_id: row.id.clone(),
             plugin_type: row.r#type.clone(),
@@ -450,6 +452,10 @@ impl ChannelManager {
             last_connected: row.last_connected,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            connected: is_running,
+            has_token,
+            bot_username: None,
+            active_users: 0,
         }
     }
 
@@ -463,6 +469,29 @@ impl ChannelManager {
             PluginType::Slack => "Slack Bot".into(),
             PluginType::Discord => "Discord Bot".into(),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::stream_relay::ChannelSender for ChannelManager {
+    async fn send_message(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        message: crate::types::UnifiedOutgoingMessage,
+    ) -> Result<String, crate::error::ChannelError> {
+        self.send_message(plugin_id, chat_id, message).await
+    }
+
+    async fn edit_message(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        message: crate::types::UnifiedOutgoingMessage,
+    ) -> Result<(), crate::error::ChannelError> {
+        self.edit_message(plugin_id, chat_id, message_id, message)
+            .await
     }
 }
 

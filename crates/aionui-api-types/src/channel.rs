@@ -79,31 +79,12 @@ pub struct RevokeUserRequest {
 
 /// Request body for `POST /api/channel/settings/sync`.
 ///
-/// Synchronizes agent and model configuration for a specific IM platform
-/// to the running plugin instance.
+/// Invalidates all channel sessions for the given platform so they
+/// are recreated with the latest agent/model configuration from
+/// `client_preferences` on the next incoming message.
 #[derive(Debug, Deserialize)]
 pub struct SyncChannelSettingsRequest {
     pub platform: String,
-    pub agent: ChannelAgentConfig,
-    #[serde(default)]
-    pub model: Option<ChannelModelConfig>,
-}
-
-/// Agent configuration within a channel settings sync request.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChannelAgentConfig {
-    pub backend: String,
-    #[serde(default)]
-    pub custom_agent_id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-/// Model configuration within a channel settings sync request.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChannelModelConfig {
-    pub id: String,
-    pub use_model: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +108,11 @@ pub struct PluginStatusResponse {
     pub last_connected: Option<TimestampMs>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    pub connected: bool,
+    pub has_token: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_username: Option<String>,
+    pub active_users: i64,
 }
 
 /// Result of a plugin credential test.
@@ -395,53 +381,15 @@ mod tests {
     // -- D. Settings requests -------------------------------------------------
 
     #[test]
-    fn test_sync_settings_request_full() {
-        let raw = json!({
-            "platform": "telegram",
-            "agent": {
-                "backend": "acp",
-                "custom_agent_id": "agent-x",
-                "name": "My Agent"
-            },
-            "model": {
-                "id": "gemini-pro",
-                "use_model": true
-            }
-        });
+    fn test_sync_settings_request_deserialize() {
+        let raw = json!({ "platform": "telegram" });
         let req: SyncChannelSettingsRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.platform, "telegram");
-        assert_eq!(req.agent.backend, "acp");
-        assert_eq!(req.agent.custom_agent_id.as_deref(), Some("agent-x"));
-        assert_eq!(req.agent.name.as_deref(), Some("My Agent"));
-        let model = req.model.unwrap();
-        assert_eq!(model.id, "gemini-pro");
-        assert!(model.use_model);
-    }
-
-    #[test]
-    fn test_sync_settings_request_minimal() {
-        let raw = json!({
-            "platform": "lark",
-            "agent": { "backend": "gemini" }
-        });
-        let req: SyncChannelSettingsRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.platform, "lark");
-        assert_eq!(req.agent.backend, "gemini");
-        assert!(req.agent.custom_agent_id.is_none());
-        assert!(req.agent.name.is_none());
-        assert!(req.model.is_none());
     }
 
     #[test]
     fn test_sync_settings_request_missing_platform() {
-        let raw = json!({ "agent": { "backend": "acp" } });
-        let result = serde_json::from_value::<SyncChannelSettingsRequest>(raw);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_sync_settings_request_missing_agent() {
-        let raw = json!({ "platform": "telegram" });
+        let raw = json!({});
         let result = serde_json::from_value::<SyncChannelSettingsRequest>(raw);
         assert!(result.is_err());
     }
@@ -459,6 +407,10 @@ mod tests {
             last_connected: Some(1700000000000),
             created_at: 1699000000000,
             updated_at: 1700000000000,
+            connected: true,
+            has_token: true,
+            bot_username: Some("my_bot".into()),
+            active_users: 5,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["plugin_id"], "telegram");
@@ -469,6 +421,10 @@ mod tests {
         assert_eq!(json["last_connected"], 1700000000000_i64);
         assert_eq!(json["created_at"], 1699000000000_i64);
         assert_eq!(json["updated_at"], 1700000000000_i64);
+        assert_eq!(json["connected"], true);
+        assert_eq!(json["has_token"], true);
+        assert_eq!(json["bot_username"], "my_bot");
+        assert_eq!(json["active_users"], 5);
     }
 
     #[test]
@@ -482,10 +438,15 @@ mod tests {
             last_connected: None,
             created_at: 1699000000000,
             updated_at: 1699000000000,
+            connected: false,
+            has_token: false,
+            bot_username: None,
+            active_users: 0,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("status").is_none());
         assert!(json.get("last_connected").is_none());
+        assert!(json.get("bot_username").is_none());
     }
 
     // -- E. Test plugin response ----------------------------------------------
@@ -716,6 +677,10 @@ mod tests {
                 last_connected: Some(1700000000000),
                 created_at: 1699000000000,
                 updated_at: 1700000000000,
+                connected: false,
+                has_token: false,
+                bot_username: None,
+                active_users: 0,
             },
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -765,6 +730,10 @@ mod tests {
             last_connected: None,
             created_at: 1699000000000,
             updated_at: 1699000000000,
+            connected: false,
+            has_token: false,
+            bot_username: None,
+            active_users: 0,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: PluginStatusResponse = serde_json::from_str(&json).unwrap();

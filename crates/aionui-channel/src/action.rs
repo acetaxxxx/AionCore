@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
+use crate::channel_settings::ChannelSettingsService;
 use crate::error::ChannelError;
 use crate::pairing::PairingService;
 use crate::session::SessionManager;
@@ -40,6 +41,7 @@ pub enum MessageResult {
 pub struct ActionExecutor {
     pairing: Arc<PairingService>,
     session_mgr: Arc<SessionManager>,
+    settings: Arc<ChannelSettingsService>,
     default_agent_type: String,
 }
 
@@ -47,11 +49,13 @@ impl ActionExecutor {
     pub fn new(
         pairing: Arc<PairingService>,
         session_mgr: Arc<SessionManager>,
+        settings: Arc<ChannelSettingsService>,
         default_agent_type: &str,
     ) -> Self {
         Self {
             pairing,
             session_mgr,
+            settings,
             default_agent_type: default_agent_type.to_owned(),
         }
     }
@@ -93,9 +97,10 @@ impl ActionExecutor {
         }
 
         // 3. Text message → session resolution → AI dispatch
+        let agent_config = self.settings.get_agent_config(msg.platform).await?;
         let session = self
             .session_mgr
-            .get_or_create_session(&internal_user_id, chat_id, &self.default_agent_type, None)
+            .get_or_create_session(&internal_user_id, chat_id, &agent_config.agent_type, None)
             .await?;
 
         info!(
@@ -238,12 +243,15 @@ impl ActionExecutor {
     ) -> Result<ActionResponse, ChannelError> {
         match action.action.as_str() {
             "session.new" => {
-                // Delete old session for this user+chat, then create fresh
                 let user_id = internal_user_id;
                 let chat_id = &action.context.chat_id;
+                let agent_config = self
+                    .settings
+                    .get_agent_config(action.context.platform)
+                    .await?;
                 let session = self
                     .session_mgr
-                    .reset_session(user_id, chat_id, &self.default_agent_type, None)
+                    .reset_session(user_id, chat_id, &agent_config.agent_type, None)
                     .await?;
 
                 Ok(ActionResponse {
@@ -267,9 +275,13 @@ impl ActionExecutor {
             "session.status" => {
                 let user_id = internal_user_id;
                 let chat_id = &action.context.chat_id;
+                let agent_config = self
+                    .settings
+                    .get_agent_config(action.context.platform)
+                    .await?;
                 let session = self
                     .session_mgr
-                    .get_or_create_session(user_id, chat_id, &self.default_agent_type, None)
+                    .get_or_create_session(user_id, chat_id, &agent_config.agent_type, None)
                     .await?;
 
                 Ok(ActionResponse {
@@ -571,9 +583,11 @@ mod tests {
     use aionui_api_types::WebSocketMessage;
     use aionui_common::{TimestampMs, now_ms};
     use aionui_db::models::{
-        AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow,
+        AssistantSessionRow, AssistantUserRow, ChannelPluginRow, ClientPreference, PairingCodeRow,
     };
-    use aionui_db::{DbError, IChannelRepository, UpdatePluginStatusParams};
+    use aionui_db::{
+        DbError, IChannelRepository, IClientPreferenceRepository, UpdatePluginStatusParams,
+    };
     use aionui_realtime::EventBroadcaster;
     use std::sync::Mutex;
 
@@ -773,6 +787,26 @@ mod tests {
         }
     }
 
+    // ── Mock IClientPreferenceRepository ──────────────────────────────
+
+    struct MockPrefRepo;
+
+    #[async_trait::async_trait]
+    impl IClientPreferenceRepository for MockPrefRepo {
+        async fn get_all(&self) -> Result<Vec<ClientPreference>, DbError> {
+            Ok(vec![])
+        }
+        async fn get_by_keys(&self, _keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+            Ok(vec![])
+        }
+        async fn upsert_batch(&self, _entries: &[(&str, &str)]) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn delete_keys(&self, _keys: &[&str]) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
     // ── Test helpers ───────────────────────────────────────────────────
 
     fn setup() -> (ActionExecutor, Arc<MockRepo>) {
@@ -780,7 +814,9 @@ mod tests {
         let broadcaster = Arc::new(MockBroadcaster);
         let pairing = Arc::new(PairingService::new(repo.clone(), broadcaster));
         let session_mgr = Arc::new(SessionManager::new(repo.clone()));
-        let executor = ActionExecutor::new(pairing, session_mgr, "gemini");
+        let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(MockPrefRepo);
+        let settings = Arc::new(ChannelSettingsService::new(pref_repo));
+        let executor = ActionExecutor::new(pairing, session_mgr, settings, "gemini");
         (executor, repo)
     }
 
@@ -1010,7 +1046,8 @@ mod tests {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
                 assert!(text.contains("New session"));
-                assert!(text.contains("gemini"));
+                // With no client_preferences configured, defaults to "aionrs"
+                assert!(text.contains("aionrs"));
             }
             _ => panic!("Expected Action result"),
         }
@@ -1145,7 +1182,7 @@ mod tests {
         let (executor, repo) = setup();
         repo.add_authorized_user("tg_42", "telegram");
 
-        // First: send a text to create a session (defaults to "gemini")
+        // First: send a text to create a session (defaults to "aionrs")
         let text_msg = make_text_message("tg_42", "chat_1", "Hello", PluginType::Telegram);
         executor.handle_incoming_message(&text_msg).await.unwrap();
 

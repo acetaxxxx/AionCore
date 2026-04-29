@@ -12,6 +12,7 @@ use aionui_db::{IChannelRepository, SqliteChannelRepository, init_database_memor
 use aionui_realtime::EventBroadcaster;
 
 use aionui_channel::action::{ActionExecutor, MessageResult};
+use aionui_channel::channel_settings::ChannelSettingsService;
 use aionui_channel::pairing::PairingService;
 use aionui_channel::session::SessionManager;
 use aionui_channel::types::{
@@ -57,7 +58,11 @@ async fn setup() -> (
         Arc::new(MockBroadcaster::new()),
     ));
     let session_mgr_arc = Arc::new(SessionManager::new(repo.clone()));
-    let executor = ActionExecutor::new(pairing_arc, session_mgr_arc, "gemini");
+    let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> = Arc::new(
+        aionui_db::SqliteClientPreferenceRepository::new(db.pool().clone()),
+    );
+    let settings = Arc::new(ChannelSettingsService::new(pref_repo));
+    let executor = ActionExecutor::new(pairing_arc, session_mgr_arc, settings, "gemini");
 
     // Keep db alive
     std::mem::forget(db);
@@ -367,7 +372,8 @@ async fn action_session_new() {
         MessageResult::Action(resp) => {
             let text = resp.text.unwrap();
             assert!(text.contains("New session"));
-            assert!(text.contains("gemini")); // default agent
+            // With no client_preferences, defaults to "aionrs"
+            assert!(text.contains("aionrs"));
         }
         _ => panic!("Expected Action result"),
     }
