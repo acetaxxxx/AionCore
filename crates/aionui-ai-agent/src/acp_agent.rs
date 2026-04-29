@@ -16,8 +16,8 @@ use crate::stream_event::{AgentStreamEvent, permission_request_to_event_data};
 use crate::types::{AcpBuildExtra, AgentStreamChunk, SendMessageData, SlashCommandItem};
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, CancelNotification, ContentBlock, HttpHeader, LoadSessionRequest, McpServer,
-    McpServerHttp, NewSessionRequest, PromptRequest, SessionConfigOption, SessionId, SessionModeState, SessionModelState,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
+    McpServerHttp, NewSessionRequest, PromptRequest, SessionConfigOption, SessionId, SessionModeState,
+    SessionModelState, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
 };
 use aionui_api_types::{AgentHandshake, AgentMetadata};
 
@@ -478,7 +478,7 @@ impl AcpAgentManager {
         let (permission_tx, permission_rx) = mpsc::channel(32);
 
         // Connect via ACP SDK — executes initialize handshake
-        let protocol = AcpProtocol::connect(stdin, stdout, event_tx.clone(), permission_tx)
+        let protocol = AcpProtocol::connect(stdin, stdout, event_tx.clone(), stream_tx.clone(), permission_tx)
             .await
             .map_err(|e| {
                 error!(
@@ -1000,7 +1000,26 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AppError> {
         self.last_activity.store(now_ms(), Ordering::Relaxed);
-        self.ensure_session_and_send(&data).await
+
+        // Drive the session, then emit a terminal chunk so subscribers
+        // (wake timeout watchdog, crash detector) always see a Finish or
+        // Error at the end of every turn — matching the contract documented
+        // on `AgentStreamChunk`.
+        let result = self.ensure_session_and_send(&data).await;
+        match &result {
+            Ok(()) => {
+                let _ = self.stream_tx.send(AgentStreamChunk::Finish {
+                    agent_crash: false,
+                    stop_reason: None,
+                });
+            }
+            Err(err) => {
+                let _ = self.stream_tx.send(AgentStreamChunk::Error {
+                    message: err.to_string(),
+                });
+            }
+        }
+        result
     }
 
     async fn stop(&self) -> Result<(), AppError> {
