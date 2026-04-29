@@ -7,6 +7,7 @@ use dashmap::{DashMap, DashSet};
 use tokio::sync::Mutex;
 use tracing::debug;
 
+use crate::crash_detection::CrashReason;
 use crate::error::TeamError;
 use crate::events::TeamEventEmitter;
 use crate::mailbox::Mailbox;
@@ -112,6 +113,51 @@ fn is_settled(status: TeammateStatus) -> bool {
         status,
         TeammateStatus::Idle | TeammateStatus::Completed | TeammateStatus::Error
     )
+}
+
+// ---------------------------------------------------------------------------
+// Crash testament formatting
+// ---------------------------------------------------------------------------
+
+/// Format a crash testament message for delivery to the leader.
+///
+/// The resulting text summarises which agent crashed, the reason, and
+/// optionally the last message seen before the crash.
+pub fn format_crash_testament(
+    agent_name: &str,
+    reason: &CrashReason,
+    last_message: Option<&str>,
+) -> String {
+    let reason_str = match reason {
+        CrashReason::ProcessExited => "ProcessExited",
+        CrashReason::SessionNotFound => "SessionNotFound",
+        CrashReason::Unknown(msg) => return format_with_unknown(agent_name, msg, last_message),
+    };
+    if let Some(msg) = last_message {
+        format!(
+            "Teammate '{}' crashed during task (reason: {}). Last message: {}. Please investigate.",
+            agent_name, reason_str, msg
+        )
+    } else {
+        format!(
+            "Teammate '{}' crashed during task (reason: {}). Please investigate.",
+            agent_name, reason_str
+        )
+    }
+}
+
+fn format_with_unknown(agent_name: &str, reason_msg: &str, last_message: Option<&str>) -> String {
+    if let Some(msg) = last_message {
+        format!(
+            "Teammate '{}' crashed during task (reason: Unknown — {}). Last message: {}. Please investigate.",
+            agent_name, reason_msg, msg
+        )
+    } else {
+        format!(
+            "Teammate '{}' crashed during task (reason: Unknown — {}). Please investigate.",
+            agent_name, reason_msg
+        )
+    }
 }
 
 impl TeammateManager {
@@ -488,6 +534,39 @@ impl TeammateManager {
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    /// Write a crash testament message to the leader's mailbox.
+    ///
+    /// When a teammate crashes, this delivers a diagnostic message to the
+    /// lead so it can decide how to recover (reassign, respawn, etc.).
+    /// No-op when no lead slot exists in the team.
+    pub async fn write_crash_testament(
+        &self,
+        slot_id: &str,
+        agent_name: &str,
+        reason: &CrashReason,
+        last_message: Option<&str>,
+    ) -> Result<(), TeamError> {
+        let Some(lead_slot_id) = self.find_lead_slot_id().await else {
+            return Ok(());
+        };
+        if lead_slot_id == slot_id {
+            // Leader crashed into itself — nothing to notify.
+            return Ok(());
+        }
+        let testament = format_crash_testament(agent_name, reason, last_message);
+        self.mailbox
+            .write(
+                &self.team_id,
+                &lead_slot_id,
+                slot_id,
+                MailboxMessageType::Message,
+                &testament,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
 
     async fn handle_send_message(
         &self,
@@ -1680,5 +1759,145 @@ mod tests {
         let map: DashMap<String, tokio::task::JoinHandle<()>> = DashMap::new();
         // Should not panic
         map.remove("nonexistent");
+    }
+
+    // -- W4-D20b1: crash testament formatting -----------------------------------
+
+    #[test]
+    fn crash_testament_contains_reason_keyword() {
+        use crate::crash_detection::CrashReason;
+
+        for (reason, keyword) in [
+            (CrashReason::ProcessExited, "ProcessExited"),
+            (CrashReason::SessionNotFound, "SessionNotFound"),
+            (
+                CrashReason::Unknown("segfault".into()),
+                "Unknown — segfault",
+            ),
+        ] {
+            let testament = format_crash_testament("Bob", &reason, None);
+            assert!(
+                testament.contains(keyword),
+                "expected '{}' in testament: {}",
+                keyword,
+                testament
+            );
+        }
+    }
+
+    #[test]
+    fn crash_testament_includes_last_message_when_provided() {
+        use crate::crash_detection::CrashReason;
+
+        let testament = format_crash_testament(
+            "Alice",
+            &CrashReason::ProcessExited,
+            Some("working on task X"),
+        );
+        assert!(testament.contains("Last message: working on task X"));
+        assert!(testament.contains("ProcessExited"));
+        assert!(testament.contains("Alice"));
+    }
+
+    #[test]
+    fn crash_testament_omits_last_message_when_none() {
+        use crate::crash_detection::CrashReason;
+
+        let testament = format_crash_testament("Charlie", &CrashReason::SessionNotFound, None);
+        assert!(!testament.contains("Last message"));
+        assert!(testament.contains("SessionNotFound"));
+        assert!(testament.contains("Charlie"));
+    }
+
+    #[tokio::test]
+    async fn write_crash_testament_delivers_to_lead_mailbox() {
+        use crate::crash_detection::CrashReason;
+
+        let agents = make_team_agents();
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Arc::new(Mailbox::new(repo.clone()));
+        let task_board = Arc::new(TaskBoard::new(repo));
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
+        let mgr = TeammateManager::new(
+            "t1".into(),
+            &agents,
+            mailbox.clone(),
+            task_board,
+            broadcaster,
+        );
+
+        mgr.write_crash_testament("worker-1", "Worker1", &CrashReason::ProcessExited, None)
+            .await
+            .unwrap();
+
+        let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(lead_msgs.len(), 1);
+        assert_eq!(lead_msgs[0].from_agent_id, "worker-1");
+        assert!(lead_msgs[0].content.contains("ProcessExited"));
+        assert!(lead_msgs[0].content.contains("Worker1"));
+    }
+
+    #[tokio::test]
+    async fn write_crash_testament_noop_when_no_lead() {
+        use crate::crash_detection::CrashReason;
+
+        // Team with no lead
+        let agents = vec![
+            make_agent("worker-1", "Worker1", TeammateRole::Teammate),
+            make_agent("worker-2", "Worker2", TeammateRole::Teammate),
+        ];
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Arc::new(Mailbox::new(repo.clone()));
+        let task_board = Arc::new(TaskBoard::new(repo));
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
+        let mgr = TeammateManager::new(
+            "t1".into(),
+            &agents,
+            mailbox.clone(),
+            task_board,
+            broadcaster,
+        );
+
+        // Should not panic or error
+        mgr.write_crash_testament(
+            "worker-1",
+            "Worker1",
+            &CrashReason::SessionNotFound,
+            Some("last words"),
+        )
+        .await
+        .unwrap();
+
+        // No messages delivered to anyone
+        let msgs1 = mailbox.read_unread("t1", "worker-1").await.unwrap();
+        let msgs2 = mailbox.read_unread("t1", "worker-2").await.unwrap();
+        assert!(msgs1.is_empty());
+        assert!(msgs2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_crash_testament_noop_when_lead_crashes() {
+        use crate::crash_detection::CrashReason;
+
+        let agents = make_team_agents();
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Arc::new(Mailbox::new(repo.clone()));
+        let task_board = Arc::new(TaskBoard::new(repo));
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
+        let mgr = TeammateManager::new(
+            "t1".into(),
+            &agents,
+            mailbox.clone(),
+            task_board,
+            broadcaster,
+        );
+
+        // Lead crashing should not write to itself
+        mgr.write_crash_testament("lead-1", "Lead", &CrashReason::ProcessExited, None)
+            .await
+            .unwrap();
+
+        let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
+        assert!(lead_msgs.is_empty());
     }
 }
