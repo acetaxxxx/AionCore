@@ -563,9 +563,19 @@ impl TeamSessionService {
 }
 
 fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
+    use aionui_common::AcpBackend;
     let quoted = format!("\"{backend}\"");
-    serde_json::from_str::<AgentType>(&quoted)
-        .map_err(|_| TeamError::InvalidRequest(format!("unsupported backend: {backend}")))
+    // Try as AcpBackend sub-type first (e.g. "claude", "gemini", "qwen").
+    if serde_json::from_str::<AcpBackend>(&quoted).is_ok() {
+        return Ok(AgentType::Acp);
+    }
+    // Then try as AgentType (e.g. "acp", "nanobot", "aionrs").
+    if let Ok(t) = serde_json::from_str::<AgentType>(&quoted) {
+        return Ok(t);
+    }
+    Err(TeamError::InvalidRequest(format!(
+        "unsupported backend: {backend}"
+    )))
 }
 
 #[cfg(test)]
