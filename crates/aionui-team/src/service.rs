@@ -86,7 +86,10 @@ impl TeamSessionService {
                 }),
                 source: None,
                 channel_chat_id: None,
-                extra: serde_json::json!({ "teamId": team_id }),
+                extra: serde_json::json!({
+                    "teamId": team_id,
+                    "backend": input.backend,
+                }),
             };
             let conv = self
                 .conversation_service
@@ -241,7 +244,10 @@ impl TeamSessionService {
             }),
             source: None,
             channel_chat_id: None,
-            extra: serde_json::json!({ "teamId": team_id }),
+            extra: serde_json::json!({
+                "teamId": team_id,
+                "backend": req.backend,
+            }),
         };
         let conv = self
             .conversation_service
