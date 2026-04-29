@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_ai_agent::{IWorkerTaskManager, SendMessageData};
-use aionui_common::generate_id;
+use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
 use tracing::{info, warn};
@@ -312,7 +312,19 @@ impl TeamSession {
     }
 
     pub async fn remove_agent(&self, slot_id: &str) -> Result<(), TeamError> {
-        self.scheduler.remove_agent(slot_id).await
+        let conversation_id = self.scheduler.remove_agent(slot_id).await?;
+        if let Some(conv_id) = conversation_id
+            && let Err(e) = self.task_manager.kill(&conv_id, Some(AgentKillReason::TeamDeleted))
+        {
+            warn!(
+                team_id = %self.team.id,
+                slot_id,
+                conversation_id = %conv_id,
+                error = %e,
+                "remove_agent: task_manager.kill failed (non-fatal)"
+            );
+        }
+        Ok(())
     }
 
     pub async fn rename_agent(&self, slot_id: &str, new_name: &str) -> Result<(), TeamError> {
@@ -480,17 +492,35 @@ mod tests {
     /// and panic to surface drift early.
     struct StubTaskManager {
         tasks: Mutex<std::collections::HashMap<String, AgentManagerHandle>>,
+        kill_calls: Mutex<Vec<(String, Option<AgentKillReason>)>>,
+        kill_error: Option<String>,
     }
 
     impl StubTaskManager {
         fn new() -> Self {
             Self {
                 tasks: Mutex::new(std::collections::HashMap::new()),
+                kill_calls: Mutex::new(Vec::new()),
+                kill_error: None,
+            }
+        }
+
+        /// Build a stub whose `kill` always fails with `AppError::NotFound` so
+        /// tests can exercise the non-fatal kill branch in `remove_agent`.
+        fn with_kill_error(msg: &str) -> Self {
+            Self {
+                tasks: Mutex::new(std::collections::HashMap::new()),
+                kill_calls: Mutex::new(Vec::new()),
+                kill_error: Some(msg.to_owned()),
             }
         }
 
         fn insert(&self, conv_id: &str, handle: AgentManagerHandle) {
             self.tasks.lock().unwrap().insert(conv_id.into(), handle);
+        }
+
+        fn kill_calls(&self) -> Vec<(String, Option<AgentKillReason>)> {
+            self.kill_calls.lock().unwrap().clone()
         }
     }
 
@@ -505,7 +535,14 @@ mod tests {
         ) -> Result<AgentManagerHandle, AppError> {
             panic!("get_or_build_task should not be called in D7b tests")
         }
-        fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+            self.kill_calls
+                .lock()
+                .unwrap()
+                .push((conversation_id.to_owned(), reason));
+            if let Some(msg) = &self.kill_error {
+                return Err(AppError::NotFound(msg.clone()));
+            }
             Ok(())
         }
         fn clear(&self) {}
@@ -683,6 +720,50 @@ mod tests {
         let agents = session.scheduler.list_agents().await;
         assert_eq!(agents.len(), 2);
 
+        session.stop();
+    }
+
+    // -- W5-D30d-1: remove_agent kills the agent process ---------------------
+
+    #[tokio::test]
+    async fn remove_agent_calls_task_manager_kill() {
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let stub = Arc::new(StubTaskManager::new());
+        let stub_dyn: Arc<dyn IWorkerTaskManager> = stub.clone();
+        let session = TeamSession::start(make_team(), repo, broadcaster, backend_path(), stub_dyn)
+            .await
+            .unwrap();
+
+        session.remove_agent("worker-1").await.unwrap();
+
+        let calls = stub.kill_calls();
+        assert_eq!(calls.len(), 1, "kill invoked exactly once");
+        assert_eq!(calls[0].0, "c2", "kill targets removed slot's conversation_id");
+        assert!(
+            matches!(calls[0].1, Some(AgentKillReason::TeamDeleted)),
+            "kill reason carries AgentKillReason"
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn remove_agent_is_non_fatal_when_kill_fails() {
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let stub = Arc::new(StubTaskManager::with_kill_error("task not found"));
+        let stub_dyn: Arc<dyn IWorkerTaskManager> = stub.clone();
+        let session = TeamSession::start(make_team(), repo, broadcaster, backend_path(), stub_dyn)
+            .await
+            .unwrap();
+
+        // kill returns Err(AppError::NotFound) but remove_agent must still
+        // succeed — NotFound means the worker already died, which is OK.
+        session.remove_agent("worker-1").await.unwrap();
+
+        let agents = session.scheduler.list_agents().await;
+        assert_eq!(agents.len(), 1, "slot still removed even after kill failure");
+        assert_eq!(stub.kill_calls().len(), 1);
         session.stop();
     }
 
