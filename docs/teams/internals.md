@@ -80,17 +80,18 @@ User                HTTP            TeamSession       Scheduler        Mailbox  
 │       ▲                    TaskBoard (SQLite)                │
 │       │ execute_action                                       │
 │       │                                                      │
-│   TeamMcpServer  ◀──── TCP + JSON-RPC ────  Agent Process    │
-│   127.0.0.1:port                            (via stdio       │
-│                                              bridge ⚠️ 未做) │
+│   TeamMcpServer  ◀──── HTTP + JSON-RPC ────  Agent Process   │
+│   127.0.0.1:port         (agent 主动连接)                     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- 每个 team session 启动时在 `127.0.0.1:<随机端口>` 起一个 TCP 服务
+- 每个 team session 启动时在 `127.0.0.1:<随机端口>` 起 HTTP MCP server
+- 传输方式：HTTP transport（commit 6c334a9 从 stdio bridge 切换）— agent CLI 主动连接，无需 stdio bridge 子进程
 - Agent 通过 JSON-RPC `initialize(auth_token, slot_id)` 鉴权后才能调工具
 - 暴露 8 个工具：`team_send_message / team_spawn_agent / team_task_create / team_task_update / team_task_list / team_members / team_rename_agent / team_shutdown_agent`（AionUi 参考实现有 10 个，差 `team_describe_assistant` 和 `team_list_models`）
 - `team_spawn_agent` 和 `team_shutdown_agent` 仅 Lead 可调用
 - `team_spawn_agent` 的 backend 白名单：`["claude", "codex"]`
+- `team_spawn_agent` 当前为 no-op：工具可调用，返回 success，但不实际创建 agent（Wave 5 待落地）
 
 ### MCP 与 Mailbox / TaskBoard 的交互
 
