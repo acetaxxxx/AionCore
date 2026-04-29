@@ -16,7 +16,7 @@
 |------|:---:|------|
 | Team CRUD（建/删/改名/加减 agent） | ✅ 已完成 | |
 | 用户→agent 发消息（走单聊 API） | ✅ 已完成 | `POST /api/conversations/{conv_id}/messages` |
-| Agent 间 MCP 通信（team_send_message 等 10 工具） | ✅ 已完成 | mcp-bridge + TCP server |
+| Agent 间 MCP 通信（team_send_message 等工具） | ✅ 已完成 | HTTP transport，agent 主动连接 |
 | Agent wake 机制（发消息后 agent 自动响应） | ✅ 已完成 | |
 | 建团自动起 session（MCP 自动注入） | ✅ 已完成 | `POST /api/teams` 后自动 ensure_session，前端无需额外调用 |
 | WS 事件推送（team.agent.status 等） | ✅ 已完成 | |
@@ -24,9 +24,58 @@
 | 单聊→建团（conversation 复用） | ✅ 已完成 | agents 里传 `conversation_id` 可复用 |
 | rename 规范化 | ✅ 已完成 | Wave 3 |
 | MCP 协议加固（64MB 帧 + 300s 超时） | ✅ 已完成 | Wave 3 |
+| MCP 注入（HTTP transport） | ✅ 已完成 | Wave 4，commit 6c334a9 |
+| MCP ready 协议类型 | ✅ 已完成 | Wave 4 D24a |
+| crash 检测 | ✅ 已完成 | Wave 4 D20a |
+| 429 限流识别 | ✅ 已完成 | Wave 4 D21 |
+| finalize dedup（5s 去重） | ✅ 已完成 | Wave 4 D19a |
+| add_agent 并发锁 | ✅ 已完成 | Wave 4 D23 |
+| AgentStreamChunk（wake 超时看门狗） | ✅ 已完成 | Wave 4 D25a |
+| D24b/c（MCP ready 握手） | ~~SKIPPED~~ | 切 HTTP transport 后不再需要 stdio ready 握手 |
+| team_spawn_agent 真实落地 | ⏳ Wave 5 | leader 动态拉人（当前工具可调用但为 no-op） |
 | Team Guide MCP（agent 自动建团） | ⏳ Wave 5 | `aion_create_team` 工具 |
-| team_spawn_agent 真实落地 | ⏳ Wave 5 | leader 动态拉人 |
-| crash recovery / 429 识别 | 🔄 Wave 4 进行中 | |
+| crash recovery / 429 自动重试 | 🔄 Wave 4 进行中 | 检测已就绪，重试调度逻辑待完成（剩余 15 模块） |
+
+### Wave 4 进度：6/25 模块已合并
+
+已合并：D19a, D20a, D21, D23, D24a, D25a + HTTP transport 切换
+已跳过：D24b, D24c（stdio ready 握手 — HTTP transport 不需要）
+剩余：15 模块，ETA ongoing
+
+## MCP Transport 变更（Wave 4）
+
+> **前端影响：无。** 这是后端内部架构变更，对前端接口完全透明。
+
+### 变更内容
+
+从 stdio bridge 切换到 HTTP transport（commit 6c334a9）。
+
+旧方案（已废弃）：后端 spawn stdio bridge 子进程，agent CLI 通过 stdin/stdout 通信 → agent CLI 从未发送 MCP initialize，链路不通。
+
+新方案（当前）：TeamMcpServer 暴露 HTTP 端点，agent CLI 主动通过 HTTP 连接 MCP server → 连接即通，无需额外握手。
+
+### Agent 可用工具
+
+agent 连接 MCP server 后，以下工具对 agent 可见且可调用：
+
+| 工具 | 状态 | 说明 |
+|------|:---:|------|
+| `team_send_message` | Working | agent 间发消息 |
+| `team_spawn_agent` | Callable (no-op) | 工具声明存在，调用返回 success，但不实际创建 agent（Wave 5 落地） |
+| `team_task_create` | Working | 创建任务 |
+| `team_task_update` | Working | 更新任务状态 |
+| `team_task_list` | Working | 列出所有任务 |
+| `team_members` | Working | 列出当前成员 |
+| `team_rename_agent` | Working | 改名 |
+| `team_shutdown_agent` | Working | Lead 请求 teammate 下线 |
+
+### 前端须知
+
+- `team_spawn_agent` 对 agent 是可见的，lead 可能会说"已创建新 agent"，但实际成员列表不会变化 — 这不是前端 bug，是后端 Wave 5 待实现的功能
+- D24b/c（MCP ready 握手协议）已跳过 — HTTP transport 不需要 stdio ready 信号，agent 连接即可用
+- 所有 WS 事件格式不变，前端代码无需任何修改
+
+---
 
 ### 单聊→建团接入方式（Wave 3 完成后可用）
 
