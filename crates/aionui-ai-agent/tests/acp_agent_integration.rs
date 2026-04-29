@@ -65,6 +65,7 @@ async fn make_mock_agent(
         preset_assistant_id: None,
         session_mode: None,
         cron_job_id: None,
+        team_mcp_stdio_config: None,
     };
 
     let tmp_skills = tempfile::TempDir::new().unwrap();
@@ -88,6 +89,7 @@ async fn make_mock_agent(
         },
         config,
         skill_manager,
+        Arc::new(std::path::PathBuf::from("/tmp/aionui-backend")),
     )
     .await
     .expect("Failed to spawn mock ACP agent");
