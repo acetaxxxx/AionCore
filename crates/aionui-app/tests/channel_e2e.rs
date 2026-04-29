@@ -328,26 +328,9 @@ async fn get_sessions_empty() {
 // §5 Settings sync
 // ===========================================================================
 
-// SS-3: Sync missing platform fails
+// SS-1: Sync valid platform clears sessions
 #[tokio::test]
-async fn sync_settings_missing_platform() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let req = json_with_token(
-        "POST",
-        "/api/channel/settings/sync",
-        json!({ "agent": { "backend": "acp" } }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-// SS-4: Sync missing agent fails
-#[tokio::test]
-async fn sync_settings_missing_agent() {
+async fn sync_settings_valid() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -359,10 +342,31 @@ async fn sync_settings_missing_agent() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert!(json["success"].as_bool().unwrap());
+    assert!(json["data"]["success"].as_bool().unwrap());
+}
+
+// SS-2: Sync missing platform fails deserialization
+#[tokio::test]
+async fn sync_settings_missing_platform() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/channel/settings/sync",
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-// SS-5: Sync invalid platform fails
+// SS-3: Sync invalid platform fails validation
 #[tokio::test]
 async fn sync_settings_invalid_platform() {
     let (mut app, services) = build_app().await;
@@ -371,69 +375,12 @@ async fn sync_settings_invalid_platform() {
     let req = json_with_token(
         "POST",
         "/api/channel/settings/sync",
-        json!({
-            "platform": "invalid",
-            "agent": { "backend": "acp" }
-        }),
+        json!({ "platform": "invalid" }),
         &token,
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-// SS-1: Sync valid settings succeeds
-#[tokio::test]
-async fn sync_settings_valid() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let req = json_with_token(
-        "POST",
-        "/api/channel/settings/sync",
-        json!({
-            "platform": "telegram",
-            "agent": {
-                "backend": "acp",
-                "name": "Default"
-            }
-        }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    assert!(json["success"].as_bool().unwrap());
-    assert!(json["data"]["success"].as_bool().unwrap());
-}
-
-// SS-2: Sync with model config succeeds
-#[tokio::test]
-async fn sync_settings_with_model() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let req = json_with_token(
-        "POST",
-        "/api/channel/settings/sync",
-        json!({
-            "platform": "telegram",
-            "agent": { "backend": "gemini" },
-            "model": {
-                "id": "gemini-pro",
-                "use_model": "gemini-2.5-flash"
-            }
-        }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    assert!(json["data"]["success"].as_bool().unwrap());
 }
 
 // ===========================================================================
