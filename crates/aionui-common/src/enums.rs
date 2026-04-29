@@ -77,6 +77,23 @@ impl AgentType {
             | AgentType::Gemini => None,
         }
     }
+
+    /// Canonical full-auto session mode id for this agent type.
+    ///
+    /// ACP agents need backend-specific mode ids, while other agent types
+    /// currently converge on the permissive `yolo` mode.
+    pub fn full_auto_mode_id(&self, backend: Option<AcpBackend>) -> &'static str {
+        match self {
+            AgentType::Acp => backend
+                .map(|backend| backend.full_auto_mode_id())
+                .unwrap_or("yolo"),
+            AgentType::Aionrs
+            | AgentType::Gemini
+            | AgentType::OpenclawGateway
+            | AgentType::Nanobot
+            | AgentType::Remote => "yolo",
+        }
+    }
 }
 
 /// ACP sub-backend identifier.
@@ -253,6 +270,21 @@ impl AcpBackend {
             | AcpBackend::Hermes
             | AcpBackend::Snow
             | AcpBackend::Auggie => None,
+        }
+    }
+
+    /// Canonical full-auto session mode id for this ACP backend.
+    ///
+    /// This mirrors the frontend `getFullAutoMode()` mapping and is used by
+    /// backend flows that need to materialize a new cron job from an existing
+    /// conversation without depending on a live ACP runtime snapshot.
+    pub fn full_auto_mode_id(&self) -> &'static str {
+        match self {
+            AcpBackend::Claude => "bypassPermissions",
+            AcpBackend::Codex => "full-access",
+            AcpBackend::Opencode => "build",
+            AcpBackend::Cursor => "agent",
+            _ => "yolo",
         }
     }
 }
@@ -686,5 +718,25 @@ mod tests {
         assert_eq!(AcpBackend::Gemini.args(), Some(&["--experimental-acp"][..]));
         // Gemini is a direct-CLI backend, no bridge
         assert_eq!(AcpBackend::Gemini.bridge_package(), None);
+    }
+
+    #[test]
+    fn acp_backend_full_auto_mode_id_matches_backend_capabilities() {
+        assert_eq!(AcpBackend::Claude.full_auto_mode_id(), "bypassPermissions");
+        assert_eq!(AcpBackend::Codex.full_auto_mode_id(), "full-access");
+        assert_eq!(AcpBackend::Opencode.full_auto_mode_id(), "build");
+        assert_eq!(AcpBackend::Cursor.full_auto_mode_id(), "agent");
+        assert_eq!(AcpBackend::Gemini.full_auto_mode_id(), "yolo");
+        assert_eq!(AcpBackend::Qwen.full_auto_mode_id(), "yolo");
+    }
+
+    #[test]
+    fn agent_type_full_auto_mode_id_supports_non_acp_agents() {
+        assert_eq!(
+            AgentType::Acp.full_auto_mode_id(Some(AcpBackend::Codex)),
+            "full-access"
+        );
+        assert_eq!(AgentType::Aionrs.full_auto_mode_id(None), "yolo");
+        assert_eq!(AgentType::Remote.full_auto_mode_id(None), "yolo");
     }
 }
