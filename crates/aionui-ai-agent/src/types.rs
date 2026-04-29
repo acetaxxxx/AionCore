@@ -74,7 +74,7 @@ pub struct AcpBuildExtra {
 }
 
 /// OpenClaw gateway configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OpenClawGatewayConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
@@ -95,6 +95,7 @@ pub struct OpenClawBuildExtra {
     #[serde(default)]
     pub agent_name: Option<String>,
     /// OpenClaw gateway configuration.
+    #[serde(default)]
     pub gateway: OpenClawGatewayConfig,
     /// Resolved skill snapshot for the session. Populated from
     /// `conversation.extra.skills` by the factory.
