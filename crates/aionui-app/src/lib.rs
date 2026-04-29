@@ -45,7 +45,8 @@ use aionui_system::{SystemRouterState, system_routes};
 use aionui_team::{TeamRouterState, team_routes};
 
 pub use state_builders::{
-    build_assistant_state, build_extension_states, build_module_states, build_ws_state,
+    ChannelOrchestratorComponents, build_assistant_state, build_extension_states,
+    build_module_states, build_ws_state,
 };
 
 /// Application configuration parsed from CLI arguments.
@@ -257,7 +258,24 @@ pub async fn create_router(services: &AppServices) -> Router {
         }
     });
 
-    let states = build_module_states(services).await;
+    let (states, channel_components) = build_module_states(services).await;
+
+    // Start channel orchestrator (message loop)
+    tokio::spawn(
+        channel_components
+            .orchestrator
+            .run(channel_components.message_rx, channel_components.confirm_rx),
+    );
+
+    // Restore enabled channel plugins (starts receiving IM messages)
+    let chan_mgr = channel_components.manager;
+    let chan_factory = channel_components.plugin_factory;
+    tokio::spawn(async move {
+        if let Err(e) = chan_mgr.restore_plugins(&chan_factory).await {
+            tracing::warn!(error = %e, "failed to restore channel plugins");
+        }
+    });
+
     create_router_with_states(services, states)
 }
 

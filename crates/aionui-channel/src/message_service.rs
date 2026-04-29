@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
 use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
-use aionui_common::{AgentType, ConversationSource, ProviderWithModel, generate_id};
+use aionui_common::{AgentType, ConversationSource, generate_id};
 use aionui_conversation::ConversationService;
 use aionui_db::models::AssistantSessionRow;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+use crate::channel_settings::{ChannelSettingsService, resolved_model_to_provider};
 use crate::constants::{STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
 use crate::error::ChannelError;
 use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
@@ -22,19 +24,22 @@ use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoin
 pub struct ChannelMessageService {
     conversation_svc: Arc<ConversationService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
-    default_model: ProviderWithModel,
+    settings: Arc<ChannelSettingsService>,
+    owner_user_id: String,
 }
 
 impl ChannelMessageService {
     pub fn new(
         conversation_svc: Arc<ConversationService>,
         task_manager: Arc<dyn IWorkerTaskManager>,
-        default_model: ProviderWithModel,
+        settings: Arc<ChannelSettingsService>,
+        owner_user_id: String,
     ) -> Self {
         Self {
             conversation_svc,
             task_manager,
-            default_model,
+            settings,
+            owner_user_id,
         }
     }
 
@@ -72,23 +77,33 @@ impl ChannelMessageService {
             hidden: false,
         };
 
-        // Use a fixed user_id for channel messages (they're system-level)
-        let user_id = "channel";
+        let user_id = &self.owner_user_id;
         self.conversation_svc
             .send_message(user_id, &conversation_id, req, &self.task_manager)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
 
+        // Subscribe to the agent's broadcast channel for the ChannelStreamRelay.
+        // The agent task exists because send_message just called get_or_build_task.
+        // ConversationService spawns agent.send_message in a background task,
+        // so the first events have not been emitted yet — no race condition.
+        let stream_rx = self
+            .task_manager
+            .get_task(&conversation_id)
+            .map(|handle| handle.subscribe());
+
         info!(
             conversation_id = %conversation_id,
             session_id = %session.id,
             msg_id = %msg_id,
+            has_stream = stream_rx.is_some(),
             "message sent to agent"
         );
 
         Ok(SendResult {
             conversation_id,
             msg_id,
+            stream_rx,
         })
     }
 
@@ -104,19 +119,29 @@ impl ChannelMessageService {
         let source = platform_to_source(platform);
         let agent_type = parse_agent_type(&session.agent_type);
 
+        let agent_config = self.settings.get_agent_config(platform).await?;
+        let model_config = self.settings.get_model_config(platform).await?;
+        let model = resolved_model_to_provider(model_config.as_ref());
+        let extra = Self::build_channel_extra(agent_config.backend.as_deref());
+        let name = channel_conversation_name(
+            platform,
+            &session.agent_type,
+            agent_config.backend.as_deref(),
+            session.chat_id.as_deref(),
+        );
+
         let req = CreateConversationRequest {
             r#type: agent_type,
-            name: None,
-            model: Some(self.default_model.clone()),
+            name: Some(name),
+            model: Some(model),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
-            extra: serde_json::Value::Object(Default::default()),
+            extra,
         };
 
-        let user_id = "channel";
         let response = self
             .conversation_svc
-            .create(user_id, req)
+            .create(&self.owner_user_id, req)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
 
@@ -245,13 +270,31 @@ impl ChannelMessageService {
     pub fn confirm_timeout() -> std::time::Duration {
         TOOL_CONFIRM_TIMEOUT
     }
+
+    /// Build the `extra` JSON for channel conversations.
+    ///
+    /// Sets `session_mode` to `"yolo"` so the agent auto-approves tool calls —
+    /// channel users have no interactive UI for confirmations.
+    pub fn build_channel_extra(backend: Option<&str>) -> serde_json::Value {
+        let mut extra = serde_json::json!({
+            "session_mode": "yolo",
+        });
+        if let Some(b) = backend {
+            extra["backend"] = serde_json::Value::String(b.to_owned());
+        }
+        extra
+    }
 }
 
 /// Result of sending a message to the agent.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SendResult {
     pub conversation_id: String,
     pub msg_id: String,
+    /// Agent event stream for the ChannelStreamRelay.
+    /// `None` when the agent task could not be found after sending
+    /// (should not happen in normal flow).
+    pub stream_rx: Option<broadcast::Receiver<AgentStreamEvent>>,
 }
 
 /// Actions derived from agent stream events.
@@ -296,6 +339,37 @@ fn parse_agent_type(s: &str) -> AgentType {
             AgentType::Acp
         }
     }
+}
+
+fn channel_conversation_name(
+    platform: PluginType,
+    agent_type: &str,
+    backend: Option<&str>,
+    chat_id: Option<&str>,
+) -> String {
+    let short = match platform {
+        PluginType::Telegram => "tg",
+        PluginType::Lark => "lark",
+        PluginType::Dingtalk => "ding",
+        PluginType::Weixin => "wx",
+        PluginType::Slack => "slack",
+        PluginType::Discord => "discord",
+    };
+
+    let mut parts = vec![short.to_owned()];
+    if !agent_type.is_empty() {
+        parts.push(agent_type.to_owned());
+    }
+    if agent_type == "acp"
+        && let Some(b) = backend
+    {
+        parts.push(b.to_owned());
+    }
+    if let Some(cid) = chat_id {
+        let end = cid.len().min(8);
+        parts.push(cid[..end].to_owned());
+    }
+    parts.join("-")
 }
 
 #[cfg(test)]
@@ -496,5 +570,71 @@ mod tests {
             ChannelMessageService::confirm_timeout(),
             std::time::Duration::from_secs(15)
         );
+    }
+
+    // ── build_channel_extra ───────────────────────────────────────────
+
+    #[test]
+    fn yolo_extra_contains_session_mode() {
+        let extra = ChannelMessageService::build_channel_extra(None);
+        assert_eq!(extra["session_mode"], "yolo");
+        assert!(extra.get("backend").is_none());
+    }
+
+    #[test]
+    fn yolo_extra_with_backend() {
+        let extra = ChannelMessageService::build_channel_extra(Some("claude"));
+        assert_eq!(extra["session_mode"], "yolo");
+        assert_eq!(extra["backend"], "claude");
+    }
+
+    // ── channel_conversation_name ─────────────────────────────────────
+
+    #[test]
+    fn conv_name_telegram_acp_with_backend() {
+        let name =
+            channel_conversation_name(PluginType::Telegram, "acp", Some("claude"), Some("70880480"));
+        assert_eq!(name, "tg-acp-claude-70880480");
+    }
+
+    #[test]
+    fn conv_name_telegram_aionrs() {
+        let name =
+            channel_conversation_name(PluginType::Telegram, "aionrs", None, Some("70880480"));
+        assert_eq!(name, "tg-aionrs-70880480");
+    }
+
+    #[test]
+    fn conv_name_lark_acp_no_backend() {
+        let name = channel_conversation_name(PluginType::Lark, "acp", None, Some("abcdef12"));
+        assert_eq!(name, "lark-acp-abcdef12");
+    }
+
+    #[test]
+    fn conv_name_dingtalk_truncates_long_chat_id() {
+        let name = channel_conversation_name(
+            PluginType::Dingtalk,
+            "acp",
+            Some("vertex"),
+            Some("123456789abcdef"),
+        );
+        assert_eq!(name, "ding-acp-vertex-12345678");
+    }
+
+    #[test]
+    fn conv_name_weixin_no_chat_id() {
+        let name = channel_conversation_name(PluginType::Weixin, "acp", Some("gemini"), None);
+        assert_eq!(name, "wx-acp-gemini");
+    }
+
+    #[test]
+    fn conv_name_non_acp_ignores_backend() {
+        let name = channel_conversation_name(
+            PluginType::Telegram,
+            "aionrs",
+            Some("claude"),
+            Some("70880480"),
+        );
+        assert_eq!(name, "tg-aionrs-70880480");
     }
 }

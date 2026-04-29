@@ -41,11 +41,11 @@ pub use auth::{
     QrLoginRequest, RefreshResponse, RefreshTokenRequest, UserInfoResponse, WsTokenResponse,
 };
 pub use channel::{
-    ApprovePairingRequest, BridgeResponse, ChannelAgentConfig, ChannelModelConfig,
-    ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest, EnablePluginRequest,
-    PairingRequestResponse, PairingRequestedPayload, PluginStatusChangedPayload,
-    PluginStatusResponse, RejectPairingRequest, RevokeUserRequest, SyncChannelSettingsRequest,
-    TestPluginExtraConfig, TestPluginRequest, TestPluginResponse, UserAuthorizedPayload,
+    ApprovePairingRequest, BridgeResponse, ChannelSessionResponse, ChannelUserResponse,
+    DisablePluginRequest, EnablePluginRequest, PairingRequestResponse, PairingRequestedPayload,
+    PluginStatusChangedPayload, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
+    SyncChannelSettingsRequest, TestPluginExtraConfig, TestPluginRequest, TestPluginResponse,
+    UserAuthorizedPayload,
 };
 pub use confirmation::{
     ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse,

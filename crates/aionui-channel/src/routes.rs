@@ -15,6 +15,7 @@ use aionui_api_types::{
 use aionui_common::AppError;
 use aionui_db::IChannelRepository;
 
+use crate::channel_settings::ChannelSettingsService;
 use crate::manager::{ChannelManager, PluginFactory};
 use crate::pairing::PairingService;
 use crate::session::SessionManager;
@@ -34,6 +35,7 @@ pub struct ChannelRouterState {
     pub session_manager: Arc<SessionManager>,
     pub repo: Arc<dyn IChannelRepository>,
     pub plugin_factory: Arc<PluginFactory>,
+    pub settings_service: Arc<ChannelSettingsService>,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,29 +299,25 @@ async fn get_active_sessions(
 // Settings sync handler
 // ---------------------------------------------------------------------------
 
-/// `POST /api/channel/settings/sync` — sync agent/model config to a plugin.
+/// `POST /api/channel/settings/sync` — invalidate channel sessions.
 ///
-/// Currently stores the sync request intent; the actual runtime sync
-/// requires an active plugin instance that supports dynamic config reload.
+/// Clears all sessions so they are recreated with the latest
+/// agent/model configuration on the next incoming message.
+/// Agent/model config is persisted separately via `PUT /api/settings/client`.
 async fn sync_channel_settings(
-    State(_state): State<ChannelRouterState>,
+    State(state): State<ChannelRouterState>,
     body: Result<Json<SyncChannelSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
 
-    // Validate platform type
-    if PluginType::from_str_opt(&req.platform).is_none() {
-        return Err(AppError::BadRequest(format!(
-            "Invalid platform: {}",
-            req.platform
-        )));
-    }
+    let _platform = PluginType::from_str_opt(&req.platform)
+        .ok_or_else(|| AppError::BadRequest(format!("Invalid platform: {}", req.platform)))?;
 
-    // Sync settings is accepted; the running plugin will pick up
-    // the new config on its next message cycle.
+    state.session_manager.clear_all_sessions().await?;
+
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
-        message: Some(format!("Settings synced for {}", req.platform)),
+        message: Some(format!("Sessions cleared for {}", req.platform)),
         error: None,
     })))
 }
