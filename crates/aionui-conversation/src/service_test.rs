@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use aionui_ai_agent::{
-    CronCommandResult, CronCreateParams, CronUpdateParams, ICronService, IWorkerTaskManager,
-};
 use aionui_ai_agent::agent_manager::{AgentManagerHandle, IAgentManager};
 use aionui_ai_agent::stream_event::{AgentStreamEvent, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+use aionui_ai_agent::{
+    CronCommandResult, CronCreateParams, CronUpdateParams, ICronService, IWorkerTaskManager,
+};
+use aionui_api_types::ConversationArtifactKind;
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery,
     SearchMessagesQuery, SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
@@ -15,7 +16,7 @@ use aionui_common::{
     AgentKillReason, AgentType, AppError, Confirmation, ConversationSource, ConversationStatus,
     PaginatedResult, TimestampMs,
 };
-use aionui_db::models::{ConversationRow, MessageRow};
+use aionui_db::models::{ConversationArtifactRow, ConversationRow, MessageRow};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IConversationRepository, MessageRowUpdate,
     MessageSearchRow, SortOrder,
@@ -55,12 +56,16 @@ impl EventBroadcaster for MockBroadcaster {
 
 struct MockRepo {
     rows: Mutex<Vec<ConversationRow>>,
+    messages: Mutex<Vec<MessageRow>>,
+    artifacts: Mutex<Vec<ConversationArtifactRow>>,
 }
 
 impl MockRepo {
     fn new() -> Self {
         Self {
             rows: Mutex::new(vec![]),
+            messages: Mutex::new(vec![]),
+            artifacts: Mutex::new(vec![]),
         }
     }
 }
@@ -179,44 +184,90 @@ impl IConversationRepository for MockRepo {
 
     async fn get_messages(
         &self,
-        _conv_id: &str,
-        _page: u32,
-        _page_size: u32,
-        _order: SortOrder,
+        conv_id: &str,
+        page: u32,
+        page_size: u32,
+        order: SortOrder,
     ) -> Result<PaginatedResult<MessageRow>, aionui_db::DbError> {
+        let messages = self.messages.lock().unwrap();
+        let mut matched: Vec<_> = messages
+            .iter()
+            .filter(|message| message.conversation_id == conv_id)
+            .cloned()
+            .collect();
+        matched.sort_by_key(|message| message.created_at);
+        if matches!(order, SortOrder::Desc) {
+            matched.reverse();
+        }
+
+        let start = page.saturating_sub(1) as usize * page_size as usize;
+        let end = (start + page_size as usize).min(matched.len());
+        let items = if start < matched.len() {
+            matched[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
         Ok(PaginatedResult {
-            items: vec![],
-            total: 0,
-            has_more: false,
+            items,
+            total: matched.len() as u64,
+            has_more: end < matched.len(),
         })
     }
 
-    async fn insert_message(&self, _message: &MessageRow) -> Result<(), aionui_db::DbError> {
+    async fn insert_message(&self, message: &MessageRow) -> Result<(), aionui_db::DbError> {
+        self.messages.lock().unwrap().push(message.clone());
         Ok(())
     }
 
     async fn update_message(
         &self,
-        _id: &str,
-        _updates: &MessageRowUpdate,
+        id: &str,
+        updates: &MessageRowUpdate,
     ) -> Result<(), aionui_db::DbError> {
+        let mut messages = self.messages.lock().unwrap();
+        let message = messages
+            .iter_mut()
+            .find(|message| message.id == id)
+            .ok_or_else(|| aionui_db::DbError::NotFound(format!("Message {id}")))?;
+
+        if let Some(content) = &updates.content {
+            message.content = content.clone();
+        }
+        if let Some(status) = &updates.status {
+            message.status = status.clone();
+        }
+        if let Some(hidden) = updates.hidden {
+            message.hidden = hidden;
+        }
         Ok(())
     }
 
     async fn delete_messages_by_conversation(
         &self,
-        _conv_id: &str,
+        conv_id: &str,
     ) -> Result<(), aionui_db::DbError> {
+        self.messages
+            .lock()
+            .unwrap()
+            .retain(|message| message.conversation_id != conv_id);
         Ok(())
     }
 
     async fn get_message_by_msg_id(
         &self,
-        _conv_id: &str,
-        _msg_id: &str,
-        _msg_type: &str,
+        conv_id: &str,
+        msg_id: &str,
+        msg_type: &str,
     ) -> Result<Option<MessageRow>, aionui_db::DbError> {
-        Ok(None)
+        let messages = self.messages.lock().unwrap();
+        Ok(messages
+            .iter()
+            .find(|message| {
+                message.conversation_id == conv_id
+                    && message.msg_id.as_deref() == Some(msg_id)
+                    && message.r#type == msg_type
+            })
+            .cloned())
     }
 
     async fn search_messages(
@@ -231,6 +282,112 @@ impl IConversationRepository for MockRepo {
             total: 0,
             has_more: false,
         })
+    }
+
+    async fn list_artifacts(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationArtifactRow>, aionui_db::DbError> {
+        Ok(self
+            .artifacts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|artifact| artifact.conversation_id == conversation_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_artifact(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+    ) -> Result<Option<ConversationArtifactRow>, aionui_db::DbError> {
+        Ok(self
+            .artifacts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|artifact| {
+                artifact.conversation_id == conversation_id && artifact.id == artifact_id
+            })
+            .cloned())
+    }
+
+    async fn upsert_artifact(
+        &self,
+        artifact: &ConversationArtifactRow,
+    ) -> Result<ConversationArtifactRow, aionui_db::DbError> {
+        let mut artifacts = self.artifacts.lock().unwrap();
+        if let Some(existing) = artifacts.iter_mut().find(|row| row.id == artifact.id) {
+            *existing = artifact.clone();
+            return Ok(existing.clone());
+        }
+        artifacts.push(artifact.clone());
+        Ok(artifact.clone())
+    }
+
+    async fn update_artifact_status(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+        status: &str,
+        updated_at: TimestampMs,
+    ) -> Result<Option<ConversationArtifactRow>, aionui_db::DbError> {
+        let mut artifacts = self.artifacts.lock().unwrap();
+        let Some(existing) = artifacts.iter_mut().find(|artifact| {
+            artifact.conversation_id == conversation_id && artifact.id == artifact_id
+        }) else {
+            return Ok(None);
+        };
+        existing.status = status.to_owned();
+        existing.updated_at = updated_at;
+        Ok(Some(existing.clone()))
+    }
+
+    async fn mark_skill_suggest_artifacts_saved(
+        &self,
+        cron_job_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<Vec<ConversationArtifactRow>, aionui_db::DbError> {
+        let mut artifacts = self.artifacts.lock().unwrap();
+        let mut updated = Vec::new();
+        for artifact in artifacts
+            .iter_mut()
+            .filter(|artifact| artifact.cron_job_id.as_deref() == Some(cron_job_id))
+        {
+            artifact.status = "saved".into();
+            artifact.updated_at = updated_at;
+            updated.push(artifact.clone());
+        }
+        Ok(updated)
+    }
+
+    async fn delete_artifacts_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), aionui_db::DbError> {
+        self.artifacts
+            .lock()
+            .unwrap()
+            .retain(|artifact| artifact.conversation_id != conversation_id);
+        Ok(())
+    }
+
+    async fn list_legacy_cron_trigger_messages(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<MessageRow>, aionui_db::DbError> {
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message.conversation_id == conversation_id && message.r#type == "cron_trigger"
+            })
+            .cloned()
+            .collect())
     }
 }
 
@@ -867,6 +1024,60 @@ async fn reset_sets_status_to_pending() {
 }
 
 #[tokio::test]
+async fn reset_clears_conversation_artifacts() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.upsert_artifact(&ConversationArtifactRow {
+        id: format!("{}:skill_suggest:cron_1", conv.id),
+        conversation_id: conv.id.clone(),
+        cron_job_id: Some("cron_1".into()),
+        kind: "skill_suggest".into(),
+        status: "pending".into(),
+        payload: json!({ "cron_job_id": "cron_1", "name": "daily-report" }).to_string(),
+        created_at: 1000,
+        updated_at: 1000,
+    })
+    .await
+    .unwrap();
+
+    svc.reset("user_1", &conv.id).await.unwrap();
+
+    let artifacts = repo.list_artifacts(&conv.id).await.unwrap();
+    assert!(artifacts.is_empty());
+}
+
+#[tokio::test]
+async fn list_artifacts_includes_legacy_cron_trigger_messages() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.insert_message(&MessageRow {
+        id: "legacy-msg-1".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("legacy-trigger-1".into()),
+        r#type: "cron_trigger".into(),
+        content: json!({
+            "cron_job_id": "cron_1",
+            "cron_job_name": "Daily Report",
+            "triggered_at": 1234
+        })
+        .to_string(),
+        position: Some("center".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1234,
+    })
+    .await
+    .unwrap();
+
+    let artifacts = svc.list_artifacts("user_1", &conv.id).await.unwrap();
+
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].kind, ConversationArtifactKind::CronTrigger);
+    assert_eq!(artifacts[0].payload["cron_job_id"], "cron_1");
+    assert_eq!(artifacts[0].payload["cron_job_name"], "Daily Report");
+}
+
+#[tokio::test]
 async fn reset_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let err = svc.reset("user_1", "no-such-id").await.unwrap_err();
@@ -1327,6 +1538,35 @@ async fn send_message_returns_accepted() {
 }
 
 #[tokio::test]
+async fn send_message_persists_hidden_user_message_when_requested() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let req: SendMessageRequest = serde_json::from_value(json!({
+        "content": "Hidden cron prompt",
+        "msg_id": "msg-hidden",
+        "hidden": true
+    }))
+    .unwrap();
+
+    svc.send_message("user_1", &conv.id, req, &task_mgr)
+        .await
+        .unwrap();
+
+    let messages = repo
+        .get_messages(&conv.id, 1, 20, SortOrder::Asc)
+        .await
+        .unwrap()
+        .items;
+    let user_message = messages
+        .iter()
+        .find(|message| message.msg_id.as_deref() == Some("msg-hidden"))
+        .expect("hidden user message should be persisted");
+    assert!(user_message.hidden);
+}
+
+#[tokio::test]
 async fn send_message_empty_content_returns_bad_request() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
@@ -1510,7 +1750,10 @@ async fn send_message_continues_cron_system_responses() {
     assert_eq!(finished.status, ConversationStatus::Finished);
 
     let events = broadcaster.take_events();
-    let turn_completed = events.iter().filter(|evt| evt.name == "turn.completed").count();
+    let turn_completed = events
+        .iter()
+        .filter(|evt| evt.name == "turn.completed")
+        .count();
     assert_eq!(turn_completed, 1);
 }
 

@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use aionui_common::PaginatedResult;
 
 use crate::error::DbError;
-use crate::models::{ConversationRow, MessageRow};
+use crate::models::{ConversationArtifactRow, ConversationRow, MessageRow};
 use crate::repository::conversation::{
     ConversationFilters, ConversationRowUpdate, IConversationRepository, MessageRowUpdate,
     MessageSearchRow, SortOrder,
@@ -296,16 +296,20 @@ impl IConversationRepository for SqliteConversationRepository {
         let offset = (effective_page - 1) * effective_size;
         let fetch_limit = effective_size + 1;
 
-        let count_row: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
-                .bind(conv_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let count_row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM messages \
+                 WHERE conversation_id = ? \
+                   AND type NOT IN ('cron_trigger', 'skill_suggest')",
+        )
+        .bind(conv_id)
+        .fetch_one(&self.pool)
+        .await?;
         let total = count_row.0 as u64;
 
         let sql = format!(
             "SELECT * FROM messages \
              WHERE conversation_id = ? \
+               AND type NOT IN ('cron_trigger', 'skill_suggest') \
              ORDER BY created_at {}, id {} \
              LIMIT ? OFFSET ?",
             order.as_sql(),
@@ -477,6 +481,153 @@ impl IConversationRepository for SqliteConversationRepository {
             total,
             has_more,
         })
+    }
+
+    async fn list_artifacts(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationArtifactRow>, DbError> {
+        let rows = sqlx::query_as::<_, ConversationArtifactRow>(
+            "SELECT * FROM conversation_artifacts \
+             WHERE conversation_id = ? \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    async fn get_artifact(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+    ) -> Result<Option<ConversationArtifactRow>, DbError> {
+        let row = sqlx::query_as::<_, ConversationArtifactRow>(
+            "SELECT * FROM conversation_artifacts WHERE conversation_id = ? AND id = ?",
+        )
+        .bind(conversation_id)
+        .bind(artifact_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    async fn upsert_artifact(
+        &self,
+        artifact: &ConversationArtifactRow,
+    ) -> Result<ConversationArtifactRow, DbError> {
+        sqlx::query(
+            "INSERT INTO conversation_artifacts \
+                (id, conversation_id, cron_job_id, kind, status, payload, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET \
+                conversation_id = excluded.conversation_id, \
+                cron_job_id = excluded.cron_job_id, \
+                kind = excluded.kind, \
+                status = excluded.status, \
+                payload = excluded.payload, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(&artifact.id)
+        .bind(&artifact.conversation_id)
+        .bind(&artifact.cron_job_id)
+        .bind(&artifact.kind)
+        .bind(&artifact.status)
+        .bind(&artifact.payload)
+        .bind(artifact.created_at)
+        .bind(artifact.updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_artifact(&artifact.conversation_id, &artifact.id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Init(format!(
+                    "upsert artifact did not produce row for id '{}'",
+                    artifact.id
+                ))
+            })
+    }
+
+    async fn update_artifact_status(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+        status: &str,
+        updated_at: i64,
+    ) -> Result<Option<ConversationArtifactRow>, DbError> {
+        let result = sqlx::query(
+            "UPDATE conversation_artifacts \
+             SET status = ?, updated_at = ? \
+             WHERE conversation_id = ? AND id = ?",
+        )
+        .bind(status)
+        .bind(updated_at)
+        .bind(conversation_id)
+        .bind(artifact_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get_artifact(conversation_id, artifact_id).await
+    }
+
+    async fn mark_skill_suggest_artifacts_saved(
+        &self,
+        cron_job_id: &str,
+        updated_at: i64,
+    ) -> Result<Vec<ConversationArtifactRow>, DbError> {
+        sqlx::query(
+            "UPDATE conversation_artifacts \
+             SET status = 'saved', updated_at = ? \
+             WHERE kind = 'skill_suggest' AND cron_job_id = ? AND status != 'saved'",
+        )
+        .bind(updated_at)
+        .bind(cron_job_id)
+        .execute(&self.pool)
+        .await?;
+
+        let rows = sqlx::query_as::<_, ConversationArtifactRow>(
+            "SELECT * FROM conversation_artifacts \
+             WHERE kind = 'skill_suggest' AND cron_job_id = ? \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(cron_job_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    async fn delete_artifacts_by_conversation(&self, conversation_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM conversation_artifacts WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn list_legacy_cron_trigger_messages(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<MessageRow>, DbError> {
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT * FROM messages \
+             WHERE conversation_id = ? AND type = 'cron_trigger' \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
     }
 }
 

@@ -7,8 +7,8 @@ mod repository;
 pub use database::{Database, init_database, init_database_memory};
 pub use error::DbError;
 pub use models::{
-    AssistantOverrideRow, AssistantRow, CreateAssistantParams, UpdateAssistantParams,
-    UpsertOverrideParams,
+    AssistantOverrideRow, AssistantRow, ConversationArtifactRow, CreateAssistantParams,
+    UpdateAssistantParams, UpsertOverrideParams,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{

@@ -46,6 +46,25 @@ fn make_message(conv_id: &str, content: &str) -> MessageRow {
     }
 }
 
+fn make_artifact(conv_id: &str, artifact_id: &str) -> aionui_db::ConversationArtifactRow {
+    aionui_db::ConversationArtifactRow {
+        id: artifact_id.to_string(),
+        conversation_id: conv_id.to_string(),
+        cron_job_id: Some("cron_1".to_string()),
+        kind: "skill_suggest".to_string(),
+        status: "pending".to_string(),
+        payload: serde_json::json!({
+            "cron_job_id": "cron_1",
+            "name": "daily-report",
+            "description": "Daily report",
+            "skillContent": "---\nname: daily-report\n---\nUse it."
+        })
+        .to_string(),
+        created_at: 1000,
+        updated_at: 1000,
+    }
+}
+
 // ── Conversation CRUD ───────────────────────────────────────────────
 
 #[tokio::test]
@@ -691,6 +710,128 @@ async fn update_extra_replaces_json() {
 
     let found = repo.get(&conv.id).await.unwrap().unwrap();
     assert_eq!(found.extra, r#"{"workspace":"/new","flag":true}"#);
+}
+
+#[tokio::test]
+async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("message-filter");
+    repo.create(&conv).await.unwrap();
+
+    repo.insert_message(&make_message(&conv.id, "visible"))
+        .await
+        .unwrap();
+
+    for (id, ty) in [
+        ("legacy-cron", "cron_trigger"),
+        ("legacy-skill", "skill_suggest"),
+    ] {
+        repo.insert_message(&MessageRow {
+            id: id.into(),
+            conversation_id: conv.id.clone(),
+            msg_id: None,
+            r#type: ty.into(),
+            content: "{}".into(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 2000,
+        })
+        .await
+        .unwrap();
+    }
+
+    let rows = repo
+        .get_messages(&conv.id, 1, 50, SortOrder::Asc)
+        .await
+        .unwrap();
+    assert_eq!(rows.total, 1);
+    assert_eq!(rows.items.len(), 1);
+    assert_eq!(rows.items[0].r#type, "text");
+}
+
+#[tokio::test]
+async fn list_legacy_cron_trigger_messages_returns_only_trigger_rows() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("legacy-cron-trigger");
+    repo.create(&conv).await.unwrap();
+
+    repo.insert_message(&MessageRow {
+        id: aionui_common::generate_prefixed_id("msg"),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("legacy-trigger".into()),
+        r#type: "cron_trigger".into(),
+        content: r#"{"cron_job_id":"cron_1","cron_job_name":"Daily Report"}"#.into(),
+        position: Some("center".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1000,
+    })
+    .await
+    .unwrap();
+    repo.insert_message(&make_message(&conv.id, "plain text"))
+        .await
+        .unwrap();
+
+    let rows = repo
+        .list_legacy_cron_trigger_messages(&conv.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].r#type, "cron_trigger");
+}
+
+#[tokio::test]
+async fn artifact_upsert_list_and_mark_saved() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("artifact-row");
+    repo.create(&conv).await.unwrap();
+
+    let artifact_id = format!("{}:skill_suggest:cron_1", conv.id);
+    let inserted = repo
+        .upsert_artifact(&make_artifact(&conv.id, &artifact_id))
+        .await
+        .unwrap();
+    assert_eq!(inserted.status, "pending");
+
+    let listed = repo.list_artifacts(&conv.id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, artifact_id);
+
+    let dismissed = repo
+        .update_artifact_status(&conv.id, &artifact_id, "dismissed", 2000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dismissed.status, "dismissed");
+    assert_eq!(dismissed.updated_at, 2000);
+
+    let saved = repo
+        .mark_skill_suggest_artifacts_saved("cron_1", 3000)
+        .await
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].status, "saved");
+    assert_eq!(saved[0].updated_at, 3000);
+}
+
+#[tokio::test]
+async fn delete_artifacts_by_conversation_removes_rows() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("artifact-delete");
+    repo.create(&conv).await.unwrap();
+
+    let artifact_id = format!("{}:skill_suggest:cron_1", conv.id);
+    repo.upsert_artifact(&make_artifact(&conv.id, &artifact_id))
+        .await
+        .unwrap();
+
+    repo.delete_artifacts_by_conversation(&conv.id)
+        .await
+        .unwrap();
+
+    let listed = repo.list_artifacts(&conv.id).await.unwrap();
+    assert!(listed.is_empty());
 }
 
 // ── User isolation ──────────────────────────────────────────────────
