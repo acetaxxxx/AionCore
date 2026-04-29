@@ -6,7 +6,7 @@ use aionui_api_types::{
     CreateCronJobRequest, CronJobResponse, CronScheduleDto, HasSkillResponse, ListCronJobsQuery,
     RunNowResponse, SaveCronSkillRequest, UpdateCronJobRequest,
 };
-use aionui_common::{ProviderWithModel, generate_prefixed_id, now_ms};
+use aionui_common::{AcpBackend, AgentType, ProviderWithModel, generate_prefixed_id, now_ms};
 use aionui_db::{ICronRepository, UpdateCronJobParams};
 use tracing::{error, info, warn};
 
@@ -1032,6 +1032,14 @@ fn build_agent_config_from_conversation(
         None
     };
 
+    let agent_type_enum =
+        serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok();
+    let backend_enum =
+        serde_json::from_value::<AcpBackend>(serde_json::Value::String(backend.clone())).ok();
+    let full_auto_mode = agent_type_enum
+        .unwrap_or(AgentType::Acp)
+        .full_auto_mode_id(backend_enum)
+        .to_owned();
     let agent_config = aionui_api_types::CronAgentConfigDto {
         backend,
         name: get_string(&extra, &["agent_name", "agentName"]).unwrap_or_else(|| row.name.clone()),
@@ -1045,7 +1053,7 @@ fn build_agent_config_from_conversation(
         is_preset,
         custom_agent_id,
         preset_agent_type,
-        mode: get_string(&extra, &["session_mode", "sessionMode"]),
+        mode: Some(full_auto_mode),
         model_id: get_string(&extra, &["current_model_id", "currentModelId"]).or_else(|| {
             model.as_ref().and_then(|value| {
                 value
@@ -1060,7 +1068,6 @@ fn build_agent_config_from_conversation(
 
     (row.r#type.clone(), Some(agent_config))
 }
-
 fn get_string(extra: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         extra
