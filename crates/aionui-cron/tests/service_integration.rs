@@ -10,18 +10,20 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use aionui_ai_agent::AgentRegistry;
 use aionui_ai_agent::agent_manager::AgentManagerHandle;
 use aionui_ai_agent::middleware::{CronCreateParams, CronUpdateParams};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_api_types::{
-    CreateCronJobRequest, CronScheduleDto, ListCronJobsQuery, SaveCronSkillRequest,
-    UpdateCronJobRequest, WebSocketMessage,
+    CreateCronJobRequest, CronScheduleDto, ListCronJobsQuery, SaveCronSkillRequest, UpdateCronJobRequest,
+    WebSocketMessage,
 };
 use aionui_common::{PaginatedResult, TimestampMs, now_ms};
 use aionui_conversation::ConversationService;
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, ICronRepository,
-    MessageRowUpdate, MessageSearchRow, SortOrder, SqliteCronRepository, init_database_memory,
+    ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
+    IConversationRepository, ICronRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteCronRepository, init_database_memory,
     models::MessageRow,
 };
 use aionui_realtime::EventBroadcaster;
@@ -64,18 +66,10 @@ impl aionui_ai_agent::task_manager::IWorkerTaskManager for StubTaskManager {
     fn get_task(&self, _: &str) -> Option<AgentManagerHandle> {
         None
     }
-    fn get_or_build_task(
-        &self,
-        _: &str,
-        _: BuildTaskOptions,
-    ) -> Result<AgentManagerHandle, aionui_common::AppError> {
+    fn get_or_build_task(&self, _: &str, _: BuildTaskOptions) -> Result<AgentManagerHandle, aionui_common::AppError> {
         Err(aionui_common::AppError::Internal("stub".into()))
     }
-    fn kill(
-        &self,
-        _: &str,
-        _: Option<aionui_common::AgentKillReason>,
-    ) -> Result<(), aionui_common::AppError> {
+    fn kill(&self, _: &str, _: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_common::AppError> {
         Ok(())
     }
     fn clear(&self) {}
@@ -123,10 +117,7 @@ impl StubConvRepo {
 
 #[async_trait::async_trait]
 impl IConversationRepository for StubConvRepo {
-    async fn get(
-        &self,
-        id: &str,
-    ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+    async fn get(&self, id: &str) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
         let mut rows = self.rows.lock().unwrap();
 
         if let Some(existing) = rows.get(id) {
@@ -307,21 +298,11 @@ impl IConversationRepository for StubConvRepo {
         rows.insert(id.to_owned(), row.clone());
         Ok(Some(row))
     }
-    async fn create(
-        &self,
-        row: &aionui_db::models::ConversationRow,
-    ) -> Result<(), aionui_db::DbError> {
-        self.rows
-            .lock()
-            .unwrap()
-            .insert(row.id.clone(), row.clone());
+    async fn create(&self, row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
+        self.rows.lock().unwrap().insert(row.id.clone(), row.clone());
         Ok(())
     }
-    async fn update(
-        &self,
-        id: &str,
-        updates: &ConversationRowUpdate,
-    ) -> Result<(), aionui_db::DbError> {
+    async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
         let mut rows = self.rows.lock().unwrap();
         let row = rows
             .entry(id.to_owned())
@@ -412,24 +393,14 @@ impl IConversationRepository for StubConvRepo {
             has_more: false,
         })
     }
-    async fn insert_message(
-        &self,
-        message: &aionui_db::models::MessageRow,
-    ) -> Result<(), aionui_db::DbError> {
+    async fn insert_message(&self, message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
         self.messages.lock().unwrap().push(message.clone());
         Ok(())
     }
-    async fn update_message(
-        &self,
-        _id: &str,
-        _updates: &MessageRowUpdate,
-    ) -> Result<(), aionui_db::DbError> {
+    async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
         Ok(())
     }
-    async fn delete_messages_by_conversation(
-        &self,
-        _conv_id: &str,
-    ) -> Result<(), aionui_db::DbError> {
+    async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), aionui_db::DbError> {
         Ok(())
     }
     async fn get_message_by_msg_id(
@@ -512,9 +483,7 @@ impl IConversationRepository for StubConvRepo {
         let mut guard = self.artifacts.lock().unwrap();
         let mut updated = Vec::new();
         for artifact in guard.iter_mut() {
-            if artifact.kind == "skill_suggest"
-                && artifact.cron_job_id.as_deref() == Some(cron_job_id)
-            {
+            if artifact.kind == "skill_suggest" && artifact.cron_job_id.as_deref() == Some(cron_job_id) {
                 artifact.status = "saved".into();
                 artifact.updated_at = updated_at;
                 updated.push(artifact.clone());
@@ -537,7 +506,10 @@ async fn setup_with_conv_repo() -> (
 ) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
-    let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool));
+    let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool.clone()));
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
+    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
     let bc = Arc::new(MockBroadcaster::new());
     let data_dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", now_ms()));
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -573,7 +545,11 @@ async fn setup_with_conv_repo() -> (
         bc.clone() as Arc<dyn EventBroadcaster>,
         std::env::temp_dir(),
         Arc::new(StubSkillResolver),
+        Arc::clone(&agent_metadata_repo),
+        acp_session_repo,
     ));
+    let agent_registry = AgentRegistry::new(agent_metadata_repo);
+    agent_registry.hydrate().await.unwrap();
     let busy_guard = Arc::new(CronBusyGuard::new());
     let executor = Arc::new(JobExecutor::new(
         Arc::new(StubTaskManager),
@@ -582,6 +558,7 @@ async fn setup_with_conv_repo() -> (
         busy_guard,
         data_dir.clone(),
         bc.clone() as Arc<dyn EventBroadcaster>,
+        agent_registry,
     ));
 
     let scheduler = Arc::new(CronScheduler::new(Arc::new(|_| {})));
@@ -664,10 +641,7 @@ async fn cj2_create_three_schedule_types() {
         .unwrap();
     assert!(at_job.next_run_at.unwrap() > now);
 
-    let every_job = svc
-        .add_job(make_create_req("Every Job", every_60s()))
-        .await
-        .unwrap();
+    let every_job = svc.add_job(make_create_req("Every Job", every_60s())).await.unwrap();
     let next = every_job.next_run_at.unwrap();
     assert!((next - now - 60000).abs() < 2000);
 
@@ -683,10 +657,7 @@ async fn cj2_create_three_schedule_types() {
 #[tokio::test]
 async fn cj4_get_single_job() {
     let (svc, _, _) = setup().await;
-    let created = svc
-        .add_job(make_create_req("Get Test", every_60s()))
-        .await
-        .unwrap();
+    let created = svc.add_job(make_create_req("Get Test", every_60s())).await.unwrap();
 
     let fetched = svc.get_job(&created.id).await.unwrap();
     assert_eq!(fetched.id, created.id);
@@ -766,10 +737,7 @@ async fn cj7b_add_job_binds_existing_conversation_to_job() {
 #[tokio::test]
 async fn cj8_update_job() {
     let (svc, _, bc) = setup().await;
-    let created = svc
-        .add_job(make_create_req("Original", every_60s()))
-        .await
-        .unwrap();
+    let created = svc.add_job(make_create_req("Original", every_60s())).await.unwrap();
     bc.take_events();
 
     let req = UpdateCronJobRequest {
@@ -850,10 +818,7 @@ async fn cj10_update_nonexistent() {
 #[tokio::test]
 async fn cj11_delete_job() {
     let (svc, _, bc) = setup().await;
-    let created = svc
-        .add_job(make_create_req("To Delete", every_60s()))
-        .await
-        .unwrap();
+    let created = svc.add_job(make_create_req("To Delete", every_60s())).await.unwrap();
     bc.take_events();
 
     svc.remove_job(&created.id).await.unwrap();
@@ -883,10 +848,7 @@ async fn cj12_delete_nonexistent() {
 #[tokio::test]
 async fn sk1_save_skill() {
     let (svc, _, _) = setup().await;
-    let job = svc
-        .add_job(make_create_req("Skill Job", every_60s()))
-        .await
-        .unwrap();
+    let job = svc.add_job(make_create_req("Skill Job", every_60s())).await.unwrap();
 
     let req = SaveCronSkillRequest {
         content: "---\nname: test\ndescription: test skill\n---\nDo something".into(),
@@ -949,10 +911,7 @@ async fn sk1_1_save_skill_marks_related_skill_suggest_artifacts_saved() {
 #[tokio::test]
 async fn sk2_has_skill_true() {
     let (svc, _, _) = setup().await;
-    let job = svc
-        .add_job(make_create_req("Skill Check", every_60s()))
-        .await
-        .unwrap();
+    let job = svc.add_job(make_create_req("Skill Check", every_60s())).await.unwrap();
 
     svc.save_skill(
         &job.id,
@@ -972,10 +931,7 @@ async fn sk2_has_skill_true() {
 #[tokio::test]
 async fn sk3_has_skill_false() {
     let (svc, _, _) = setup().await;
-    let job = svc
-        .add_job(make_create_req("No Skill", every_60s()))
-        .await
-        .unwrap();
+    let job = svc.add_job(make_create_req("No Skill", every_60s())).await.unwrap();
 
     let resp = svc.has_skill(&job.id).await.unwrap();
     assert!(!resp.has_skill);
@@ -986,19 +942,13 @@ async fn sk3_has_skill_false() {
 #[tokio::test]
 async fn sk4_save_empty_skill() {
     let (svc, _, _) = setup().await;
-    let job = svc
-        .add_job(make_create_req("Empty Skill", every_60s()))
-        .await
-        .unwrap();
+    let job = svc.add_job(make_create_req("Empty Skill", every_60s())).await.unwrap();
 
     let err = svc
         .save_skill(&job.id, SaveCronSkillRequest { content: "".into() })
         .await
         .unwrap_err();
-    assert!(matches!(
-        err,
-        aionui_cron::error::CronError::InvalidSkillContent(_)
-    ));
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidSkillContent(_)));
 }
 
 // ── SK-5: Save placeholder skill ──────────────────────────────────
@@ -1020,10 +970,7 @@ async fn sk5_save_placeholder_skill() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(
-        err,
-        aionui_cron::error::CronError::InvalidSkillContent(_)
-    ));
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidSkillContent(_)));
 }
 
 // ── SK-6: Save skill for nonexistent job ──────────────────────────
@@ -1073,10 +1020,7 @@ async fn sk7_delete_cleans_skill() {
 async fn sc3_every_type_next_run() {
     let (svc, _, _) = setup().await;
     let now = now_ms();
-    let job = svc
-        .add_job(make_create_req("Every 60s", every_60s()))
-        .await
-        .unwrap();
+    let job = svc.add_job(make_create_req("Every 60s", every_60s())).await.unwrap();
 
     let next = job.next_run_at.unwrap();
     let diff = (next - now - 60000).abs();
@@ -1097,10 +1041,7 @@ async fn sc5_invalid_cron_expression() {
         },
     );
     let err = svc.add_job(req).await.unwrap_err();
-    assert!(matches!(
-        err,
-        aionui_cron::error::CronError::InvalidCronExpression(_)
-    ));
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidCronExpression(_)));
 }
 
 // ── SC-6: Cron with timezone ──────────────────────────────────────
@@ -1134,10 +1075,7 @@ async fn sc7_every_zero_interval() {
         },
     );
     let err = svc.add_job(req).await.unwrap_err();
-    assert!(matches!(
-        err,
-        aionui_cron::error::CronError::InvalidSchedule(_)
-    ));
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidSchedule(_)));
 }
 
 // ── SC-8: Every negative interval ─────────────────────────────────
@@ -1153,10 +1091,7 @@ async fn sc8_every_negative_interval() {
         },
     );
     let err = svc.add_job(req).await.unwrap_err();
-    assert!(matches!(
-        err,
-        aionui_cron::error::CronError::InvalidSchedule(_)
-    ));
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidSchedule(_)));
 }
 
 // ── OC-1: Init cleans orphan jobs ─────────────────────────────────
@@ -1207,10 +1142,7 @@ async fn oc2_init_cleans_jobs_with_missing_conversation() {
 #[tokio::test]
 async fn delete_skill_clears_content() {
     let (svc, _, _) = setup().await;
-    let job = svc
-        .add_job(make_create_req("Del Skill", every_60s()))
-        .await
-        .unwrap();
+    let job = svc.add_job(make_create_req("Del Skill", every_60s())).await.unwrap();
 
     svc.save_skill(
         &job.id,
@@ -1279,10 +1211,7 @@ async fn icron_service_create_job_inherits_conversation_mode_and_backend() {
     assert_eq!(jobs.len(), 1);
 
     let job = &jobs[0];
-    let config = job
-        .agent_config
-        .as_ref()
-        .expect("agent config should be copied");
+    let config = job.agent_config.as_ref().expect("agent config should be copied");
     assert_eq!(job.agent_type, "acp");
     assert_eq!(job.conversation_title.as_deref(), Some("Gemini Chat"));
     assert_eq!(config.backend, "gemini");
@@ -1384,11 +1313,7 @@ async fn icron_service_list_jobs() {
 
     let result = ICronService::list_jobs(&svc, "user_1", "conv_1").await;
     assert!(result.success);
-    assert!(
-        result
-            .message
-            .contains("No cron jobs found for conversation 'conv_1'")
-    );
+    assert!(result.message.contains("No cron jobs found for conversation 'conv_1'"));
 
     let mut req = make_create_req("Listed Job", every_60s());
     req.conversation_id = "conv_1".into();
@@ -1396,11 +1321,7 @@ async fn icron_service_list_jobs() {
 
     let result = ICronService::list_jobs(&svc, "user_1", "conv_1").await;
     assert!(result.success);
-    assert!(
-        result
-            .message
-            .contains("1 cron job(s) for conversation 'conv_1'")
-    );
+    assert!(result.message.contains("1 cron job(s) for conversation 'conv_1'"));
     assert!(result.message.contains("Listed Job"));
 }
 
@@ -1464,10 +1385,7 @@ async fn icron_service_delete_job() {
 #[tokio::test]
 async fn update_max_retries() {
     let (svc, _, _) = setup().await;
-    let job = svc
-        .add_job(make_create_req("Retries", every_60s()))
-        .await
-        .unwrap();
+    let job = svc.add_job(make_create_req("Retries", every_60s())).await.unwrap();
     assert_eq!(job.max_retries, 3);
 
     let req = UpdateCronJobRequest {
@@ -1568,9 +1486,7 @@ async fn sr1_system_resume_missed_job() {
     );
     assert!(
         events.iter().any(|event| {
-            event.name == "message.stream"
-                && event.data["type"] == "tips"
-                && event.data["conversation_id"] == "conv_1"
+            event.name == "message.stream" && event.data["type"] == "tips" && event.data["conversation_id"] == "conv_1"
         }),
         "resume should emit a tips websocket message"
     );
@@ -1605,10 +1521,7 @@ async fn cd1_cascade_delete_by_conversation() {
     assert_eq!(remaining.len(), 1, "only the unrelated job should remain");
 
     let events = bc.take_events();
-    let removed_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.name == "cron.job-removed")
-        .collect();
+    let removed_events: Vec<_> = events.iter().filter(|e| e.name == "cron.job-removed").collect();
     assert_eq!(removed_events.len(), 2, "should emit 2 removed events");
 }
 
@@ -1618,18 +1531,13 @@ async fn cd1_cascade_delete_by_conversation() {
 async fn cd2_cascade_delete_no_matching_jobs() {
     let (svc, _repo, bc) = setup().await;
 
-    svc.add_job(make_create_req("Existing", every_60s()))
-        .await
-        .unwrap();
+    svc.add_job(make_create_req("Existing", every_60s())).await.unwrap();
     bc.take_events();
 
     svc.delete_jobs_by_conversation("conv_nonexistent").await;
 
     let events = bc.take_events();
-    assert!(
-        events.is_empty(),
-        "no events should be emitted when no jobs match"
-    );
+    assert!(events.is_empty(), "no events should be emitted when no jobs match");
 
     let all = svc.list_jobs(&ListCronJobsQuery::default()).await.unwrap();
     assert_eq!(all.len(), 1, "existing job should remain untouched");

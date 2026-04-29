@@ -6,10 +6,13 @@ use std::sync::Mutex;
 use aionui_ai_agent::{AgentFactory, BuildTaskOptions, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
 use aionui_common::{AgentKillReason, AppError, PaginatedResult};
-use aionui_db::models::{ConversationRow, MessageRow};
+use aionui_db::models::{
+    AcpSessionRow, AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+};
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, DbError, IConversationRepository, ITeamRepository,
-    MessageRowUpdate, MessageSearchRow, SortOrder,
+    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
+    IAgentMetadataRepository, IConversationRepository, ITeamRepository, MessageRowUpdate, MessageSearchRow,
+    PersistedSessionState, SaveRuntimeStateParams, SortOrder,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -90,18 +93,10 @@ impl IConversationRepository for MockConversationRepo {
     ) -> Result<Option<ConversationRow>, DbError> {
         Ok(None)
     }
-    async fn list_by_cron_job(
-        &self,
-        _user_id: &str,
-        _cron_job_id: &str,
-    ) -> Result<Vec<ConversationRow>, DbError> {
+    async fn list_by_cron_job(&self, _user_id: &str, _cron_job_id: &str) -> Result<Vec<ConversationRow>, DbError> {
         Ok(vec![])
     }
-    async fn list_associated(
-        &self,
-        _user_id: &str,
-        _conversation_id: &str,
-    ) -> Result<Vec<ConversationRow>, DbError> {
+    async fn list_associated(&self, _user_id: &str, _conversation_id: &str) -> Result<Vec<ConversationRow>, DbError> {
         Ok(vec![])
     }
     async fn get_messages(
@@ -186,19 +181,9 @@ impl ITeamRepository for FullMockTeamRepo {
         Ok(self.teams.lock().unwrap().clone())
     }
     async fn get_team(&self, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
-        Ok(self
-            .teams
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|t| t.id == id)
-            .cloned())
+        Ok(self.teams.lock().unwrap().iter().find(|t| t.id == id).cloned())
     }
-    async fn update_team(
-        &self,
-        id: &str,
-        params: &aionui_db::UpdateTeamParams,
-    ) -> Result<(), DbError> {
+    async fn update_team(&self, id: &str, params: &aionui_db::UpdateTeamParams) -> Result<(), DbError> {
         let mut teams = self.teams.lock().unwrap();
         let team = teams
             .iter_mut()
@@ -221,10 +206,7 @@ impl ITeamRepository for FullMockTeamRepo {
         Ok(())
     }
 
-    async fn write_message(
-        &self,
-        row: &aionui_db::models::MailboxMessageRow,
-    ) -> Result<(), DbError> {
+    async fn write_message(&self, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
         self.inner.write_message(row).await
     }
     async fn read_unread_and_mark(
@@ -256,30 +238,17 @@ impl ITeamRepository for FullMockTeamRepo {
     ) -> Result<Option<aionui_db::models::TeamTaskRow>, DbError> {
         self.inner.find_task_by_id(team_id, task_id).await
     }
-    async fn update_task(
-        &self,
-        task_id: &str,
-        params: &aionui_db::UpdateTaskParams,
-    ) -> Result<(), DbError> {
+    async fn update_task(&self, task_id: &str, params: &aionui_db::UpdateTaskParams) -> Result<(), DbError> {
         self.inner.update_task(task_id, params).await
     }
-    async fn list_tasks(
-        &self,
-        team_id: &str,
-    ) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
+    async fn list_tasks(&self, team_id: &str) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
         self.inner.list_tasks(team_id).await
     }
     async fn append_to_blocks(&self, task_id: &str, blocked_task_id: &str) -> Result<(), DbError> {
         self.inner.append_to_blocks(task_id, blocked_task_id).await
     }
-    async fn remove_from_blocked_by(
-        &self,
-        task_id: &str,
-        unblocked_task_id: &str,
-    ) -> Result<(), DbError> {
-        self.inner
-            .remove_from_blocked_by(task_id, unblocked_task_id)
-            .await
+    async fn remove_from_blocked_by(&self, task_id: &str, unblocked_task_id: &str) -> Result<(), DbError> {
+        self.inner.remove_from_blocked_by(task_id, unblocked_task_id).await
     }
     async fn delete_tasks_by_team(&self, team_id: &str) -> Result<(), DbError> {
         self.inner.delete_tasks_by_team(team_id).await
@@ -296,10 +265,7 @@ impl aionui_conversation::skill_resolver::SkillResolver for StubSkillResolver {
     async fn auto_inject_names(&self) -> Vec<String> {
         Vec::new()
     }
-    async fn resolve_skills(
-        &self,
-        _names: &[String],
-    ) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
+    async fn resolve_skills(&self, _names: &[String]) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
         Vec::new()
     }
     async fn link_workspace_skills(
@@ -309,6 +275,72 @@ impl aionui_conversation::skill_resolver::SkillResolver for StubSkillResolver {
         _skills: &[aionui_conversation::skill_resolver::ResolvedAgentSkill],
     ) -> usize {
         0
+    }
+}
+
+struct StubAgentMetadataRepo;
+
+#[async_trait::async_trait]
+impl IAgentMetadataRepository for StubAgentMetadataRepo {
+    async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
+        Ok(Vec::new())
+    }
+    async fn get(&self, _id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn find_by_source_and_name(
+        &self,
+        _agent_source: &str,
+        _name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn find_builtin_by_backend(&self, _backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
+        Err(DbError::Init("stub".into()))
+    }
+    async fn apply_handshake(
+        &self,
+        _id: &str,
+        _params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
+        Ok(false)
+    }
+    async fn delete(&self, _id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
+struct StubAcpSessionRepo;
+
+#[async_trait::async_trait]
+impl IAcpSessionRepository for StubAcpSessionRepo {
+    async fn get(&self, _conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
+        Ok(None)
+    }
+    async fn create(&self, _params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
+        Err(DbError::Init("stub".into()))
+    }
+    async fn update_session_id(&self, _conversation_id: &str, _session_id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+    async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+    async fn load_runtime_state(&self, _conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError> {
+        Ok(None)
+    }
+    async fn save_runtime_state(
+        &self,
+        _conversation_id: &str,
+        _params: &SaveRuntimeStateParams<'_>,
+    ) -> Result<bool, DbError> {
+        Ok(false)
     }
 }
 
@@ -350,11 +382,7 @@ impl IWorkerTaskManager for CountingTaskManager {
         conversation_id: &str,
         options: BuildTaskOptions,
     ) -> Result<aionui_ai_agent::AgentManagerHandle, AppError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .build
-            .push(conversation_id.to_owned());
+        self.calls.lock().unwrap().build.push(conversation_id.to_owned());
         self.inner.get_or_build_task(conversation_id, options)
     }
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
@@ -383,9 +411,7 @@ mod mock_agent {
     use aionui_ai_agent::agent_manager::IAgentManager;
     use aionui_ai_agent::stream_event::AgentStreamEvent;
     use aionui_ai_agent::types::SendMessageData;
-    use aionui_common::{
-        AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs,
-    };
+    use aionui_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs};
     use tokio::sync::broadcast;
 
     pub struct MockAgent {
@@ -457,10 +483,10 @@ mod mock_agent {
 
 fn success_factory() -> AgentFactory {
     Arc::new(|opts: BuildTaskOptions| {
-        Ok(Arc::new(mock_agent::MockAgent::new(
-            opts.conversation_id,
-            opts.workspace,
-        )) as aionui_ai_agent::AgentManagerHandle)
+        Ok(
+            Arc::new(mock_agent::MockAgent::new(opts.conversation_id, opts.workspace))
+                as aionui_ai_agent::AgentManagerHandle,
+        )
     })
 }
 
@@ -468,11 +494,15 @@ fn setup_with_factory(factory: AgentFactory) -> (TeamSessionService, Arc<Countin
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(FullMockTeamRepo::new());
     let conv_repo: Arc<dyn IConversationRepository> = Arc::new(MockConversationRepo::new());
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
     let conv_service = ConversationService::new_with_workspace_root(
         conv_repo,
         broadcaster.clone(),
         std::env::temp_dir(),
         Arc::new(StubSkillResolver),
+        agent_metadata_repo,
+        acp_session_repo,
     );
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aionui-backend-test"));
     let task_manager = Arc::new(CountingTaskManager::new(factory));
@@ -625,10 +655,7 @@ async fn tc3_each_agent_has_conversation_id() {
     for agent in &resp.agents {
         assert!(!agent.conversation_id.is_empty());
     }
-    assert_ne!(
-        resp.agents[0].conversation_id,
-        resp.agents[1].conversation_id
-    );
+    assert_ne!(resp.agents[0].conversation_id, resp.agents[1].conversation_id);
 }
 
 // -- List teams ---------------------------------------------------------------
@@ -832,9 +859,7 @@ async fn ar1_remove_agent_from_team() {
         .unwrap();
 
     let worker_slot = created.agents[1].slot_id.clone();
-    svc.remove_agent("user1", &created.id, &worker_slot)
-        .await
-        .unwrap();
+    svc.remove_agent("user1", &created.id, &worker_slot).await.unwrap();
 
     let got = svc.get_team(&created.id).await.unwrap();
     assert_eq!(got.agents.len(), 1);
@@ -874,9 +899,7 @@ async fn an1_rename_agent() {
         .unwrap();
 
     let slot_id = created.agents[1].slot_id.clone();
-    svc.rename_agent(&created.id, &slot_id, "Senior Worker")
-        .await
-        .unwrap();
+    svc.rename_agent(&created.id, &slot_id, "Senior Worker").await.unwrap();
 
     let got = svc.get_team(&created.id).await.unwrap();
     let agent = got.agents.iter().find(|a| a.slot_id == slot_id).unwrap();
@@ -1008,9 +1031,7 @@ async fn sm1_send_message_with_active_session() {
         .unwrap();
 
     svc.ensure_session(&created.id).await.unwrap();
-    svc.send_message(&created.id, "Hello team", None)
-        .await
-        .unwrap();
+    svc.send_message(&created.id, "Hello team", None).await.unwrap();
 }
 
 #[tokio::test]
@@ -1165,10 +1186,10 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
             "factory called without team_mcp_stdio_config in extra: {:?}",
             opts.extra
         );
-        Ok(Arc::new(mock_agent::MockAgent::new(
-            opts.conversation_id,
-            opts.workspace,
-        )) as aionui_ai_agent::AgentManagerHandle)
+        Ok(
+            Arc::new(mock_agent::MockAgent::new(opts.conversation_id, opts.workspace))
+                as aionui_ai_agent::AgentManagerHandle,
+        )
     }));
 
     let created = svc
@@ -1204,25 +1225,16 @@ async fn d9_ensure_session_is_idempotent() {
 
     // Second call short-circuits — no additional kill/build calls.
     let calls = tm.snapshot();
-    assert_eq!(
-        calls.kill.len(),
-        2,
-        "second ensure_session must not re-kill"
-    );
-    assert_eq!(
-        calls.build.len(),
-        2,
-        "second ensure_session must not re-build"
-    );
+    assert_eq!(calls.kill.len(), 2, "second ensure_session must not re-kill");
+    assert_eq!(calls.build.len(), 2, "second ensure_session must not re-build");
 }
 
 #[tokio::test]
 async fn d9_ensure_session_rollbacks_when_build_fails() {
     // Factory always fails → ensure_session must propagate error and not
     // insert into sessions, so send_message afterwards still errors.
-    let failing_factory: AgentFactory = Arc::new(|_opts: BuildTaskOptions| {
-        Err(AppError::Internal("simulated build failure".into()))
-    });
+    let failing_factory: AgentFactory =
+        Arc::new(|_opts: BuildTaskOptions| Err(AppError::Internal("simulated build failure".into())));
     let (svc, tm) = setup_with_factory(failing_factory);
     let created = svc
         .create_team(
@@ -1236,10 +1248,7 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
         .unwrap();
 
     let result = svc.ensure_session(&created.id).await;
-    assert!(
-        result.is_err(),
-        "ensure_session should propagate build error"
-    );
+    assert!(result.is_err(), "ensure_session should propagate build error");
 
     // Kill ran for the first agent (before warmup failed), build ran once
     // and errored. No session inserted, so send_message errors.
@@ -1354,11 +1363,7 @@ async fn d115_remove_team_kills_every_agent_process() {
 
     // Bring two agents online — after ensure_session, active_count == 2.
     svc.ensure_session(&created.id).await.unwrap();
-    assert_eq!(
-        tm.active_count(),
-        2,
-        "ensure_session must register 2 live agents"
-    );
+    assert_eq!(tm.active_count(), 2, "ensure_session must register 2 live agents");
 
     let before_kill = tm.snapshot().kill.len();
 
