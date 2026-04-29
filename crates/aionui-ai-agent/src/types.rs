@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use aionui_api_types::TeamMcpStdioConfig;
-use aionui_common::{AcpBackend, AgentType, ProviderWithModel};
+use aionui_common::{AgentType, ProviderWithModel};
 
 /// Data payload for sending a user message to an Agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,9 +43,10 @@ pub struct AcpBuildExtra {
     /// from the registry and need not be supplied by the caller.
     #[serde(default)]
     pub agent_id: Option<String>,
-    /// ACP sub-backend identifier.
+    /// Vendor label (e.g. "claude"). When present without `agent_id`, the
+    /// factory looks up the first builtin row matching this label.
     #[serde(default)]
-    pub backend: Option<AcpBackend>,
+    pub backend: Option<String>,
     /// Path to the CLI executable (resolved from registry when `agent_id` is set).
     #[serde(default)]
     pub cli_path: Option<String>,
@@ -97,7 +98,7 @@ pub struct OpenClawGatewayConfig {
 pub struct OpenClawBuildExtra {
     /// Optional downstream AI backend (informational only).
     #[serde(default)]
-    pub backend: Option<AcpBackend>,
+    pub backend: Option<String>,
     /// Agent name.
     #[serde(default)]
     pub agent_name: Option<String>,
@@ -391,9 +392,7 @@ mod tests {
     #[test]
     fn agent_stream_chunk_all_variants_serde_roundtrip() {
         let cases = vec![
-            AgentStreamChunk::Text {
-                text: "hello".into(),
-            },
+            AgentStreamChunk::Text { text: "hello".into() },
             AgentStreamChunk::ToolUse {
                 tool_name: "read_file".into(),
                 input: json!({ "path": "/tmp/a.txt" }),
@@ -429,10 +428,7 @@ mod tests {
                     assert_eq!(a1, b1);
                     assert_eq!(a2, b2);
                 }
-                (
-                    AgentStreamChunk::Thought { content: a },
-                    AgentStreamChunk::Thought { content: b },
-                ) => {
+                (AgentStreamChunk::Thought { content: a }, AgentStreamChunk::Thought { content: b }) => {
                     assert_eq!(a, b);
                 }
                 (
@@ -448,10 +444,7 @@ mod tests {
                     assert_eq!(a1, b1);
                     assert_eq!(a2, b2);
                 }
-                (
-                    AgentStreamChunk::Error { message: a },
-                    AgentStreamChunk::Error { message: b },
-                ) => {
+                (AgentStreamChunk::Error { message: a }, AgentStreamChunk::Error { message: b }) => {
                     assert_eq!(a, b);
                 }
                 _ => panic!("variant mismatch after roundtrip"),
