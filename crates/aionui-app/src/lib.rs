@@ -211,10 +211,16 @@ impl AppServices {
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    version: &'static str,
+    build_time: &'static str,
 }
 
 async fn health_check() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        build_time: env!("BUILD_TIME"),
+    })
 }
 
 /// Derive a 32-byte encryption key from the JWT secret using SHA-256.
