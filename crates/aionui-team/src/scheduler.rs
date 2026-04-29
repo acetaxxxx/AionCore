@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aionui_ai_agent::types::AgentStreamChunk;
 use aionui_realtime::EventBroadcaster;
 use dashmap::{DashMap, DashSet};
-use tokio::sync::Mutex;
-use tracing::debug;
+use tokio::sync::{Mutex, broadcast};
+use tracing::{debug, warn};
 
 use crate::crash_detection::CrashReason;
 use crate::error::TeamError;
@@ -95,8 +98,18 @@ pub struct TeammateManager {
     // conversation; without this dedup window, finalize_turn would run twice
     // and double-write the IdleNotification (aionui-audit §4.3, §8 #3).
     finalized_turns: Arc<DashMap<String, Instant>>,
-    wake_timeouts: DashMap<String, tokio::task::JoinHandle<()>>,
+    wake_timeouts: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
 }
+
+/// Callback invoked when the wake-timeout watchdog elapses without seeing
+/// any stream activity for a slot.
+///
+/// Reason: `arm_wake_timeout` is written against `origin/main`, where
+/// `handle_inactivity_timeout` (W4-D22, PR #99) does not yet exist. Taking
+/// the recovery action as an injected closure keeps this module decoupled —
+/// once D22 lands, callers just pass `mgr.handle_inactivity_timeout(...)`
+/// through this slot without touching `arm_wake_timeout` itself.
+pub type WakeTimeoutHandler = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Status set that counts as "settled" for the purpose of
 /// "all teammates settled → wake leader" transitions.
@@ -181,7 +194,7 @@ impl TeammateManager {
             events,
             active_wakes: DashSet::new(),
             finalized_turns: Arc::new(DashMap::new()),
-            wake_timeouts: DashMap::new(),
+            wake_timeouts: Arc::new(DashMap::new()),
         }
     }
 
@@ -494,6 +507,70 @@ impl TeammateManager {
     pub fn clear_wake_timeout(&self, slot_id: &str) {
         if let Some((_, handle)) = self.wake_timeouts.remove(slot_id) {
             handle.abort();
+        }
+    }
+
+    /// Arm a wake-timeout watchdog for `slot_id`.
+    ///
+    /// Spawns a background task that subscribes to `stream_rx` and enforces
+    /// the [`WAKE_TIMEOUT_MS`] inactivity budget:
+    ///
+    /// - Any chunk (`Text` / `Thought` / `ToolUse` / `Error`) resets the
+    ///   deadline — the agent is still alive and producing output.
+    /// - A `Finish` chunk, or a closed / lagging channel, exits the watchdog
+    ///   cleanly (no timeout fires).
+    /// - If no chunk arrives within the deadline, `on_timeout(slot_id)` is
+    ///   invoked exactly once and the watchdog exits.
+    ///
+    /// In every exit path the map entry is removed so the `JoinHandle` is
+    /// dropped promptly.
+    ///
+    /// If a previous watchdog is still running for this slot, it is aborted
+    /// first — a fresh wake supersedes any stale watchdog (aionui-audit §6.2).
+    pub fn arm_wake_timeout(
+        &self,
+        slot_id: &str,
+        stream_rx: broadcast::Receiver<AgentStreamChunk>,
+        on_timeout: WakeTimeoutHandler,
+    ) {
+        let slot_id_owned = slot_id.to_owned();
+        let map = self.wake_timeouts.clone();
+        let map_for_task = map.clone();
+        let handle = tokio::spawn(async move {
+            let mut rx = stream_rx;
+            let timeout = Duration::from_millis(WAKE_TIMEOUT_MS);
+            let sleep = tokio::time::sleep(timeout);
+            tokio::pin!(sleep);
+
+            let timed_out = loop {
+                tokio::select! {
+                    chunk = rx.recv() => {
+                        match chunk {
+                            Ok(AgentStreamChunk::Finish { .. }) => break false,
+                            Err(broadcast::error::RecvError::Closed) => break false,
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(slot_id = %slot_id_owned, skipped = n, "wake watchdog lagged");
+                                sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
+                            }
+                            Ok(_) => {
+                                // Activity detected — reset deadline.
+                                sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
+                            }
+                        }
+                    }
+                    _ = &mut sleep => break true,
+                }
+            };
+
+            if timed_out {
+                on_timeout(slot_id_owned.clone()).await;
+            }
+
+            map_for_task.remove(&slot_id_owned);
+        });
+
+        if let Some(old) = map.insert(slot_id.to_owned(), handle) {
+            old.abort();
         }
     }
 
@@ -1722,6 +1799,168 @@ mod tests {
         let map: DashMap<String, tokio::task::JoinHandle<()>> = DashMap::new();
         // Should not panic
         map.remove("nonexistent");
+    }
+
+    // -- W4-D18b-2: arm_wake_timeout --------------------------------------------
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn counting_handler(counter: Arc<AtomicU32>) -> WakeTimeoutHandler {
+        Arc::new(move |_slot_id: String| {
+            let c = counter.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+    }
+
+    async fn wait_for_map_empty(mgr: &TeammateManager, slot_id: &str, ticks: u32) {
+        for _ in 0..ticks {
+            if mgr.wake_timeouts.get(slot_id).is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Yield repeatedly so a freshly spawned watchdog task gets a chance to
+    /// reach its `select!` (and arm its sleep) before the test advances time.
+    async fn let_watchdog_settle() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arm_wake_timeout_fires_handler_after_deadline() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+        let counter = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = broadcast::channel::<AgentStreamChunk>(8);
+
+        mgr.arm_wake_timeout("worker-1", rx, counting_handler(counter.clone()));
+        // Keep the sender alive so the channel does not close before the deadline.
+        let_watchdog_settle().await;
+        // Advance slightly past the deadline — handler must fire exactly once.
+        tokio::time::advance(Duration::from_millis(WAKE_TIMEOUT_MS + 500)).await;
+        wait_for_map_empty(&mgr, "worker-1", 128).await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "handler must fire on inactivity");
+        assert!(
+            mgr.wake_timeouts.get("worker-1").is_none(),
+            "map entry must be cleared after watchdog exit"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arm_wake_timeout_activity_resets_deadline() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+        let counter = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = broadcast::channel::<AgentStreamChunk>(8);
+
+        mgr.arm_wake_timeout("worker-1", rx, counting_handler(counter.clone()));
+        let_watchdog_settle().await;
+
+        // Just before the first deadline, an activity chunk arrives.
+        tokio::time::advance(Duration::from_millis(WAKE_TIMEOUT_MS - 1_000)).await;
+        tx.send(AgentStreamChunk::Text { text: "hi".into() }).unwrap();
+        // Let the select branch observe the chunk before advancing again.
+        tokio::task::yield_now().await;
+
+        // Advance another near-full window — deadline should have been reset,
+        // so no timeout has fired yet.
+        tokio::time::advance(Duration::from_millis(WAKE_TIMEOUT_MS - 1_000)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "activity must reset deadline; handler must not have fired"
+        );
+
+        // Cross the new deadline — handler fires.
+        tokio::time::advance(Duration::from_millis(2_000)).await;
+        wait_for_map_empty(&mgr, "worker-1", 128).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arm_wake_timeout_finish_exits_without_firing() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+        let counter = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = broadcast::channel::<AgentStreamChunk>(8);
+
+        mgr.arm_wake_timeout("worker-1", rx, counting_handler(counter.clone()));
+        let_watchdog_settle().await;
+
+        tx.send(AgentStreamChunk::Finish {
+            agent_crash: false,
+            stop_reason: Some("end_turn".into()),
+        })
+        .unwrap();
+        wait_for_map_empty(&mgr, "worker-1", 128).await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "Finish must not trigger timeout handler"
+        );
+        assert!(
+            mgr.wake_timeouts.get("worker-1").is_none(),
+            "map entry must be cleared after Finish"
+        );
+
+        // Advance past the would-be deadline to make sure no lingering timer fires.
+        tokio::time::advance(Duration::from_millis(WAKE_TIMEOUT_MS * 2)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arm_wake_timeout_channel_close_exits_without_firing() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+        let counter = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = broadcast::channel::<AgentStreamChunk>(8);
+
+        mgr.arm_wake_timeout("worker-1", rx, counting_handler(counter.clone()));
+        let_watchdog_settle().await;
+        drop(tx);
+        wait_for_map_empty(&mgr, "worker-1", 128).await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "closed channel must not fire inactivity handler"
+        );
+        assert!(mgr.wake_timeouts.get("worker-1").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arm_wake_timeout_replaces_existing_watchdog() {
+        let agents = make_team_agents();
+        let (mgr, _) = make_manager(&agents);
+        let counter_a = Arc::new(AtomicU32::new(0));
+        let counter_b = Arc::new(AtomicU32::new(0));
+
+        let (tx_a, rx_a) = broadcast::channel::<AgentStreamChunk>(8);
+        mgr.arm_wake_timeout("worker-1", rx_a, counting_handler(counter_a.clone()));
+
+        // Immediately re-arm — the first watchdog must be aborted.
+        let (tx_b, rx_b) = broadcast::channel::<AgentStreamChunk>(8);
+        mgr.arm_wake_timeout("worker-1", rx_b, counting_handler(counter_b.clone()));
+        let_watchdog_settle().await;
+
+        // Cross the deadline. Only one handler (the second watchdog's) may fire.
+        tokio::time::advance(Duration::from_millis(WAKE_TIMEOUT_MS + 500)).await;
+        wait_for_map_empty(&mgr, "worker-1", 128).await;
+
+        assert_eq!(counter_a.load(Ordering::SeqCst), 0, "aborted watchdog must not fire");
+        assert_eq!(counter_b.load(Ordering::SeqCst), 1, "replacement watchdog must fire");
+        drop(tx_a);
+        drop(tx_b);
     }
 
     // -- W4-D20b1: crash testament formatting -----------------------------------
