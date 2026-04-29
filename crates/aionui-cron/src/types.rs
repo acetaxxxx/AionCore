@@ -383,6 +383,7 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
     CronJobResponse {
         id: job.id.clone(),
         name: job.name.clone(),
+        description: job.description.clone(),
         enabled: job.enabled,
         schedule,
         target: CronJobTargetDto {

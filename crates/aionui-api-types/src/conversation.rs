@@ -46,6 +46,8 @@ pub struct SendMessageRequest {
     pub files: Vec<String>,
     #[serde(default)]
     pub inject_skills: Vec<String>,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 // ── Query types ────────────────────────────────────────────────────
@@ -66,6 +68,12 @@ pub struct ListMessagesQuery {
     pub page: Option<u32>,
     pub page_size: Option<u32>,
     pub order: Option<String>,
+}
+
+/// Body for `PATCH /api/conversations/:id/artifacts/:artifact_id`.
+#[derive(Debug, Deserialize)]
+pub struct UpdateConversationArtifactRequest {
+    pub status: ConversationArtifactStatus,
 }
 
 /// Query parameters for `GET /api/messages/search`.
@@ -114,6 +122,40 @@ pub struct MessageResponse {
 
 /// Paginated list of messages.
 pub type MessageListResponse = PaginatedResult<MessageResponse>;
+
+/// Artifact kind discriminant for conversation-bound UI artifacts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationArtifactKind {
+    CronTrigger,
+    SkillSuggest,
+}
+
+/// Durable artifact state exposed to the client.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationArtifactStatus {
+    Active,
+    Pending,
+    Dismissed,
+    Saved,
+}
+
+/// Artifact object returned by conversation artifact APIs and websocket events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationArtifactResponse {
+    pub id: String,
+    pub conversation_id: String,
+    pub cron_job_id: Option<String>,
+    pub kind: ConversationArtifactKind,
+    pub status: ConversationArtifactStatus,
+    pub payload: serde_json::Value,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// List of conversation artifacts for a single conversation.
+pub type ConversationArtifactListResponse = Vec<ConversationArtifactResponse>;
 
 /// A single item from cross-conversation message search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +285,13 @@ mod tests {
         assert!(req.pinned.is_none());
         assert!(req.model.is_none());
         assert!(req.extra.is_none());
+    }
+
+    #[test]
+    fn deserialize_update_artifact_request() {
+        let raw = json!({ "status": "dismissed" });
+        let req: UpdateConversationArtifactRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.status, ConversationArtifactStatus::Dismissed);
     }
 
     // ── CloneConversationRequest ────────────────────────────────────
@@ -507,13 +556,15 @@ mod tests {
             "content": "Review this code",
             "msg_id": "msg-001",
             "files": ["/tmp/a.rs"],
-            "inject_skills": ["security-review"]
+            "inject_skills": ["security-review"],
+            "hidden": true
         });
         let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Review this code");
         assert_eq!(req.msg_id, "msg-001");
         assert_eq!(req.files, vec!["/tmp/a.rs"]);
         assert_eq!(req.inject_skills, vec!["security-review"]);
+        assert!(req.hidden);
     }
 
     #[test]
@@ -524,6 +575,7 @@ mod tests {
         assert_eq!(req.msg_id, "m1");
         assert!(req.files.is_empty());
         assert!(req.inject_skills.is_empty());
+        assert!(!req.hidden);
     }
 
     #[test]
@@ -595,5 +647,29 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["items"][0]["message_id"], "m1");
         assert_eq!(json["total"], 1);
+    }
+
+    #[test]
+    fn serialize_conversation_artifact_response() {
+        let artifact = ConversationArtifactResponse {
+            id: "conv_1:skill_suggest:cron_1".into(),
+            conversation_id: "conv_1".into(),
+            cron_job_id: Some("cron_1".into()),
+            kind: ConversationArtifactKind::SkillSuggest,
+            status: ConversationArtifactStatus::Active,
+            payload: json!({
+                "cron_job_id": "cron_1",
+                "name": "daily-report",
+                "description": "Daily report",
+                "skillContent": "---\nname: daily-report\n---\nUse it.",
+            }),
+            created_at: 1000,
+            updated_at: 2000,
+        };
+
+        let raw = serde_json::to_value(&artifact).unwrap();
+        assert_eq!(raw["kind"], "skill_suggest");
+        assert_eq!(raw["status"], "active");
+        assert_eq!(raw["payload"]["name"], "daily-report");
     }
 }

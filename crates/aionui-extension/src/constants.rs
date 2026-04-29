@@ -55,6 +55,9 @@ pub const RESERVED_ROUTE_PREFIXES: &[&str] = &["/api/", "/auth/", "/ws/"];
 /// Default subdirectory name for user-created skills.
 pub const SKILLS_DIR_NAME: &str = "skills";
 
+/// Default subdirectory name for per-job cron skills under the data dir.
+pub const CRON_SKILLS_DIR_NAME: &str = "cron/skills";
+
 /// Default subdirectory name for built-in skills.
 pub const BUILTIN_SKILLS_DIR_NAME: &str = "builtin-skills";
 

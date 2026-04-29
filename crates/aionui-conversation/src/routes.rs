@@ -2,13 +2,15 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
     ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CloneConversationRequest,
-    ConfirmRequest, ConfirmationListResponse, ConversationListResponse, ConversationResponse,
+    ConfirmRequest, ConfirmationListResponse, ConversationArtifactListResponse,
+    ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, UpdateConversationRequest,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::AppError;
@@ -32,6 +34,11 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route(
             "/api/conversations/{id}/messages",
             get(list_messages).post(send_message),
+        )
+        .route("/api/conversations/{id}/artifacts", get(list_artifacts))
+        .route(
+            "/api/conversations/{id}/artifacts/{artifactId}",
+            patch(update_artifact),
         )
         .route("/api/conversations/{id}/stop", post(stop_stream))
         .route("/api/conversations/{id}/warmup", post(warmup))
@@ -164,6 +171,39 @@ async fn send_message(
         .send_message(&user.id, &id, req, &state.worker_task_manager)
         .await?;
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::success())))
+}
+
+async fn list_artifacts(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ConversationArtifactListResponse>>, AppError> {
+    let result = state
+        .conversation_service
+        .list_artifacts(&user.id, &id)
+        .await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[derive(serde::Deserialize)]
+struct ArtifactPathParams {
+    id: String,
+    #[serde(rename = "artifactId")]
+    artifact_id: String,
+}
+
+async fn update_artifact(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<ArtifactPathParams>,
+    body: Result<Json<UpdateConversationArtifactRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ConversationArtifactResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let artifact = state
+        .conversation_service
+        .update_artifact(&user.id, &params.id, &params.artifact_id, req)
+        .await?;
+    Ok(Json(ApiResponse::ok(artifact)))
 }
 
 async fn stop_stream(

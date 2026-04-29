@@ -108,6 +108,8 @@ pub struct CronJobStateDto {
 pub struct CronJobResponse {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub enabled: bool,
     pub schedule: CronScheduleDto,
     pub target: CronJobTargetDto,
@@ -122,6 +124,8 @@ pub struct CronJobResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateCronJobRequest {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub schedule: CronScheduleDto,
     #[serde(default)]
     pub prompt: Option<String>,
@@ -142,6 +146,8 @@ pub struct CreateCronJobRequest {
 pub struct UpdateCronJobRequest {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -441,6 +447,7 @@ mod tests {
         CronJobResponse {
             id: "cron_abc".into(),
             name: "Daily report".into(),
+            description: Some("Daily report description".into()),
             enabled: true,
             schedule: CronScheduleDto::Cron {
                 expr: "0 0 9 * * *".into(),
@@ -522,6 +529,7 @@ mod tests {
         let resp = CronJobResponse {
             id: "cron_min".into(),
             name: "Ping".into(),
+            description: None,
             enabled: false,
             schedule: CronScheduleDto::Every {
                 every_ms: 60000,

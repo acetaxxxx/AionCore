@@ -1,7 +1,7 @@
 //! E2E tests for cron job HTTP endpoints.
 //!
 //! Covers test-plan items: CJ-1..CJ-12, SK-1..SK-6, SC-3..SC-8, AU-1..AU-2,
-//! RN-2 (run-now nonexistent).
+//! RN-1..RN-2.
 //! Items requiring real AI execution (RN-1, EV-*, SR-*, OC-*, CD-*) are tested
 //! at the service integration level in `aionui-cron/tests/service_integration.rs`.
 
@@ -88,6 +88,7 @@ async fn au2_unauthenticated_all_endpoints() {
         ("GET", "/api/cron/jobs"),
         ("GET", "/api/cron/jobs/cron_test"),
         ("GET", "/api/cron/jobs/cron_test/skill"),
+        ("DELETE", "/api/cron/jobs/cron_test/skill"),
     ];
 
     for (method, uri) in endpoints {
@@ -380,6 +381,47 @@ async fn cj12_delete_nonexistent() {
 // ── RN-2: Run now nonexistent ────────────────────────────────────────
 
 #[tokio::test]
+async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let create_conv_req = json_with_token(
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "name": "Run Now Source",
+            "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
+            "extra": { "workspace": "/project" }
+        }),
+        &token,
+        &csrf,
+    );
+    let create_conv_resp = app.clone().oneshot(create_conv_req).await.unwrap();
+    assert_eq!(create_conv_resp.status(), StatusCode::CREATED);
+    let created_conv = body_json(create_conv_resp).await;
+    let conversation_id = created_conv["data"]["id"].as_str().unwrap();
+
+    let mut body = create_job_body("Run Now Job");
+    body["conversation_id"] = json!(conversation_id);
+    let created = create_job(&mut app, &token, &csrf, body).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/run"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["conversation_id"], json!(conversation_id));
+}
+
+#[tokio::test]
 async fn rn2_run_now_nonexistent() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
@@ -529,6 +571,50 @@ async fn sk6_save_skill_nonexistent() {
         &token,
         &csrf,
     );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── SK-7: Delete existing skill ──────────────────────────────────────
+
+#[tokio::test]
+async fn sk7_delete_skill() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(&mut app, &token, &csrf, create_job_body("Delete Skill Job")).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let save_req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/skill"),
+        json!({"content": "---\nname: delete-me\n---\nContent"}),
+        &token,
+        &csrf,
+    );
+    let save_resp = app.clone().oneshot(save_req).await.unwrap();
+    assert_eq!(save_resp.status(), StatusCode::OK);
+
+    let delete_req = delete_with_token(&format!("/api/cron/jobs/{job_id}/skill"), &token, &csrf);
+    let delete_resp = app.clone().oneshot(delete_req).await.unwrap();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let has_req = get_with_token(&format!("/api/cron/jobs/{job_id}/skill"), &token);
+    let has_resp = app.oneshot(has_req).await.unwrap();
+    assert_eq!(has_resp.status(), StatusCode::OK);
+
+    let json = body_json(has_resp).await;
+    assert_eq!(json["data"]["has_skill"], false);
+}
+
+// ── SK-8: Delete skill for nonexistent job ───────────────────────────
+
+#[tokio::test]
+async fn sk8_delete_skill_nonexistent() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = delete_with_token("/api/cron/jobs/cron_nonexistent/skill", &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

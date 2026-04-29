@@ -5,7 +5,8 @@ use tracing::{debug, warn};
 
 use crate::constants::{
     ASSISTANT_RULES_DIR_NAME, ASSISTANT_SKILLS_DIR_NAME, BUILTIN_AUTO_SKILLS_SUBDIR,
-    BUILTIN_RULES_DIR_NAME, COMMON_SKILL_DIRS, SKILL_MANIFEST_FILE, SKILLS_DIR_NAME,
+    BUILTIN_RULES_DIR_NAME, COMMON_SKILL_DIRS, CRON_SKILLS_DIR_NAME, SKILL_MANIFEST_FILE,
+    SKILLS_DIR_NAME,
 };
 use crate::error::ExtensionError;
 
@@ -46,6 +47,8 @@ pub struct SkillPaths {
     pub data_dir: PathBuf,
     /// User-created skills directory (~/.aionui/skills/).
     pub user_skills_dir: PathBuf,
+    /// Per-job cron skills directory (~/.aionui/cron/skills/).
+    pub cron_skills_dir: PathBuf,
     /// Built-in skills directory on disk. Always set.
     /// Points to `{data_dir}/builtin-skills/` in production (populated at
     /// startup by `startup_materialize::materialize_if_needed`) or
@@ -82,6 +85,7 @@ pub fn resolve_skill_paths(app_resource_dir: &Path, data_dir: &Path) -> SkillPat
     SkillPaths {
         data_dir: data_dir.to_path_buf(),
         user_skills_dir: data_dir.join(SKILLS_DIR_NAME),
+        cron_skills_dir: data_dir.join(CRON_SKILLS_DIR_NAME),
         builtin_skills_dir,
         builtin_rules_dir: app_resource_dir.join(BUILTIN_RULES_DIR_NAME),
         assistant_rules_dir: data_dir.join(ASSISTANT_RULES_DIR_NAME),
@@ -575,6 +579,7 @@ pub struct ResolvedAgentSkill {
 /// 1. `{builtin_skills_dir}/{name}/` — top-level opt-in builtin.
 /// 2. `{builtin_skills_dir}/auto-inject/{name}/` — auto-inject builtin.
 /// 3. `{user_skills_dir}/{name}/` — user-created custom skill.
+/// 4. `{cron_skills_dir}/{name}/` — per-job cron skill.
 ///
 /// No files are copied and no per-conversation directory is created —
 /// the backend just hands the absolute source paths back to the caller,
@@ -700,6 +705,10 @@ fn resolve_skill_source_path(paths: &SkillPaths, name: &str) -> Option<PathBuf> 
     let user = paths.user_skills_dir.join(name);
     if user.is_dir() {
         return Some(user);
+    }
+    let cron = paths.cron_skills_dir.join(name);
+    if cron.is_dir() {
+        return Some(cron);
     }
     None
 }
@@ -1154,6 +1163,7 @@ mod tests {
         let paths = SkillPaths {
             data_dir: tmp.path().to_path_buf(),
             user_skills_dir: tmp.path().join(SKILLS_DIR_NAME),
+            cron_skills_dir: tmp.path().join(CRON_SKILLS_DIR_NAME),
             builtin_skills_dir: tmp.path().join(crate::constants::BUILTIN_SKILLS_DIR_NAME),
             builtin_rules_dir: rules_dir,
             assistant_rules_dir: tmp.path().join(ASSISTANT_RULES_DIR_NAME),
@@ -1662,6 +1672,7 @@ mod tests {
         SkillPaths {
             data_dir: base.to_path_buf(),
             user_skills_dir: base.join(SKILLS_DIR_NAME),
+            cron_skills_dir: base.join(CRON_SKILLS_DIR_NAME),
             builtin_skills_dir: base.join(crate::constants::BUILTIN_SKILLS_DIR_NAME),
             builtin_rules_dir: base.join(BUILTIN_RULES_DIR_NAME),
             assistant_rules_dir: base.join(ASSISTANT_RULES_DIR_NAME),

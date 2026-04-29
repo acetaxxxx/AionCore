@@ -52,10 +52,12 @@ pub use confirmation::{
 };
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
-    CloneConversationRequest, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse,
-    MessageResponse, MessageSearchItem, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, UpdateConversationRequest,
+    CloneConversationRequest, ConversationArtifactKind, ConversationArtifactListResponse,
+    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse,
+    ConversationResponse, CreateConversationRequest, ListConversationsQuery, ListMessagesQuery,
+    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use cron::{
     CreateCronJobRequest, CronAgentConfigDto, CronJobExecutedEvent, CronJobMetadataDto,

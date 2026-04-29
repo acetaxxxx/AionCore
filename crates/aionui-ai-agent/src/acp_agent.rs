@@ -47,6 +47,27 @@ impl SessionResumeStrategy {
     }
 }
 
+fn normalize_requested_mode(backend: AcpBackend, mode: &str) -> String {
+    let trimmed = mode.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    match backend {
+        // Codex ACP now reports native mode ids (`read-only`, `auto`,
+        // `full-access`) while existing AionUi flows still persist the legacy
+        // semantic ids (`default`, `autoEdit`, `yolo`, `yoloNoSandbox`).
+        // Cron reuses the persisted value directly, so normalize it before
+        // comparing or calling `session/set_mode`.
+        AcpBackend::Codex => match trimmed {
+            "default" | "autoEdit" => "auto".to_owned(),
+            "yolo" | "yoloNoSandbox" => "full-access".to_owned(),
+            other => other.to_owned(),
+        },
+        _ => trimmed.to_owned(),
+    }
+}
+
 fn confirm_option_id(data: &Value) -> Option<String> {
     match data {
         Value::String(v) => Some(v.clone()),
@@ -92,6 +113,8 @@ pub struct AcpAgentManager {
     backend: AcpBackend,
     /// Build configuration (preset context, enabled/excluded skills, session mode, …).
     config: AcpBuildExtra,
+    /// Preferred session mode to apply on the next session initialization.
+    preferred_mode: RwLock<Option<String>>,
     /// Underlying CLI process (for lifecycle management: kill, is_running).
     process: Arc<CliAgentProcess>,
     /// ACP protocol handle (SDK connection).
@@ -122,6 +145,56 @@ impl AcpAgentManager {
     pub async fn modes(&self) -> Option<SessionModeState> {
         let snapshot = self.runtime_snapshot.read().await;
         snapshot.modes().cloned()
+    }
+
+    async fn preferred_mode(&self) -> Option<String> {
+        self.preferred_mode
+            .read()
+            .await
+            .clone()
+            .filter(|mode| !mode.is_empty())
+    }
+
+    async fn update_cached_mode(&self, mode: &str) {
+        let mut snapshot = self.runtime_snapshot.write().await;
+        if let Some(modes) = snapshot.modes().cloned() {
+            snapshot.set_modes(SessionModeState::new(
+                mode.to_owned(),
+                modes.available_modes,
+            ));
+        }
+    }
+
+    async fn apply_preferred_mode(&self, session_id: &str) -> Result<(), AppError> {
+        let Some(mode) = self.preferred_mode().await else {
+            return Ok(());
+        };
+        let normalized_mode = normalize_requested_mode(self.backend, &mode);
+        if normalized_mode.is_empty() {
+            return Ok(());
+        }
+
+        let current_mode = {
+            let snapshot = self.runtime_snapshot.read().await;
+            snapshot.current_mode_id()
+        };
+
+        if current_mode.as_deref() == Some(normalized_mode.as_str()) {
+            return Ok(());
+        }
+
+        self.protocol
+            .set_mode(SetSessionModeRequest::new(
+                SessionId::new(session_id),
+                normalized_mode.clone(),
+            ))
+            .await
+            .map_err(AppError::from)?;
+
+        self.update_cached_mode(&normalized_mode).await;
+        let mut preferred_mode = self.preferred_mode.write().await;
+        *preferred_mode = Some(normalized_mode);
+        Ok(())
     }
 
     async fn _set_modes(&self, mode: &str) -> Result<(), AppError> {
@@ -264,6 +337,7 @@ impl AcpAgentManager {
             workspace,
             is_custom_workspace,
             backend,
+            preferred_mode: RwLock::new(config.session_mode.clone()),
             config,
             process: Arc::new(process),
             protocol,
@@ -403,6 +477,8 @@ impl AcpAgentManager {
             let mut state = self.state.write().await;
             state.session_id = Some(sid.clone());
         }
+
+        self.apply_preferred_mode(&sid).await?;
 
         // Inject first-message prefix (preset context + skills index).
         // Backends with native skill discovery (e.g. Claude via .claude/skills/)
@@ -725,27 +801,43 @@ impl crate::agent_manager::IAgentManager for AcpAgentManager {
     }
 
     async fn get_mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
+        let preferred_mode = self
+            .preferred_mode()
+            .await
+            .map(|mode| normalize_requested_mode(self.backend, &mode))
+            .filter(|mode| !mode.is_empty());
         Ok(aionui_api_types::AgentModeResponse {
             mode: self
                 .modes()
                 .await
                 .map(|modes| modes.current_mode_id.to_string())
-                .or_else(|| self.config.session_mode.clone())
-                .unwrap_or_else(|| "default".to_owned()),
+                .or(preferred_mode)
+                .unwrap_or_else(|| normalize_requested_mode(self.backend, "default")),
             initialized: self.session_id().await.is_some(),
         })
     }
 
     async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
-        let sid = self.require_session_id().await?;
-        self.protocol
-            .set_mode(SetSessionModeRequest::new(
-                SessionId::new(sid),
-                mode.to_owned(),
-            ))
-            .await
-            .map_err(AppError::from)
-            .map(|_| ())
+        let normalized_mode = normalize_requested_mode(self.backend, mode);
+        if normalized_mode.is_empty() {
+            return Ok(());
+        }
+        let session_id = self.state.read().await.session_id.clone();
+
+        if let Some(sid) = session_id {
+            self.protocol
+                .set_mode(SetSessionModeRequest::new(
+                    SessionId::new(sid),
+                    normalized_mode.clone(),
+                ))
+                .await
+                .map_err(AppError::from)?;
+            self.update_cached_mode(&normalized_mode).await;
+        }
+
+        let mut preferred_mode = self.preferred_mode.write().await;
+        *preferred_mode = Some(normalized_mode);
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -795,6 +887,34 @@ mod tests {
         assert_eq!(
             confirm_option_id(&json!({ "value": "allow_always" })).as_deref(),
             Some("allow_always")
+        );
+    }
+
+    #[test]
+    fn normalize_requested_mode_maps_legacy_codex_modes() {
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "default"),
+            "auto"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "autoEdit"),
+            "auto"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "yolo"),
+            "full-access"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "yoloNoSandbox"),
+            "full-access"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Codex, "read-only"),
+            "read-only"
+        );
+        assert_eq!(
+            normalize_requested_mode(AcpBackend::Claude, "bypassPermissions"),
+            "bypassPermissions"
         );
     }
 }
