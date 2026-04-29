@@ -71,6 +71,7 @@ async fn fixture_embedded() -> Fixture {
     let skill_paths = SkillPaths {
         data_dir: data_dir.clone(),
         user_skills_dir: data_dir.join("skills"),
+        cron_skills_dir: data_dir.join("cron").join("skills"),
         builtin_skills_dir: data_dir.join("builtin-skills"),
         builtin_rules_dir: data_dir.join("builtin-rules"),
         assistant_rules_dir: data_dir.join("assistant-rules"),

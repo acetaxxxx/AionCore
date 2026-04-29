@@ -1,13 +1,14 @@
 use std::path::Path;
 
-use aionui_api_types::{ConversationResponse, MessageResponse, MessageSearchItem};
+use aionui_api_types::{
+    ConversationArtifactResponse, ConversationResponse, MessageResponse, MessageSearchItem,
+};
 use aionui_common::{
     AgentType, AppError, ConversationSource, ConversationStatus, MessagePosition, MessageStatus,
     MessageType, ProviderWithModel,
 };
 use aionui_db::MessageSearchRow;
-use aionui_db::models::ConversationRow;
-use aionui_db::models::MessageRow;
+use aionui_db::models::{ConversationArtifactRow, ConversationRow, MessageRow};
 
 /// Convert a database row into an API response DTO.
 ///
@@ -52,7 +53,6 @@ pub fn row_to_response_with_extra(
             serde_json::Value::Bool(is_temporary_workspace),
         );
     }
-
 
     let agent_type: AgentType = string_to_enum(&row.r#type)?;
     let status: ConversationStatus = match row.status.as_deref() {
@@ -162,6 +162,27 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppEr
         status,
         hidden: row.hidden,
         created_at: row.created_at,
+    })
+}
+
+/// Convert an artifact database row into an API response DTO.
+pub fn row_to_artifact_response(
+    row: ConversationArtifactRow,
+) -> Result<ConversationArtifactResponse, AppError> {
+    let kind = string_to_enum(&row.kind)?;
+    let status = string_to_enum(&row.status)?;
+    let payload: serde_json::Value = serde_json::from_str(&row.payload)
+        .map_err(|e| AppError::Internal(format!("Invalid artifact payload JSON: {e}")))?;
+
+    Ok(ConversationArtifactResponse {
+        id: row.id,
+        conversation_id: row.conversation_id,
+        cron_job_id: row.cron_job_id,
+        kind,
+        status,
+        payload,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
     })
 }
 

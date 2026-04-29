@@ -1,7 +1,7 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 
 use aionui_api_types::{
@@ -22,11 +22,15 @@ pub fn cron_routes(state: CronRouterState) -> Router {
             get(get_job).put(update_job).delete(delete_job),
         )
         .route("/api/cron/jobs/{id}/run", post(run_now))
+        .route("/api/cron/internal/system-resume", post(system_resume))
         .route(
             "/api/cron/jobs/{id}/conversations",
             get(list_conversations_by_cron_job),
         )
-        .route("/api/cron/jobs/{id}/skill", get(has_skill).post(save_skill))
+        .route(
+            "/api/cron/jobs/{id}/skill",
+            get(has_skill).post(save_skill).delete(delete_skill),
+        )
         .with_state(state)
 }
 
@@ -89,6 +93,22 @@ async fn run_now(
     Ok(Json(ApiResponse::ok(resp)))
 }
 
+async fn system_resume(
+    State(state): State<CronRouterState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    let is_internal = headers
+        .get("x-aionui-internal")
+        .and_then(|value| value.to_str().ok())
+        == Some("1");
+    if !is_internal {
+        return Err(AppError::Forbidden("internal route".into()));
+    }
+
+    state.cron_service.handle_system_resume().await;
+    Ok(Json(ApiResponse::success()))
+}
+
 async fn save_skill(
     State(state): State<CronRouterState>,
     Extension(_user): Extension<CurrentUser>,
@@ -119,4 +139,13 @@ async fn has_skill(
 ) -> Result<Json<ApiResponse<HasSkillResponse>>, AppError> {
     let resp = state.cron_service.has_skill(&id).await?;
     Ok(Json(ApiResponse::ok(resp)))
+}
+
+async fn delete_skill(
+    State(state): State<CronRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    state.cron_service.delete_skill(&id).await?;
+    Ok(Json(ApiResponse::success()))
 }

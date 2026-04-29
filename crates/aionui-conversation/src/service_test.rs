@@ -1,9 +1,13 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use aionui_ai_agent::IWorkerTaskManager;
 use aionui_ai_agent::agent_manager::{AgentManagerHandle, IAgentManager};
-use aionui_ai_agent::stream_event::AgentStreamEvent;
+use aionui_ai_agent::stream_event::{AgentStreamEvent, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+use aionui_ai_agent::{
+    CronCommandResult, CronCreateParams, CronUpdateParams, ICronService, IWorkerTaskManager,
+};
+use aionui_api_types::ConversationArtifactKind;
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery,
     SearchMessagesQuery, SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
@@ -12,7 +16,7 @@ use aionui_common::{
     AgentKillReason, AgentType, AppError, Confirmation, ConversationSource, ConversationStatus,
     PaginatedResult, TimestampMs,
 };
-use aionui_db::models::{ConversationRow, MessageRow};
+use aionui_db::models::{ConversationArtifactRow, ConversationRow, MessageRow};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IConversationRepository, MessageRowUpdate,
     MessageSearchRow, SortOrder,
@@ -52,12 +56,16 @@ impl EventBroadcaster for MockBroadcaster {
 
 struct MockRepo {
     rows: Mutex<Vec<ConversationRow>>,
+    messages: Mutex<Vec<MessageRow>>,
+    artifacts: Mutex<Vec<ConversationArtifactRow>>,
 }
 
 impl MockRepo {
     fn new() -> Self {
         Self {
             rows: Mutex::new(vec![]),
+            messages: Mutex::new(vec![]),
+            artifacts: Mutex::new(vec![]),
         }
     }
 }
@@ -176,44 +184,90 @@ impl IConversationRepository for MockRepo {
 
     async fn get_messages(
         &self,
-        _conv_id: &str,
-        _page: u32,
-        _page_size: u32,
-        _order: SortOrder,
+        conv_id: &str,
+        page: u32,
+        page_size: u32,
+        order: SortOrder,
     ) -> Result<PaginatedResult<MessageRow>, aionui_db::DbError> {
+        let messages = self.messages.lock().unwrap();
+        let mut matched: Vec<_> = messages
+            .iter()
+            .filter(|message| message.conversation_id == conv_id)
+            .cloned()
+            .collect();
+        matched.sort_by_key(|message| message.created_at);
+        if matches!(order, SortOrder::Desc) {
+            matched.reverse();
+        }
+
+        let start = page.saturating_sub(1) as usize * page_size as usize;
+        let end = (start + page_size as usize).min(matched.len());
+        let items = if start < matched.len() {
+            matched[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
         Ok(PaginatedResult {
-            items: vec![],
-            total: 0,
-            has_more: false,
+            items,
+            total: matched.len() as u64,
+            has_more: end < matched.len(),
         })
     }
 
-    async fn insert_message(&self, _message: &MessageRow) -> Result<(), aionui_db::DbError> {
+    async fn insert_message(&self, message: &MessageRow) -> Result<(), aionui_db::DbError> {
+        self.messages.lock().unwrap().push(message.clone());
         Ok(())
     }
 
     async fn update_message(
         &self,
-        _id: &str,
-        _updates: &MessageRowUpdate,
+        id: &str,
+        updates: &MessageRowUpdate,
     ) -> Result<(), aionui_db::DbError> {
+        let mut messages = self.messages.lock().unwrap();
+        let message = messages
+            .iter_mut()
+            .find(|message| message.id == id)
+            .ok_or_else(|| aionui_db::DbError::NotFound(format!("Message {id}")))?;
+
+        if let Some(content) = &updates.content {
+            message.content = content.clone();
+        }
+        if let Some(status) = &updates.status {
+            message.status = status.clone();
+        }
+        if let Some(hidden) = updates.hidden {
+            message.hidden = hidden;
+        }
         Ok(())
     }
 
     async fn delete_messages_by_conversation(
         &self,
-        _conv_id: &str,
+        conv_id: &str,
     ) -> Result<(), aionui_db::DbError> {
+        self.messages
+            .lock()
+            .unwrap()
+            .retain(|message| message.conversation_id != conv_id);
         Ok(())
     }
 
     async fn get_message_by_msg_id(
         &self,
-        _conv_id: &str,
-        _msg_id: &str,
-        _msg_type: &str,
+        conv_id: &str,
+        msg_id: &str,
+        msg_type: &str,
     ) -> Result<Option<MessageRow>, aionui_db::DbError> {
-        Ok(None)
+        let messages = self.messages.lock().unwrap();
+        Ok(messages
+            .iter()
+            .find(|message| {
+                message.conversation_id == conv_id
+                    && message.msg_id.as_deref() == Some(msg_id)
+                    && message.r#type == msg_type
+            })
+            .cloned())
     }
 
     async fn search_messages(
@@ -228,6 +282,112 @@ impl IConversationRepository for MockRepo {
             total: 0,
             has_more: false,
         })
+    }
+
+    async fn list_artifacts(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationArtifactRow>, aionui_db::DbError> {
+        Ok(self
+            .artifacts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|artifact| artifact.conversation_id == conversation_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_artifact(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+    ) -> Result<Option<ConversationArtifactRow>, aionui_db::DbError> {
+        Ok(self
+            .artifacts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|artifact| {
+                artifact.conversation_id == conversation_id && artifact.id == artifact_id
+            })
+            .cloned())
+    }
+
+    async fn upsert_artifact(
+        &self,
+        artifact: &ConversationArtifactRow,
+    ) -> Result<ConversationArtifactRow, aionui_db::DbError> {
+        let mut artifacts = self.artifacts.lock().unwrap();
+        if let Some(existing) = artifacts.iter_mut().find(|row| row.id == artifact.id) {
+            *existing = artifact.clone();
+            return Ok(existing.clone());
+        }
+        artifacts.push(artifact.clone());
+        Ok(artifact.clone())
+    }
+
+    async fn update_artifact_status(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+        status: &str,
+        updated_at: TimestampMs,
+    ) -> Result<Option<ConversationArtifactRow>, aionui_db::DbError> {
+        let mut artifacts = self.artifacts.lock().unwrap();
+        let Some(existing) = artifacts.iter_mut().find(|artifact| {
+            artifact.conversation_id == conversation_id && artifact.id == artifact_id
+        }) else {
+            return Ok(None);
+        };
+        existing.status = status.to_owned();
+        existing.updated_at = updated_at;
+        Ok(Some(existing.clone()))
+    }
+
+    async fn mark_skill_suggest_artifacts_saved(
+        &self,
+        cron_job_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<Vec<ConversationArtifactRow>, aionui_db::DbError> {
+        let mut artifacts = self.artifacts.lock().unwrap();
+        let mut updated = Vec::new();
+        for artifact in artifacts
+            .iter_mut()
+            .filter(|artifact| artifact.cron_job_id.as_deref() == Some(cron_job_id))
+        {
+            artifact.status = "saved".into();
+            artifact.updated_at = updated_at;
+            updated.push(artifact.clone());
+        }
+        Ok(updated)
+    }
+
+    async fn delete_artifacts_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), aionui_db::DbError> {
+        self.artifacts
+            .lock()
+            .unwrap()
+            .retain(|artifact| artifact.conversation_id != conversation_id);
+        Ok(())
+    }
+
+    async fn list_legacy_cron_trigger_messages(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<MessageRow>, aionui_db::DbError> {
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message.conversation_id == conversation_id && message.r#type == "cron_trigger"
+            })
+            .cloned()
+            .collect())
     }
 }
 
@@ -791,6 +951,7 @@ async fn clone_strips_cron_job_id_by_default() {
 
     // cronJobId should not be carried over
     assert!(cloned.extra.get("cronJobId").is_none());
+    assert!(cloned.extra.get("cron_job_id").is_none());
 }
 
 #[tokio::test]
@@ -818,6 +979,35 @@ async fn clone_with_migrate_cron_preserves_cron_job_id() {
     let cloned = svc.clone_create("user_1", clone_req).await.unwrap();
 
     assert_eq!(cloned.extra["cronJobId"], "cron_1");
+    assert_eq!(cloned.extra["cron_job_id"], "cron_1");
+}
+
+#[tokio::test]
+async fn clone_with_migrate_cron_preserves_snake_case_cron_job_id() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    let source_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "model": { "provider_id": "p1", "model": "m1" },
+        "extra": { "workspace": "/p", "cron_job_id": "cron_2" }
+    }))
+    .unwrap();
+    let source = svc.create("user_1", source_req).await.unwrap();
+
+    let clone_req: CloneConversationRequest = serde_json::from_value(json!({
+        "source_conversation_id": source.id,
+        "conversation": {
+            "type": "acp",
+            "model": { "provider_id": "p1", "model": "m1" },
+            "extra": {}
+        },
+        "migrate_cron": true
+    }))
+    .unwrap();
+    let cloned = svc.clone_create("user_1", clone_req).await.unwrap();
+
+    assert_eq!(cloned.extra["cronJobId"], "cron_2");
+    assert_eq!(cloned.extra["cron_job_id"], "cron_2");
 }
 
 // ── Reset tests ───────────────────────────────────────────────────
@@ -831,6 +1021,60 @@ async fn reset_sets_status_to_pending() {
 
     let fetched = svc.get("user_1", &conv.id).await.unwrap();
     assert_eq!(fetched.status, ConversationStatus::Pending);
+}
+
+#[tokio::test]
+async fn reset_clears_conversation_artifacts() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.upsert_artifact(&ConversationArtifactRow {
+        id: format!("{}:skill_suggest:cron_1", conv.id),
+        conversation_id: conv.id.clone(),
+        cron_job_id: Some("cron_1".into()),
+        kind: "skill_suggest".into(),
+        status: "pending".into(),
+        payload: json!({ "cron_job_id": "cron_1", "name": "daily-report" }).to_string(),
+        created_at: 1000,
+        updated_at: 1000,
+    })
+    .await
+    .unwrap();
+
+    svc.reset("user_1", &conv.id).await.unwrap();
+
+    let artifacts = repo.list_artifacts(&conv.id).await.unwrap();
+    assert!(artifacts.is_empty());
+}
+
+#[tokio::test]
+async fn list_artifacts_includes_legacy_cron_trigger_messages() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.insert_message(&MessageRow {
+        id: "legacy-msg-1".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("legacy-trigger-1".into()),
+        r#type: "cron_trigger".into(),
+        content: json!({
+            "cron_job_id": "cron_1",
+            "cron_job_name": "Daily Report",
+            "triggered_at": 1234
+        })
+        .to_string(),
+        position: Some("center".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1234,
+    })
+    .await
+    .unwrap();
+
+    let artifacts = svc.list_artifacts("user_1", &conv.id).await.unwrap();
+
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].kind, ConversationArtifactKind::CronTrigger);
+    assert_eq!(artifacts[0].payload["cron_job_id"], "cron_1");
+    assert_eq!(artifacts[0].payload["cron_job_name"], "Daily Report");
 }
 
 #[tokio::test]
@@ -1133,6 +1377,143 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
     }
 }
 
+struct ScriptedAgent {
+    conversation_id: String,
+    event_tx: broadcast::Sender<AgentStreamEvent>,
+    scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
+    sent_contents: Mutex<Vec<String>>,
+}
+
+impl ScriptedAgent {
+    fn new(conversation_id: &str, scripts: Vec<Vec<AgentStreamEvent>>) -> Self {
+        let (event_tx, _) = broadcast::channel(64);
+        Self {
+            conversation_id: conversation_id.to_owned(),
+            event_tx,
+            scripts: Mutex::new(VecDeque::from(scripts)),
+            sent_contents: Mutex::new(vec![]),
+        }
+    }
+
+    fn sent_contents(&self) -> Vec<String> {
+        self.sent_contents.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentManager for ScriptedAgent {
+    fn agent_type(&self) -> AgentType {
+        AgentType::Acp
+    }
+
+    fn status(&self) -> Option<ConversationStatus> {
+        Some(ConversationStatus::Finished)
+    }
+
+    fn workspace(&self) -> &str {
+        "/tmp/test"
+    }
+
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+
+    fn last_activity_at(&self) -> TimestampMs {
+        0
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+        self.event_tx.subscribe()
+    }
+
+    async fn send_message(&self, data: SendMessageData) -> Result<(), AppError> {
+        self.sent_contents.lock().unwrap().push(data.content);
+        let script = self
+            .scripts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![AgentStreamEvent::Finish(FinishEventData::default())]);
+        for event in script {
+            let _ = self.event_tx.send(event);
+        }
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn confirm(
+        &self,
+        _msg_id: &str,
+        _call_id: &str,
+        _data: serde_json::Value,
+        _always_allow: bool,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn get_confirmations(&self) -> Vec<Confirmation> {
+        vec![]
+    }
+
+    fn check_approval(&self, _action: &str, _command_type: Option<&str>) -> bool {
+        false
+    }
+
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct MockCronContinuationService;
+
+#[async_trait::async_trait]
+impl ICronService for MockCronContinuationService {
+    async fn create_job(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        params: &CronCreateParams,
+    ) -> CronCommandResult {
+        CronCommandResult {
+            success: true,
+            message: format!("Created cron job '{}'", params.name),
+        }
+    }
+
+    async fn update_job(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _params: &CronUpdateParams,
+    ) -> CronCommandResult {
+        CronCommandResult {
+            success: true,
+            message: "Updated cron job".into(),
+        }
+    }
+
+    async fn list_jobs(&self, _user_id: &str, _conversation_id: &str) -> CronCommandResult {
+        CronCommandResult {
+            success: true,
+            message: "No scheduled tasks".into(),
+        }
+    }
+
+    async fn delete_job(&self, _user_id: &str, _job_id: &str) -> CronCommandResult {
+        CronCommandResult {
+            success: true,
+            message: "Deleted cron job".into(),
+        }
+    }
+}
+
 // ── send_message tests ──────────────────────────────────────────
 
 fn make_send_req() -> SendMessageRequest {
@@ -1154,6 +1535,35 @@ async fn send_message_returns_accepted() {
         .await;
 
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn send_message_persists_hidden_user_message_when_requested() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let req: SendMessageRequest = serde_json::from_value(json!({
+        "content": "Hidden cron prompt",
+        "msg_id": "msg-hidden",
+        "hidden": true
+    }))
+    .unwrap();
+
+    svc.send_message("user_1", &conv.id, req, &task_mgr)
+        .await
+        .unwrap();
+
+    let messages = repo
+        .get_messages(&conv.id, 1, 20, SortOrder::Asc)
+        .await
+        .unwrap()
+        .items;
+    let user_message = messages
+        .iter()
+        .find(|message| message.msg_id.as_deref() == Some("msg-hidden"))
+        .expect("hidden user message should be persisted");
+    assert!(user_message.hidden);
 }
 
 #[tokio::test]
@@ -1274,6 +1684,77 @@ async fn send_message_persists_factory_resolved_workspace() {
     // Verify the workspace was written back.
     let updated = svc.get("user_1", &conv.id).await.unwrap();
     assert_eq!(updated.extra["workspace"], auto_workspace);
+}
+
+#[tokio::test]
+async fn send_message_continues_cron_system_responses() {
+    let (svc, broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![
+            vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "I'll check. [CRON_LIST]".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ],
+            vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "[CRON_CREATE]\nname: Daily Greeting\nschedule: 0 9 * * *\nschedule_description: Daily at 9:00 AM\nmessage: Say good morning\n[/CRON_CREATE]".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ],
+            vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "Done. The task is scheduled.".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ],
+        ],
+    ));
+    task_mgr.insert_agent(&conv.id, scripted_agent.clone());
+    svc.set_cron_service(Some(Arc::new(MockCronContinuationService)));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let req: SendMessageRequest = serde_json::from_value(json!({
+        "content": "Create the task now",
+        "msg_id": "msg-1"
+    }))
+    .unwrap();
+
+    svc.send_message("user_1", &conv.id, req, &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if scripted_agent.sent_contents().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let sends = scripted_agent.sent_contents();
+    assert_eq!(sends.len(), 3);
+    assert_eq!(sends[0], "Create the task now");
+    assert_eq!(sends[1], "[System: No scheduled tasks]");
+    assert_eq!(sends[2], "[System: Created cron job 'Daily Greeting']");
+
+    let finished = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(finished.status, ConversationStatus::Finished);
+
+    let events = broadcaster.take_events();
+    let turn_completed = events
+        .iter()
+        .filter(|evt| evt.name == "turn.completed")
+        .count();
+    assert_eq!(turn_completed, 1);
 }
 
 // ── stop_stream tests ───────────────────────────────────────────
