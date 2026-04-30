@@ -639,6 +639,7 @@ impl TeamSessionService {
             .sessions
             .get(team_id)
             .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        entry.session.scheduler().set_status(slot_id, crate::types::TeammateStatus::Working).await?;
         entry.session.try_wake(slot_id, None).await;
         Ok(())
     }
