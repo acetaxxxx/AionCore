@@ -105,13 +105,19 @@ async fn setup_team_with_lead() -> SmokeEnv {
         &agents,
         mailbox.clone(),
         task_board.clone(),
-        broadcaster,
+        broadcaster.clone(),
     ));
 
     let auth_token = "smoke-token".to_string();
-    let server = TeamMcpServer::start(auth_token.clone(), scheduler.clone())
-        .await
-        .unwrap();
+    let server = TeamMcpServer::start(
+        auth_token.clone(),
+        scheduler.clone(),
+        team_id.clone(),
+        broadcaster,
+        std::sync::Weak::new(),
+    )
+    .await
+    .unwrap();
 
     SmokeEnv {
         server,
