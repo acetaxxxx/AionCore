@@ -634,13 +634,33 @@ impl TeamSessionService {
 
     /// Wake a specific agent in a team session (trigger it to read mailbox).
     /// Called by MCP dispatch after `team_send_message` writes to mailbox.
+    /// Fire-and-forget: spawns wake as background task, does not block MCP response.
     pub async fn wake_agent_in_session(&self, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
         let entry = self
             .sessions
             .get(team_id)
             .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
         entry.session.scheduler().set_status(slot_id, crate::types::TeammateStatus::Working).await?;
-        entry.session.try_wake(slot_id, None).await;
+        // Compute wake input while we hold the entry ref
+        let input = entry.session.compute_wake_input(slot_id).await;
+        let task_mgr = self.task_manager.clone();
+        drop(entry);
+
+        // Spawn actual send as background task (send_message blocks until agent finishes)
+        tokio::spawn(async move {
+            let input = match input {
+                Ok(Some(i)) if i.should_send => i,
+                _ => return,
+            };
+            let Some(handle) = task_mgr.get_task(&input.conversation_id) else { return };
+            let data = aionui_ai_agent::SendMessageData {
+                content: input.first_message,
+                msg_id: aionui_common::generate_id(),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+            };
+            let _ = handle.send_message(data).await;
+        });
         Ok(())
     }
 
