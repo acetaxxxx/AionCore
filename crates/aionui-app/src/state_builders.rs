@@ -40,6 +40,13 @@ use aionui_team::{TeamRouterState, TeamSessionService};
 
 use crate::{AppServices, ModuleStates, derive_encryption_key};
 
+fn default_allowed_roots() -> Vec<std::path::PathBuf> {
+    vec![
+        std::env::temp_dir(),
+        dirs::home_dir().unwrap_or_else(std::env::temp_dir),
+    ]
+}
+
 /// Convert extension-contributed ACP adapters into `DetectedAgent` values.
 pub(crate) async fn resolve_extension_agents(registry: &ExtensionRegistry) -> Vec<DetectedAgent> {
     registry
@@ -247,11 +254,8 @@ pub fn build_auxiliary_state(services: &AppServices) -> AuxiliaryRouterState {
 /// Build the default `FileRouterState` from application services.
 pub fn build_file_state(services: &AppServices) -> FileRouterState {
     let broadcaster = services.event_bus.clone();
-    let allowed_roots = vec![
-        std::env::temp_dir(),
-        dirs::home_dir().unwrap_or_else(std::env::temp_dir),
-    ];
-    let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots));
+    let allowed_roots = default_allowed_roots();
+    let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
     let watch_service =
         Arc::new(FileWatchService::new(broadcaster).expect("file watch service initialization"));
     let snapshot_service = Arc::new(SnapshotService::new());
@@ -259,6 +263,7 @@ pub fn build_file_state(services: &AppServices) -> FileRouterState {
         file_service,
         watch_service,
         snapshot_service,
+        allowed_roots,
     }
 }
 
@@ -501,6 +506,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
 /// Build the default `OfficeRouterState` from application services.
 pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let data_dir = std::path::Path::new(&services.data_dir);
+    let allowed_roots = default_allowed_roots();
 
     let spawner: Arc<dyn aionui_office::ProcessSpawner> =
         Arc::new(aionui_office::DefaultProcessSpawner);
@@ -520,6 +526,7 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
         star_office_detector,
         conversion_service,
         proxy_service,
+        allowed_roots,
     }
 }
 

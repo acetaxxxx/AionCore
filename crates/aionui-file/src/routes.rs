@@ -2,6 +2,7 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, State};
 use axum::routing::post;
+use std::path::Path;
 
 use aionui_api_types::{
     ApiResponse, CancelZipRequest, CopyFilesRequest, CopyFilesResponse, CreateTempFileRequest,
@@ -30,6 +31,7 @@ pub struct FileRouterState {
     pub file_service: FileServiceRef,
     pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
+    pub allowed_roots: Vec<std::path::PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +113,10 @@ async fn get_file_metadata(
     body: Result<Json<GetFileMetadataRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FileMetadataResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let meta = state.file_service.get_file_metadata(&req.path).await?;
+    let meta = state
+        .file_service
+        .get_file_metadata(&req.path, req.workspace.as_deref().map(Path::new))
+        .await?;
     Ok(Json(ApiResponse::ok(to_metadata_response(meta))))
 }
 
@@ -120,7 +125,10 @@ async fn read_file(
     body: Result<Json<ReadFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let content = state.file_service.read_file(&req.path).await?;
+    let content = state
+        .file_service
+        .read_file(&req.path, req.workspace.as_deref().map(Path::new))
+        .await?;
     Ok(Json(ApiResponse::ok(content)))
 }
 
@@ -129,7 +137,10 @@ async fn read_file_buffer(
     body: Result<Json<ReadFileBufferRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let data = state.file_service.read_file_buffer(&req.path).await?;
+    let data = state
+        .file_service
+        .read_file_buffer(&req.path, req.workspace.as_deref().map(Path::new))
+        .await?;
     // Binary data is base64-encoded for JSON transport.
     let encoded = data.map(|bytes| {
         use base64::Engine;
@@ -212,7 +223,10 @@ async fn get_image_base64(
     body: Result<Json<GetImageBase64Request>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let data_url = state.file_service.get_image_base64(&req.path).await?;
+    let data_url = state
+        .file_service
+        .get_image_base64(&req.path, req.workspace.as_deref().map(Path::new))
+        .await?;
     Ok(Json(ApiResponse::ok(data_url)))
 }
 
@@ -281,6 +295,16 @@ async fn start_office_watch(
     body: Result<Json<WorkspaceOfficeWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let allowed_roots: Vec<&Path> = state
+        .allowed_roots
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect();
+    crate::path_safety::validate_path_with_extra_root(
+        &req.workspace,
+        &allowed_roots,
+        Some(Path::new(&req.workspace)),
+    )?;
     state
         .watch_service
         .start_office_watch(&req.workspace)

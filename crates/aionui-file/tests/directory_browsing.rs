@@ -261,7 +261,10 @@ async fn get_file_metadata_text_file() {
     fs::write(&file, "hello world").unwrap();
 
     let svc = make_service(dir.path());
-    let meta = svc.get_file_metadata(file.to_str().unwrap()).await.unwrap();
+    let meta = svc
+        .get_file_metadata(file.to_str().unwrap(), None)
+        .await
+        .unwrap();
 
     assert_eq!(meta.name, "hello.txt");
     assert_eq!(meta.size, 11);
@@ -277,7 +280,10 @@ async fn get_file_metadata_image() {
     fs::write(&png, [0x89, 0x50, 0x4E, 0x47]).unwrap();
 
     let svc = make_service(dir.path());
-    let meta = svc.get_file_metadata(png.to_str().unwrap()).await.unwrap();
+    let meta = svc
+        .get_file_metadata(png.to_str().unwrap(), None)
+        .await
+        .unwrap();
 
     assert_eq!(meta.mime_type, "image/png");
 }
@@ -289,7 +295,10 @@ async fn get_file_metadata_directory() {
     fs::create_dir(&sub).unwrap();
 
     let svc = make_service(dir.path());
-    let meta = svc.get_file_metadata(sub.to_str().unwrap()).await.unwrap();
+    let meta = svc
+        .get_file_metadata(sub.to_str().unwrap(), None)
+        .await
+        .unwrap();
 
     assert!(meta.is_directory);
     assert_eq!(meta.mime_type, "inode/directory");
@@ -302,7 +311,7 @@ async fn get_file_metadata_nonexistent() {
     let fake = dir.path().join("missing.txt");
 
     let svc = make_service(dir.path());
-    let result = svc.get_file_metadata(fake.to_str().unwrap()).await;
+    let result = svc.get_file_metadata(fake.to_str().unwrap(), None).await;
 
     assert!(result.is_err());
 }
@@ -315,7 +324,7 @@ async fn get_file_metadata_outside_sandbox() {
     fs::write(&secret, "secret").unwrap();
 
     let svc = make_service(sandbox.path());
-    let result = svc.get_file_metadata(secret.to_str().unwrap()).await;
+    let result = svc.get_file_metadata(secret.to_str().unwrap(), None).await;
 
     assert!(result.is_err());
 }
@@ -327,7 +336,10 @@ async fn get_file_metadata_json_file() {
     fs::write(&file, r#"{"key":"value"}"#).unwrap();
 
     let svc = make_service(dir.path());
-    let meta = svc.get_file_metadata(file.to_str().unwrap()).await.unwrap();
+    let meta = svc
+        .get_file_metadata(file.to_str().unwrap(), None)
+        .await
+        .unwrap();
 
     assert_eq!(meta.mime_type, "application/json");
 }
