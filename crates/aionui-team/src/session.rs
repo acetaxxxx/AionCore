@@ -26,6 +26,16 @@ pub struct WakeInput {
     /// `false` when the mailbox is empty — caller should skip wake and
     /// leave the agent idle.
     pub should_send: bool,
+    /// Unread mailbox rows consumed to build `first_message`. Returned so the
+    /// caller can mirror non-user senders into the target agent's conversation
+    /// as left bubbles (matches AionUi `TeammateManager.wake()`). Drained
+    /// already — no additional `read_unread` call is safe.
+    pub unread: Vec<crate::types::MailboxMessage>,
+    /// Role of the wake target. Leader wakes do **not** mirror mailbox rows
+    /// into the conversation — the content is already embedded in the role
+    /// prompt sent to the leader directly. Only teammate wakes get the left
+    /// bubble treatment.
+    pub agent_role: TeammateRole,
 }
 
 /// Input for [`TeamSession::spawn_agent`]. Populated by the lead agent when
@@ -54,6 +64,10 @@ pub struct TeamSession {
     /// without creating a strong cycle with the session map that owns `self`.
     /// `None` in unit tests that don't exercise the DB path.
     service: Weak<TeamSessionService>,
+    /// Used by the wake path to mirror non-user mailbox rows into the target
+    /// agent's conversation as left bubbles (AionUi parity: see
+    /// `TeammateManager.wake()`'s `teammate_message` emission).
+    broadcaster: Arc<dyn EventBroadcaster>,
 }
 
 impl TeamSession {
@@ -82,7 +96,7 @@ impl TeamSession {
             auth_token,
             scheduler.clone(),
             team.id.clone(),
-            broadcaster,
+            broadcaster.clone(),
             service.clone(),
         )
         .await?;
@@ -103,6 +117,7 @@ impl TeamSession {
             task_manager,
             user_id,
             service,
+            broadcaster,
         })
     }
 
@@ -183,6 +198,8 @@ impl TeamSession {
             conversation_id: agent.conversation_id,
             first_message,
             should_send,
+            unread,
+            agent_role: agent.role,
         }))
     }
 
@@ -313,6 +330,8 @@ impl TeamSession {
             return;
         }
 
+        self.mirror_unread_to_conversation(&input).await;
+
         let Some(handle) = self.task_manager.get_task(&input.conversation_id) else {
             warn!(
                 team_id = %self.team.id,
@@ -338,6 +357,95 @@ impl TeamSession {
                 error = %err,
                 "agent.send_message failed; mailbox retained, wake will be retried on next trigger"
             );
+        }
+    }
+
+    /// Mirror each non-user mailbox row into the target agent's conversation
+    /// as a left bubble so the UI shows "who said what" when the user opens
+    /// a teammate's chat panel.
+    ///
+    /// Skipped for:
+    /// - Leader wakes: the mailbox content is embedded inside the role prompt
+    ///   sent to the leader directly; duplicating it as a bubble would clutter
+    ///   the leader's own thread (AionUi parity: `agent.role !== 'leader'`).
+    /// - `from_agent_id == "user"`: user-originated messages are already
+    ///   written to the conversation by the standard user-send path, and we
+    ///   must not double-write them.
+    /// - Test/unit contexts where `TeamSession::service` is a dangling
+    ///   `Weak` (no conversation service reachable).
+    ///
+    /// Failures per-message are logged and swallowed — the mailbox rows are
+    /// already marked read, and we never let a conversation-write failure
+    /// block the wake itself.
+    pub(crate) async fn mirror_unread_to_conversation(&self, input: &WakeInput) {
+        if matches!(input.agent_role, TeammateRole::Lead) {
+            return;
+        }
+        if input.unread.is_empty() {
+            return;
+        }
+        let Some(service) = self.service.upgrade() else {
+            return;
+        };
+        let conversation_service = service.conversation_service_ref();
+        let agents = self.scheduler.list_agents().await;
+        let total = input.unread.len();
+
+        for msg in &input.unread {
+            if msg.from_agent_id == "user" {
+                continue;
+            }
+            let sender = agents.iter().find(|a| a.slot_id == msg.from_agent_id);
+            let sender_name = sender.map(|a| a.name.clone()).unwrap_or_else(|| msg.from_agent_id.clone());
+            let sender_backend = sender.map(|a| a.backend.clone());
+            let sender_conv_id = sender.map(|a| a.conversation_id.clone());
+            let display_content = if total > 1 {
+                format!("[{sender_name}] {}", msg.content)
+            } else {
+                msg.content.clone()
+            };
+            let msg_id = generate_id();
+            let content_json = serde_json::json!({
+                "content": display_content,
+                "teammate_message": true,
+                "sender_name": sender_name,
+                "sender_backend": sender_backend,
+                "sender_conversation_id": sender_conv_id,
+            })
+            .to_string();
+            let row = aionui_db::models::MessageRow {
+                id: msg_id.clone(),
+                conversation_id: input.conversation_id.clone(),
+                msg_id: Some(msg_id.clone()),
+                r#type: "text".into(),
+                content: content_json,
+                position: Some("left".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: aionui_common::now_ms(),
+            };
+            if let Err(err) = conversation_service.insert_raw_message(&row).await {
+                warn!(
+                    team_id = %self.team.id,
+                    conversation_id = %input.conversation_id,
+                    from = %msg.from_agent_id,
+                    error = %err,
+                    "mirror_unread_to_conversation: insert_raw_message failed (mailbox already read)"
+                );
+                continue;
+            }
+
+            let ws_payload = aionui_api_types::TeammateMessagePayload {
+                conversation_id: input.conversation_id.clone(),
+                content: display_content,
+                from_slot_id: msg.from_agent_id.clone(),
+                from_name: sender_name,
+            };
+            let event = aionui_api_types::WebSocketMessage::new(
+                "team.teammate.message",
+                serde_json::to_value(ws_payload).expect("serialize teammate message payload"),
+            );
+            self.broadcaster.broadcast(event);
         }
     }
 
@@ -1099,6 +1207,88 @@ mod tests {
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
         assert!(!input.should_send);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn compute_wake_input_returns_unread_rows_and_role_for_teammate() {
+        let session = start_session().await;
+        session
+            .mailbox
+            .write("t1", "worker-1", "lead-1", MailboxMessageType::Message, "from lead", None)
+            .await
+            .unwrap();
+        session
+            .mailbox
+            .write("t1", "worker-1", "user", MailboxMessageType::Message, "from user", None)
+            .await
+            .unwrap();
+
+        let input = session
+            .compute_wake_input("worker-1")
+            .await
+            .unwrap()
+            .expect("WakeInput");
+
+        assert_eq!(input.unread.len(), 2);
+        assert!(matches!(input.agent_role, TeammateRole::Teammate));
+        assert!(input.unread.iter().any(|m| m.from_agent_id == "lead-1"));
+        assert!(input.unread.iter().any(|m| m.from_agent_id == "user"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn compute_wake_input_returns_lead_role() {
+        let session = start_session().await;
+        session
+            .mailbox
+            .write("t1", "lead-1", "user", MailboxMessageType::Message, "hi lead", None)
+            .await
+            .unwrap();
+
+        let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
+
+        assert!(matches!(input.agent_role, TeammateRole::Lead));
+        assert_eq!(input.unread.len(), 1);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn mirror_unread_to_conversation_is_noop_for_leader() {
+        let session = start_session().await;
+        session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "lead-gets-this", None)
+            .await
+            .unwrap();
+
+        let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
+
+        // The service `Weak` is dangling in unit tests, but the leader short-circuit
+        // must hit before any upgrade — this call must not panic.
+        session.mirror_unread_to_conversation(&input).await;
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn mirror_unread_to_conversation_skips_when_service_weak_is_dangling() {
+        let session = start_session().await;
+        session
+            .mailbox
+            .write("t1", "worker-1", "lead-1", MailboxMessageType::Message, "do it", None)
+            .await
+            .unwrap();
+
+        let input = session
+            .compute_wake_input("worker-1")
+            .await
+            .unwrap()
+            .expect("WakeInput");
+
+        // In unit tests, `service` is a dangling Weak — the mirror helper must
+        // skip gracefully (no panic, no broadcast), leaving the wake path to
+        // still forward `first_message` to the agent.
+        session.mirror_unread_to_conversation(&input).await;
         session.stop();
     }
 
