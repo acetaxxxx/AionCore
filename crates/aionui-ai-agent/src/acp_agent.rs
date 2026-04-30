@@ -686,7 +686,7 @@ impl AcpAgentManager {
             }));
 
         if let Err(e) = self.apply_preferred_mode(&sid).await {
-            tracing::warn!(
+            tracing::error!(
                 conversation_id = %self.conversation_id,
                 error = %e,
                 "failed to apply preferred mode, continuing with default"
