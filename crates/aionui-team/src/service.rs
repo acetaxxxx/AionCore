@@ -511,7 +511,7 @@ impl TeamSessionService {
         &self,
         team_id: &str,
         session: &TeamSession,
-        user_id: &str,
+        _user_id: &str,
         agents: &[TeamAgent],
     ) -> Result<(), TeamError> {
         for agent in agents {
@@ -530,28 +530,11 @@ impl TeamSessionService {
                 return Err(TeamError::InvalidRequest(msg));
             }
 
-            if let Err(e) = self
-                .task_manager
-                .kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
-            {
-                let msg = format!("failed to kill agent task {}: {e}", agent.conversation_id);
-                self.broadcast_mcp_phase(team_id, &agent.slot_id, TeamMcpPhase::SessionError, None, |p| {
-                    p.error = Some(msg.clone());
-                });
-                return Err(TeamError::InvalidRequest(msg));
-            }
-
-            if let Err(e) = self
-                .conversation_service
-                .warmup(user_id, &agent.conversation_id, &self.task_manager)
-                .await
-            {
-                let msg = format!("failed to rebuild agent task {}: {e}", agent.conversation_id);
-                self.broadcast_mcp_phase(team_id, &agent.slot_id, TeamMcpPhase::SessionError, None, |p| {
-                    p.error = Some(msg.clone());
-                });
-                return Err(TeamError::InvalidRequest(msg));
-            }
+            // Kill cached task so next get_or_build_task reads fresh config from DB.
+            // Don't warmup — let the next user message trigger rebuild naturally.
+            // Claude CLI persists session history to disk; session/new+resume
+            // restores it, so conversation context is NOT lost across restarts.
+            let _ = self.task_manager.kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild));
         }
         Ok(())
     }
