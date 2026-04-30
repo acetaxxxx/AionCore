@@ -155,7 +155,21 @@ impl TeamSession {
 
         let first_message = if needs_role_prompt {
             let role_prompt = match agent.role {
-                TeammateRole::Lead => build_lead_prompt(&self.team.name, &self.scheduler.list_agents().await),
+                TeammateRole::Lead => {
+                    // TODO(W5+): source display names from the dynamic backend registry
+                    // once it exposes a public listing. For now, hard-code the
+                    // team-capable whitelist from `guide::capability::TEAM_CAPABLE_BACKENDS`.
+                    let available_agent_types: Vec<(String, String)> = vec![
+                        ("claude".into(), "Claude".into()),
+                        ("codex".into(), "Codex".into()),
+                        ("gemini".into(), "Gemini".into()),
+                    ];
+                    build_lead_prompt(
+                        &self.team.name,
+                        &self.scheduler.list_agents().await,
+                        &available_agent_types,
+                    )
+                }
                 TeammateRole::Teammate => build_teammate_prompt(&agent, &self.team.name),
             };
             format!("{role_prompt}\n\n{wake_body}")
@@ -1018,7 +1032,7 @@ mod tests {
         assert_eq!(input.conversation_id, "c1");
         assert!(input.should_send);
         assert!(
-            input.first_message.contains("Lead Agent of team"),
+            input.first_message.contains("You are the Team Leader"),
             "expected lead role prompt, got: {}",
             input.first_message
         );
