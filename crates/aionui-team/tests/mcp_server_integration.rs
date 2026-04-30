@@ -628,6 +628,18 @@ async fn tm1_list_all_members() {
     assert!(names.contains(&"Leader"));
     assert!(names.contains(&"Worker"));
 
+    // Regression: cold-start agents (including the lead before its first
+    // wake) must report an explicit `idle` status — never `null` — so MCP
+    // clients do not misread a live teammate as offline.
+    for m in &members {
+        assert_eq!(
+            m["status"].as_str(),
+            Some("idle"),
+            "team_members must report idle status for cold-start agents, got {:?}",
+            m["status"]
+        );
+    }
+
     env.server.stop();
 }
 
