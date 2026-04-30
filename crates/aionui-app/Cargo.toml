@@ -8,7 +8,10 @@ name = "aionui-backend"
 path = "src/main.rs"
 
 [features]
-default = ["weixin"]
+default = ["telegram", "lark", "dingtalk", "weixin"]
+telegram = ["aionui-channel/telegram"]
+lark = ["aionui-channel/lark"]
+dingtalk = ["aionui-channel/dingtalk"]
 weixin = ["aionui-channel/weixin"]
 
 [dependencies]

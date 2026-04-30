@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["telegram"]
+default = []
 telegram = ["dep:reqwest"]
 lark = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
 dingtalk = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
