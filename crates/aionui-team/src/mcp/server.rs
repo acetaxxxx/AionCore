@@ -722,10 +722,9 @@ async fn http_mcp_loop(
                             let params = value.get("params").cloned().unwrap_or(json!({}));
                             let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
                             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                            // Extract slot_id from auth header or use empty
-                            let auth_header = request.lines()
-                                .find(|l| l.to_lowercase().starts_with("authorization:"))
-                                .and_then(|l| l.split_whitespace().last())
+                            let caller_slot_id = request.lines()
+                                .find(|l| l.to_lowercase().starts_with("x-slot-id:"))
+                                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
                                 .unwrap_or("");
                             match dispatch_tool(
                                 tool_name,
@@ -733,7 +732,7 @@ async fn http_mcp_loop(
                                 &sched,
                                 &svc,
                                 &tid,
-                                auth_header,
+                                caller_slot_id,
                                 TeammateRole::Lead,
                             )
                             .await
