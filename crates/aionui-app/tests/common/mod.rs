@@ -26,9 +26,7 @@ pub async fn build_app() -> (axum::Router, AppServices) {
 /// E5 `/api/skills/info`). Returns the router, services, and the
 /// `SkillPaths` so the test can seed fixtures at known locations.
 #[allow(dead_code)]
-pub async fn build_app_with_skill_paths(
-    root: &std::path::Path,
-) -> (axum::Router, AppServices, SkillPaths) {
+pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router, AppServices, SkillPaths) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_database(db).await.unwrap();
     let (mut states, _) = build_module_states(&services).await;
@@ -53,8 +51,7 @@ pub async fn build_app_with_skill_paths(
         std::fs::create_dir_all(dir).unwrap();
     }
 
-    let ext_paths_mgr =
-        std::sync::Arc::new(ExternalPathsManager::with_file(root.join("paths.json")).await);
+    let ext_paths_mgr = std::sync::Arc::new(ExternalPathsManager::with_file(root.join("paths.json")).await);
     states.skill = SkillRouterState {
         skill_paths: paths.clone(),
         external_paths_manager: ext_paths_mgr,
@@ -69,9 +66,9 @@ pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_database(db).await.unwrap();
     let (mut states, _) = build_module_states(&services).await;
-    states.shell.shell_service = std::sync::Arc::new(aionui_shell::ShellService::new(
-        std::sync::Arc::new(aionui_shell::NoopSystemOpener),
-    ));
+    states.shell.shell_service = std::sync::Arc::new(aionui_shell::ShellService::new(std::sync::Arc::new(
+        aionui_shell::NoopSystemOpener,
+    )));
     let router = create_router_with_states(&services, states);
     (router, services)
 }
@@ -95,11 +92,8 @@ pub async fn build_app_with_mock_version(
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_database(db).await.unwrap();
     let (mut states, _) = build_module_states(&services).await;
-    states.system.version_check_service = VersionCheckService::with_api_base(
-        reqwest::Client::new(),
-        current_version.to_owned(),
-        mock_server.uri(),
-    );
+    states.system.version_check_service =
+        VersionCheckService::with_api_base(reqwest::Client::new(), current_version.to_owned(), mock_server.uri());
     let router = create_router_with_states(&services, states);
     (router, services)
 }
@@ -126,11 +120,7 @@ pub fn extract_csrf_token(resp: &axum::response::Response) -> Option<String> {
 }
 
 pub fn get_request(uri: &str) -> Request<Body> {
-    Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap()
+    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
 }
 
 pub fn get_with_token(uri: &str, token: &str) -> Request<Body> {
@@ -142,13 +132,7 @@ pub fn get_with_token(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
-pub fn json_with_token(
-    method_str: &str,
-    uri: &str,
-    body: serde_json::Value,
-    token: &str,
-    csrf: &str,
-) -> Request<Body> {
+pub fn json_with_token(method_str: &str, uri: &str, body: serde_json::Value, token: &str, csrf: &str) -> Request<Body> {
     Request::builder()
         .method(method_str)
         .uri(uri)
@@ -179,17 +163,9 @@ pub async fn setup_and_login(
     password: &str,
 ) -> (String, String) {
     let hash = aionui_auth::hash_password(password).unwrap();
-    services
-        .user_repo
-        .create_user(username, &hash)
-        .await
-        .unwrap();
+    services.user_repo.create_user(username, &hash).await.unwrap();
 
-    let resp = app
-        .clone()
-        .oneshot(get_request("/api/auth/status"))
-        .await
-        .unwrap();
+    let resp = app.clone().oneshot(get_request("/api/auth/status")).await.unwrap();
     let csrf = extract_csrf_token(&resp).expect("CSRF cookie should be set");
 
     let body = format!(r#"{{"username":"{username}","password":"{password}"}}"#);

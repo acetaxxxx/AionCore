@@ -8,15 +8,110 @@
 
 客户端不需要保留任何 team 专属的本地 session、状态复制、wake 逻辑。Team 的调度、状态机、mailbox、任务板全部在后端。全部走 REST + WebSocket 即可。
 
-> **关于 MCP**：agent 之间的通信（发消息、任务板、spawn teammate）走的是 MCP，这是**后端进程 ↔ agent 子进程**之间的事，浏览器前端不接触。详情看 [mcp.md](./mcp.md)。前端只需要记一条：**"单聊→自动建团"在 AionUi 参考设计里是通过 `aion_create_team` MCP 工具触发的，但后端尚未实现**，所以前端要建团只能显式调 `POST /api/teams`。
+> **关于 MCP**：agent 之间的通信（发消息、任务板、spawn teammate）走的是 MCP，这是**后端进程 ↔ agent 子进程**之间的事，浏览器前端不接触。详情看 [mcp.md](./mcp.md)。
+
+## 开发进度（实时更新）
+
+| 能力 | 状态 | 说明 |
+|------|:---:|------|
+| Team CRUD（建/删/改名/加减 agent） | ✅ 已完成 | |
+| 用户→agent 发消息（走单聊 API） | ✅ 已完成 | `POST /api/conversations/{conv_id}/messages` |
+| Agent 间 MCP 通信（team_send_message 等工具） | ✅ 已完成 | HTTP transport，agent 主动连接 |
+| Agent wake 机制（发消息后 agent 自动响应） | ✅ 已完成 | |
+| 建团自动起 session（MCP 自动注入） | ✅ 已完成 | `POST /api/teams` 后自动 ensure_session，前端无需额外调用 |
+| WS 事件推送（team.agent.status 等） | ✅ 已完成 | |
+| user_id 权限隔离（list/get/remove 按用户过滤） | ✅ 已完成 | Wave 3 |
+| 单聊→建团（conversation 复用） | ✅ 已完成 | agents 里传 `conversation_id` 可复用 |
+| rename 规范化 | ✅ 已完成 | Wave 3 |
+| MCP 协议加固（64MB 帧 + 300s 超时） | ✅ 已完成 | Wave 3 |
+| MCP 注入（HTTP transport） | ✅ 已完成 | Wave 4，commit 6c334a9 |
+| MCP ready 协议类型 | ✅ 已完成 | Wave 4 D24a |
+| crash 检测 | ✅ 已完成 | Wave 4 D20a |
+| 429 限流识别 | ✅ 已完成 | Wave 4 D21 |
+| finalize dedup（5s 去重） | ✅ 已完成 | Wave 4 D19a |
+| add_agent 并发锁 | ✅ 已完成 | Wave 4 D23 |
+| AgentStreamChunk（wake 超时看门狗） | ✅ 已完成 | Wave 4 D25a |
+| D24b/c（MCP ready 握手） | ~~SKIPPED~~ | 切 HTTP transport 后不再需要 stdio ready 握手 |
+| team_spawn_agent 真实落地 | ⏳ Wave 5 | leader 动态拉人（当前工具可调用但为 no-op） |
+| Team Guide MCP（agent 自动建团） | ⏳ Wave 5 | `aion_create_team` 工具 |
+| crash recovery / 429 自动重试 | 🔄 Wave 4 进行中 | 检测已就绪，重试调度逻辑待完成（剩余 15 模块） |
+
+### Wave 4 进度：6/25 模块已合并
+
+已合并：D19a, D20a, D21, D23, D24a, D25a + HTTP transport 切换
+已跳过：D24b, D24c（stdio ready 握手 — HTTP transport 不需要）
+剩余：15 模块，ETA ongoing
+
+## MCP Transport 变更（Wave 4）
+
+> **前端影响：无。** 这是后端内部架构变更，对前端接口完全透明。
+
+### 变更内容
+
+从 stdio bridge 切换到 HTTP transport（commit 6c334a9）。
+
+旧方案（已废弃）：后端 spawn stdio bridge 子进程，agent CLI 通过 stdin/stdout 通信 → agent CLI 从未发送 MCP initialize，链路不通。
+
+新方案（当前）：TeamMcpServer 暴露 HTTP 端点，agent CLI 主动通过 HTTP 连接 MCP server → 连接即通，无需额外握手。
+
+### Agent 可用工具
+
+agent 连接 MCP server 后，以下工具对 agent 可见且可调用：
+
+| 工具 | 状态 | 说明 |
+|------|:---:|------|
+| `team_send_message` | Working | agent 间发消息 |
+| `team_spawn_agent` | Callable (no-op) | 工具声明存在，调用返回 success，但不实际创建 agent（Wave 5 落地） |
+| `team_task_create` | Working | 创建任务 |
+| `team_task_update` | Working | 更新任务状态 |
+| `team_task_list` | Working | 列出所有任务 |
+| `team_members` | Working | 列出当前成员 |
+| `team_rename_agent` | Working | 改名 |
+| `team_shutdown_agent` | Working | Lead 请求 teammate 下线 |
+
+### 前端须知
+
+- `team_spawn_agent` 对 agent 是可见的，lead 可能会说"已创建新 agent"，但实际成员列表不会变化 — 这不是前端 bug，是后端 Wave 5 待实现的功能
+- D24b/c（MCP ready 握手协议）已跳过 — HTTP transport 不需要 stdio ready 信号，agent 连接即可用
+- 所有 WS 事件格式不变，前端代码无需任何修改
+
+---
+
+### 单聊→建团接入方式（Wave 3 完成后可用）
+
+```json
+POST /api/teams
+{
+  "name": "My Team",
+  "agents": [
+    {
+      "name": "Leader",
+      "role": "lead",
+      "backend": "claude",
+      "model": "claude-sonnet-4",
+      "conversation_id": "existing-conv-id"  // ← 传已有单聊的 conv_id，历史消息保留
+    },
+    {
+      "name": "Developer",
+      "role": "teammate",
+      "backend": "claude",
+      "model": "claude-sonnet-4"
+      // 不传 conversation_id → 新建
+    }
+  ]
+}
+```
+
+传 `conversation_id` 时后端复用该 conversation（extra 打 teamId 标记），不新建。消息历史完整保留。不传则正常新建。
 
 ## 必须走 REST 的操作
 
 | 动作 | 端点 |
 |------|------|
 | 建 team / 加 agent / 改名 / 删 | `/api/teams/**`（见 [api.md](./api.md)） |
-| **发消息前必须先**起 session | `POST /api/teams/{id}/session`（幂等，可重复调） |
 | 关闭 session | `DELETE /api/teams/{id}/session` |
+
+> **注意**：`POST /api/teams` 建团后，后端**自动**起 session 并注入 MCP。前端不需要单独调 `POST /api/teams/{id}/session`。但如果后端重启了，需要在进入 team 页时调一次 `POST /api/teams/{id}/session`（幂等）重新激活。
 
 ### 发消息：走单聊 API
 
@@ -55,12 +150,12 @@ GET /api/conversations/{conversation_id}/messages
 
 ## 最小接入 checklist
 
-1. [ ] `POST /api/teams` 建团队，拿到 `team.id` 和每个 `agent.slot_id / conversation_id`
-2. [ ] `POST /api/teams/{id}/session` 起 session（重进 app 也要调）
-3. [ ] 订阅 WS，过滤 `team.agent.*` 事件更新 UI 上的 agent 状态
-4. [ ] 进入某 agent 聊天页：`GET /api/conversations/{conversation_id}/messages` 拉历史
-5. [ ] 用户在任意 agent 页发言：`POST /api/conversations/{conversation_id}/messages`（lead 也走这个，不再有 team-level 发消息端点）
-6. [ ] 关闭 team 页/切换：不需要主动 stop session，幂等 ensure 即可；真要回收调 `DELETE .../session`
+1. [ ] `POST /api/teams` 建团队，拿到 `team.id` 和每个 `agent.slot_id / conversation_id`（后端自动起 session + 注入 MCP）
+2. [ ] 订阅 WS，过滤 `team.agent.*` 事件更新 UI 上的 agent 状态
+3. [ ] 进入某 agent 聊天页：`GET /api/conversations/{conversation_id}/messages` 拉历史
+4. [ ] 用户在任意 agent 页发言：`POST /api/conversations/{conversation_id}/messages`（lead 也走这个，不再有 team-level 发消息端点）
+5. [ ] 重进 app / 后端重启后：调一次 `POST /api/teams/{id}/session`（幂等，重新激活 MCP）
+6. [ ] 关闭 team 页/切换：不需要主动 stop session；真要回收调 `DELETE .../session`
 
 **不要做**：不要前端再造一套 agent 状态机/任务调度；不要缓存 mailbox；不要试图通过 team API 拉消息历史或发消息。
 

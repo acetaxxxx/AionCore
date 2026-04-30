@@ -100,10 +100,7 @@ async fn read_file_path_traversal_rejected() {
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("traversal"),
-        "expected traversal error, got: {err}"
-    );
+    assert!(err.contains("traversal"), "expected traversal error, got: {err}");
 }
 
 #[tokio::test]
@@ -266,10 +263,7 @@ async fn write_file_normal() {
 
     let svc = make_service(dir.path());
     let ws = dir.path().to_str().unwrap();
-    let ok = svc
-        .write_file(file.to_str().unwrap(), b"hello", ws)
-        .await
-        .unwrap();
+    let ok = svc.write_file(file.to_str().unwrap(), b"hello", ws).await.unwrap();
 
     assert!(ok);
     assert_eq!(fs::read_to_string(&file).unwrap(), "hello");
@@ -283,10 +277,7 @@ async fn write_file_creates_new_file() {
 
     let svc = make_service(dir.path());
     let ws = dir.path().to_str().unwrap();
-    let ok = svc
-        .write_file(file.to_str().unwrap(), b"created", ws)
-        .await
-        .unwrap();
+    let ok = svc.write_file(file.to_str().unwrap(), b"created", ws).await.unwrap();
 
     assert!(ok);
     assert!(file.exists());
@@ -355,10 +346,7 @@ async fn write_file_emits_content_update_event() {
     assert_eq!(event.data["operation"], "write");
     // file_path should be the canonical path
     assert!(
-        event.data["file_path"]
-            .as_str()
-            .unwrap()
-            .contains("event_test.txt"),
+        event.data["file_path"].as_str().unwrap().contains("event_test.txt"),
         "file_path should contain the file name"
     );
     // relative_path should be relative to workspace
@@ -375,9 +363,7 @@ async fn write_file_binary_omits_content_in_event() {
     let (svc, recorder) = make_service_with_recorder(dir.path());
     let ws = dir.path().to_str().unwrap();
 
-    svc.write_file(file.to_str().unwrap(), &data, ws)
-        .await
-        .unwrap();
+    svc.write_file(file.to_str().unwrap(), &data, ws).await.unwrap();
 
     let events = recorder.take_events();
     assert_eq!(events.len(), 1);
@@ -399,9 +385,7 @@ async fn write_file_nested_relative_path() {
     let (svc, recorder) = make_service_with_recorder(dir.path());
     let ws = dir.path().to_str().unwrap();
 
-    svc.write_file(file.to_str().unwrap(), b"export {}", ws)
-        .await
-        .unwrap();
+    svc.write_file(file.to_str().unwrap(), b"export {}", ws).await.unwrap();
 
     let events = recorder.take_events();
     assert_eq!(events.len(), 1);
@@ -442,9 +426,7 @@ async fn read_buffer_after_write_roundtrip() {
     let svc = make_service(dir.path());
     let ws = dir.path().to_str().unwrap();
 
-    svc.write_file(file.to_str().unwrap(), &data, ws)
-        .await
-        .unwrap();
+    svc.write_file(file.to_str().unwrap(), &data, ws).await.unwrap();
 
     let read_result = svc
         .read_file_buffer(file.to_str().unwrap(), None)
@@ -471,9 +453,7 @@ async fn write_file_invalidates_cache() {
 
     // Write a new file (should invalidate cache)
     let new_file = dir.path().join("new.txt");
-    svc.write_file(new_file.to_str().unwrap(), b"new", ws)
-        .await
-        .unwrap();
+    svc.write_file(new_file.to_str().unwrap(), b"new", ws).await.unwrap();
 
     // Cache should be invalidated, so we see the new file
     let files = svc.list_workspace_files(ws).await.unwrap();
