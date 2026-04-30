@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, json_with_token, setup_and_login};
+use common::{body_json, build_app, build_app_with_file_roots, json_with_token, setup_and_login};
 
 // ===========================================================================
 // Auth guard
@@ -217,6 +217,111 @@ async fn read_file_nonexistent_returns_null() {
 }
 
 #[tokio::test]
+async fn read_file_with_workspace_field_accepts_non_home_path() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let file_path = workspace.path().join("preview.md");
+    std::fs::write(&file_path, "# hello").unwrap();
+
+    let req = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({
+            "path": file_path.to_str().unwrap(),
+            "workspace": workspace.path().to_str().unwrap()
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["data"], "# hello");
+}
+
+#[tokio::test]
+async fn read_file_without_workspace_rejects_non_sandbox_path() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let file_path = workspace.path().join("preview.md");
+    std::fs::write(&file_path, "# hello").unwrap();
+
+    let req = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({ "path": file_path.to_str().unwrap() }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
+}
+
+#[tokio::test]
+async fn read_file_non_existent_within_sandbox_returns_null() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let file_path = sandbox.path().join("missing.md");
+
+    let req = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({ "path": file_path.to_str().unwrap() }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert!(json["data"].is_null());
+}
+
+#[tokio::test]
+async fn image_base64_with_workspace_field_accepts_non_home_path() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let file_path = workspace.path().join("preview.png");
+    std::fs::write(&file_path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+
+    let req = json_with_token(
+        "POST",
+        "/api/fs/image-base64",
+        json!({
+            "path": file_path.to_str().unwrap(),
+            "workspace": workspace.path().to_str().unwrap()
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert!(
+        json["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
+}
+
+#[tokio::test]
 async fn write_file_creates_and_returns_true() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
@@ -269,9 +374,7 @@ async fn read_file_buffer_returns_base64() {
     let encoded = json["data"].as_str().unwrap();
     // Verify base64 roundtrip
     use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
     assert_eq!(decoded, vec![0x00, 0xFF, 0xAB]);
 }
 
@@ -396,11 +499,10 @@ async fn get_image_base64_returns_data_url() {
     let img_path = dir.path().join("pixel.png");
     // Minimal valid 1x1 PNG
     let png_bytes: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
-        0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, 0x00, 0x00, 0x00,
-        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+        0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2,
+        0x21, 0xBC, 0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
     std::fs::write(&img_path, png_bytes).unwrap();
 
@@ -615,8 +717,7 @@ async fn snapshot_init_git_repo() {
     let tree_id = index.write_tree().unwrap();
     let tree = repo.find_tree(tree_id).unwrap();
     let sig = git2::Signature::now("test", "test@test.com").unwrap();
-    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
-        .unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
 
     // Init snapshot — should detect git-repo mode
     let req = json_with_token(

@@ -10,9 +10,8 @@ use axum::response::Response;
 use axum::routing::{get, post};
 
 use aionui_api_types::{
-    ApiResponse, DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse,
-    GetI18nRequest, GetPermissionsRequest, GetRiskLevelRequest, PermissionDetailResponse,
-    PermissionSummaryResponse,
+    ApiResponse, DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest,
+    GetPermissionsRequest, GetRiskLevelRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
 use aionui_common::AppError;
 
@@ -197,10 +196,7 @@ async fn get_extension_asset(
 
     Response::builder()
         .status(StatusCode::OK)
-        .header(
-            header::CONTENT_TYPE,
-            content_type_for_path(&canonical_asset),
-        )
+        .header(header::CONTENT_TYPE, content_type_for_path(&canonical_asset))
         .header(header::CACHE_CONTROL, "public, max-age=3600")
         .body(Body::from(bytes))
         .map_err(|err| AppError::Internal(err.to_string()))
@@ -335,8 +331,7 @@ fn enum_to_string<T: serde::Serialize>(value: &T) -> String {
 
 fn content_type_for_path(path: &FsPath) -> HeaderValue {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
-    HeaderValue::from_str(mime.as_ref())
-        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
+    HeaderValue::from_str(mime.as_ref()).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
 }
 
 fn map_asset_lookup_error(error: std::io::Error) -> AppError {
@@ -392,11 +387,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        std::fs::write(
-            ext_dir.join("settings").join("index.html"),
-            "<h1>Hello</h1>",
-        )
-        .unwrap();
+        std::fs::write(ext_dir.join("settings").join("index.html"), "<h1>Hello</h1>").unwrap();
 
         let store = ExtensionStateStore::new(tmp.path().join("states.json"));
         let bus = Arc::new(BroadcastEventBus::new(64));
@@ -409,11 +400,7 @@ mod tests {
             .await
             .unwrap();
 
-        (
-            extension_routes(ExtensionRouterState { registry }),
-            tmp,
-            ext_dir,
-        )
+        (extension_routes(ExtensionRouterState { registry }), tmp, ext_dir)
     }
 
     #[tokio::test]
@@ -430,10 +417,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[header::CACHE_CONTROL],
-            "public, max-age=3600"
-        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "public, max-age=3600");
         assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html");
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes, "<h1>Hello</h1>");

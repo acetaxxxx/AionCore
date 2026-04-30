@@ -619,6 +619,7 @@ dependencies = [
  "aionui-api-types",
  "aionui-auth",
  "aionui-common",
+ "aionui-file",
  "aionui-realtime",
  "async-trait",
  "axum",
@@ -703,6 +704,7 @@ dependencies = [
 name = "aionui-team"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
  "aionui-ai-agent",
  "aionui-api-types",
  "aionui-auth",
@@ -713,6 +715,7 @@ dependencies = [
  "async-trait",
  "axum",
  "dashmap",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",

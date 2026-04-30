@@ -63,7 +63,7 @@ async fn read_file_normal_utf8() {
     fs::write(&file, "hello world").unwrap();
 
     let svc = make_service(dir.path());
-    let result = svc.read_file(file.to_str().unwrap()).await.unwrap();
+    let result = svc.read_file(file.to_str().unwrap(), None).await.unwrap();
 
     assert_eq!(result.as_deref(), Some("hello world"));
 }
@@ -75,7 +75,7 @@ async fn read_file_empty() {
     fs::write(&file, "").unwrap();
 
     let svc = make_service(dir.path());
-    let result = svc.read_file(file.to_str().unwrap()).await.unwrap();
+    let result = svc.read_file(file.to_str().unwrap(), None).await.unwrap();
 
     assert_eq!(result.as_deref(), Some(""));
 }
@@ -86,7 +86,7 @@ async fn read_file_nonexistent_returns_none() {
     let fake = dir.path().join("missing.txt");
 
     let svc = make_service(dir.path());
-    let result = svc.read_file(fake.to_str().unwrap()).await.unwrap();
+    let result = svc.read_file(fake.to_str().unwrap(), None).await.unwrap();
 
     assert!(result.is_none());
 }
@@ -96,14 +96,11 @@ async fn read_file_path_traversal_rejected() {
     let dir = tempfile::tempdir().unwrap();
 
     let svc = make_service(dir.path());
-    let result = svc.read_file("../../etc/passwd").await;
+    let result = svc.read_file("../../etc/passwd", None).await;
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("traversal"),
-        "expected traversal error, got: {err}"
-    );
+    assert!(err.contains("traversal"), "expected traversal error, got: {err}");
 }
 
 #[tokio::test]
@@ -114,7 +111,7 @@ async fn read_file_multiline_content() {
     fs::write(&file, content).unwrap();
 
     let svc = make_service(dir.path());
-    let result = svc.read_file(file.to_str().unwrap()).await.unwrap();
+    let result = svc.read_file(file.to_str().unwrap(), None).await.unwrap();
 
     assert_eq!(result.as_deref(), Some(content));
 }
@@ -127,9 +124,95 @@ async fn read_file_unicode_content() {
     fs::write(&file, content).unwrap();
 
     let svc = make_service(dir.path());
-    let result = svc.read_file(file.to_str().unwrap()).await.unwrap();
+    let result = svc.read_file(file.to_str().unwrap(), None).await.unwrap();
 
     assert_eq!(result.as_deref(), Some(content));
+}
+
+#[tokio::test]
+async fn read_file_with_extra_workspace_root_outside_home() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let file = workspace.path().join("outside.txt");
+    fs::write(&file, "workspace content").unwrap();
+
+    let svc = make_service(sandbox.path());
+    let result = svc
+        .read_file(file.to_str().unwrap(), Some(workspace.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(result.as_deref(), Some("workspace content"));
+}
+
+#[tokio::test]
+async fn read_file_rejects_outside_sandbox_without_workspace() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let file = outside.path().join("secret.txt");
+    fs::write(&file, "secret").unwrap();
+
+    let svc = make_service(sandbox.path());
+    let err = svc.read_file(file.to_str().unwrap(), None).await.unwrap_err();
+
+    assert!(matches!(err, aionui_common::AppError::Forbidden(_)));
+    assert_eq!(err.error_code(), "PATH_OUTSIDE_SANDBOX");
+}
+
+#[tokio::test]
+async fn read_file_returns_none_for_missing_file_in_sandbox() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let missing = sandbox.path().join("missing.txt");
+
+    let svc = make_service(sandbox.path());
+    let result = svc.read_file(missing.to_str().unwrap(), None).await.unwrap();
+
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn read_file_rejects_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("aionui-skills");
+    fs::create_dir(&folder).unwrap();
+
+    let svc = make_service(dir.path());
+    let err = svc.read_file(folder.to_str().unwrap(), None).await.unwrap_err();
+
+    assert!(matches!(err, aionui_common::AppError::BadRequest(_)));
+    assert!(err.to_string().contains("is a directory"));
+}
+
+#[tokio::test]
+async fn read_file_buffer_with_extra_workspace_root() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let file = workspace.path().join("outside.bin");
+    let bytes = vec![1, 2, 3, 4];
+    fs::write(&file, &bytes).unwrap();
+
+    let svc = make_service(sandbox.path());
+    let result = svc
+        .read_file_buffer(file.to_str().unwrap(), Some(workspace.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(result.as_deref(), Some(bytes.as_slice()));
+}
+
+#[tokio::test]
+async fn read_file_nonexistent_inside_workspace_prefix_returns_none() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let missing = workspace.path().join("missing.txt");
+
+    let svc = make_service(sandbox.path());
+    let result = svc
+        .read_file(missing.to_str().unwrap(), Some(workspace.path()))
+        .await
+        .unwrap();
+
+    assert!(result.is_none());
 }
 
 // -----------------------------------------------------------------------
@@ -144,7 +227,7 @@ async fn read_file_buffer_normal() {
     fs::write(&file, &data).unwrap();
 
     let svc = make_service(dir.path());
-    let result = svc.read_file_buffer(file.to_str().unwrap()).await.unwrap();
+    let result = svc.read_file_buffer(file.to_str().unwrap(), None).await.unwrap();
 
     assert_eq!(result.as_deref(), Some(data.as_slice()));
 }
@@ -155,7 +238,7 @@ async fn read_file_buffer_nonexistent_returns_none() {
     let fake = dir.path().join("missing.bin");
 
     let svc = make_service(dir.path());
-    let result = svc.read_file_buffer(fake.to_str().unwrap()).await.unwrap();
+    let result = svc.read_file_buffer(fake.to_str().unwrap(), None).await.unwrap();
 
     assert!(result.is_none());
 }
@@ -165,7 +248,7 @@ async fn read_file_buffer_path_traversal_rejected() {
     let dir = tempfile::tempdir().unwrap();
 
     let svc = make_service(dir.path());
-    let result = svc.read_file_buffer("../../etc/passwd").await;
+    let result = svc.read_file_buffer("../../etc/passwd", None).await;
 
     assert!(result.is_err());
 }
@@ -181,10 +264,7 @@ async fn write_file_normal() {
 
     let svc = make_service(dir.path());
     let ws = dir.path().to_str().unwrap();
-    let ok = svc
-        .write_file(file.to_str().unwrap(), b"hello", ws)
-        .await
-        .unwrap();
+    let ok = svc.write_file(file.to_str().unwrap(), b"hello", ws).await.unwrap();
 
     assert!(ok);
     assert_eq!(fs::read_to_string(&file).unwrap(), "hello");
@@ -198,10 +278,7 @@ async fn write_file_creates_new_file() {
 
     let svc = make_service(dir.path());
     let ws = dir.path().to_str().unwrap();
-    let ok = svc
-        .write_file(file.to_str().unwrap(), b"created", ws)
-        .await
-        .unwrap();
+    let ok = svc.write_file(file.to_str().unwrap(), b"created", ws).await.unwrap();
 
     assert!(ok);
     assert!(file.exists());
@@ -270,10 +347,7 @@ async fn write_file_emits_content_update_event() {
     assert_eq!(event.data["operation"], "write");
     // file_path should be the canonical path
     assert!(
-        event.data["file_path"]
-            .as_str()
-            .unwrap()
-            .contains("event_test.txt"),
+        event.data["file_path"].as_str().unwrap().contains("event_test.txt"),
         "file_path should contain the file name"
     );
     // relative_path should be relative to workspace
@@ -290,9 +364,7 @@ async fn write_file_binary_omits_content_in_event() {
     let (svc, recorder) = make_service_with_recorder(dir.path());
     let ws = dir.path().to_str().unwrap();
 
-    svc.write_file(file.to_str().unwrap(), &data, ws)
-        .await
-        .unwrap();
+    svc.write_file(file.to_str().unwrap(), &data, ws).await.unwrap();
 
     let events = recorder.take_events();
     assert_eq!(events.len(), 1);
@@ -314,9 +386,7 @@ async fn write_file_nested_relative_path() {
     let (svc, recorder) = make_service_with_recorder(dir.path());
     let ws = dir.path().to_str().unwrap();
 
-    svc.write_file(file.to_str().unwrap(), b"export {}", ws)
-        .await
-        .unwrap();
+    svc.write_file(file.to_str().unwrap(), b"export {}", ws).await.unwrap();
 
     let events = recorder.take_events();
     assert_eq!(events.len(), 1);
@@ -344,7 +414,7 @@ async fn read_after_write_roundtrip() {
     assert!(ok);
 
     // Read back
-    let read_result = svc.read_file(file.to_str().unwrap()).await.unwrap();
+    let read_result = svc.read_file(file.to_str().unwrap(), None).await.unwrap();
     assert_eq!(read_result.as_deref(), Some(content));
 }
 
@@ -357,11 +427,9 @@ async fn read_buffer_after_write_roundtrip() {
     let svc = make_service(dir.path());
     let ws = dir.path().to_str().unwrap();
 
-    svc.write_file(file.to_str().unwrap(), &data, ws)
-        .await
-        .unwrap();
+    svc.write_file(file.to_str().unwrap(), &data, ws).await.unwrap();
 
-    let read_result = svc.read_file_buffer(file.to_str().unwrap()).await.unwrap();
+    let read_result = svc.read_file_buffer(file.to_str().unwrap(), None).await.unwrap();
     assert_eq!(read_result.as_deref(), Some(data.as_slice()));
 }
 
@@ -383,9 +451,7 @@ async fn write_file_invalidates_cache() {
 
     // Write a new file (should invalidate cache)
     let new_file = dir.path().join("new.txt");
-    svc.write_file(new_file.to_str().unwrap(), b"new", ws)
-        .await
-        .unwrap();
+    svc.write_file(new_file.to_str().unwrap(), b"new", ws).await.unwrap();
 
     // Cache should be invalidated, so we see the new file
     let files = svc.list_workspace_files(ws).await.unwrap();
