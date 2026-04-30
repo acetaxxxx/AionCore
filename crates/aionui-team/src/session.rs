@@ -147,11 +147,7 @@ impl TeamSession {
 
         let wake_body = build_wake_payload(&agent, &tasks, &unread);
 
-        // TODO(D8): swap `needs_role_prompt` to match `{Pending, Error}` once
-        // `TeammateStatus::Pending` is reintroduced (it currently serde-aliases
-        // into `Idle`, so we use the `TeamAgent::status` sentinel — `None` means
-        // the scheduler never transitioned the slot, i.e. cold start).
-        let needs_role_prompt = matches!(agent.status, None | Some(TeammateStatus::Error));
+        let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
 
         let first_message = if needs_role_prompt {
             let role_prompt = match agent.role {
