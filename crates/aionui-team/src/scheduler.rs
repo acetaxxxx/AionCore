@@ -99,6 +99,8 @@ pub struct WakePayload {
 struct AgentSlot {
     agent: TeamAgent,
     status: TeammateStatus,
+    /// True until the first wake completes — used to inject role prompt on cold start.
+    needs_role_prompt: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,11 +197,14 @@ impl TeammateManager {
     ) -> Self {
         let mut slots = HashMap::new();
         for agent in agents {
+            let mut a = agent.clone();
+            a.status = Some(TeammateStatus::Idle);
             slots.insert(
-                agent.slot_id.clone(),
+                a.slot_id.clone(),
                 AgentSlot {
-                    agent: agent.clone(),
+                    agent: a,
                     status: TeammateStatus::Idle,
+                    needs_role_prompt: true,
                 },
             );
         }
@@ -425,6 +430,7 @@ impl TeammateManager {
             AgentSlot {
                 agent: agent.clone(),
                 status: TeammateStatus::Idle,
+                needs_role_prompt: true,
             },
         );
         self.events.broadcast_agent_spawned(agent);
@@ -508,6 +514,19 @@ impl TeammateManager {
     pub async fn list_agents(&self) -> Vec<TeamAgent> {
         let slots = self.slots.lock().await;
         slots.values().map(|s| s.agent.clone()).collect()
+    }
+
+    /// Check and consume the cold-start flag for a slot.
+    /// Returns true on the first call (agent needs role prompt), false after.
+    pub async fn take_needs_role_prompt(&self, slot_id: &str) -> bool {
+        let mut slots = self.slots.lock().await;
+        if let Some(slot) = slots.get_mut(slot_id) {
+            let needed = slot.needs_role_prompt;
+            slot.needs_role_prompt = false;
+            needed
+        } else {
+            false
+        }
     }
 
     pub async fn list_tasks(&self) -> Result<Vec<crate::types::TeamTask>, TeamError> {
