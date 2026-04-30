@@ -6,7 +6,7 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::TeamError;
 use crate::scheduler::TeammateManager;
@@ -229,11 +229,15 @@ async fn handle_connection(
         let response = if !authenticated {
             match handle_initialize(&request, &auth_token) {
                 InitResult::Authenticated(slot_id, resp) => {
+                    info!(team_id = %team_id, slot_id = %slot_id, "MCP agent authenticated");
                     authenticated = true;
                     caller_slot_id = Some(slot_id);
                     resp
                 }
-                InitResult::Response(resp) => resp,
+                InitResult::Response(resp) => {
+                    warn!(team_id = %team_id, method = %request.method, "MCP auth rejected");
+                    resp
+                }
             }
         } else {
             handle_method(
@@ -247,6 +251,7 @@ async fn handle_connection(
         };
 
         if write_response(&mut writer, &response).await.is_err() {
+            warn!(team_id = %team_id, "MCP connection write failed, closing");
             break;
         }
     }
@@ -370,6 +375,13 @@ async fn handle_tools_call(
         Err(_) => TeammateRole::Teammate,
     };
 
+    info!(
+        team_id = %team_id,
+        caller = %caller_slot_id,
+        tool = %tool_name,
+        "MCP tools/call invoked"
+    );
+
     let result = dispatch_tool(
         tool_name,
         &arguments,
@@ -380,6 +392,11 @@ async fn handle_tools_call(
         caller_role,
     )
     .await;
+
+    match &result {
+        Ok(_) => info!(team_id = %team_id, tool = %tool_name, caller = %caller_slot_id, "MCP tool call succeeded"),
+        Err(e) => warn!(team_id = %team_id, tool = %tool_name, caller = %caller_slot_id, error = %e, "MCP tool call failed"),
+    }
 
     match result {
         Ok(content) => JsonRpcResponse::success(
