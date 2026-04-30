@@ -685,7 +685,13 @@ impl AcpAgentManager {
                 session_id: sid.clone(),
             }));
 
-        self.apply_preferred_mode(&sid).await?;
+        if let Err(e) = self.apply_preferred_mode(&sid).await {
+            tracing::warn!(
+                conversation_id = %self.conversation_id,
+                error = %e,
+                "failed to apply preferred mode, continuing with default"
+            );
+        }
         self.apply_preferred_config_selections(&sid).await;
 
         // Inject first-message prefix (preset context + skills index).

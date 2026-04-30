@@ -136,7 +136,7 @@ VALUES
      '[]',
      '[".codebuddy/skills"]',
      '{"supports_side_question":false}',
-     NULL,
+     'bypassPermissions',
      NULL, NULL, NULL, NULL, NULL, NULL,
      unixepoch('now','subsec')*1000, unixepoch('now','subsec')*1000),
 
