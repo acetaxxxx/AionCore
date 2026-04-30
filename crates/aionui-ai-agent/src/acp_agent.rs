@@ -825,11 +825,56 @@ impl AcpAgentManager {
     /// last explicit choice; the CLI's own `current_*` is only used
     /// when the snapshot has nothing yet.
     async fn session_resume_and_send(&self, data: &SendMessageData, session_id: Option<&str>) -> Result<(), AppError> {
-        if self.supports_session_load()
+        if self.uses_claude_meta_resume() {
+            // Claude backend: use session/new with _meta.claudeCode.options.resume
+            // instead of session/load. This matches AionUi frontend behavior and
+            // ensures mcpServers are re-injected on resume.
+            if let Some(sid) = session_id {
+                let mut meta = serde_json::Map::new();
+                let mut claude_code = serde_json::Map::new();
+                let mut options = serde_json::Map::new();
+                options.insert("resume".into(), Value::String(sid.to_owned()));
+                claude_code.insert("options".into(), Value::Object(options));
+                meta.insert("claudeCode".into(), Value::Object(claude_code));
+
+                let req = build_new_session_request(&self.workspace, &self.config)
+                    .meta(meta);
+
+                info!(
+                    session_id = %sid,
+                    has_team_mcp = self.config.team_mcp_stdio_config.is_some(),
+                    mcp_servers_count = req.mcp_servers.len(),
+                    "session_resume: using session/new with claudeCode.options.resume"
+                );
+
+                let session_response = self.protocol.new_session(req).await.map_err(AppError::from)?;
+
+                let new_sid = session_response.session_id.to_string();
+                {
+                    let mut snapshot = self.runtime_snapshot.write().await;
+                    if let Some(models) = session_response.models {
+                        snapshot.set_model_info(models);
+                    }
+                    if let Some(modes) = session_response.modes {
+                        snapshot.set_modes(modes);
+                    }
+                    if let Some(config_options) = session_response.config_options {
+                        snapshot.set_config_options(config_options);
+                    }
+                }
+                self.emit_snapshot_events().await;
+
+                let mut state = self.state.write().await;
+                state.session_id = Some(new_sid.clone());
+                drop(state);
+
+                self.apply_preferred_config_selections(&new_sid).await;
+                return self.prompt_existing_session(data, Some(&new_sid)).await;
+            }
+        } else if self.supports_session_load()
             && let Some(sid) = session_id
         {
-            // Capture anything preload put into the snapshot so the
-            // CLI merge below can keep it.
+            // Non-Claude backends (e.g. Codex): use session/load
             let (preloaded_mode, preloaded_model) = {
                 let snapshot = self.runtime_snapshot.read().await;
                 (
@@ -845,10 +890,6 @@ impl AcpAgentManager {
                 .map_err(AppError::from)?;
 
             let mut snapshot = self.runtime_snapshot.write().await;
-            // Available lists always come from the CLI (source of truth
-            // for what the agent now supports). `current_*` prefers
-            // the preloaded value when present — that's the user's
-            // last explicit choice.
             if let Some(mut models) = resp.models {
                 if let Some(db_current) = preloaded_model {
                     models.current_model_id = db_current.into();
@@ -1003,6 +1044,22 @@ impl AcpAgentManager {
     /// The raw ACP wire field is `loadSession` (camelCase); we store
     /// the snake_case form because every handshake blob is normalised
     /// before being persisted (see `sdk_to_snake_value`).
+    /// Whether this agent uses Claude-style meta resume (session/new with
+    /// `_meta.claudeCode.options.resume`) instead of session/load.
+    /// Matches AionUi frontend: `useClaudeMetaResume = backend === 'claude' || !!caps?._meta?.claudeCode`
+    fn uses_claude_meta_resume(&self) -> bool {
+        if self.metadata.backend.as_deref() == Some("claude") {
+            return true;
+        }
+        self.metadata
+            .handshake
+            .agent_capabilities
+            .as_ref()
+            .and_then(|caps| caps.get("_meta"))
+            .and_then(|meta| meta.get("claude_code").or_else(|| meta.get("claudeCode")))
+            .is_some()
+    }
+
     fn supports_session_load(&self) -> bool {
         self.metadata
             .handshake
