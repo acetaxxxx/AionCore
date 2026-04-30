@@ -338,21 +338,20 @@ impl TeamSession {
             h
         } else {
             // Task missing — warmup to create it (mirrors AionUi's getOrBuildTask).
-            if let Some(svc) = self.service.upgrade() {
-                if let Err(e) = svc
+            if let Some(svc) = self.service.upgrade()
+                && let Err(e) = svc
                     .conversation_service_ref()
                     .warmup(&self.user_id, &input.conversation_id, &self.task_manager)
                     .await
-                {
-                    warn!(
-                        team_id = %self.team.id,
-                        slot_id,
-                        conversation_id = %input.conversation_id,
-                        error = %e,
-                        "warmup in try_wake failed; skipping wake"
-                    );
-                    return;
-                }
+            {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %input.conversation_id,
+                    error = %e,
+                    "warmup in try_wake failed; skipping wake"
+                );
+                return;
             }
             let Some(h) = self.task_manager.get_task(&input.conversation_id) else {
                 warn!(
@@ -420,7 +419,9 @@ impl TeamSession {
                 continue;
             }
             let sender = agents.iter().find(|a| a.slot_id == msg.from_agent_id);
-            let sender_name = sender.map(|a| a.name.clone()).unwrap_or_else(|| msg.from_agent_id.clone());
+            let sender_name = sender
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| msg.from_agent_id.clone());
             let sender_backend = sender.map(|a| a.backend.clone());
             let sender_conv_id = sender.map(|a| a.conversation_id.clone());
             let display_content = if total > 1 {
@@ -821,11 +822,12 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl IWorkerTaskManager for StubTaskManager {
         fn get_task(&self, conversation_id: &str) -> Option<AgentManagerHandle> {
             self.tasks.lock().unwrap().get(conversation_id).cloned()
         }
-        fn get_or_build_task(
+        async fn get_or_build_task(
             &self,
             _conversation_id: &str,
             _options: BuildTaskOptions,
@@ -1239,7 +1241,14 @@ mod tests {
         let session = start_session().await;
         session
             .mailbox
-            .write("t1", "worker-1", "lead-1", MailboxMessageType::Message, "from lead", None)
+            .write(
+                "t1",
+                "worker-1",
+                "lead-1",
+                MailboxMessageType::Message,
+                "from lead",
+                None,
+            )
             .await
             .unwrap();
         session
@@ -1282,7 +1291,14 @@ mod tests {
         let session = start_session().await;
         session
             .mailbox
-            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "lead-gets-this", None)
+            .write(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::Message,
+                "lead-gets-this",
+                None,
+            )
             .await
             .unwrap();
 
