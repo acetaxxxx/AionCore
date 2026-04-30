@@ -552,6 +552,7 @@ dependencies = [
  "dirs",
  "http-body-util",
  "include_dir",
+ "mime_guess",
  "notify",
  "semver",
  "serde",

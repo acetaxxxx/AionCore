@@ -1,8 +1,12 @@
 use std::collections::HashMap;
+use std::path::Path as FsPath;
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, State};
+use axum::extract::{Json, Path, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::Response;
 use axum::routing::{get, post};
 
 use aionui_api_types::{
@@ -12,6 +16,7 @@ use aionui_api_types::{
 };
 use aionui_common::AppError;
 
+use crate::asset_paths::normalize_relative_asset_path;
 use crate::permission::{build_permission_summary, calculate_risk_level};
 use crate::registry::ExtensionRegistry;
 
@@ -44,6 +49,10 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
         .route("/api/extensions/mcp-servers", get(get_mcp_servers))
         .route("/api/extensions/skills", get(get_skills))
         .route("/api/extensions/settings-tabs", get(get_settings_tabs))
+        .route(
+            "/api/extensions/{extension_name}/assets/{*asset_path}",
+            get(get_extension_asset),
+        )
         .route("/api/extensions/webui", get(get_webui))
         .route("/api/extensions/agent-activity", get(get_agent_activity))
         // Query routes with body
@@ -146,6 +155,55 @@ async fn get_settings_tabs(
     let tabs = state.registry.get_settings_tabs().await;
     let value = serde_json::to_value(&tabs).unwrap_or_default();
     Ok(Json(ApiResponse::ok(value)))
+}
+
+/// `GET /api/extensions/{extension_name}/assets/{*asset_path}` — serve an
+/// extension asset under the trusted extension root.
+async fn get_extension_asset(
+    State(state): State<ExtensionRouterState>,
+    Path((extension_name, asset_path)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let ext = state
+        .registry
+        .get_extension_by_name(&extension_name)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Extension not found: {extension_name}")))?;
+
+    let canonical_root = tokio::fs::canonicalize(&ext.directory)
+        .await
+        .map_err(map_asset_lookup_error)?;
+
+    let relative_path = normalize_relative_asset_path(&asset_path).ok_or_else(|| {
+        AppError::Forbidden(format!(
+            "Asset path escapes extension root: {extension_name}/{asset_path}"
+        ))
+    })?;
+
+    let requested_path = canonical_root.join(&relative_path);
+    let canonical_asset = tokio::fs::canonicalize(&requested_path)
+        .await
+        .map_err(map_asset_lookup_error)?;
+
+    if !canonical_asset.starts_with(&canonical_root) {
+        return Err(AppError::Forbidden(format!(
+            "Asset path escapes extension root: {}",
+            canonical_asset.display()
+        )));
+    }
+
+    let bytes = tokio::fs::read(&canonical_asset)
+        .await
+        .map_err(map_asset_lookup_error)?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            content_type_for_path(&canonical_asset),
+        )
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(Body::from(bytes))
+        .map_err(|err| AppError::Internal(err.to_string()))
 }
 
 /// `GET /api/extensions/webui` — get all WebUI contributions.
@@ -275,6 +333,19 @@ fn enum_to_string<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_default()
 }
 
+fn content_type_for_path(path: &FsPath) -> HeaderValue {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    HeaderValue::from_str(mime.as_ref())
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
+}
+
+fn map_asset_lookup_error(error: std::io::Error) -> AppError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => AppError::NotFound("Extension asset not found".into()),
+        _ => AppError::Internal(error.to_string()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -282,9 +353,14 @@ fn enum_to_string<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     use crate::state::ExtensionStateStore;
+    use crate::{ExtensionSource, ScanPath};
     use aionui_realtime::BroadcastEventBus;
 
     fn make_state() -> ExtensionRouterState {
@@ -300,5 +376,114 @@ mod tests {
     fn extension_routes_builds_router() {
         let state = make_state();
         let _router = extension_routes(state);
+    }
+
+    async fn make_router_with_extension() -> (Router, tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ext_root = tmp.path().join("extensions");
+        let ext_dir = ext_root.join("hello");
+        std::fs::create_dir_all(ext_dir.join("settings")).unwrap();
+        std::fs::write(
+            ext_dir.join("aion-extension.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "hello",
+                "version": "1.0.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("settings").join("index.html"),
+            "<h1>Hello</h1>",
+        )
+        .unwrap();
+
+        let store = ExtensionStateStore::new(tmp.path().join("states.json"));
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let registry = ExtensionRegistry::new(store, bus, "1.0.0".into());
+        registry
+            .initialize_with_scan_paths(vec![ScanPath {
+                path: ext_root,
+                source: ExtensionSource::Env,
+            }])
+            .await
+            .unwrap();
+
+        (
+            extension_routes(ExtensionRouterState { registry }),
+            tmp,
+            ext_dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn get_extension_asset_serves_local_file() {
+        let (router, _tmp, _ext_dir) = make_router_with_extension().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/extensions/hello/assets/settings/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=3600"
+        );
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes, "<h1>Hello</h1>");
+    }
+
+    #[tokio::test]
+    async fn get_extension_asset_rejects_traversal() {
+        let (router, _tmp, _ext_dir) = make_router_with_extension().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/extensions/hello/assets/%2E%2E%2Fsecret.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn get_extension_asset_returns_not_found_for_missing_file() {
+        let (router, _tmp, _ext_dir) = make_router_with_extension().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/extensions/hello/assets/settings/missing.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_extension_asset_returns_not_found_for_unknown_extension() {
+        let (router, _tmp, _ext_dir) = make_router_with_extension().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/extensions/unknown/assets/settings/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

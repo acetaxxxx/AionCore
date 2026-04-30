@@ -1,5 +1,6 @@
 //! Extension registry: manifest parsing, hub installer, skill scanning, and lifecycle hooks.
 
+mod asset_paths;
 pub mod classifier;
 pub mod constants;
 pub mod dependency;
