@@ -187,7 +187,7 @@ async fn em1_enable_extension_broadcasts_state_changed() {
 
     // Verify stateChanged event was broadcast.
     let msg = rx.recv().await.unwrap();
-    assert_eq!(msg.name, "extensions.stateChanged");
+    assert_eq!(msg.name, "extensions.state-changed");
     assert_eq!(msg.data["name"], "my-ext");
     assert_eq!(msg.data["enabled"], true);
 }
@@ -214,7 +214,7 @@ async fn em2_disable_extension_broadcasts_state_changed() {
 
     // Verify stateChanged event was broadcast.
     let msg = rx.recv().await.unwrap();
-    assert_eq!(msg.name, "extensions.stateChanged");
+    assert_eq!(msg.name, "extensions.state-changed");
     assert_eq!(msg.data["name"], "my-ext");
     assert_eq!(msg.data["enabled"], false);
 }
@@ -259,11 +259,12 @@ async fn hr3_hot_reload_emits_registry_reloaded() {
     let mut found_reload = false;
     while let Ok(msg) = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
     {
-        if let Ok(msg) = msg {
-            if msg.name == "extensions.lifecycle" && msg.data["event"] == "REGISTRY_RELOADED" {
-                found_reload = true;
-                break;
-            }
+        if let Ok(msg) = msg
+            && msg.name == "extensions.lifecycle"
+            && msg.data["event"] == "REGISTRY_RELOADED"
+        {
+            found_reload = true;
+            break;
         }
     }
     assert!(found_reload, "expected REGISTRY_RELOADED event");

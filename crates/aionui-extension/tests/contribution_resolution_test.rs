@@ -390,12 +390,13 @@ fn cr8_settings_tab_position_preserved() {
         settings_tabs: vec![ExtSettingsTab {
             id: "ext-settings".into(),
             label: "My Extension".into(),
-            icon: Some("gear".into()),
-            url: "aion-asset://my-ext/settings.html".into(),
+            icon: Some("icons/gear.svg".into()),
+            url: "settings/index.html".into(),
             position: Some(SettingsTabPosition {
                 relative_to: "general".into(),
                 placement: "after".into(),
             }),
+            order: 80,
         }],
         ..Default::default()
     };
@@ -406,6 +407,13 @@ fn cr8_settings_tab_position_preserved() {
     assert_eq!(result.settings_tabs.len(), 1);
     let tab = &result.settings_tabs[0];
     assert_eq!(tab.extension_name, "my-ext");
+    assert_eq!(tab.id, "ext-my-ext-ext-settings");
+    assert_eq!(tab.url, "/api/extensions/my-ext/assets/settings/index.html");
+    assert_eq!(
+        tab.icon.as_deref(),
+        Some("/api/extensions/my-ext/assets/icons/gear.svg")
+    );
+    assert_eq!(tab.order, 80);
     let pos = tab.position.as_ref().unwrap();
     assert_eq!(pos.relative_to, "general");
     assert_eq!(pos.placement, "after");

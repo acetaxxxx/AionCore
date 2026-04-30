@@ -86,6 +86,11 @@ pub async fn build_module_states(
     services: &AppServices,
 ) -> (ModuleStates, ChannelOrchestratorComponents) {
     let (ext_state, hub_state, mut skill_state) = build_extension_states(services).await;
+
+    if let Err(error) = ext_state.registry.initialize().await {
+        tracing::warn!(error = %error, "extension registry initialize failed");
+    }
+
     let assistant = build_assistant_state(services, ext_state.registry.clone());
     let cron = build_cron_state(services);
     cron.cron_service.init().await;

@@ -219,20 +219,29 @@ pub struct ExtWebui {
 /// Settings tab position relative to a built-in tab.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SettingsTabPosition {
+    #[serde(rename = "relativeTo", alias = "anchor", alias = "relative_to")]
     pub relative_to: String,
     pub placement: String,
+}
+
+fn default_settings_tab_order() -> u32 {
+    100
 }
 
 /// Settings tab contributed by an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExtSettingsTab {
     pub id: String,
+    #[serde(alias = "name")]
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    #[serde(alias = "entryPoint")]
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<SettingsTabPosition>,
+    #[serde(default = "default_settings_tab_order")]
+    pub order: u32,
 }
 
 /// Model provider contributed by an extension.
@@ -576,6 +585,7 @@ pub struct WebuiContribution {
 /// Resolved settings tab (after position parsing).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedSettingsTab {
+    #[serde(rename = "extensionName")]
     pub extension_name: String,
     pub id: String,
     pub label: String,
@@ -584,6 +594,7 @@ pub struct ResolvedSettingsTab {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<SettingsTabPosition>,
+    pub order: u32,
 }
 
 /// Resolved model provider.

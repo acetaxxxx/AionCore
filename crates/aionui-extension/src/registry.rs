@@ -210,7 +210,7 @@ impl ExtensionRegistry {
     /// Enable an extension by name.
     ///
     /// Updates the in-memory state, re-resolves contributions, persists the
-    /// change, and broadcasts `extensions.stateChanged`.
+    /// change, and broadcasts `extensions.state-changed`.
     pub async fn enable_extension(&self, name: &str) -> Result<(), ExtensionError> {
         let state = {
             let mut guard = self.inner.write().await;
@@ -247,7 +247,7 @@ impl ExtensionRegistry {
     ///
     /// Optionally records a reason (logged for auditing). Updates state,
     /// re-resolves contributions, persists, and broadcasts
-    /// `extensions.stateChanged`.
+    /// `extensions.state-changed`.
     pub async fn disable_extension(
         &self,
         name: &str,
@@ -297,6 +297,10 @@ impl ExtensionRegistry {
     pub async fn get_loaded_extensions(&self) -> Vec<ExtensionSummary> {
         let guard = self.inner.read().await;
         guard.extensions.iter().map(to_summary).collect()
+    }
+
+    pub(crate) fn event_broadcaster(&self) -> Arc<dyn EventBroadcaster> {
+        self.broadcaster.clone()
     }
 
     /// Look up a single loaded extension by name.
@@ -405,7 +409,7 @@ impl ExtensionRegistry {
 impl ExtensionRegistry {
     fn broadcast_state_changed(&self, name: &str, enabled: bool) {
         let event = WebSocketMessage::new(
-            "extensions.stateChanged",
+            "extensions.state-changed",
             json!({ "name": name, "enabled": enabled }),
         );
         self.broadcaster.broadcast(event);
@@ -594,7 +598,7 @@ mod tests {
         }
 
         let msg = rx.recv().await.unwrap();
-        assert_eq!(msg.name, "extensions.stateChanged");
+        assert_eq!(msg.name, "extensions.state-changed");
         assert_eq!(msg.data["enabled"], true);
 
         // Disable
@@ -608,7 +612,7 @@ mod tests {
         }
 
         let msg = rx.recv().await.unwrap();
-        assert_eq!(msg.name, "extensions.stateChanged");
+        assert_eq!(msg.name, "extensions.state-changed");
         assert_eq!(msg.data["enabled"], false);
     }
 
