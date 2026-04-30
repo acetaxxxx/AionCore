@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use aionui_common::{AcpBackend, AgentType, ProviderWithModel};
+use aionui_api_types::TeamMcpStdioConfig;
+use aionui_common::{AgentType, ProviderWithModel};
 
 /// Data payload for sending a user message to an Agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,9 +43,10 @@ pub struct AcpBuildExtra {
     /// from the registry and need not be supplied by the caller.
     #[serde(default)]
     pub agent_id: Option<String>,
-    /// ACP sub-backend identifier.
+    /// Vendor label (e.g. "claude"). When present without `agent_id`, the
+    /// factory looks up the first builtin row matching this label.
     #[serde(default)]
-    pub backend: Option<AcpBackend>,
+    pub backend: Option<String>,
     /// Path to the CLI executable (resolved from registry when `agent_id` is set).
     #[serde(default)]
     pub cli_path: Option<String>,
@@ -71,6 +73,12 @@ pub struct AcpBuildExtra {
     /// Associated cron job ID.
     #[serde(default)]
     pub cron_job_id: Option<String>,
+    /// Team session MCP stdio config. When present, the factory injects it as
+    /// a stdio MCP server on `session/new`. Written by
+    /// `TeamSessionService::ensure_session` into `conversation.extra`; solo
+    /// conversations leave this unset.
+    #[serde(default)]
+    pub team_mcp_stdio_config: Option<TeamMcpStdioConfig>,
 }
 
 /// OpenClaw gateway configuration.
@@ -90,7 +98,7 @@ pub struct OpenClawGatewayConfig {
 pub struct OpenClawBuildExtra {
     /// Optional downstream AI backend (informational only).
     #[serde(default)]
-    pub backend: Option<AcpBackend>,
+    pub backend: Option<String>,
     /// Agent name.
     #[serde(default)]
     pub agent_name: Option<String>,
@@ -206,6 +214,33 @@ pub struct SlashCommandItem {
     pub description: String,
 }
 
+/// Unified stream chunk published on the per-session broadcast channel.
+///
+/// Emitted by `AgentManagerHandle` implementations at every stream event so
+/// downstream subscribers (wake timeout watchdog, crash detector) can observe
+/// agent progress without intercepting the existing frontend event pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentStreamChunk {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        tool_name: String,
+        input: serde_json::Value,
+    },
+    Thought {
+        content: String,
+    },
+    Finish {
+        agent_crash: bool,
+        stop_reason: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +259,35 @@ mod tests {
         let with_field = r#"{"backend":"claude","skills":["cron","pdf"]}"#;
         let parsed: AcpBuildExtra = serde_json::from_str(with_field).unwrap();
         assert_eq!(parsed.skills, vec!["cron".to_owned(), "pdf".to_owned()]);
+    }
+
+    #[test]
+    fn acp_build_extra_missing_team_mcp_stdio_config_is_none() {
+        // Legacy extra (pre-team-wave1) must deserialize cleanly with the new
+        // optional `team_mcp_stdio_config` absent — this keeps solo chat
+        // conversations working without any migration.
+        let legacy = r#"{"backend":"claude","skills":["cron"]}"#;
+        let parsed: AcpBuildExtra = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.team_mcp_stdio_config.is_none());
+    }
+
+    #[test]
+    fn acp_build_extra_parses_team_mcp_stdio_config() {
+        let with_cfg = r#"{
+            "backend":"claude",
+            "team_mcp_stdio_config":{
+                "team_id":"team-42",
+                "port":54321,
+                "token":"tok-abc",
+                "slot_id":"slot-lead"
+            }
+        }"#;
+        let parsed: AcpBuildExtra = serde_json::from_str(with_cfg).unwrap();
+        let cfg = parsed.team_mcp_stdio_config.expect("config present");
+        assert_eq!(cfg.team_id, "team-42");
+        assert_eq!(cfg.port, 54321);
+        assert_eq!(cfg.token, "tok-abc");
+        assert_eq!(cfg.slot_id, "slot-lead");
     }
 
     #[test]
@@ -323,6 +387,69 @@ mod tests {
         assert!(extra.system_prompt.is_none());
         assert_eq!(extra.max_tokens, 8192);
         assert!(extra.max_turns.is_none());
+    }
+
+    #[test]
+    fn agent_stream_chunk_all_variants_serde_roundtrip() {
+        let cases = vec![
+            AgentStreamChunk::Text { text: "hello".into() },
+            AgentStreamChunk::ToolUse {
+                tool_name: "read_file".into(),
+                input: json!({ "path": "/tmp/a.txt" }),
+            },
+            AgentStreamChunk::Thought {
+                content: "analyzing".into(),
+            },
+            AgentStreamChunk::Finish {
+                agent_crash: false,
+                stop_reason: Some("end_turn".into()),
+            },
+            AgentStreamChunk::Error {
+                message: "timeout".into(),
+            },
+        ];
+        for chunk in cases {
+            let json = serde_json::to_value(&chunk).unwrap();
+            let parsed: AgentStreamChunk = serde_json::from_value(json).unwrap();
+            match (chunk, parsed) {
+                (AgentStreamChunk::Text { text: a }, AgentStreamChunk::Text { text: b }) => {
+                    assert_eq!(a, b);
+                }
+                (
+                    AgentStreamChunk::ToolUse {
+                        tool_name: a1,
+                        input: a2,
+                    },
+                    AgentStreamChunk::ToolUse {
+                        tool_name: b1,
+                        input: b2,
+                    },
+                ) => {
+                    assert_eq!(a1, b1);
+                    assert_eq!(a2, b2);
+                }
+                (AgentStreamChunk::Thought { content: a }, AgentStreamChunk::Thought { content: b }) => {
+                    assert_eq!(a, b);
+                }
+                (
+                    AgentStreamChunk::Finish {
+                        agent_crash: a1,
+                        stop_reason: a2,
+                    },
+                    AgentStreamChunk::Finish {
+                        agent_crash: b1,
+                        stop_reason: b2,
+                    },
+                ) => {
+                    assert_eq!(a1, b1);
+                    assert_eq!(a2, b2);
+                }
+                (AgentStreamChunk::Error { message: a }, AgentStreamChunk::Error { message: b }) => {
+                    assert_eq!(a, b);
+                }
+                _ => panic!("variant mismatch after roundtrip"),
+            }
+        }
     }
 
     #[test]

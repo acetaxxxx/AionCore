@@ -11,9 +11,7 @@ fn resolve_asset_url(extension_name: &str, raw: &str) -> Option<String> {
     }
 
     let relative = normalized_asset_url_path(raw)?;
-    Some(format!(
-        "/api/extensions/{extension_name}/assets/{relative}"
-    ))
+    Some(format!("/api/extensions/{extension_name}/assets/{relative}"))
 }
 
 /// Resolve a single settings tab contribution.
@@ -69,11 +67,7 @@ pub fn resolve_settings_tabs(
         .filter_map(|tab| resolve_settings_tab(tab, extension_name, ext_dir))
         .collect();
 
-    resolved.sort_by(|left, right| {
-        left.order
-            .cmp(&right.order)
-            .then_with(|| left.label.cmp(&right.label))
-    });
+    resolved.sort_by(|left, right| left.order.cmp(&right.order).then_with(|| left.label.cmp(&right.label)));
 
     resolved
 }
@@ -101,10 +95,7 @@ mod tests {
 
         assert_eq!(result.extension_name, "my-ext");
         assert_eq!(result.id, "ext-my-ext-my-settings");
-        assert_eq!(
-            result.url,
-            "/api/extensions/my-ext/assets/settings/index.html"
-        );
+        assert_eq!(result.url, "/api/extensions/my-ext/assets/settings/index.html");
         assert_eq!(
             result.icon.as_deref(),
             Some("/api/extensions/my-ext/assets/icons/gear.svg")

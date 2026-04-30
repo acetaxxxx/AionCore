@@ -11,12 +11,12 @@ use crate::scheduler::TeammateManager;
 use crate::types::TeammateRole;
 
 use super::protocol::{
-    INVALID_PARAMS, INVALID_REQUEST, JsonRpcResponse, METHOD_NOT_FOUND, PROTOCOL_VERSION,
-    SERVER_NAME, SERVER_VERSION, read_request, write_response,
+    INVALID_PARAMS, INVALID_REQUEST, JsonRpcResponse, METHOD_NOT_FOUND, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION,
+    read_request, write_response,
 };
 use super::tools::{
-    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput,
-    TaskUpdateInput, all_tool_descriptors, is_whitelisted_backend,
+    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskUpdateInput,
+    all_tool_descriptors, handle_team_describe_assistant, handle_team_list_models, is_whitelisted_backend,
 };
 
 // ---------------------------------------------------------------------------
@@ -25,15 +25,13 @@ use super::tools::{
 
 pub struct TeamMcpServer {
     addr: SocketAddr,
+    http_addr: SocketAddr,
     auth_token: String,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl TeamMcpServer {
-    pub async fn start(
-        auth_token: String,
-        scheduler: Arc<TeammateManager>,
-    ) -> Result<Self, TeamError> {
+    pub async fn start(auth_token: String, scheduler: Arc<TeammateManager>) -> Result<Self, TeamError> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| TeamError::InvalidRequest(format!("Failed to bind TCP: {e}")))?;
@@ -44,12 +42,30 @@ impl TeamMcpServer {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let token = auth_token.clone();
-        tokio::spawn(accept_loop(listener, token, scheduler, shutdown_rx));
+        let sched_for_tcp = scheduler.clone();
+        tokio::spawn(accept_loop(listener, token, sched_for_tcp, shutdown_rx.clone()));
 
-        debug!(port = addr.port(), "Team MCP Server started");
+        // HTTP MCP endpoint for agents that prefer http transport.
+        let http_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| TeamError::InvalidRequest(format!("Failed to bind HTTP: {e}")))?;
+        let http_addr = http_listener
+            .local_addr()
+            .map_err(|e| TeamError::InvalidRequest(format!("Failed to get HTTP addr: {e}")))?;
+
+        let http_token = auth_token.clone();
+        let http_sched = scheduler.clone();
+        tokio::spawn(http_mcp_loop(http_listener, http_token, http_sched, shutdown_rx));
+
+        debug!(
+            tcp_port = addr.port(),
+            http_port = http_addr.port(),
+            "Team MCP Server started"
+        );
 
         Ok(Self {
             addr,
+            http_addr,
             auth_token,
             shutdown_tx,
         })
@@ -57,6 +73,10 @@ impl TeamMcpServer {
 
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    pub fn http_port(&self) -> u16 {
+        self.http_addr.port()
     }
 
     pub fn auth_token(&self) -> &str {
@@ -144,12 +164,7 @@ async fn handle_connection(stream: TcpStream, auth_token: String, scheduler: Arc
                 InitResult::Response(resp) => resp,
             }
         } else {
-            handle_method(
-                &request,
-                &scheduler,
-                caller_slot_id.as_deref().unwrap_or("unknown"),
-            )
-            .await
+            handle_method(&request, &scheduler, caller_slot_id.as_deref().unwrap_or("unknown")).await
         };
 
         if write_response(&mut writer, &response).await.is_err() {
@@ -254,22 +269,14 @@ async fn handle_tools_call(
     let params = match request.params.as_ref() {
         Some(p) => p,
         None => {
-            return JsonRpcResponse::error(
-                request.id,
-                INVALID_PARAMS,
-                "Missing params for tools/call",
-            );
+            return JsonRpcResponse::error(request.id, INVALID_PARAMS, "Missing params for tools/call");
         }
     };
 
     let tool_name = match params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
         None => {
-            return JsonRpcResponse::error(
-                request.id,
-                INVALID_PARAMS,
-                "Missing 'name' in tools/call params",
-            );
+            return JsonRpcResponse::error(request.id, INVALID_PARAMS, "Missing 'name' in tools/call params");
         }
     };
 
@@ -280,14 +287,7 @@ async fn handle_tools_call(
         Err(_) => TeammateRole::Teammate,
     };
 
-    let result = dispatch_tool(
-        tool_name,
-        &arguments,
-        scheduler,
-        caller_slot_id,
-        caller_role,
-    )
-    .await;
+    let result = dispatch_tool(tool_name, &arguments, scheduler, caller_slot_id, caller_role).await;
 
     match result {
         Ok(content) => JsonRpcResponse::success(
@@ -325,24 +325,28 @@ async fn dispatch_tool(
         "team_task_list" => exec_task_list(scheduler).await,
         "team_members" => exec_members(scheduler).await,
         "team_rename_agent" => exec_rename_agent(arguments, scheduler).await,
-        "team_shutdown_agent" => {
-            exec_shutdown_agent(arguments, scheduler, caller_slot_id, caller_role).await
-        }
+        "team_shutdown_agent" => exec_shutdown_agent(arguments, scheduler, caller_slot_id, caller_role).await,
+        "team_list_models" => exec_list_models(arguments).await,
+        "team_describe_assistant" => exec_describe_assistant(arguments).await,
         _ => Err(format!("Unknown tool: {tool_name}")),
     }
+}
+
+async fn exec_list_models(args: &Value) -> Result<String, String> {
+    let value = handle_team_list_models(args);
+    serde_json::to_string_pretty(&value).map_err(|e| format!("Serialization error: {e}"))
+}
+
+async fn exec_describe_assistant(args: &Value) -> Result<String, String> {
+    Ok(handle_team_describe_assistant(args))
 }
 
 // ---------------------------------------------------------------------------
 // Individual tool handlers
 // ---------------------------------------------------------------------------
 
-async fn exec_send_message(
-    args: &Value,
-    scheduler: &TeammateManager,
-    caller_slot_id: &str,
-) -> Result<String, String> {
-    let input: SendMessageInput =
-        serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
+async fn exec_send_message(args: &Value, scheduler: &TeammateManager, caller_slot_id: &str) -> Result<String, String> {
+    let input: SendMessageInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
     let action = crate::scheduler::SchedulerAction::SendMessage {
         to: input.to.clone(),
@@ -364,8 +368,7 @@ async fn exec_spawn_agent(
     if caller_role != TeammateRole::Lead {
         return Err("Only Lead can spawn agents".into());
     }
-    let input: SpawnAgentInput =
-        serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
+    let input: SpawnAgentInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
     if !is_whitelisted_backend(&input.backend) {
         return Err(format!(
@@ -388,8 +391,7 @@ async fn exec_spawn_agent(
 }
 
 async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<String, String> {
-    let input: TaskCreateInput =
-        serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
+    let input: TaskCreateInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
     let action = crate::scheduler::SchedulerAction::TaskCreate {
         subject: input.subject.clone(),
@@ -406,8 +408,7 @@ async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<S
 }
 
 async fn exec_task_update(args: &Value, scheduler: &TeammateManager) -> Result<String, String> {
-    let input: TaskUpdateInput =
-        serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
+    let input: TaskUpdateInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
     let action = crate::scheduler::SchedulerAction::TaskUpdate {
         task_id: input.task_id.clone(),
@@ -462,18 +463,14 @@ async fn exec_members(scheduler: &TeammateManager) -> Result<String, String> {
 }
 
 async fn exec_rename_agent(args: &Value, scheduler: &TeammateManager) -> Result<String, String> {
-    let input: RenameAgentInput =
-        serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
+    let input: RenameAgentInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
     scheduler
         .rename_agent(&input.slot_id, &input.new_name)
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(format!(
-        "Agent '{}' renamed to '{}'",
-        input.slot_id, input.new_name
-    ))
+    Ok(format!("Agent '{}' renamed to '{}'", input.slot_id, input.new_name))
 }
 
 async fn exec_shutdown_agent(
@@ -485,8 +482,7 @@ async fn exec_shutdown_agent(
     if caller_role != TeammateRole::Lead {
         return Err("Only Lead can shut down agents".into());
     }
-    let input: ShutdownAgentInput =
-        serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
+    let input: ShutdownAgentInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
     let action = crate::scheduler::SchedulerAction::ShutdownAgent {
         slot_id: input.slot_id.clone(),
@@ -497,8 +493,108 @@ async fn exec_shutdown_agent(
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(format!(
-        "Shutdown request sent to agent '{}'",
-        input.slot_id
-    ))
+    Ok(format!("Shutdown request sent to agent '{}'", input.slot_id))
+}
+
+// ---------------------------------------------------------------------------
+// HTTP MCP endpoint (Streamable HTTP transport for MCP)
+// ---------------------------------------------------------------------------
+
+async fn http_mcp_loop(
+    listener: TcpListener,
+    auth_token: String,
+    scheduler: Arc<TeammateManager>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    loop {
+        tokio::select! {
+            accept = listener.accept() => {
+                let Ok((mut stream, _)) = accept else { continue };
+                let _token = auth_token.clone();
+                let sched = scheduler.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]);
+
+                    // Extract JSON body (after \r\n\r\n)
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let Ok(value): Result<Value, _> = serde_json::from_str(body) else {
+                        let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        return;
+                    };
+
+                    // Handle JSON-RPC request
+                    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                    let id = value.get("id").cloned();
+
+                    let result = match method {
+                        "initialize" => {
+                            json!({
+                                "capabilities": { "tools": {} },
+                                "protocolVersion": PROTOCOL_VERSION,
+                                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+                            })
+                        }
+                        "notifications/initialized" => {
+                            let resp = "HTTP/1.1 204 No Content\r\n\r\n";
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            return;
+                        }
+                        "tools/list" => {
+                            let tools: Vec<Value> = all_tool_descriptors()
+                                .iter()
+                                .map(|d| json!({
+                                    "name": d.name,
+                                    "description": d.description,
+                                    "inputSchema": d.input_schema,
+                                }))
+                                .collect();
+                            json!({ "tools": tools })
+                        }
+                        "tools/call" => {
+                            let params = value.get("params").cloned().unwrap_or(json!({}));
+                            let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                            // Extract slot_id from auth header or use empty
+                            let auth_header = request.lines()
+                                .find(|l| l.to_lowercase().starts_with("authorization:"))
+                                .and_then(|l| l.split_whitespace().last())
+                                .unwrap_or("");
+                            let _slot_id = auth_header; // Will use header as slot_id for now
+                            match dispatch_tool(tool_name, &arguments, &sched, auth_header, TeammateRole::Lead).await {
+                                Ok(text) => json!({ "content": [{"type": "text", "text": text}] }),
+                                Err(text) => json!({ "content": [{"type": "text", "text": text}], "isError": true }),
+                            }
+                        }
+                        _ => {
+                            json!({"error": {"code": -32601, "message": "Method not found"}})
+                        }
+                    };
+
+                    let response_body = if result.get("error").is_some() {
+                        json!({"jsonrpc": "2.0", "id": id, "error": result["error"]})
+                    } else {
+                        json!({"jsonrpc": "2.0", "id": id, "result": result})
+                    };
+                    let body_bytes = serde_json::to_vec(&response_body).unwrap_or_default();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body_bytes).await;
+                });
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { break; }
+            }
+        }
+    }
 }

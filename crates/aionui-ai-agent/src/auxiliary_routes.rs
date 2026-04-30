@@ -4,6 +4,7 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::routing::{get, post};
+use std::path::Component;
 
 use crate::acp_agent::AcpAgentManager;
 use crate::agent_manager::AgentManagerHandle;
@@ -12,9 +13,9 @@ use crate::task_manager::IWorkerTaskManager;
 use crate::types::SlashCommandItem;
 use agent_client_protocol::schema::{AgentCapabilities, SessionConfigOption, UsageUpdate};
 use aionui_api_types::{
-    AgentModeResponse, ApiResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
-    SetConfigOptionRequest, SetConfigOptionsRequest, SetModeRequest, SetModelRequest,
-    SideQuestionRequest, SideQuestionResponse, WorkspaceBrowseQuery, WorkspaceEntry,
+    AgentModeResponse, ApiResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionRequest,
+    SetConfigOptionsRequest, SetModeRequest, SetModelRequest, SideQuestionRequest, SideQuestionResponse,
+    WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{AgentType, AppError};
@@ -32,24 +33,12 @@ pub struct AuxiliaryRouterState {
 pub fn auxiliary_routes(state: AuxiliaryRouterState) -> Router {
     Router::new()
         .route("/api/conversations/{id}/workspace", get(browse_workspace))
-        .route(
-            "/api/conversations/{id}/reload-context",
-            post(reload_context),
-        )
+        .route("/api/conversations/{id}/reload-context", post(reload_context))
         .route("/api/conversations/{id}/side-question", post(side_question))
-        .route(
-            "/api/conversations/{id}/slash-commands",
-            get(get_slash_commands),
-        )
+        .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/mode", get(get_mode).put(set_mode))
-        .route(
-            "/api/conversations/{id}/model",
-            get(get_model).put(set_model),
-        )
-        .route(
-            "/api/conversations/{id}/config",
-            get(get_configs).put(set_configs),
-        )
+        .route("/api/conversations/{id}/model", get(get_model).put(set_model))
+        .route("/api/conversations/{id}/config", get(get_configs).put(set_configs))
         .route(
             "/api/conversations/{id}/config/{configId}",
             get(get_config).put(set_config),
@@ -59,10 +48,7 @@ pub fn auxiliary_routes(state: AuxiliaryRouterState) -> Router {
             "/api/conversations/{id}/agent-capabilities",
             get(get_agent_capabilities),
         )
-        .route(
-            "/api/conversations/{id}/openclaw/runtime",
-            get(get_openclaw_runtime),
-        )
+        .route("/api/conversations/{id}/openclaw/runtime", get(get_openclaw_runtime))
         .with_state(state)
 }
 
@@ -95,8 +81,8 @@ async fn browse_workspace(
         .map_err(|e| AppError::Internal(format!("Failed to load conversation: {e}")))?
         .ok_or_else(|| AppError::NotFound(format!("Conversation '{id}' not found")))?;
 
-    let extra: serde_json::Value = serde_json::from_str(&row.extra)
-        .map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
+    let extra: serde_json::Value =
+        serde_json::from_str(&row.extra).map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
     let workspace = extra
         .get("workspace")
         .and_then(|v| v.as_str())
@@ -104,33 +90,45 @@ async fn browse_workspace(
         .trim()
         .to_owned();
     if workspace.is_empty() {
+        return Err(AppError::BadRequest("Conversation has no workspace assigned".into()));
+    }
+
+    let relative_path = query.path.trim_start_matches('/');
+    let relative_path_obj = std::path::Path::new(relative_path);
+    if relative_path_obj
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
         return Err(AppError::BadRequest(
-            "Conversation has no workspace assigned".into(),
+            "Path traversal outside workspace is not allowed".into(),
         ));
     }
 
     // Resolve the browsed path relative to the workspace root
     let base = std::path::Path::new(&workspace);
-    let browse_path = base.join(query.path.trim_start_matches('/'));
+    let browse_path = if relative_path.is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(relative_path_obj)
+    };
 
-    // Security: ensure the resolved path is within the workspace
+    // Security: reject direct traversal outside the workspace root, but allow
+    // symlinked directories mounted inside the workspace (e.g. native skill
+    // dirs that point at the builtin skills corpus under data-dir).
     let canonical_base = base
         .canonicalize()
         .map_err(|e| AppError::Internal(format!("Failed to resolve workspace path: {e}")))?;
     let canonical_browse = browse_path
         .canonicalize()
         .map_err(|_| AppError::NotFound("Directory not found".into()))?;
-    if !canonical_browse.starts_with(&canonical_base) {
+    if !browse_path.starts_with(base) && !canonical_browse.starts_with(&canonical_base) {
         return Err(AppError::BadRequest(
             "Path traversal outside workspace is not allowed".into(),
         ));
     }
 
     // Check depth limit
-    let relative = canonical_browse
-        .strip_prefix(&canonical_base)
-        .unwrap_or(&canonical_browse);
-    let depth = relative.components().count();
+    let depth = relative_path_obj.components().count();
     if depth > MAX_DIR_DEPTH {
         return Err(AppError::BadRequest(format!(
             "Directory depth exceeds maximum of {MAX_DIR_DEPTH}"
@@ -153,16 +151,12 @@ async fn browse_workspace(
             continue;
         }
 
-        let file_type = entry
-            .file_type()
+        let entry_path = entry.path();
+        let metadata = tokio::fs::metadata(&entry_path)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to read file type: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("Failed to read entry metadata: {e}")))?;
 
-        let entry_type = if file_type.is_dir() {
-            "directory"
-        } else {
-            "file"
-        };
+        let entry_type = if metadata.is_dir() { "directory" } else { "file" };
 
         entries.push(WorkspaceEntry {
             name,
@@ -218,9 +212,8 @@ async fn side_question(
 
     let acp = downcast_acp(&handle)?;
 
-    // Check if the backend is Claude (side question is only supported for Claude)
-    let backend = acp.backend();
-    if backend != aionui_common::AcpBackend::Claude {
+    // Side question is gated by the agent's behavior_policy flag.
+    if !acp.supports_side_question() {
         return Ok(Json(ApiResponse::ok(SideQuestionResponse {
             status: "unsupported".into(),
             answer: None,
@@ -423,8 +416,7 @@ async fn set_configs(
         if update.config_id.trim().is_empty() {
             return Err(AppError::BadRequest("config_id must not be empty".into()));
         }
-        acp.set_config_option(&update.config_id, &update.value)
-            .await?;
+        acp.set_config_option(&update.config_id, &update.value).await?;
     }
 
     Ok(Json(ApiResponse::success()))
@@ -490,18 +482,11 @@ async fn get_openclaw_runtime(
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-fn get_task(
-    state: &AuxiliaryRouterState,
-    conversation_id: &str,
-) -> Result<AgentManagerHandle, AppError> {
+fn get_task(state: &AuxiliaryRouterState, conversation_id: &str) -> Result<AgentManagerHandle, AppError> {
     state
         .worker_task_manager
         .get_task(conversation_id)
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "No active agent for conversation '{conversation_id}'"
-            ))
-        })
+        .ok_or_else(|| AppError::NotFound(format!("No active agent for conversation '{conversation_id}'")))
 }
 
 fn downcast_acp(handle: &AgentManagerHandle) -> Result<&AcpAgentManager, AppError> {

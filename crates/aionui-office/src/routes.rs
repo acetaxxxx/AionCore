@@ -4,15 +4,18 @@ use axum::extract::{Extension, Json, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use std::path::{Path as FsPath, PathBuf};
 
 use aionui_api_types::{
-    ApiResponse, DetectStarOfficeRequest, DocumentConversionRequest, GetSnapshotContentRequest,
-    ListSnapshotsRequest, PreviewSnapshotInfoDto, PreviewUrlResponse, SaveSnapshotRequest,
-    SnapshotContentResponse, StarOfficeDetectResponse, StartPreviewRequest, StopPreviewRequest,
+    ApiResponse, DetectStarOfficeRequest, DocumentConversionRequest, GetSnapshotContentRequest, ListSnapshotsRequest,
+    PreviewSnapshotInfoDto, PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StarOfficeDetectResponse,
+    StartPreviewRequest, StopPreviewRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::AppError;
+use aionui_file::path_safety::validate_path_with_extra_root;
 
+use crate::error::OfficeError;
 use crate::state::OfficeRouterState;
 use crate::types::DocType;
 
@@ -26,10 +29,7 @@ pub fn office_routes(state: OfficeRouterState) -> Router {
         .route("/api/ppt-preview/stop", post(stop_ppt_preview))
         .route("/api/preview-history/list", post(list_snapshots))
         .route("/api/preview-history/save", post(save_snapshot))
-        .route(
-            "/api/preview-history/get-content",
-            post(get_snapshot_content),
-        )
+        .route("/api/preview-history/get-content", post(get_snapshot_content))
         .route("/api/star-office/detect", post(detect_star_office))
         .route("/api/document/convert", post(convert_document))
         .with_state(state)
@@ -40,10 +40,7 @@ pub fn office_proxy_routes(state: OfficeRouterState) -> Router {
         .route("/api/ppt-proxy/{port}", get(ppt_proxy))
         .route("/api/ppt-proxy/{port}/{*path}", get(ppt_proxy))
         .route("/api/office-watch-proxy/{port}", get(office_watch_proxy))
-        .route(
-            "/api/office-watch-proxy/{port}/{*path}",
-            get(office_watch_proxy),
-        )
+        .route("/api/office-watch-proxy/{port}/{*path}", get(office_watch_proxy))
         .with_state(state)
 }
 
@@ -109,8 +106,10 @@ async fn start_preview(
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
+    let validated_path = validated_path.to_string_lossy().into_owned();
 
-    let result = state.watch_manager.start(&req.file_path, doc_type).await;
+    let result = state.watch_manager.start(&validated_path, doc_type).await;
 
     let resp = match result {
         Ok(port) => {
@@ -119,7 +118,7 @@ async fn start_preview(
         }
         Err(e) => PreviewUrlResponse {
             url: String::new(),
-            error: Some(e.to_string()),
+            error: Some(preview_error_code(&e).to_owned()),
         },
     };
 
@@ -154,10 +153,7 @@ async fn save_snapshot(
     body: Result<Json<SaveSnapshotRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewSnapshotInfoDto>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let info = state
-        .snapshot_service
-        .save(&req.target, &req.content)
-        .await?;
+    let info = state.snapshot_service.save(&req.target, &req.content).await?;
     Ok(Json(ApiResponse::ok(info)))
 }
 
@@ -184,11 +180,7 @@ async fn detect_star_office(
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let url = state
         .star_office_detector
-        .detect(
-            req.preferred_url.as_deref(),
-            req.force.unwrap_or(false),
-            req.timeout_ms,
-        )
+        .detect(req.preferred_url.as_deref(), req.force.unwrap_or(false), req.timeout_ms)
         .await;
     Ok(Json(ApiResponse::ok(StarOfficeDetectResponse { url })))
 }
@@ -201,11 +193,35 @@ async fn convert_document(
     body: Result<Json<DocumentConversionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<aionui_api_types::DocumentConversionResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
     let resp = state
         .conversion_service
-        .convert(&req.file_path, req.to)
+        .convert(validated_path.to_string_lossy().as_ref(), req.to)
         .await?;
     Ok(Json(ApiResponse::ok(resp)))
+}
+
+fn validate_office_path(
+    state: &OfficeRouterState,
+    file_path: &str,
+    workspace: Option<&str>,
+) -> Result<PathBuf, AppError> {
+    let allowed_roots: Vec<&FsPath> = state.allowed_roots.iter().map(PathBuf::as_path).collect();
+    validate_path_with_extra_root(file_path, &allowed_roots, workspace.map(FsPath::new))
+}
+
+fn preview_error_code(error: &OfficeError) -> &'static str {
+    match error {
+        OfficeError::OfficecliNotFound => "OFFICECLI_NOT_FOUND",
+        OfficeError::InstallFailed(_) => "OFFICECLI_INSTALL_FAILED",
+        OfficeError::PortTimeout(_) => "OFFICECLI_PORT_TIMEOUT",
+        OfficeError::StartFailed(_)
+        | OfficeError::Io(_)
+        | OfficeError::Snapshot(_)
+        | OfficeError::Json(_)
+        | OfficeError::Conversion(_)
+        | OfficeError::ToolNotFound(_) => "OFFICECLI_START_FAILED",
+    }
 }
 
 // -- Reverse proxy handlers -----------------------------------------------
@@ -227,11 +243,7 @@ async fn office_watch_proxy(
     let path = params.path.as_deref().unwrap_or("/");
     let request_headers: Vec<(String, String)> = headers
         .iter()
-        .filter_map(|(k, v)| {
-            v.to_str()
-                .ok()
-                .map(|val| (k.as_str().to_owned(), val.to_owned()))
-        })
+        .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.as_str().to_owned(), val.to_owned())))
         .collect();
 
     let proxy_resp = state
@@ -239,8 +251,7 @@ async fn office_watch_proxy(
         .forward_watch(params.port, path, &request_headers)
         .await?;
 
-    let status =
-        StatusCode::from_u16(proxy_resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(proxy_resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = axum::response::Response::builder().status(status);
 
     for (key, value) in &proxy_resp.headers {
@@ -261,11 +272,7 @@ async fn proxy_forward(
 ) -> Result<Response, AppError> {
     let request_headers: Vec<(String, String)> = headers
         .iter()
-        .filter_map(|(k, v)| {
-            v.to_str()
-                .ok()
-                .map(|val| (k.as_str().to_owned(), val.to_owned()))
-        })
+        .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.as_str().to_owned(), val.to_owned())))
         .collect();
 
     let proxy_resp = state
@@ -273,8 +280,7 @@ async fn proxy_forward(
         .forward(port, path, doc_type, &request_headers)
         .await?;
 
-    let status =
-        StatusCode::from_u16(proxy_resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(proxy_resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = axum::response::Response::builder().status(status);
 
     for (key, value) in &proxy_resp.headers {
@@ -357,6 +363,7 @@ mod tests {
             star_office_detector: detector,
             conversion_service: conversion,
             proxy_service: proxy,
+            allowed_roots: vec![std::env::temp_dir()],
         }
     }
 }
