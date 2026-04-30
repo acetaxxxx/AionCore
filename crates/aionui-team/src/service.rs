@@ -632,6 +632,17 @@ impl TeamSessionService {
         entry.session.send_message_to_agent(slot_id, content, files).await
     }
 
+    /// Wake a specific agent in a team session (trigger it to read mailbox).
+    /// Called by MCP dispatch after `team_send_message` writes to mailbox.
+    pub async fn wake_agent_in_session(&self, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let entry = self
+            .sessions
+            .get(team_id)
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        entry.session.try_wake(slot_id, None).await;
+        Ok(())
+    }
+
     /// Route an MCP `team_spawn_agent` call into the live [`TeamSession`].
     ///
     /// Looks up the session for `team_id` (errors with [`TeamError::SessionNotFound`]

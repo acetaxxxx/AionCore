@@ -429,7 +429,7 @@ async fn dispatch_tool(
     caller_role: TeammateRole,
 ) -> Result<String, String> {
     match tool_name {
-        "team_send_message" => exec_send_message(arguments, scheduler, caller_slot_id).await,
+        "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
         "team_task_create" => exec_task_create(arguments, scheduler).await,
         "team_task_update" => exec_task_update(arguments, scheduler).await,
@@ -456,7 +456,13 @@ async fn exec_describe_assistant(args: &Value) -> Result<String, String> {
 // Individual tool handlers
 // ---------------------------------------------------------------------------
 
-async fn exec_send_message(args: &Value, scheduler: &TeammateManager, caller_slot_id: &str) -> Result<String, String> {
+async fn exec_send_message(
+    args: &Value,
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_slot_id: &str,
+) -> Result<String, String> {
     let input: SendMessageInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
     let trimmed = input.message.trim();
@@ -465,10 +471,6 @@ async fn exec_send_message(args: &Value, scheduler: &TeammateManager, caller_slo
         scheduler.notify_shutdown_acknowledged(caller_slot_id);
         return Ok(json!({"status": "shutdown_approved_received"}).to_string());
     }
-    // Reason: a teammate replying to a shutdown request with
-    // `shutdown_rejected: <reason>` is a protocol sentinel, not a normal
-    // message. Divert it to a leader-directed notification and return without
-    // removing the agent — the teammate keeps running.
     if let Some(rest) = trimmed.strip_prefix("shutdown_rejected:") {
         let reason = rest.trim();
         scheduler
@@ -479,6 +481,7 @@ async fn exec_send_message(args: &Value, scheduler: &TeammateManager, caller_slo
         return Ok(format!("shutdown_rejected: {reason}"));
     }
 
+    let to_target = input.to.clone();
     let action = crate::scheduler::SchedulerAction::SendMessage {
         to: input.to.clone(),
         message: input.message,
@@ -488,7 +491,24 @@ async fn exec_send_message(args: &Value, scheduler: &TeammateManager, caller_slo
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(format!("Message sent to {}", input.to))
+    // Wake target agent(s) so they process the new mailbox message.
+    if let Some(svc) = service.upgrade() {
+        let targets = if input.to == "*" {
+            scheduler.list_agents().await.iter()
+                .filter(|a| a.slot_id != caller_slot_id)
+                .map(|a| a.slot_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            vec![input.to]
+        };
+        for target in &targets {
+            if let Err(e) = svc.wake_agent_in_session(team_id, target).await {
+                debug!(team_id, target = target.as_str(), error = %e, "wake after send_message failed (non-fatal)");
+            }
+        }
+    }
+
+    Ok(format!("Message sent to {to_target}"))
 }
 
 async fn exec_spawn_agent(

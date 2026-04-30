@@ -273,7 +273,7 @@ impl TeamSession {
     /// Compute the wake payload and forward it to the task manager. All
     /// error paths downgrade to `warn!` — the mailbox write has already
     /// succeeded and is the source of truth.
-    async fn try_wake(&self, slot_id: &str, files: Option<Vec<String>>) {
+    pub(crate) async fn try_wake(&self, slot_id: &str, files: Option<Vec<String>>) {
         let input = match self.compute_wake_input(slot_id).await {
             Ok(Some(input)) => input,
             Ok(None) => {
