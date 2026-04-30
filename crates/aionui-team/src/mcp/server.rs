@@ -668,7 +668,8 @@ async fn http_mcp_loop(
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                let Ok((mut stream, _)) = accept else { continue };
+                let Ok((mut stream, peer)) = accept else { continue };
+                info!(team_id = %team_id, ?peer, "HTTP MCP: new connection accepted");
                 let _token = auth_token.clone();
                 let sched = scheduler.clone();
                 let svc = service.clone();
