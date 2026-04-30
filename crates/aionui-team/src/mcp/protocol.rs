@@ -96,19 +96,14 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Res
     Ok(buf)
 }
 
-pub async fn write_frame<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    data: &[u8],
-) -> std::io::Result<()> {
+pub async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> std::io::Result<()> {
     let len = data.len() as u32;
     writer.write_u32(len).await?;
     writer.write_all(data).await?;
     writer.flush().await
 }
 
-pub async fn read_request<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<JsonRpcRequest> {
+pub async fn read_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<JsonRpcRequest> {
     let frame = read_frame(reader).await?;
     serde_json::from_slice(&frame).map_err(std::io::Error::other)
 }
@@ -119,6 +114,38 @@ pub async fn write_response<W: AsyncWriteExt + Unpin>(
 ) -> std::io::Result<()> {
     let data = serde_json::to_vec(response).map_err(std::io::Error::other)?;
     write_frame(writer, &data).await
+}
+
+// ---------------------------------------------------------------------------
+// MCP ready notification (W4-D24a)
+//
+// Bridge 在 TCP connect + initialize 成功后 fire-and-forget 发送一帧通知给
+// TeamMcpServer，声明对应 slot 已就绪。扁平结构（非 JSON-RPC），格式：
+//   { "type": "mcp_ready", "slot_id": "...", "auth_token": "..." }
+// 事实来源：docs/teams/phase1/aionui-audit.md §3.1 "MCP ready 握手"
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpReadyNotification {
+    pub r#type: String,
+    pub slot_id: String,
+    pub auth_token: String,
+}
+
+impl McpReadyNotification {
+    pub const TYPE: &'static str = "mcp_ready";
+
+    pub fn new(slot_id: impl Into<String>, auth_token: impl Into<String>) -> Self {
+        Self {
+            r#type: Self::TYPE.to_string(),
+            slot_id: slot_id.into(),
+            auth_token: auth_token.into(),
+        }
+    }
+
+    pub fn is_mcp_ready(json: &serde_json::Value) -> bool {
+        json.get("type").and_then(|v| v.as_str()) == Some(Self::TYPE)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +194,8 @@ mod tests {
 
     #[test]
     fn request_with_params() {
-        let json = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"test","arguments":{"key":"val"}}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"test","arguments":{"key":"val"}}}"#;
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.method, "tools/call");
         let params = req.params.unwrap();
@@ -237,5 +265,39 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let read_back = read_frame(&mut cursor).await.unwrap();
         assert!(read_back.is_empty());
+    }
+
+    #[test]
+    fn mcp_ready_notification_roundtrip() {
+        let original = McpReadyNotification::new("slot-123", "token-abc");
+        let json = serde_json::to_string(&original).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "mcp_ready");
+        assert_eq!(value["slot_id"], "slot-123");
+        assert_eq!(value["auth_token"], "token-abc");
+
+        let parsed: McpReadyNotification = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.r#type, "mcp_ready");
+        assert_eq!(parsed.slot_id, "slot-123");
+        assert_eq!(parsed.auth_token, "token-abc");
+    }
+
+    #[test]
+    fn mcp_ready_notification_is_mcp_ready() {
+        let positive = serde_json::json!({
+            "type": "mcp_ready",
+            "slot_id": "s",
+            "auth_token": "t"
+        });
+        assert!(McpReadyNotification::is_mcp_ready(&positive));
+
+        let wrong_type = serde_json::json!({ "type": "other" });
+        assert!(!McpReadyNotification::is_mcp_ready(&wrong_type));
+
+        let missing_type = serde_json::json!({ "slot_id": "s" });
+        assert!(!McpReadyNotification::is_mcp_ready(&missing_type));
+
+        let non_object = serde_json::json!("mcp_ready");
+        assert!(!McpReadyNotification::is_mcp_ready(&non_object));
     }
 }

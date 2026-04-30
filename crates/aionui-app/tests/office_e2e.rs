@@ -24,8 +24,7 @@ use common::{body_json, get_request, json_with_token, setup_and_login};
 
 use aionui_app::{AppServices, build_module_states, create_router_with_states};
 use aionui_office::{
-    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService,
-    StarOfficeDetector,
+    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService, StarOfficeDetector,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -56,10 +55,7 @@ async fn build_office_app_with_roots(
     (router, services, tmp)
 }
 
-fn build_test_office_state(
-    data_dir: &std::path::Path,
-    allowed_roots: Vec<std::path::PathBuf>,
-) -> OfficeRouterState {
+fn build_test_office_state(data_dir: &std::path::Path, allowed_roots: Vec<std::path::PathBuf>) -> OfficeRouterState {
     use aionui_office::error::OfficeError;
     use aionui_office::types::DocType;
     use aionui_office::{ProcessHandle, ProcessSpawner};
@@ -177,10 +173,7 @@ async fn wp4_word_preview_officecli_not_available() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let url = json["data"]["url"].as_str().unwrap();
-    assert!(
-        url.is_empty(),
-        "url should be empty when officecli unavailable"
-    );
+    assert!(url.is_empty(), "url should be empty when officecli unavailable");
     assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
 }
 
@@ -191,8 +184,7 @@ async fn wp5_word_preview_with_workspace_accepts_non_sandbox_path() {
     let file_path = outside.path().join("demo.docx");
     std::fs::write(&file_path, b"docx").unwrap();
 
-    let (mut app, services, _tmp) =
-        build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user2", "pass123").await;
 
     let body = json!({
@@ -215,8 +207,7 @@ async fn wp6_word_preview_without_workspace_rejects_non_sandbox_path() {
     let file_path = outside.path().join("demo.docx");
     std::fs::write(&file_path, b"docx").unwrap();
 
-    let (mut app, services, _tmp) =
-        build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user3", "pass123").await;
 
     let body = json!({
@@ -237,8 +228,7 @@ async fn ep1_excel_preview_with_workspace_accepts_non_sandbox_path() {
     let file_path = outside.path().join("demo.xlsx");
     std::fs::write(&file_path, b"xlsx").unwrap();
 
-    let (mut app, services, _tmp) =
-        build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user4", "pass123").await;
 
     let body = json!({
@@ -261,8 +251,7 @@ async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
     let file_path = outside.path().join("demo.pptx");
     std::fs::write(&file_path, b"pptx").unwrap();
 
-    let (mut app, services, _tmp) =
-        build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user5", "pass123").await;
 
     let body = json!({
@@ -344,13 +333,7 @@ async fn sh3_get_snapshot_content() {
         "target": snapshot_target(),
         "content": "# Hello"
     });
-    let req = json_with_token(
-        "POST",
-        "/api/preview-history/save",
-        save_body,
-        &token,
-        &csrf,
-    );
+    let req = json_with_token("POST", "/api/preview-history/save", save_body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let save_json = body_json(resp).await;
     let snapshot_id = save_json["data"]["id"].as_str().unwrap();
@@ -359,13 +342,7 @@ async fn sh3_get_snapshot_content() {
         "target": snapshot_target(),
         "snapshot_id": snapshot_id
     });
-    let req = json_with_token(
-        "POST",
-        "/api/preview-history/get-content",
-        get_body,
-        &token,
-        &csrf,
-    );
+    let req = json_with_token("POST", "/api/preview-history/get-content", get_body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
@@ -386,13 +363,7 @@ async fn sh4_get_nonexistent_snapshot() {
         "target": snapshot_target(),
         "snapshot_id": "nonexistent"
     });
-    let req = json_with_token(
-        "POST",
-        "/api/preview-history/get-content",
-        body,
-        &token,
-        &csrf,
-    );
+    let req = json_with_token("POST", "/api/preview-history/get-content", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
@@ -595,8 +566,7 @@ async fn dc5_document_convert_rejects_outside_sandbox() {
     let xlsx_path = outside.path().join("test.xlsx");
     create_test_xlsx(&xlsx_path);
 
-    let (mut app, services, _tmp) =
-        build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user6", "pass123").await;
 
     let body = json!({

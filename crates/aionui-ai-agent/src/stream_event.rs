@@ -1,8 +1,7 @@
 use agent_client_protocol::schema::{
-    AvailableCommand, ContentBlock, Meta as SdkMeta, PermissionOption,
-    PermissionOptionKind as SdkPermissionOptionKind, RequestPermissionRequest, SessionNotification,
-    SessionUpdate, ToolCallContent as SdkToolCallContent, ToolCallLocation as SdkToolCallLocation,
-    ToolCallStatus as SdkToolCallStatus, ToolCallUpdate as SdkToolCallUpdate,
+    AvailableCommand, ContentBlock, Meta as SdkMeta, PermissionOption, PermissionOptionKind as SdkPermissionOptionKind,
+    RequestPermissionRequest, SessionNotification, SessionUpdate, ToolCallContent as SdkToolCallContent,
+    ToolCallLocation as SdkToolCallLocation, ToolCallStatus as SdkToolCallStatus, ToolCallUpdate as SdkToolCallUpdate,
     ToolKind as SdkToolKind,
 };
 use aionui_common::{Confirmation, ConfirmationOption};
@@ -71,6 +70,15 @@ pub enum AgentStreamEvent {
     System(serde_json::Value),
     /// Raw request trace (ACP debug info).
     RequestTrace(serde_json::Value),
+
+    /// Emitted exactly once per conversation, right after the ACP CLI
+    /// returns a fresh `session_id` from `session/new`. Subscribers
+    /// (e.g. `AcpAgentService`) persist the id into `acp_session` so a
+    /// later resume can call `session/load`.
+    ///
+    /// Not emitted on `session/load` — the id in that path is
+    /// already stored.
+    SessionAssigned(SessionAssignedEventData),
 }
 
 /// Data for the `Start` event.
@@ -79,6 +87,13 @@ pub struct StartEventData {
     /// Session ID for this turn (if available).
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+/// Data for the `SessionAssigned` event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAssignedEventData {
+    /// The CLI-assigned session id, freshly minted by `session/new`.
+    pub session_id: String,
 }
 
 /// Data for the `Text` event.
@@ -363,6 +378,11 @@ pub struct PlanEventData {
 }
 
 /// Data for the `AvailableCommands` event.
+///
+/// `commands` carries ACP SDK structs that serialise as camelCase on
+/// their own. Producers keep them typed; the case normalisation to
+/// snake_case happens at the stream-relay layer when the event is
+/// serialised for WebSocket delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailableCommandsEventData {
     pub commands: Vec<AvailableCommand>,
@@ -496,11 +516,9 @@ pub fn session_notification_to_events(notif: &SessionNotification) -> Vec<AgentS
         }
 
         SessionUpdate::AvailableCommandsUpdate(update) => {
-            events.push(AgentStreamEvent::AvailableCommands(
-                AvailableCommandsEventData {
-                    commands: update.available_commands.clone(),
-                },
-            ));
+            events.push(AgentStreamEvent::AvailableCommands(AvailableCommandsEventData {
+                commands: update.available_commands.clone(),
+            }));
         }
 
         SessionUpdate::CurrentModeUpdate(update) => {
@@ -568,9 +586,7 @@ fn map_sdk_permission_option_kind(kind: SdkPermissionOptionKind) -> AcpPermissio
     }
 }
 
-pub fn permission_request_to_event_data(
-    request: &RequestPermissionRequest,
-) -> AcpPermissionEventData {
+pub fn permission_request_to_event_data(request: &RequestPermissionRequest) -> AcpPermissionEventData {
     AcpPermissionEventData::Request(AcpPermissionRequestData {
         session_id: request.session_id.to_string(),
         tool_call: map_permission_tool_call(&request.tool_call),
@@ -636,9 +652,7 @@ fn map_tool_call_content(content: &[SdkToolCallContent]) -> Option<Vec<AcpToolCa
     if items.is_empty() { None } else { Some(items) }
 }
 
-fn map_tool_call_locations(
-    locations: &[SdkToolCallLocation],
-) -> Option<Vec<AcpToolCallLocationItem>> {
+fn map_tool_call_locations(locations: &[SdkToolCallLocation]) -> Option<Vec<AcpToolCallLocationItem>> {
     (!locations.is_empty()).then(|| {
         locations
             .iter()
@@ -653,9 +667,9 @@ fn map_tool_call_locations(
 mod tests {
     use super::*;
     use agent_client_protocol::schema::{
-        PermissionOption, PermissionOptionKind as SdkPermissionOptionKind, SessionNotification,
-        SessionUpdate, ToolCall as SdkToolCall, ToolCallStatus as SdkToolCallStatus,
-        ToolCallUpdate as SdkToolCallUpdate, ToolCallUpdateFields, ToolKind as SdkToolKind,
+        PermissionOption, PermissionOptionKind as SdkPermissionOptionKind, SessionNotification, SessionUpdate,
+        ToolCall as SdkToolCall, ToolCallStatus as SdkToolCallStatus, ToolCallUpdate as SdkToolCallUpdate,
+        ToolCallUpdateFields, ToolKind as SdkToolKind,
     };
     use serde_json::json;
 
@@ -873,10 +887,7 @@ mod tests {
         assert_eq!(json["type"], "acp_permission");
         assert_eq!(json["data"]["session_id"], "sess-1");
         assert_eq!(json["data"]["tool_call"]["tool_call_id"], "tool-1");
-        assert_eq!(
-            json["data"]["tool_call"]["raw_input"]["file_path"],
-            "/tmp/a.txt"
-        );
+        assert_eq!(json["data"]["tool_call"]["raw_input"]["file_path"], "/tmp/a.txt");
         assert_eq!(json["data"]["options"][0]["option_id"], "allow");
         assert_eq!(json["data"]["options"][0]["kind"], "allow_once");
         assert!(json["data"].get("toolCall").is_none());

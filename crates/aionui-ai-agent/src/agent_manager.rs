@@ -2,13 +2,11 @@ use std::any::Any;
 use std::sync::Arc;
 
 use aionui_api_types::AgentModeResponse;
-use aionui_common::{
-    AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs,
-};
+use aionui_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs};
 use tokio::sync::broadcast;
 
 use crate::stream_event::AgentStreamEvent;
-use crate::types::SendMessageData;
+use crate::types::{AgentStreamChunk, SendMessageData};
 
 /// Core trait for managing a single Agent instance.
 ///
@@ -39,6 +37,15 @@ pub trait IAgentManager: Send + Sync {
     /// as the agent processes a message turn.
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent>;
 
+    /// Subscribe to the raw stream chunk channel (used by team scheduler for watchdogs).
+    ///
+    /// Returns a broadcast receiver yielding [`AgentStreamChunk`] values.
+    /// Default implementation returns a receiver that immediately closes (for non-ACP agents).
+    fn subscribe_stream(&self) -> broadcast::Receiver<AgentStreamChunk> {
+        let (tx, _) = broadcast::channel(1);
+        tx.subscribe()
+    }
+
     /// Send a user message to the agent.
     ///
     /// This triggers the agent to start processing. Events are emitted
@@ -53,13 +60,8 @@ pub trait IAgentManager: Send + Sync {
     /// If `always_allow` is `true`, the confirmation's `action` (and optional
     /// `command_type`) are recorded in the session-level approval memory so
     /// that future identical requests can be auto-approved by the frontend.
-    fn confirm(
-        &self,
-        msg_id: &str,
-        call_id: &str,
-        data: serde_json::Value,
-        always_allow: bool,
-    ) -> Result<(), AppError>;
+    fn confirm(&self, msg_id: &str, call_id: &str, data: serde_json::Value, always_allow: bool)
+    -> Result<(), AppError>;
 
     /// Get the list of pending confirmation items.
     fn get_confirmations(&self) -> Vec<Confirmation>;
@@ -120,5 +122,16 @@ pub fn approval_key(action: Option<&str>, command_type: Option<&str>) -> String 
         (Some(a), Some(ct)) => format!("{a}:{ct}"),
         (Some(a), None) => a.to_owned(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscribe_stream_receiver_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<broadcast::Receiver<crate::types::AgentStreamChunk>>();
     }
 }

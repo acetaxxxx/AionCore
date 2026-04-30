@@ -32,6 +32,10 @@ pub struct TeamSessionService {
     task_manager: Arc<dyn IWorkerTaskManager>,
     backend_binary_path: Arc<PathBuf>,
     sessions: Arc<DashMap<String, SessionEntry>>,
+    /// Per-team mutex serializing `add_agent` so concurrent callers cannot
+    /// read-modify-write the `agents` JSON with stale state (last-writer-wins
+    /// would otherwise drop entries).
+    add_agent_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl TeamSessionService {
@@ -49,18 +53,13 @@ impl TeamSessionService {
             task_manager,
             backend_binary_path,
             sessions: Arc::new(DashMap::new()),
+            add_agent_locks: Arc::new(DashMap::new()),
         }
     }
 
-    pub async fn create_team(
-        &self,
-        user_id: &str,
-        req: CreateTeamRequest,
-    ) -> Result<TeamResponse, TeamError> {
+    pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
         if req.agents.is_empty() {
-            return Err(TeamError::InvalidRequest(
-                "at least one agent is required".into(),
-            ));
+            return Err(TeamError::InvalidRequest("at least one agent is required".into()));
         }
 
         let team_id = generate_id();
@@ -86,15 +85,16 @@ impl TeamSessionService {
                 }),
                 source: None,
                 channel_chat_id: None,
-                extra: serde_json::json!({ "teamId": team_id }),
+                extra: serde_json::json!({
+                    "teamId": team_id,
+                    "backend": input.backend,
+                }),
             };
             let conv = self
                 .conversation_service
                 .create(user_id, conv_req)
                 .await
-                .map_err(|e| {
-                    TeamError::InvalidRequest(format!("failed to create conversation: {e}"))
-                })?;
+                .map_err(|e| TeamError::InvalidRequest(format!("failed to create conversation: {e}")))?;
 
             agents.push(TeamAgent {
                 slot_id,
@@ -137,6 +137,14 @@ impl TeamSessionService {
         };
 
         info!(team_id = %team.id, "Team created");
+
+        // Auto-start session so MCP is injected immediately after team creation.
+        // Failure only logs — the team is persisted and frontend can retry
+        // via POST /api/teams/{id}/session if needed.
+        if let Err(e) = self.ensure_session(&team.id).await {
+            warn!(team_id = %team.id, error = %e, "auto ensure_session after create_team failed");
+        }
+
         Ok(team.to_response())
     }
 
@@ -181,15 +189,16 @@ impl TeamSessionService {
         }
 
         for agent in &team.agents {
-            let _ = self
-                .conversation_service
-                .delete(user_id, &agent.conversation_id)
-                .await;
+            let _ = self.conversation_service.delete(user_id, &agent.conversation_id).await;
         }
 
         self.repo.delete_mailbox_by_team(team_id).await?;
         self.repo.delete_tasks_by_team(team_id).await?;
         self.repo.delete_team(team_id).await?;
+
+        // Drop the per-team add_agent lock so the DashMap entry does not leak
+        // across team lifecycles (W4-D23).
+        self.add_agent_locks.remove(team_id);
 
         info!(team_id = %team_id, "Team removed");
         Ok(())
@@ -220,6 +229,13 @@ impl TeamSessionService {
         team_id: &str,
         req: AddAgentRequest,
     ) -> Result<TeamAgentResponse, TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
         let row = self
             .repo
             .get_team(team_id)
@@ -241,15 +257,16 @@ impl TeamSessionService {
             }),
             source: None,
             channel_chat_id: None,
-            extra: serde_json::json!({ "teamId": team_id }),
+            extra: serde_json::json!({
+                "teamId": team_id,
+                "backend": req.backend,
+            }),
         };
         let conv = self
             .conversation_service
             .create(user_id, conv_req)
             .await
-            .map_err(|e| {
-                TeamError::InvalidRequest(format!("failed to create conversation: {e}"))
-            })?;
+            .map_err(|e| TeamError::InvalidRequest(format!("failed to create conversation: {e}")))?;
 
         let agent = TeamAgent {
             slot_id,
@@ -285,12 +302,7 @@ impl TeamSessionService {
         Ok(response)
     }
 
-    pub async fn remove_agent(
-        &self,
-        user_id: &str,
-        team_id: &str,
-        slot_id: &str,
-    ) -> Result<(), TeamError> {
+    pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
         let row = self
             .repo
             .get_team(team_id)
@@ -330,12 +342,7 @@ impl TeamSessionService {
         Ok(())
     }
 
-    pub async fn rename_agent(
-        &self,
-        team_id: &str,
-        slot_id: &str,
-        name: &str,
-    ) -> Result<(), TeamError> {
+    pub async fn rename_agent(&self, team_id: &str, slot_id: &str, name: &str) -> Result<(), TeamError> {
         let row = self
             .repo
             .get_team(team_id)
@@ -406,10 +413,7 @@ impl TeamSessionService {
         )
         .await?;
 
-        if let Err(e) = self
-            .rebuild_agent_processes(&session, &user_id, &agents_snapshot)
-            .await
-        {
+        if let Err(e) = self.rebuild_agent_processes(&session, &user_id, &agents_snapshot).await {
             session.stop();
             return Err(e);
         }
@@ -446,25 +450,16 @@ impl TeamSessionService {
                 })?;
 
             self.task_manager
-                .kill(
-                    &agent.conversation_id,
-                    Some(AgentKillReason::TeamMcpRebuild),
-                )
+                .kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
                 .map_err(|e| {
-                    TeamError::InvalidRequest(format!(
-                        "failed to kill agent task {}: {e}",
-                        agent.conversation_id
-                    ))
+                    TeamError::InvalidRequest(format!("failed to kill agent task {}: {e}", agent.conversation_id))
                 })?;
 
             self.conversation_service
                 .warmup(user_id, &agent.conversation_id, &self.task_manager)
                 .await
                 .map_err(|e| {
-                    TeamError::InvalidRequest(format!(
-                        "failed to rebuild agent task {}: {e}",
-                        agent.conversation_id
-                    ))
+                    TeamError::InvalidRequest(format!("failed to rebuild agent task {}: {e}", agent.conversation_id))
                 })?;
         }
         Ok(())
@@ -543,18 +538,11 @@ impl TeamSessionService {
             .sessions
             .get(team_id)
             .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        entry
-            .session
-            .send_message_to_agent(slot_id, content, files)
-            .await
+        entry.session.send_message_to_agent(slot_id, content, files).await
     }
 
     pub fn dispose_all(&self) {
-        let keys: Vec<String> = self
-            .sessions
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
+        let keys: Vec<String> = self.sessions.iter().map(|entry| entry.key().clone()).collect();
         for key in keys {
             self.stop_session(&key);
         }
@@ -562,10 +550,42 @@ impl TeamSessionService {
     }
 }
 
+/// Known ACP vendor labels. Kept in lockstep with the `agent_metadata`
+/// seed in `005_agent_metadata.sql` — a caller hitting an unknown
+/// vendor should trigger a schema drift discussion, not silently fall
+/// through.
+const ACP_VENDOR_LABELS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "qwen",
+    "codebuddy",
+    "droid",
+    "goose",
+    "auggie",
+    "kimi",
+    "opencode",
+    "copilot",
+    "qoder",
+    "vibe",
+    "cursor",
+    "kiro",
+    "hermes",
+    "snow",
+];
+
 fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
+    // Any registered ACP vendor label collapses to `AgentType::Acp`.
+    if ACP_VENDOR_LABELS.contains(&backend) {
+        return Ok(AgentType::Acp);
+    }
+    // Otherwise interpret as a top-level `AgentType` (e.g. "acp",
+    // "nanobot", "aionrs", "remote", "openclaw-gateway").
     let quoted = format!("\"{backend}\"");
-    serde_json::from_str::<AgentType>(&quoted)
-        .map_err(|_| TeamError::InvalidRequest(format!("unsupported backend: {backend}")))
+    if let Ok(t) = serde_json::from_str::<AgentType>(&quoted) {
+        return Ok(t);
+    }
+    Err(TeamError::InvalidRequest(format!("unsupported backend: {backend}")))
 }
 
 #[cfg(test)]
