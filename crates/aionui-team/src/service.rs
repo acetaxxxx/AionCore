@@ -626,6 +626,15 @@ impl TeamSessionService {
         entry.session.scheduler().set_status(slot_id, crate::types::TeammateStatus::Working).await?;
         // Compute wake input while we hold the entry ref
         let input = entry.session.compute_wake_input(slot_id).await;
+
+        // Mirror non-user mailbox rows into the target conversation before
+        // we drop `entry` (the session borrow is still live here). Skipped
+        // for leader wakes inside `mirror_unread_to_conversation`.
+        if let Ok(Some(ref i)) = input
+            && i.should_send
+        {
+            entry.session.mirror_unread_to_conversation(i).await;
+        }
         let task_mgr = self.task_manager.clone();
         drop(entry);
 

@@ -12,7 +12,7 @@ use crate::error::TeamError;
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::SpawnAgentRequest;
-use crate::types::TeammateRole;
+use crate::types::{TeammateRole, TeammateStatus};
 
 use super::protocol::{
     INVALID_PARAMS, INVALID_REQUEST, JsonRpcResponse, METHOD_NOT_FOUND, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION,
@@ -624,11 +624,19 @@ async fn exec_members(scheduler: &TeammateManager) -> Result<String, String> {
     let output: Vec<Value> = agents
         .iter()
         .map(|a| {
+            // `TeamAgent::status` is `None` for cold-start agents that have not
+            // yet transitioned through `set_status` (e.g. the lead before its
+            // first wake). The scheduler already tracks them as `Idle`
+            // internally (see `TeammateManager::new`), and AionUi's
+            // TeammateManager exposes `'idle'` as the initial value. Mirror
+            // that here so MCP clients never see `null` and misread a live
+            // teammate as offline.
+            let status = a.status.unwrap_or(TeammateStatus::Idle);
             json!({
                 "slot_id": a.slot_id,
                 "name": a.name,
                 "role": a.role,
-                "status": a.status,
+                "status": status,
                 "backend": a.backend,
                 "model": a.model,
             })
