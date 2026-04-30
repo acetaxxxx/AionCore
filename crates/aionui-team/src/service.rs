@@ -65,6 +65,26 @@ impl TeamSessionService {
         })
     }
 
+    /// Restore sessions for all existing teams. Called once at app startup
+    /// so that MCP servers are available before any user sends a message.
+    pub async fn restore_all_sessions(&self) {
+        let teams = match self.repo.list_teams().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list teams for session restore");
+                return;
+            }
+        };
+        for team in &teams {
+            if let Err(e) = self.ensure_session(&team.id).await {
+                tracing::warn!(team_id = %team.id, error = %e, "failed to restore session on startup");
+            }
+        }
+        if !teams.is_empty() {
+            tracing::info!(count = teams.len(), "team sessions restored on startup");
+        }
+    }
+
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
         if req.agents.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
