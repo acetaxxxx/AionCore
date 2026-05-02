@@ -40,9 +40,10 @@ pub async fn run_guide_stdio() -> ExitCode {
     };
     let backend = std::env::var("AION_MCP_BACKEND").unwrap_or_default();
     let conversation_id = std::env::var("AION_MCP_CONVERSATION_ID").unwrap_or_default();
+    let user_id = std::env::var("AION_MCP_USER_ID").unwrap_or_default();
 
     eprintln!(
-        "[mcp-guide-stdio] Started OK. PORT={port}, BACKEND={backend}, CONV_ID={conversation_id}"
+        "[mcp-guide-stdio] Started OK. PORT={port}, BACKEND={backend}, CONV_ID={conversation_id}, USER={user_id}"
     );
 
     let server = GuideServer {
@@ -50,6 +51,7 @@ pub async fn run_guide_stdio() -> ExitCode {
         token,
         backend,
         conversation_id,
+        user_id,
         http_client: reqwest::Client::new(),
     };
 
@@ -77,6 +79,7 @@ struct GuideServer {
     token: String,
     backend: String,
     conversation_id: String,
+    user_id: String,
     http_client: reqwest::Client,
 }
 
@@ -131,6 +134,7 @@ impl GuideServer {
             "args": args,
             "backend": self.backend,
             "conversation_id": self.conversation_id,
+            "user_id": self.user_id,
         });
 
         eprintln!("[mcp-guide-stdio] HTTP POST {url}");

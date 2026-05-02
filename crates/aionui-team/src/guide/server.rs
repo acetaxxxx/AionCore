@@ -118,6 +118,15 @@ async fn handle_aion_create_team(
         .unwrap_or("system_default_user")
         .to_owned();
 
+    // When the caller passes its conversation_id, the leader adopts the
+    // existing conversation (single-chat → team conversion). The original
+    // conversation becomes the team leader slot — no duplicate item.
+    let caller_conversation_id = request_body
+        .get("conversation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
     let req = CreateTeamRequest {
         name: params.name.clone(),
         agents: vec![TeamAgentInput {
@@ -126,7 +135,7 @@ async fn handle_aion_create_team(
             backend: backend.clone(),
             model: model.clone(),
             custom_agent_id: None,
-            conversation_id: None,
+            conversation_id: caller_conversation_id,
         }],
     };
 
@@ -180,12 +189,41 @@ async fn accept_loop(
                 let token = auth_token.clone();
                 let svc = service.clone();
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 65536];
-                    let n = match stream.read(&mut buf).await {
-                        Ok(n) if n > 0 => n,
-                        _ => return,
-                    };
-                    let request = String::from_utf8_lossy(&buf[..n]);
+                    // Read the full HTTP request. Large bodies (e.g. aion_create_team
+                    // with a long summary) may arrive across multiple TCP segments.
+                    let mut buf = Vec::with_capacity(65536);
+                    let mut tmp = [0u8; 8192];
+                    loop {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            stream.read(&mut tmp),
+                        ).await {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(n)) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                // Check if we have the full body by parsing Content-Length
+                                let so_far = String::from_utf8_lossy(&buf);
+                                if let Some(header_end) = so_far.find("\r\n\r\n") {
+                                    let headers = &so_far[..header_end];
+                                    let body_start = header_end + 4;
+                                    let content_length = headers
+                                        .lines()
+                                        .find(|l| l.to_lowercase().starts_with("content-length:"))
+                                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
+                                        .and_then(|v| v.parse::<usize>().ok())
+                                        .unwrap_or(0);
+                                    if buf.len() >= body_start + content_length {
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if buf.is_empty() {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buf);
 
                     // Auth: extract Bearer token from Authorization header
                     let provided_token = request
