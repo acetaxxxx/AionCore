@@ -189,40 +189,42 @@ async fn accept_loop(
                 let token = auth_token.clone();
                 let svc = service.clone();
                 tokio::spawn(async move {
-                    // Read the full HTTP request. Large bodies (e.g. aion_create_team
-                    // with a long summary) may arrive across multiple TCP segments.
-                    let mut buf = Vec::with_capacity(65536);
-                    let mut tmp = [0u8; 8192];
-                    loop {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            stream.read(&mut tmp),
-                        ).await {
-                            Ok(Ok(0)) => break,
-                            Ok(Ok(n)) => {
-                                buf.extend_from_slice(&tmp[..n]);
-                                // Check if we have the full body by parsing Content-Length
-                                let so_far = String::from_utf8_lossy(&buf);
-                                if let Some(header_end) = so_far.find("\r\n\r\n") {
-                                    let headers = &so_far[..header_end];
-                                    let body_start = header_end + 4;
-                                    let content_length = headers
-                                        .lines()
-                                        .find(|l| l.to_lowercase().starts_with("content-length:"))
-                                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
-                                        .and_then(|v| v.parse::<usize>().ok())
-                                        .unwrap_or(0);
-                                    if buf.len() >= body_start + content_length {
-                                        break;
-                                    }
+                    // Read the full HTTP request within a 10s deadline.
+                    let deadline = std::time::Duration::from_secs(10);
+                    let read_result = tokio::time::timeout(deadline, async {
+                        let mut buf = Vec::with_capacity(65536);
+                        let mut tmp = [0u8; 65536];
+                        loop {
+                            let n = match stream.read(&mut tmp).await {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            buf.extend_from_slice(&tmp[..n]);
+                            // Check if we have the full body by parsing Content-Length
+                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let body_start = header_end + 4;
+                                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                                let content_length = headers
+                                    .lines()
+                                    .find(|l| l.to_lowercase().starts_with("content-length:"))
+                                    .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
+                                    .and_then(|v| v.parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                if buf.len() >= body_start + content_length {
+                                    break;
                                 }
                             }
-                            _ => break,
                         }
-                    }
-                    if buf.is_empty() {
-                        return;
-                    }
+                        buf
+                    }).await;
+                    let buf = match read_result {
+                        Ok(b) if !b.is_empty() => b,
+                        _ => {
+                            warn!(?peer, "Guide HTTP: read timeout or empty request");
+                            return;
+                        }
+                    };
                     let request = String::from_utf8_lossy(&buf);
 
                     // Auth: extract Bearer token from Authorization header
