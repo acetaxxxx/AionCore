@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// Each agent gets its own conversation; the first agent in a create
 /// request becomes the team lead.
+///
+/// When `conversation_id` is supplied the existing conversation is adopted
+/// rather than creating a new one (single-chat → team-chat handoff).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TeamAgentInput {
     pub name: String,
@@ -17,6 +20,11 @@ pub struct TeamAgentInput {
     pub model: String,
     #[serde(default)]
     pub custom_agent_id: Option<String>,
+    /// Adopt an existing conversation instead of creating a new one.
+    /// When present the conversation's `extra` is updated with `teamId`
+    /// and `backend`; no new conversation row is written.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 /// Request body for `POST /api/teams`.
@@ -273,6 +281,31 @@ mod tests {
         assert_eq!(req.agents[0].custom_agent_id.as_deref(), Some("agent-x"));
         assert_eq!(req.agents[1].name, "Worker");
         assert!(req.agents[1].custom_agent_id.is_none());
+    }
+
+    #[test]
+    fn deserialize_team_agent_input_with_conversation_id() {
+        let raw = json!({
+            "name": "Lead",
+            "role": "lead",
+            "backend": "acp",
+            "model": "claude",
+            "conversation_id": "existing-conv-123"
+        });
+        let input: TeamAgentInput = serde_json::from_value(raw).unwrap();
+        assert_eq!(input.conversation_id.as_deref(), Some("existing-conv-123"));
+    }
+
+    #[test]
+    fn deserialize_team_agent_input_conversation_id_defaults_to_none() {
+        let raw = json!({
+            "name": "Lead",
+            "role": "lead",
+            "backend": "acp",
+            "model": "claude"
+        });
+        let input: TeamAgentInput = serde_json::from_value(raw).unwrap();
+        assert!(input.conversation_id.is_none());
     }
 
     #[test]

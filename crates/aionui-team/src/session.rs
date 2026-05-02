@@ -226,18 +226,27 @@ impl TeamSession {
                 .ok_or_else(|| TeamError::AgentNotFound(format!("no agent with conversation_id={conversation_id}")))?
         };
 
+        // If a wake is actively queued for this agent (send_message is pending
+        // behind session_lock), this Finish belongs to the *previous* turn.
+        // Skip finalize and let the upcoming send_message produce a fresh Finish.
+        if self.scheduler.is_wake_active(&slot_id) {
+            self.scheduler.clear_finalized_turn(conversation_id);
+            return Ok(None);
+        }
+
         if is_error {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
         }
 
         let wake_target = self.scheduler.finalize_turn(&slot_id, &[]).await?;
 
-        // Clear the dedup window once finalize succeeded — the next legitimate
-        // finish event (after the re-woken agent completes) must be allowed
-        // through.
-        if wake_target.is_some() {
-            self.scheduler.clear_finalized_turn(conversation_id);
-        }
+        // Clear the dedup window unconditionally once finalize has run.
+        // Without this, an agent that completes two consecutive turns within
+        // the 5-second dedup window would have its second Finish silently
+        // dropped (begin_finalize returns false the second time).
+        // Clearing here ensures every completed turn re-opens the window for
+        // the next one, regardless of whether a wake target was produced.
+        self.scheduler.clear_finalized_turn(conversation_id);
 
         Ok(wake_target)
     }
@@ -586,6 +595,13 @@ impl TeamSession {
                 "failed to attach spawned agent process; agent is persisted but not yet running"
             );
         }
+
+        // Step 6b: register a finish subscriber for the newly spawned agent so
+        // its Finish/Error events are forwarded to on_agent_finish — the same
+        // wiring that ensure_session sets up for initial members. Without this,
+        // the spawned agent's completion is never forwarded to the scheduler and
+        // the leader is never woken after the teammate finishes.
+        service.register_finish_subscriber(&self.team.id, &new_agent.conversation_id);
 
         // Step 7: welcome message. The mailbox write is the source of truth —
         // if the wake never fires (e.g. warmup raced), the next caller-triggered
