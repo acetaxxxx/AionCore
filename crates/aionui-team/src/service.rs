@@ -102,33 +102,50 @@ impl TeamSessionService {
                 TeammateRole::parse(&input.role).unwrap_or(TeammateRole::Teammate)
             };
 
-            let agent_type = parse_agent_type(&input.backend)?;
-            let conv_req = CreateConversationRequest {
-                r#type: agent_type,
-                name: Some(input.name.clone()),
-                model: Some(ProviderWithModel {
-                    provider_id: input.backend.clone(),
-                    model: input.model.clone(),
-                    use_model: None,
-                }),
-                source: None,
-                channel_chat_id: None,
-                extra: serde_json::json!({
-                    "teamId": team_id,
-                    "backend": input.backend,
-                }),
+            // Resolve the conversation_id: adopt an existing conversation when
+            // the caller supplies one (single-chat → team-chat handoff), or
+            // create a new one otherwise.
+            let conv_id = if let Some(ref existing_id) = input.conversation_id {
+                // Adopt the existing conversation by updating its extra with
+                // teamId and backend so the agent is wired into this team.
+                self.conversation_service
+                    .update_extra(
+                        existing_id,
+                        serde_json::json!({"teamId": team_id, "backend": input.backend}),
+                    )
+                    .await
+                    .map_err(|e| TeamError::InvalidRequest(format!("failed to adopt conversation: {e}")))?;
+                existing_id.clone()
+            } else {
+                let agent_type = parse_agent_type(&input.backend)?;
+                let conv_req = CreateConversationRequest {
+                    r#type: agent_type,
+                    name: Some(input.name.clone()),
+                    model: Some(ProviderWithModel {
+                        provider_id: input.backend.clone(),
+                        model: input.model.clone(),
+                        use_model: None,
+                    }),
+                    source: None,
+                    channel_chat_id: None,
+                    extra: serde_json::json!({
+                        "teamId": team_id,
+                        "backend": input.backend,
+                    }),
+                };
+                let conv = self
+                    .conversation_service
+                    .create(user_id, conv_req)
+                    .await
+                    .map_err(|e| TeamError::InvalidRequest(format!("failed to create conversation: {e}")))?;
+                conv.id
             };
-            let conv = self
-                .conversation_service
-                .create(user_id, conv_req)
-                .await
-                .map_err(|e| TeamError::InvalidRequest(format!("failed to create conversation: {e}")))?;
 
             agents.push(TeamAgent {
                 slot_id,
                 name: input.name.clone(),
                 role,
-                conversation_id: conv.id,
+                conversation_id: conv_id,
                 backend: input.backend.clone(),
                 model: input.model.clone(),
                 custom_agent_id: input.custom_agent_id.clone(),
@@ -595,6 +612,65 @@ impl TeamSessionService {
         handles
     }
 
+    /// Register a finish subscriber for a dynamically spawned agent.
+    ///
+    /// Called by [`TeamSession::spawn_agent`] after `attach_spawned_agent_process`
+    /// succeeds so that the newly booted agent's `Finish` / `Error` stream events
+    /// are forwarded to `session.on_agent_finish` — exactly as `spawn_finish_subscribers`
+    /// does for the initial members during `ensure_session`.
+    ///
+    /// If the agent task is not yet available in `task_manager` (rare race where
+    /// warmup hasn't propagated), the subscription is silently skipped and a
+    /// warning is emitted. The agent is already persisted and the welcome message
+    /// already in the mailbox; the next user-triggered wake will still fire.
+    pub(crate) fn register_finish_subscriber(&self, team_id: &str, conversation_id: &str) {
+        use aionui_ai_agent::AgentStreamEvent;
+
+        let Some(task) = self.task_manager.get_task(conversation_id) else {
+            warn!(
+                team_id,
+                conversation_id,
+                "register_finish_subscriber: no agent task found, skipping finish subscription for spawned agent"
+            );
+            return;
+        };
+
+        let mut rx = task.subscribe();
+        let conv_id = conversation_id.to_owned();
+        let team_id_owned = team_id.to_owned();
+        let sessions = self.sessions.clone();
+
+        let handle = tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                let is_error = matches!(event, AgentStreamEvent::Error(_));
+                if !is_error && !matches!(event, AgentStreamEvent::Finish(_)) {
+                    continue;
+                }
+                let Some(entry) = sessions.get(&team_id_owned) else {
+                    break;
+                };
+                match entry.session.on_agent_finish(&conv_id, is_error).await {
+                    Ok(Some(wake_target)) => {
+                        entry.session.try_wake(&wake_target, None).await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(conversation_id = %conv_id, error = %e, "on_agent_finish failed (spawned agent)");
+                    }
+                }
+            }
+        });
+
+        // Append the handle to the session entry's finish_subscribers so
+        // stop_session aborts it cleanly.
+        if let Some(mut entry) = self.sessions.get_mut(team_id) {
+            entry.finish_subscribers.push(handle);
+        } else {
+            // Session was stopped between spawn and here; abort immediately.
+            handle.abort();
+        }
+    }
+
     pub fn stop_session(&self, team_id: &str) {
         if let Some((_, entry)) = self.sessions.remove(team_id) {
             for handle in &entry.finish_subscribers {
@@ -638,6 +714,14 @@ impl TeamSessionService {
             .sessions
             .get(team_id)
             .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+
+        // Acquire an exclusive wake lock before proceeding. If another wake is
+        // already in-flight for this slot, skip — the queued wake will produce
+        // its own Finish event when it completes (Bug 3: race with finish_subscriber).
+        if !entry.session.scheduler().acquire_wake_lock(slot_id) {
+            return Ok(());
+        }
+
         entry.session.scheduler().set_status(slot_id, crate::types::TeammateStatus::Working).await?;
         let input = entry.session.compute_wake_input(slot_id).await;
 
@@ -648,11 +732,16 @@ impl TeamSessionService {
         }
 
         let user_id = entry.session.user_id().to_owned();
+        let scheduler = entry.session.scheduler().clone();
         drop(entry);
 
         let conv_id = match &input {
             Ok(Some(i)) if i.should_send => i.conversation_id.clone(),
-            _ => return Ok(()),
+            _ => {
+                // No message to send — release the wake lock immediately.
+                scheduler.release_wake_lock(slot_id);
+                return Ok(());
+            }
         };
 
         // Ensure the agent task exists (mirrors AionUi's getOrBuildTask).
@@ -663,24 +752,37 @@ impl TeamSessionService {
                 .await
             {
                 warn!(team_id, slot_id, conversation_id = %conv_id, error = %e, "warmup in wake failed");
+                scheduler.release_wake_lock(slot_id);
                 return Ok(());
             }
         }
 
         let task_mgr = self.task_manager.clone();
+        let slot_id_owned = slot_id.to_owned();
         tokio::spawn(async move {
             let input = match input {
                 Ok(Some(i)) if i.should_send => i,
-                _ => return,
+                _ => {
+                    scheduler.release_wake_lock(&slot_id_owned);
+                    return;
+                }
             };
-            let Some(handle) = task_mgr.get_task(&input.conversation_id) else { return };
+            let Some(handle) = task_mgr.get_task(&input.conversation_id) else {
+                scheduler.release_wake_lock(&slot_id_owned);
+                return;
+            };
             let data = aionui_ai_agent::SendMessageData {
                 content: input.first_message,
                 msg_id: aionui_common::generate_id(),
                 files: Vec::new(),
                 inject_skills: Vec::new(),
             };
+            // Release the wake lock after send_message returns (success or
+            // failure). The ACP session processes this message next; the
+            // subsequent Finish event will then be allowed through
+            // on_agent_finish.
             let _ = handle.send_message(data).await;
+            scheduler.release_wake_lock(&slot_id_owned);
         });
         Ok(())
     }

@@ -110,6 +110,14 @@ async fn handle_aion_create_team(
         .unwrap_or("")
         .to_owned();
 
+    // Prefer the caller-supplied user_id; fall back to a sentinel only when
+    // the guide server is invoked without an authenticated context (e.g. tests).
+    let user_id = request_body
+        .get("user_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("system_default_user")
+        .to_owned();
+
     let req = CreateTeamRequest {
         name: params.name.clone(),
         agents: vec![TeamAgentInput {
@@ -118,12 +126,11 @@ async fn handle_aion_create_team(
             backend: backend.clone(),
             model: model.clone(),
             custom_agent_id: None,
+            conversation_id: None,
         }],
     };
 
-    let user_id = "system_default_user";
-
-    let team = match svc.create_team(user_id, req).await {
+    let team = match svc.create_team(&user_id, req).await {
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, "Guide HTTP: aion_create_team create_team failed");

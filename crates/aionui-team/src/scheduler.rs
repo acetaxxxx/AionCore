@@ -561,6 +561,13 @@ impl TeammateManager {
         self.active_wakes.remove(slot_id);
     }
 
+    /// Returns `true` when a wake is currently in-flight for `slot_id`
+    /// (i.e., [`Self::acquire_wake_lock`] was called but
+    /// [`Self::release_wake_lock`] has not yet been called).
+    pub fn is_wake_active(&self, slot_id: &str) -> bool {
+        self.active_wakes.contains(slot_id)
+    }
+
     /// Cancel and remove the wake timeout task for a slot.
     pub fn clear_wake_timeout(&self, slot_id: &str) {
         if let Some((_, handle)) = self.wake_timeouts.remove(slot_id) {
