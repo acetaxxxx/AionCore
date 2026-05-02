@@ -347,21 +347,20 @@ impl TeamSession {
             h
         } else {
             // Task missing — warmup to create it (mirrors AionUi's getOrBuildTask).
-            if let Some(svc) = self.service.upgrade() {
-                if let Err(e) = svc
+            if let Some(svc) = self.service.upgrade()
+                && let Err(e) = svc
                     .conversation_service_ref()
                     .warmup(&self.user_id, &input.conversation_id, &self.task_manager)
                     .await
-                {
-                    warn!(
-                        team_id = %self.team.id,
-                        slot_id,
-                        conversation_id = %input.conversation_id,
-                        error = %e,
-                        "warmup in try_wake failed; skipping wake"
-                    );
-                    return;
-                }
+            {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %input.conversation_id,
+                    error = %e,
+                    "warmup in try_wake failed; skipping wake"
+                );
+                return;
             }
             let Some(h) = self.task_manager.get_task(&input.conversation_id) else {
                 warn!(
@@ -584,26 +583,7 @@ impl TeamSession {
         // the new slot immediately.
         self.scheduler.add_agent(&new_agent).await;
 
-        // Step 6: push the team MCP stdio config into the new conversation's
-        // extras, then kill + rebuild the agent task so the freshly spawned
-        // process boots with the MCP handshake pointing at our session.
-        if let Err(err) = self.attach_spawned_agent_process(&service, &new_agent).await {
-            warn!(
-                team_id = %self.team.id,
-                slot_id = %new_agent.slot_id,
-                error = %err,
-                "failed to attach spawned agent process; agent is persisted but not yet running"
-            );
-        }
-
-        // Step 6b: register a finish subscriber for the newly spawned agent so
-        // its Finish/Error events are forwarded to on_agent_finish — the same
-        // wiring that ensure_session sets up for initial members. Without this,
-        // the spawned agent's completion is never forwarded to the scheduler and
-        // the leader is never woken after the teammate finishes.
-        service.register_finish_subscriber(&self.team.id, &new_agent.conversation_id);
-
-        // Step 7: welcome message. The mailbox write is the source of truth —
+        // Step 6: welcome message. The mailbox write is the source of truth —
         // if the wake never fires (e.g. warmup raced), the next caller-triggered
         // wake will still drain this entry.
         self.mailbox
@@ -617,18 +597,63 @@ impl TeamSession {
             )
             .await?;
 
+        // Step 7: attach the CLI process and register the finish subscriber
+        // in a background task. This involves spawning the CLI process and
+        // completing the ACP protocol handshake, which can take significant
+        // time (10-30s). Running it asynchronously ensures `spawn_agent`
+        // returns promptly so the MCP tool call completes without blocking
+        // the leader's connection loop.
+        {
+            let team_id = self.team.id.clone();
+            let user_id = self.user_id.clone();
+            let agent_clone = new_agent.clone();
+            let mcp_stdio_cfg = self.mcp_stdio_config(&new_agent.slot_id);
+            let task_manager = self.task_manager.clone();
+            tokio::spawn(async move {
+                // Push the team MCP stdio config into the new conversation's
+                // extras, then kill + rebuild the agent task so the freshly
+                // spawned process boots with the MCP handshake pointing at
+                // our session.
+                if let Err(err) = Self::attach_spawned_agent_process_bg(
+                    &service,
+                    &agent_clone,
+                    mcp_stdio_cfg,
+                    &user_id,
+                    &task_manager,
+                )
+                .await
+                {
+                    warn!(
+                        team_id = %team_id,
+                        slot_id = %agent_clone.slot_id,
+                        error = %err,
+                        "failed to attach spawned agent process; agent is persisted but not yet running"
+                    );
+                }
+
+                // Register a finish subscriber for the newly spawned agent so
+                // its Finish/Error events are forwarded to on_agent_finish —
+                // the same wiring that ensure_session sets up for initial members.
+                service.register_finish_subscriber(&team_id, &agent_clone.conversation_id);
+            });
+        }
+
         Ok(new_agent)
     }
 
     /// Persist the team MCP stdio config into the spawned agent's conversation
     /// row, then kill any pre-existing task and warm up the new one.
-    async fn attach_spawned_agent_process(
-        &self,
+    ///
+    /// This is a static helper suitable for use inside `tokio::spawn` (no
+    /// `&self` borrow). The caller passes all necessary context by value.
+    async fn attach_spawned_agent_process_bg(
         service: &TeamSessionService,
         agent: &TeamAgent,
+        mcp_stdio_cfg: crate::mcp::TeamMcpStdioConfig,
+        user_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError> {
-        let cfg = self.mcp_stdio_config(&agent.slot_id);
-        let patch = serde_json::json!({ "team_mcp_stdio_config": cfg });
+        let patch = serde_json::json!({ "team_mcp_stdio_config": mcp_stdio_cfg });
 
         service
             .conversation_service_ref()
@@ -641,13 +666,11 @@ impl TeamSession {
                 ))
             })?;
 
-        let _ = self
-            .task_manager
-            .kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild));
+        let _ = task_manager.kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild));
 
         service
             .conversation_service_ref()
-            .warmup(&self.user_id, &agent.conversation_id, &self.task_manager)
+            .warmup(user_id, &agent.conversation_id, task_manager)
             .await
             .map_err(|e| {
                 TeamError::InvalidRequest(format!(
