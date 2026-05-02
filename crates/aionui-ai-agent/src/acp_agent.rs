@@ -183,7 +183,7 @@ const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs"];
 /// type, port/token resolution) lands with D26a/D27, after which the
 /// `// TODO(D26a)` branch here will push an `McpServer::Http` onto
 /// `mcp_servers` instead of falling through.
-fn build_new_session_request(workspace: &str, config: &AcpBuildExtra) -> NewSessionRequest {
+fn build_new_session_request(workspace: &str, config: &AcpBuildExtra, conversation_id: &str) -> NewSessionRequest {
     let req = NewSessionRequest::new(workspace);
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         return req.mcp_servers(vec![team_mcp_server(cfg)]);
@@ -192,7 +192,7 @@ fn build_new_session_request(workspace: &str, config: &AcpBuildExtra) -> NewSess
     if let Some(guide_cfg) = config.guide_mcp_config.as_ref()
         && config.backend.as_deref().map_or(false, |b| TEAM_CAPABLE_BACKENDS.contains(&b))
     {
-        return req.mcp_servers(vec![guide_mcp_server(guide_cfg, config)]);
+        return req.mcp_servers(vec![guide_mcp_server(guide_cfg, config, conversation_id)]);
     }
     req
 }
@@ -218,13 +218,21 @@ fn team_mcp_server(cfg: &TeamMcpStdioConfig) -> McpServer {
 }
 
 /// Build a stdio `McpServer` for the Guide MCP server in solo team-capable sessions.
-fn guide_mcp_server(cfg: &GuideMcpConfig, extra: &AcpBuildExtra) -> McpServer {
+fn guide_mcp_server(cfg: &GuideMcpConfig, extra: &AcpBuildExtra, conversation_id: &str) -> McpServer {
     let env = vec![
         EnvVariable::new("AION_MCP_PORT".to_owned(), cfg.port.to_string()),
         EnvVariable::new("AION_MCP_TOKEN".to_owned(), cfg.token.clone()),
         EnvVariable::new(
             "AION_MCP_BACKEND".to_owned(),
             extra.backend.clone().unwrap_or_default(),
+        ),
+        EnvVariable::new(
+            "AION_MCP_CONVERSATION_ID".to_owned(),
+            conversation_id.to_owned(),
+        ),
+        EnvVariable::new(
+            "AION_MCP_USER_ID".to_owned(),
+            extra.user_id.clone().unwrap_or_default(),
         ),
     ];
     let stdio = McpServerStdio::new("aionui-team-guide", &cfg.binary_path)
@@ -652,6 +660,14 @@ impl AcpAgentManager {
 
                 let call_id = perm_req.request.tool_call.tool_call_id.to_string();
 
+                // Auto-approve team MCP tools without user interaction.
+                if Self::is_auto_approve_tool(&perm_req.request) {
+                    let _ = perm_req.response_tx.send(PermissionDecision::Selected {
+                        option_id: "allow_always".into(),
+                    });
+                    continue;
+                }
+
                 let mut pending = this.pending_permissions.lock().unwrap();
                 if let Some(previous) = pending.insert(call_id.clone(), perm_req.response_tx) {
                     let _ = previous.send(PermissionDecision::Cancelled);
@@ -670,6 +686,17 @@ impl AcpAgentManager {
                 }
             }
         });
+    }
+
+    /// MCP tool prefixes that are auto-approved without user permission.
+    const AUTO_APPROVE_PREFIXES: &[&str] = &[
+        "mcp__aionui-team-",
+        "mcp__aionui-team-guide__",
+    ];
+
+    fn is_auto_approve_tool(request: &agent_client_protocol::schema::RequestPermissionRequest) -> bool {
+        let title = request.tool_call.fields.title.as_deref().unwrap_or("");
+        Self::AUTO_APPROVE_PREFIXES.iter().any(|prefix| title.starts_with(prefix))
     }
 
     /// Start the runtime snapshot tracker loop.
@@ -759,7 +786,7 @@ impl AcpAgentManager {
             .event_tx
             .send(AgentStreamEvent::Start(StartEventData { session_id: None }));
 
-        let req = build_new_session_request(&self.workspace, &self.config);
+        let req = build_new_session_request(&self.workspace, &self.config, &self.conversation_id);
         tracing::info!(
             has_team_mcp = self.config.team_mcp_stdio_config.is_some(),
             has_guide_mcp = self.config.guide_mcp_config.is_some(),
@@ -881,7 +908,7 @@ impl AcpAgentManager {
                 claude_code.insert("options".into(), Value::Object(options));
                 meta.insert("claudeCode".into(), Value::Object(claude_code));
 
-                let req = build_new_session_request(&self.workspace, &self.config).meta(meta);
+                let req = build_new_session_request(&self.workspace, &self.config, &self.conversation_id).meta(meta);
 
                 info!(
                     session_id = %sid,
@@ -1520,7 +1547,7 @@ mod tests {
         // `team_mcp_stdio_config` and Guide injection is still pending
         // D26a, so `mcp_servers` remains empty (matches the legacy
         // single-chat payload byte-for-byte).
-        let req = build_new_session_request("/workspace", &build_extra_without_team());
+        let req = build_new_session_request("/workspace", &build_extra_without_team(), "conv-test");
         assert!(
             req.mcp_servers.is_empty(),
             "solo chat must not inject any MCP servers, got {:?}",
@@ -1535,7 +1562,7 @@ mod tests {
         // load-bearing when the D26a follow-up starts pushing
         // `McpServer::Http` onto the list.
         let extra: AcpBuildExtra = serde_json::from_value(json!({ "backend": "custom" })).unwrap();
-        let req = build_new_session_request("/workspace", &extra);
+        let req = build_new_session_request("/workspace", &extra, "conv-test");
         assert!(
             req.mcp_servers.is_empty(),
             "non-capable backend must not inject Guide MCP, got {:?}",
@@ -1548,7 +1575,7 @@ mod tests {
         // Defensive: `extra.backend` is optional and historically may be
         // absent on legacy conversations. Guard must handle `None`.
         let extra: AcpBuildExtra = serde_json::from_value(json!({})).unwrap();
-        let req = build_new_session_request("/workspace", &extra);
+        let req = build_new_session_request("/workspace", &extra, "conv-test");
         assert!(
             req.mcp_servers.is_empty(),
             "missing backend must not inject Guide MCP, got {:?}",
@@ -1563,7 +1590,7 @@ mod tests {
         // Today this reduces to "team path still yields exactly one
         // server" — the assertion will tighten when the Guide branch
         // starts pushing servers.
-        let req = build_new_session_request("/workspace", &build_extra_with_team());
+        let req = build_new_session_request("/workspace", &build_extra_with_team(), "conv-test");
         assert_eq!(
             req.mcp_servers.len(),
             1,
@@ -1580,7 +1607,7 @@ mod tests {
     /// `McpServer::Stdio` fails loud.
     #[test]
     fn build_new_session_request_injects_team_http_server() {
-        let req = build_new_session_request("/workspace", &build_extra_with_team());
+        let req = build_new_session_request("/workspace", &build_extra_with_team(), "conv-test");
         assert_eq!(req.mcp_servers.len(), 1, "exactly one team MCP server");
 
         let server = req.mcp_servers.into_iter().next().unwrap();

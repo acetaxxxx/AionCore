@@ -328,6 +328,7 @@ impl TeamStdioServer {
         // initialize with auth
         let init_frame = serde_json::json!({
             "jsonrpc": "2.0",
+            "id": 1,
             "method": "initialize",
             "params": {
                 "auth_token": self.token,
@@ -344,6 +345,7 @@ impl TeamStdioServer {
         // tools/call
         let call_frame = serde_json::json!({
             "jsonrpc": "2.0",
+            "id": 2,
             "method": "tools/call",
             "params": {
                 "name": tool_name,

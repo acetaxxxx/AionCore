@@ -84,6 +84,10 @@ pub struct AcpBuildExtra {
     /// `build_new_session_request` injects the Guide as a stdio MCP server.
     #[serde(default)]
     pub guide_mcp_config: Option<GuideMcpConfig>,
+    /// Owner user_id — passed to the Guide MCP bridge so `aion_create_team`
+    /// can associate the new team with the correct user.
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// OpenClaw gateway configuration.
