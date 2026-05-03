@@ -567,8 +567,13 @@ impl TeamSessionService {
         };
         self.sessions.insert(team_id.to_owned(), entry);
 
+        let active_count = if skip_leader {
+            agents_snapshot.iter().filter(|a| a.role != TeammateRole::Lead).count()
+        } else {
+            agents_snapshot.len()
+        };
         self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionReady, None, |p| {
-            p.server_count = Some(agents_snapshot.len());
+            p.server_count = Some(active_count);
         });
 
         Ok(())
