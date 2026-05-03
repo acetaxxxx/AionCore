@@ -205,7 +205,7 @@ impl TeamSessionService {
         // Auto-start session so MCP is injected immediately after team creation.
         // Failure only logs — the team is persisted and frontend can retry
         // via POST /api/teams/{id}/session if needed.
-        if let Err(e) = self.ensure_session(&team.id).await {
+        if let Err(e) = self.ensure_session_inner(&team.id, true).await {
             warn!(team_id = %team.id, error = %e, "auto ensure_session after create_team failed");
         }
 
@@ -455,6 +455,10 @@ impl TeamSessionService {
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
     pub async fn ensure_session(&self, team_id: &str) -> Result<(), TeamError> {
+        self.ensure_session_inner(team_id, false).await
+    }
+
+    async fn ensure_session_inner(&self, team_id: &str, skip_leader: bool) -> Result<(), TeamError> {
         if self.sessions.contains_key(team_id) {
             return Ok(());
         }
@@ -513,7 +517,7 @@ impl TeamSessionService {
         self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionInjecting, None, |_| {});
 
         if let Err(e) = self
-            .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot)
+            .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot, skip_leader)
             .await
         {
             session.stop();
@@ -561,8 +565,12 @@ impl TeamSessionService {
         session: &TeamSession,
         user_id: &str,
         agents: &[TeamAgent],
+        skip_leader: bool,
     ) -> Result<(), TeamError> {
         for agent in agents {
+            if skip_leader && agent.role == TeammateRole::Lead {
+                continue;
+            }
             let cfg = session.mcp_stdio_config(&agent.slot_id);
             let patch = serde_json::json!({
                 "team_mcp_stdio_config": cfg,
