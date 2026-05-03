@@ -530,7 +530,9 @@ async fn exec_send_message(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Wake target agent(s) so they process the new mailbox message.
+    // Wake target agent(s) only if they are currently Idle.
+    // If Working, the message stays in the mailbox and will be drained
+    // when the current turn finishes (on_agent_finish re-wake pattern).
     if let Some(svc) = service.upgrade() {
         let targets = if resolved_to == "*" {
             scheduler
@@ -544,6 +546,11 @@ async fn exec_send_message(
             vec![resolved_to.clone()]
         };
         for target in &targets {
+            let status = scheduler.get_status(target).await.unwrap_or(TeammateStatus::Idle);
+            if status != TeammateStatus::Idle {
+                debug!(team_id, target = target.as_str(), %status, "skip wake: target not idle, message queued in mailbox");
+                continue;
+            }
             if let Err(e) = svc.wake_agent_in_session(team_id, target).await {
                 debug!(team_id, target = target.as_str(), error = %e, "wake after send_message failed (non-fatal)");
             }

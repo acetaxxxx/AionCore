@@ -165,6 +165,38 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
+    async fn peek_unread(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let rows = sqlx::query_as::<_, MailboxMessageRow>(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at \
+             FROM mailbox \
+             WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
+             ORDER BY created_at ASC",
+        )
+        .bind(team_id)
+        .bind(to_agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn mark_read_batch(&self, ids: &[String]) -> Result<(), DbError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // SQLite placeholder limit is 999; batch if needed.
+        for chunk in ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("UPDATE mailbox SET read = 1 WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query.execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
     async fn get_history(
         &self,
         team_id: &str,

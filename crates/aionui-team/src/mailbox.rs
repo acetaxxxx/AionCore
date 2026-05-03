@@ -62,6 +62,21 @@ impl Mailbox {
         Ok(messages)
     }
 
+    /// Reads all unread messages without marking them as read.
+    /// Used by the drain_mailbox pattern: peek → prompt → mark_read on success.
+    pub async fn peek_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
+        let rows = self.repo.peek_unread(team_id, agent_id).await?;
+        debug!(team_id, agent_id, count = rows.len(), "mailbox peek_unread");
+        let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
+        Ok(messages)
+    }
+
+    /// Marks the given message IDs as read. Called after successful prompt delivery.
+    pub async fn mark_read_batch(&self, ids: &[String]) -> Result<(), TeamError> {
+        self.repo.mark_read_batch(ids).await?;
+        Ok(())
+    }
+
     pub async fn get_history(
         &self,
         team_id: &str,
