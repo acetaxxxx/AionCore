@@ -555,6 +555,7 @@ fn setup_with_factory(factory: AgentFactory) -> (Arc<TeamSessionService>, Arc<Co
         broadcaster,
         task_manager_dyn,
         backend_binary_path,
+        None,
     );
     (svc, task_manager)
 }
@@ -580,7 +581,7 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
     );
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aionui-backend-test"));
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
-    let svc = TeamSessionService::new(team_repo, conv_service, broadcaster, task_manager, backend_binary_path);
+    let svc = TeamSessionService::new(team_repo, conv_service, broadcaster, task_manager, backend_binary_path, None);
     (svc, recorder)
 }
 

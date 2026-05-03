@@ -99,7 +99,7 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         hub: hub_state,
         skill: skill_state,
         channel: channel_state,
-        team: build_team_state(services, Some(cron.cron_service.clone()), backend_binary_path.clone()),
+        team: build_team_state(services, Some(cron.cron_service.clone()), backend_binary_path.clone(), services.guide_mcp_config.clone()),
         cron,
         office: build_office_state(services),
         shell: build_shell_state(services),
@@ -366,6 +366,7 @@ pub fn build_team_state(
     services: &AppServices,
     cron_service: Option<Arc<aionui_cron::service::CronService>>,
     backend_binary_path: Arc<std::path::PathBuf>,
+    guide_mcp_config: Option<aionui_api_types::GuideMcpConfig>,
 ) -> TeamRouterState {
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
@@ -394,6 +395,7 @@ pub fn build_team_state(
         services.event_bus.clone(),
         services.worker_task_manager.clone(),
         backend_binary_path,
+        guide_mcp_config,
     );
     TeamRouterState { service }
 }
