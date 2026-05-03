@@ -27,10 +27,11 @@ pub struct WakeInput {
     /// `false` when the mailbox is empty — caller should skip wake and
     /// leave the agent idle.
     pub should_send: bool,
-    /// Unread mailbox rows consumed to build `first_message`. Returned so the
+    /// Unread mailbox rows used to build `first_message`. Returned so the
     /// caller can mirror non-user senders into the target agent's conversation
-    /// as left bubbles (matches AionUi `TeammateManager.wake()`). Drained
-    /// already — no additional `read_unread` call is safe.
+    /// as left bubbles (matches AionUi `TeammateManager.wake()`). These are
+    /// **not** yet marked as read — the caller must call
+    /// `mailbox.mark_read_batch` after successful delivery.
     pub unread: Vec<crate::types::MailboxMessage>,
     /// Role of the wake target. Leader wakes do **not** mirror mailbox rows
     /// into the conversation — the content is already embedded in the role
@@ -185,11 +186,15 @@ impl TeamSession {
     ///   receive the full role prompt prepended to the wake payload.
     /// - When the mailbox is empty, returns `WakeInput { should_send: false, .. }`
     ///   so the caller can skip the wake and mark the agent idle.
+    /// - Filters out messages where `from_agent_id == slot_id` (prevent self-trigger).
     ///
-    /// Side effect: `mailbox.read_unread` marks the messages as read.
+    /// Messages are **not** marked as read here. The caller is responsible for
+    /// calling `mailbox.mark_read_batch` after successful delivery.
     pub async fn compute_wake_input(&self, slot_id: &str) -> Result<Option<WakeInput>, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
-        let unread = self.mailbox.read_unread(&self.team.id, slot_id).await?;
+        let all_unread = self.mailbox.peek_unread(&self.team.id, slot_id).await?;
+        // Filter out self-messages to prevent an agent from triggering itself.
+        let unread: Vec<_> = all_unread.into_iter().filter(|m| m.from_agent_id != slot_id).collect();
         let tasks = self.scheduler.list_tasks().await?;
 
         let wake_body = build_wake_payload(&agent, &tasks, &unread);
@@ -506,6 +511,22 @@ impl TeamSession {
                 error = %err,
                 "agent.send_message failed; mailbox retained, wake will be retried on next trigger"
             );
+            // Messages stay unread — next wake attempt will pick them up.
+            self.scheduler.release_wake_lock(slot_id);
+            return;
+        }
+
+        // Prompt succeeded — mark the messages as read so they are not re-delivered.
+        let msg_ids: Vec<String> = input.unread.iter().map(|m| m.id.clone()).collect();
+        if !msg_ids.is_empty()
+            && let Err(e) = self.mailbox.mark_read_batch(&msg_ids).await
+        {
+            warn!(
+                team_id = %self.team.id,
+                slot_id,
+                error = %e,
+                "mark_read_batch failed after successful send (non-fatal)"
+            );
         }
 
         self.scheduler.release_wake_lock(slot_id);
@@ -583,7 +604,7 @@ impl TeamSession {
                     conversation_id = %input.conversation_id,
                     from = %msg.from_agent_id,
                     error = %err,
-                    "mirror_unread_to_conversation: insert_raw_message failed (mailbox already read)"
+                    "mirror_unread_to_conversation: insert_raw_message failed (non-fatal)"
                 );
                 continue;
             }
@@ -756,12 +777,27 @@ impl TeamSession {
                         error = %err,
                         "failed to attach spawned agent process; agent is persisted but not yet running"
                     );
+                    // Still register the finish subscriber so future manual
+                    // wakes work if/when the process eventually comes up.
+                    service.register_finish_subscriber(&team_id, &agent_clone.conversation_id);
+                    return;
                 }
 
                 // Register a finish subscriber for the newly spawned agent so
                 // its Finish/Error events are forwarded to on_agent_finish —
                 // the same wiring that ensure_session sets up for initial members.
                 service.register_finish_subscriber(&team_id, &agent_clone.conversation_id);
+
+                // Process startup complete — trigger a wake for the new agent
+                // so any messages that arrived during warmup are delivered.
+                if let Err(e) = service.wake_agent_in_session(&team_id, &agent_clone.slot_id).await {
+                    warn!(
+                        team_id = %team_id,
+                        slot_id = %agent_clone.slot_id,
+                        error = %e,
+                        "wake after spawn process ready failed (non-fatal; mailbox retained)"
+                    );
+                }
             });
         }
 

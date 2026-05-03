@@ -243,6 +243,16 @@ impl ITeamRepository for FullMockTeamRepo {
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
         self.inner.read_unread_and_mark(team_id, to_agent_id).await
     }
+    async fn peek_unread(
+        &self,
+        team_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner.peek_unread(team_id, to_agent_id).await
+    }
+    async fn mark_read_batch(&self, ids: &[String]) -> Result<(), DbError> {
+        self.inner.mark_read_batch(ids).await
+    }
     async fn get_history(
         &self,
         team_id: &str,

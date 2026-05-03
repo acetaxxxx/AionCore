@@ -887,7 +887,22 @@ impl TeamSessionService {
             );
             tokio::spawn(async move { relay.consume(rx).await });
 
-            let _ = handle.send_message(data).await;
+            // Collect message IDs before sending (input will be consumed).
+            let msg_ids: Vec<String> = input.unread.iter().map(|m| m.id.clone()).collect();
+
+            let send_result = handle.send_message(data).await;
+
+            if send_result.is_ok() && !msg_ids.is_empty()
+                && let Some(entry) = sessions.get(&team_id_owned)
+                && let Err(e) = entry.session.mailbox().mark_read_batch(&msg_ids).await
+            {
+                warn!(
+                    slot_id = %slot_id_owned,
+                    error = %e,
+                    "mark_read_batch failed after successful send in wake_agent_in_session (non-fatal)"
+                );
+            }
+
             scheduler.release_wake_lock(&slot_id_owned);
 
             // The Finish event was emitted inside send_message (before it
