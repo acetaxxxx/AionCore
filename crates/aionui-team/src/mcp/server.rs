@@ -703,10 +703,10 @@ async fn exec_shutdown_agent(
         .map_err(|e| e.to_string())?;
 
     // Wake the target agent so it reads the shutdown_request from its mailbox.
-    if let Some(svc) = service.upgrade() {
-        if let Err(e) = svc.wake_agent_in_session(team_id, &target_slot_id).await {
-            debug!(team_id, target = %target_slot_id, error = %e, "wake after shutdown_request failed (non-fatal)");
-        }
+    if let Some(svc) = service.upgrade()
+        && let Err(e) = svc.wake_agent_in_session(team_id, &target_slot_id).await
+    {
+        debug!(team_id, target = %target_slot_id, error = %e, "wake after shutdown_request failed (non-fatal)");
     }
 
     Ok(format!("Shutdown request sent to agent '{}'", target_slot_id))
