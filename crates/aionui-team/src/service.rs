@@ -719,6 +719,10 @@ impl TeamSessionService {
         self.sessions.get(team_id).map(|e| e.session.user_id().to_owned())
     }
 
+    pub fn get_session_scheduler(&self, team_id: &str) -> Option<Arc<crate::scheduler::TeammateManager>> {
+        self.sessions.get(team_id).map(|e| e.session.scheduler().clone())
+    }
+
     pub fn stop_session(&self, team_id: &str) {
         if let Some((_, entry)) = self.sessions.remove(team_id) {
             for handle in &entry.finish_subscribers {
