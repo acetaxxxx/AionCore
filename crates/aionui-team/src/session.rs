@@ -152,6 +152,32 @@ impl TeamSession {
         TeamMcpStdioServerSpec::from_config(binary_path.as_ref(), &self.mcp_stdio_config(slot_id))
     }
 
+    /// [`compute_wake_input`] with up to 3 retries on transient DB errors
+    /// (e.g. "database is locked"). Avoids permanently stalling an agent in
+    /// Working state when SQLite contention occurs during team creation.
+    async fn compute_wake_input_with_retry(&self, slot_id: &str) -> Result<Option<WakeInput>, TeamError> {
+        let mut last_err = None;
+        for attempt in 0..3u8 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt))).await;
+            }
+            match self.compute_wake_input(slot_id).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    warn!(
+                        team_id = %self.team.id,
+                        slot_id,
+                        attempt,
+                        error = %e,
+                        "compute_wake_input transient failure, retrying"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap())
+    }
+
     /// Assemble the payload that will drive the next wake of `slot_id`.
     ///
     /// - Reads status, unread messages and tasks.
@@ -226,13 +252,13 @@ impl TeamSession {
                 .ok_or_else(|| TeamError::AgentNotFound(format!("no agent with conversation_id={conversation_id}")))?
         };
 
-        // If a wake is actively queued for this agent (send_message is pending
-        // behind session_lock), this Finish belongs to the *previous* turn.
-        // Skip finalize and let the upcoming send_message produce a fresh Finish.
-        if self.scheduler.is_wake_active(&slot_id) {
-            self.scheduler.clear_finalized_turn(conversation_id);
-            return Ok(None);
-        }
+        // If a wake is actively in-flight (try_wake or wake_agent_in_session
+        // holds the lock), the finish_subscriber should still finalize this
+        // turn. The wake lock prevents duplicate StreamRelays; begin_finalize
+        // dedup prevents double finalization from the manual on_agent_finish
+        // call after lock release.
+        // (Previously this checked is_wake_active and skipped — removed because
+        // it caused missed finalizations when try_wake held the lock.)
 
         if is_error {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
@@ -241,12 +267,18 @@ impl TeamSession {
         let wake_target = self.scheduler.finalize_turn(&slot_id, &[]).await?;
 
         // Clear the dedup window unconditionally once finalize has run.
-        // Without this, an agent that completes two consecutive turns within
-        // the 5-second dedup window would have its second Finish silently
-        // dropped (begin_finalize returns false the second time).
-        // Clearing here ensures every completed turn re-opens the window for
-        // the next one, regardless of whether a wake target was produced.
         self.scheduler.clear_finalized_turn(conversation_id);
+
+        // Re-wake self if there are still unread messages in mailbox.
+        // This handles the case where messages arrived while the agent was
+        // working (e.g. shutdown_request). Mirrors Claude's useMailboxBridge:
+        // when isLoading becomes false, poll mailbox and submit if non-empty.
+        if wake_target.as_deref() != Some(&slot_id) {
+            let has_unread = self.mailbox.has_unread(&self.team.id, &slot_id).await.unwrap_or(false);
+            if has_unread {
+                return Ok(Some(slot_id));
+            }
+        }
 
         Ok(wake_target)
     }
@@ -264,6 +296,8 @@ impl TeamSession {
             .await
             .ok_or_else(|| TeamError::AgentNotFound("no lead agent in team".into()))?;
 
+        let lead_conv_id = self.scheduler.get_agent(&lead_slot_id).await?.conversation_id;
+
         self.mailbox
             .write(
                 &self.team.id,
@@ -274,6 +308,32 @@ impl TeamSession {
                 None,
             )
             .await?;
+
+        // Persist the user message as a right bubble in the leader's conversation.
+        // Strip [SYSTEM NOTE: ...] blocks so internal instructions are not visible
+        // to the user in the chat UI.
+        if let Some(svc) = self.service.upgrade() {
+            let visible_content = strip_system_notes(content);
+            let msg_id = ConversationService::mint_msg_id();
+            let row = aionui_db::models::MessageRow {
+                id: msg_id.clone(),
+                conversation_id: lead_conv_id,
+                msg_id: Some(msg_id),
+                r#type: "text".into(),
+                content: serde_json::json!({ "content": visible_content }).to_string(),
+                position: Some("right".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: aionui_common::now_ms(),
+            };
+            if let Err(e) = svc.conversation_service_ref().insert_raw_message(&row).await {
+                warn!(
+                    team_id = %self.team.id,
+                    error = %e,
+                    "failed to persist user right bubble for leader (non-fatal)"
+                );
+            }
+        }
 
         self.scheduler
             .set_status(&lead_slot_id, TeammateStatus::Working)
@@ -293,7 +353,7 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<(), TeamError> {
-        self.scheduler.get_agent(slot_id).await?;
+        let agent = self.scheduler.get_agent(slot_id).await?;
 
         self.mailbox
             .write(
@@ -306,6 +366,31 @@ impl TeamSession {
             )
             .await?;
 
+        // Persist the user message as a right bubble in the agent's conversation
+        // so the teammate panel shows what the user said.
+        if let Some(svc) = self.service.upgrade() {
+            let msg_id = ConversationService::mint_msg_id();
+            let row = aionui_db::models::MessageRow {
+                id: msg_id.clone(),
+                conversation_id: agent.conversation_id.clone(),
+                msg_id: Some(msg_id),
+                r#type: "text".into(),
+                content: serde_json::json!({ "content": content }).to_string(),
+                position: Some("right".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: aionui_common::now_ms(),
+            };
+            if let Err(e) = svc.conversation_service_ref().insert_raw_message(&row).await {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    error = %e,
+                    "failed to persist user right bubble (non-fatal)"
+                );
+            }
+        }
+
         self.scheduler.set_status(slot_id, TeammateStatus::Working).await?;
 
         self.try_wake(slot_id, files).await;
@@ -316,7 +401,15 @@ impl TeamSession {
     /// error paths downgrade to `warn!` — the mailbox write has already
     /// succeeded and is the source of truth.
     pub(crate) async fn try_wake(&self, slot_id: &str, files: Option<Vec<String>>) {
-        let input = match self.compute_wake_input(slot_id).await {
+        // Acquire the wake lock to prevent racing with wake_agent_in_session.
+        // If another wake is already in-flight for this slot, skip — that path
+        // handles on_agent_finish and re-wake after completion. The unread
+        // messages will be picked up by the on_agent_finish cascade.
+        if !self.scheduler.acquire_wake_lock(slot_id) {
+            return;
+        }
+
+        let input = match self.compute_wake_input_with_retry(slot_id).await {
             Ok(Some(input)) => input,
             Ok(None) => {
                 warn!(
@@ -324,6 +417,7 @@ impl TeamSession {
                     slot_id,
                     "compute_wake_input returned None; skipping wake"
                 );
+                self.scheduler.release_wake_lock(slot_id);
                 return;
             }
             Err(err) => {
@@ -331,13 +425,16 @@ impl TeamSession {
                     team_id = %self.team.id,
                     slot_id,
                     error = %err,
-                    "compute_wake_input failed; skipping wake (mailbox already written)"
+                    "compute_wake_input failed after retries; resetting status to Idle"
                 );
+                self.scheduler.release_wake_lock(slot_id);
+                let _ = self.scheduler.set_status(slot_id, TeammateStatus::Idle).await;
                 return;
             }
         };
 
         if !input.should_send {
+            self.scheduler.release_wake_lock(slot_id);
             return;
         }
 
@@ -360,6 +457,7 @@ impl TeamSession {
                     error = %e,
                     "warmup in try_wake failed; skipping wake"
                 );
+                self.scheduler.release_wake_lock(slot_id);
                 return;
             }
             let Some(h) = self.task_manager.get_task(&input.conversation_id) else {
@@ -369,17 +467,36 @@ impl TeamSession {
                     conversation_id = %input.conversation_id,
                     "no active agent task after warmup; skipping wake"
                 );
+                self.scheduler.release_wake_lock(slot_id);
                 return;
             };
             h
         };
 
+        let msg_id = ConversationService::mint_msg_id();
         let data = SendMessageData {
             content: input.first_message,
-            msg_id: ConversationService::mint_msg_id(),
+            msg_id: msg_id.clone(),
             files: files.unwrap_or_default(),
             inject_skills: Vec::new(),
         };
+
+        // Set up a StreamRelay so the agent's response is persisted to the
+        // conversation messages table and forwarded to WebSocket (making the
+        // output visible in the team panel). Turn completion is enabled so the
+        // frontend receives `turn.completed` and re-enables the input box.
+        let rx = handle.subscribe();
+        if let Some(svc) = self.service.upgrade() {
+            let relay = aionui_conversation::stream_relay::StreamRelay::new(
+                input.conversation_id.clone(),
+                msg_id,
+                self.user_id.clone(),
+                Arc::clone(svc.conversation_service_ref().repo()),
+                self.broadcaster.clone(),
+                None,
+            );
+            tokio::spawn(async move { relay.consume(rx).await });
+        }
 
         if let Err(err) = handle.send_message(data).await {
             warn!(
@@ -390,6 +507,8 @@ impl TeamSession {
                 "agent.send_message failed; mailbox retained, wake will be retried on next trigger"
             );
         }
+
+        self.scheduler.release_wake_lock(slot_id);
     }
 
     /// Mirror each non-user mailbox row into the target agent's conversation
@@ -410,10 +529,10 @@ impl TeamSession {
     /// already marked read, and we never let a conversation-write failure
     /// block the wake itself.
     pub(crate) async fn mirror_unread_to_conversation(&self, input: &WakeInput) {
-        if matches!(input.agent_role, TeammateRole::Lead) {
+        if input.unread.is_empty() {
             return;
         }
-        if input.unread.is_empty() {
+        if matches!(input.agent_role, TeammateRole::Lead) {
             return;
         }
         let Some(service) = self.service.upgrade() else {
@@ -469,15 +588,21 @@ impl TeamSession {
                 continue;
             }
 
-            let ws_payload = aionui_api_types::TeammateMessagePayload {
-                conversation_id: input.conversation_id.clone(),
-                content: display_content,
-                from_slot_id: msg.from_agent_id.clone(),
-                from_name: sender_name,
-            };
+            // Broadcast so the frontend can render the bubble in real-time
+            // without a full message reload. The msg_id is included for
+            // deduplication against the DB-persisted row.
+            let ws_payload = serde_json::json!({
+                "conversation_id": input.conversation_id,
+                "msg_id": msg_id,
+                "content": display_content,
+                "from_slot_id": msg.from_agent_id,
+                "from_name": sender_name,
+                "teammate_message": true,
+                "sender_backend": sender_backend,
+            });
             let event = aionui_api_types::WebSocketMessage::new(
                 "team.teammate.message",
-                serde_json::to_value(ws_payload).expect("serialize teammate message payload"),
+                ws_payload,
             );
             self.broadcaster.broadcast(event);
         }
@@ -655,7 +780,10 @@ impl TeamSession {
         user_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError> {
-        let patch = serde_json::json!({ "team_mcp_stdio_config": mcp_stdio_cfg });
+        let patch = serde_json::json!({
+            "team_mcp_stdio_config": mcp_stdio_cfg,
+            "session_mode": "bypassPermissions",
+        });
 
         service
             .conversation_service_ref()
@@ -696,6 +824,25 @@ impl TeamSession {
     pub fn task_board(&self) -> &Arc<TaskBoard> {
         &self.task_board
     }
+}
+
+/// Remove `[SYSTEM NOTE: ...]` blocks from a message so they don't appear in
+/// user-visible chat bubbles. The full content (with notes) is still delivered
+/// to the agent via the mailbox/wake payload.
+fn strip_system_notes(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[SYSTEM NOTE:") {
+        result.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find(']') {
+            rest = &rest[start + end + 1..];
+        } else {
+            rest = &rest[start..];
+            break;
+        }
+    }
+    result.push_str(rest);
+    result.trim().to_owned()
 }
 
 #[cfg(test)]

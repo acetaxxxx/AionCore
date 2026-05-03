@@ -998,9 +998,13 @@ impl AcpAgentManager {
                 )
             };
 
+            let mut load_req = LoadSessionRequest::new(SessionId::new(sid), &self.workspace);
+            if let Some(cfg) = self.config.team_mcp_stdio_config.as_ref() {
+                load_req = load_req.mcp_servers(vec![team_mcp_server(cfg)]);
+            }
             let resp = self
                 .protocol
-                .load_session(LoadSessionRequest::new(SessionId::new(sid), &self.workspace))
+                .load_session(load_req)
                 .await
                 .map_err(AppError::from)?;
 

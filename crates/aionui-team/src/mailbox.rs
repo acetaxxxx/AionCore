@@ -73,6 +73,11 @@ impl Mailbox {
         Ok(messages)
     }
 
+    pub async fn has_unread(&self, team_id: &str, agent_id: &str) -> Result<bool, TeamError> {
+        let rows = self.repo.get_history(team_id, agent_id, None).await?;
+        Ok(rows.iter().any(|r| !r.read))
+    }
+
     pub async fn delete_by_team(&self, team_id: &str) -> Result<(), TeamError> {
         self.repo.delete_mailbox_by_team(team_id).await?;
         debug!(team_id, "mailbox messages deleted for team");

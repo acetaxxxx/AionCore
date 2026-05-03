@@ -46,13 +46,20 @@ pub async fn run_guide_stdio() -> ExitCode {
         "[mcp-guide-stdio] Started OK. PORT={port}, BACKEND={backend}, CONV_ID={conversation_id}, USER={user_id}"
     );
 
+    let http_client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
     let server = GuideServer {
         port: port.parse().unwrap_or(0),
         token,
         backend,
         conversation_id,
         user_id,
-        http_client: reqwest::Client::new(),
+        http_client,
     };
 
     let transport = transport::io::stdio();
@@ -148,43 +155,55 @@ impl GuideServer {
             "user_id": self.user_id,
         });
 
-        eprintln!("[mcp-guide-stdio] HTTP POST {url}");
-        match self
-            .http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.text().await {
-                    Ok(text) => {
-                        eprintln!(
-                            "[mcp-guide-stdio] HTTP POST /tool → status={status}, body_preview={}",
-                            &text[..text.len().min(100)]
-                        );
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if let Some(result) = v.get("result").and_then(|r| r.as_str()) {
-                                return result.to_owned();
+        // Retry up to 3 times with backoff — the Guide HTTP server may not be
+        // fully ready immediately after a session resume spawns this process.
+        let delays_ms: &[u64] = &[0, 1000, 2000, 3000];
+        let mut last_error = String::new();
+        for (attempt, &delay_ms) in delays_ms.iter().enumerate() {
+            if delay_ms > 0 {
+                let delay = std::time::Duration::from_millis(delay_ms);
+                eprintln!("[mcp-guide-stdio] retrying in {delay:?}...");
+                tokio::time::sleep(delay).await;
+            }
+            eprintln!("[mcp-guide-stdio] HTTP POST {url} (attempt {})", attempt + 1);
+            match self
+                .http_client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.token))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.text().await {
+                        Ok(text) => {
+                            eprintln!(
+                                "[mcp-guide-stdio] HTTP POST /tool → status={status}, body_preview={}",
+                                &text[..text.len().min(100)]
+                            );
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if let Some(result) = v.get("result").and_then(|r| r.as_str()) {
+                                    return result.to_owned();
+                                }
+                                if let Some(error) = v.get("error") {
+                                    return format!("Error: {error}");
+                                }
                             }
-                            if let Some(error) = v.get("error") {
-                                return format!("Error: {error}");
-                            }
+                            return text;
                         }
-                        text
-                    }
-                    Err(e) => {
-                        eprintln!("[mcp-guide-stdio] HTTP FAILED: read body: {e}");
-                        format!("Error: failed to read response: {e}")
+                        Err(e) => {
+                            last_error = format!("failed to read response: {e}");
+                            eprintln!("[mcp-guide-stdio] HTTP FAILED: {last_error}");
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("[mcp-guide-stdio] HTTP FAILED: {e}");
-                format!("Error: {e}")
+                Err(e) => {
+                    last_error = format!("{e:#}");
+                    eprintln!("[mcp-guide-stdio] HTTP FAILED: {last_error}");
+                }
             }
         }
+        format!("Error: {last_error}")
     }
 }

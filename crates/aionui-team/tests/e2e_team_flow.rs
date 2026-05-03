@@ -661,12 +661,14 @@ async fn s3c_finish_triggers_lead_wake_with_idle_notification() {
         .await
         .unwrap();
 
-    // Set worker Working
+    // Set worker Working and drain its mailbox (simulates the wake consuming
+    // messages via compute_wake_input before on_agent_finish fires).
     session
         .scheduler()
         .set_status("worker-1", aionui_team::TeammateStatus::Working)
         .await
         .unwrap();
+    let _ = session.mailbox().read_unread("e2e-team", "worker-1").await;
 
     // Worker finishes → IdleNotification → lead returned
     let wake_target = session.on_agent_finish("conv-worker", false).await.unwrap();

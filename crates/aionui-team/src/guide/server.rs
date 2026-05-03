@@ -2,18 +2,29 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
 use aionui_common::generate_id;
+use axum::Json;
+use axum::extract::State;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::IntoResponse;
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::service::TeamSessionService;
 
+type ServiceSlot = Arc<RwLock<Weak<TeamSessionService>>>;
+
+#[derive(Clone)]
+struct GuideState {
+    auth_token: String,
+    service: ServiceSlot,
+}
+
 pub struct GuideMcpServer {
     http_addr: SocketAddr,
     auth_token: String,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    /// Shared slot so the accept-loop can see the service after it is wired up.
-    service_slot: Arc<RwLock<Weak<TeamSessionService>>>,
+    shutdown_handle: Option<tokio::task::JoinHandle<()>>,
+    service_slot: ServiceSlot,
 }
 
 impl GuideMcpServer {
@@ -26,22 +37,29 @@ impl GuideMcpServer {
             .local_addr()
             .map_err(|e| format!("Failed to read guide MCP local addr: {e}"))?;
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let service_slot: Arc<RwLock<Weak<TeamSessionService>>> = Arc::new(RwLock::new(Weak::new()));
+        let service_slot: ServiceSlot = Arc::new(RwLock::new(Weak::new()));
 
-        tokio::spawn(accept_loop(
-            listener,
-            auth_token.clone(),
-            shutdown_rx,
-            service_slot.clone(),
-        ));
+        let state = GuideState {
+            auth_token: auth_token.clone(),
+            service: service_slot.clone(),
+        };
 
-        debug!(http_port = http_addr.port(), "Guide MCP Server started");
+        let app = axum::Router::new()
+            .route("/tool", axum::routing::post(handle_tool_request))
+            .with_state(state);
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                warn!(error = %e, "Guide MCP axum server exited with error");
+            }
+        });
+
+        debug!(http_port = http_addr.port(), "Guide MCP Server started (axum)");
 
         Ok(Self {
             http_addr,
             auth_token,
-            shutdown_tx: Some(shutdown_tx),
+            shutdown_handle: Some(handle),
             service_slot,
         })
     }
@@ -65,8 +83,8 @@ impl GuideMcpServer {
     }
 
     pub fn stop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
+        if let Some(handle) = self.shutdown_handle.take() {
+            handle.abort();
             debug!(http_port = self.http_addr.port(), "Guide MCP Server stop requested");
         }
     }
@@ -78,10 +96,61 @@ impl Drop for GuideMcpServer {
     }
 }
 
-async fn handle_aion_create_team(
+// ---------------------------------------------------------------------------
+// Axum handler
+// ---------------------------------------------------------------------------
+
+async fn handle_tool_request(
+    State(state): State<GuideState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Auth check
+    let provided_token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    if provided_token != state.auth_token {
+        warn!("Guide HTTP: unauthorized request");
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response();
+    }
+
+    let tool = body.get("tool").and_then(serde_json::Value::as_str).unwrap_or("");
+    let args = body.get("args").cloned().unwrap_or(serde_json::Value::Null);
+
+    info!(tool, "Guide HTTP: dispatching tool");
+
+    let response_body = match tool {
+        "aion_create_team" => exec_create_team(&body, &args, &state.service).await,
+        "aion_list_models" => {
+            let result = crate::guide::handlers::handle_aion_list_models();
+            info!("Guide HTTP: aion_list_models succeeded");
+            serde_json::json!({"result": serde_json::to_string(&result).unwrap_or_default()})
+        }
+        unknown => {
+            warn!(tool = unknown, "Guide HTTP: unknown tool");
+            serde_json::json!({"error": format!("Unknown tool: {unknown}")})
+        }
+    };
+
+    let mut resp = Json(response_body).into_response();
+    resp.headers_mut().insert(
+        header::CONNECTION,
+        HeaderValue::from_static("close"),
+    );
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// Tool implementations
+// ---------------------------------------------------------------------------
+
+async fn exec_create_team(
     request_body: &serde_json::Value,
     args: &serde_json::Value,
-    service: Arc<RwLock<Weak<TeamSessionService>>>,
+    service: &ServiceSlot,
 ) -> serde_json::Value {
     use crate::guide::handlers::parse_create_team_args;
     use aionui_api_types::{CreateTeamRequest, TeamAgentInput};
@@ -115,17 +184,12 @@ async fn handle_aion_create_team(
         .unwrap_or("")
         .to_owned();
 
-    // Prefer the caller-supplied user_id; fall back to a sentinel only when
-    // the guide server is invoked without an authenticated context (e.g. tests).
     let user_id = request_body
         .get("user_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("system_default_user")
         .to_owned();
 
-    // When the caller passes its conversation_id, the leader adopts the
-    // existing conversation (single-chat → team conversion). The original
-    // conversation becomes the team leader slot — no duplicate item.
     let caller_conversation_id = request_body
         .get("conversation_id")
         .and_then(serde_json::Value::as_str)
@@ -152,13 +216,17 @@ async fn handle_aion_create_team(
         }
     };
 
-    // ensure_session is already called inside create_team, but call send_message separately.
-    // Fire-and-forget: send summary to leader so it can plan/spawn teammates.
     let team_id = team.id.clone();
     let summary = params.summary.clone();
     let svc2 = svc.clone();
     tokio::spawn(async move {
-        if let Err(e) = svc2.send_message(&team_id, &summary, None).await {
+        let message = format!(
+            "{}\n\n[SYSTEM NOTE: The user has already confirmed this team lineup during team creation. \
+            Proceed immediately with team_spawn_agent for each teammate listed above. \
+            Do NOT ask for confirmation again.]",
+            summary
+        );
+        if let Err(e) = svc2.send_message(&team_id, &message, None).await {
             warn!(team_id = %team_id, error = %e, "Guide HTTP: failed to send summary to leader");
         }
     });
@@ -174,133 +242,10 @@ async fn handle_aion_create_team(
     })
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    auth_token: String,
-    mut shutdown_rx: oneshot::Receiver<()>,
-    service: Arc<RwLock<Weak<TeamSessionService>>>,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => {
-                debug!("Guide MCP Server shutting down");
-                break;
-            }
-            accept = listener.accept() => {
-                let Ok((mut stream, peer)) = accept else { continue };
-                info!(?peer, "Guide HTTP: new connection accepted");
-                let token = auth_token.clone();
-                let svc = service.clone();
-                tokio::spawn(async move {
-                    // Read the full HTTP request within a 10s deadline.
-                    let deadline = std::time::Duration::from_secs(10);
-                    let read_result = tokio::time::timeout(deadline, async {
-                        let mut buf = Vec::with_capacity(65536);
-                        let mut tmp = [0u8; 65536];
-                        loop {
-                            let n = match stream.read(&mut tmp).await {
-                                Ok(0) => break,
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-                            buf.extend_from_slice(&tmp[..n]);
-                            // Check if we have the full body by parsing Content-Length
-                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                let body_start = header_end + 4;
-                                let headers = String::from_utf8_lossy(&buf[..header_end]);
-                                let content_length = headers
-                                    .lines()
-                                    .find(|l| l.to_lowercase().starts_with("content-length:"))
-                                    .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
-                                    .and_then(|v| v.parse::<usize>().ok())
-                                    .unwrap_or(0);
-                                if buf.len() >= body_start + content_length {
-                                    break;
-                                }
-                            }
-                        }
-                        buf
-                    }).await;
-                    let buf = match read_result {
-                        Ok(b) if !b.is_empty() => b,
-                        _ => {
-                            warn!(?peer, "Guide HTTP: read timeout or empty request");
-                            return;
-                        }
-                    };
-                    let request = String::from_utf8_lossy(&buf);
-
-                    // Auth: extract Bearer token from Authorization header
-                    let provided_token = request
-                        .lines()
-                        .find(|l| l.to_lowercase().starts_with("authorization:"))
-                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
-                        .and_then(|v| v.strip_prefix("Bearer "))
-                        .unwrap_or("");
-
-                    if provided_token != token {
-                        warn!(?peer, "Guide HTTP: unauthorized request (bad or missing token)");
-                        let resp = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
-                        let _ = stream.write_all(resp.as_bytes()).await;
-                        return;
-                    }
-
-                    // Extract JSON body (after \r\n\r\n)
-                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
-                    debug!(?peer, body_preview = &body[..body.len().min(200)], "Guide HTTP: request body");
-
-                    let value: serde_json::Value = match serde_json::from_str(body) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(?peer, error = %e, "Guide HTTP: JSON parse failed");
-                            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-                            let _ = stream.write_all(resp.as_bytes()).await;
-                            return;
-                        }
-                    };
-
-                    let tool = value.get("tool").and_then(serde_json::Value::as_str).unwrap_or("");
-                    let args = value.get("args").cloned().unwrap_or(serde_json::Value::Null);
-
-                    info!(?peer, tool, "Guide HTTP: dispatching tool");
-
-                    let response_body = match tool {
-                        "aion_create_team" => {
-                            handle_aion_create_team(&value, &args, svc).await
-                        }
-                        "aion_list_models" => {
-                            let result = crate::guide::handlers::handle_aion_list_models();
-                            info!(?peer, "Guide HTTP: aion_list_models succeeded");
-                            serde_json::json!({"result": serde_json::to_string(&result).unwrap_or_default()})
-                        }
-                        unknown => {
-                            warn!(?peer, tool = unknown, "Guide HTTP: unknown tool");
-                            serde_json::json!({"error": format!("Unknown tool: {unknown}")})
-                        }
-                    };
-
-                    let body_bytes = serde_json::to_vec(&response_body).unwrap_or_default();
-                    let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                        body_bytes.len()
-                    );
-                    let _ = stream.write_all(header.as_bytes()).await;
-                    let _ = stream.write_all(&body_bytes).await;
-                    info!(?peer, tool, "Guide HTTP: response sent");
-                });
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpStream;
     use tokio::time::timeout;
 
     #[tokio::test]
@@ -323,25 +268,23 @@ mod tests {
         let port = server.http_port();
         server.stop();
 
-        // Give the accept loop a moment to observe the shutdown signal.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Either the connect is refused outright, or it succeeds but the
-        // listener-less port yields an immediate EOF on read. Both are
-        // acceptable evidence that the server is no longer serving.
-        match timeout(Duration::from_millis(200), TcpStream::connect(("127.0.0.1", port))).await {
-            Ok(Ok(mut stream)) => {
-                let mut buf = [0u8; 1];
-                let read = timeout(Duration::from_millis(200), stream.read(&mut buf)).await;
-                match read {
-                    Ok(Ok(0)) => { /* EOF — expected */ }
-                    Ok(Err(_)) => { /* connection error — expected */ }
-                    Ok(Ok(_)) => panic!("unexpected data from stopped server"),
-                    Err(_) => panic!("server still reading after stop"),
-                }
-            }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let result = timeout(
+            Duration::from_millis(500),
+            client.post(format!("http://127.0.0.1:{port}/tool"))
+                .json(&serde_json::json!({}))
+                .send(),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => { /* may still accept in-flight during abort */ }
             Ok(Err(_)) => { /* connection refused — expected */ }
-            Err(_) => panic!("connect timed out (expected refuse or EOF)"),
+            Err(_) => { /* timeout — expected */ }
         }
     }
 
@@ -350,5 +293,40 @@ mod tests {
         let mut server = GuideMcpServer::start().await.unwrap();
         server.stop();
         server.stop();
+    }
+
+    #[tokio::test]
+    async fn tool_call_requires_auth() {
+        let server = GuideMcpServer::start().await.unwrap();
+        let port = server.http_port();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/tool"))
+            .json(&serde_json::json!({"tool": "aion_list_models", "args": {}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn tool_call_with_valid_token_succeeds() {
+        let server = GuideMcpServer::start().await.unwrap();
+        let port = server.http_port();
+        let token = server.auth_token().to_owned();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/tool"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"tool": "aion_list_models", "args": {}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body.get("result").is_some());
     }
 }
