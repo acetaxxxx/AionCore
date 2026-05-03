@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::service::TeamSessionService;
+use crate::types::TeammateRole;
 
 type ServiceSlot = Arc<RwLock<Weak<TeamSessionService>>>;
 
@@ -129,6 +130,7 @@ async fn handle_tool_request(
             info!("Guide HTTP: aion_list_models succeeded");
             serde_json::json!({"result": serde_json::to_string(&result).unwrap_or_default()})
         }
+        t if t.starts_with("team_") => exec_team_tool(t, &body, &args, &state.service).await,
         unknown => {
             warn!(tool = unknown, "Guide HTTP: unknown tool");
             serde_json::json!({"error": format!("Unknown tool: {unknown}")})
@@ -229,6 +231,114 @@ async fn exec_create_team(
             params.summary
         )
     })
+}
+
+async fn exec_team_tool(
+    tool_name: &str,
+    request_body: &serde_json::Value,
+    args: &serde_json::Value,
+    service: &ServiceSlot,
+) -> serde_json::Value {
+    let svc = match service.read().await.upgrade() {
+        Some(s) => s,
+        None => {
+            warn!("Guide HTTP: {} — service not available", tool_name);
+            return serde_json::json!({"error": "service_unavailable"});
+        }
+    };
+
+    let conversation_id = match request_body
+        .get("conversation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id.to_owned(),
+        None => {
+            warn!(tool = tool_name, "Guide HTTP: team tool missing conversation_id");
+            return serde_json::json!({"error": "missing conversation_id"});
+        }
+    };
+
+    let (team_id, slot_id) = match resolve_team_context(&svc, &conversation_id).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            warn!(tool = tool_name, error = %e, "Guide HTTP: resolve_team_context failed");
+            return serde_json::json!({"error": e});
+        }
+    };
+
+    let scheduler = match svc.get_session_scheduler(&team_id) {
+        Some(s) => s,
+        None => {
+            warn!(tool = tool_name, team_id = %team_id, "Guide HTTP: no active session for team");
+            return serde_json::json!({"error": "No active team session. The team may still be starting up."});
+        }
+    };
+
+    let svc_weak = Arc::downgrade(&svc);
+    let result = crate::mcp::server::dispatch_tool(
+        tool_name,
+        args,
+        &scheduler,
+        &svc_weak,
+        &team_id,
+        &slot_id,
+        TeammateRole::Lead,
+    )
+    .await;
+
+    match result {
+        Ok(text) => {
+            info!(tool = tool_name, team_id = %team_id, "Guide HTTP: team tool succeeded");
+            serde_json::json!({"result": text})
+        }
+        Err(err) => {
+            warn!(tool = tool_name, team_id = %team_id, error = %err, "Guide HTTP: team tool failed");
+            serde_json::json!({"error": err})
+        }
+    }
+}
+
+/// Resolve `(team_id, slot_id)` for a caller identified by `conversation_id`.
+///
+/// Reads the conversation row's `extra` JSON to extract `teamId`, then finds
+/// the agent slot whose `conversation_id` matches. Returns an error string if
+/// no active team is found for this conversation.
+async fn resolve_team_context(
+    service: &TeamSessionService,
+    conversation_id: &str,
+) -> Result<(String, String), String> {
+    // Extract teamId from conversation.extra via the conversation service repo.
+    let repo = service.conversation_service_ref().repo().clone();
+    let row = repo
+        .get(conversation_id)
+        .await
+        .map_err(|e| format!("DB error reading conversation: {e}"))?
+        .ok_or_else(|| format!("Conversation not found: {conversation_id}"))?;
+
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+    let team_id = extra
+        .get("teamId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "No active team for this conversation. Create a team first with aion_create_team.".to_owned()
+        })?
+        .to_owned();
+
+    // Find the slot_id by matching conversation_id in the session scheduler.
+    let scheduler = service
+        .get_session_scheduler(&team_id)
+        .ok_or_else(|| "No active team session. The team may still be starting up.".to_owned())?;
+
+    let agents = scheduler.list_agents().await;
+    let slot_id = agents
+        .iter()
+        .find(|a| a.conversation_id == conversation_id)
+        .map(|a| a.slot_id.clone())
+        .ok_or_else(|| format!("Agent with conversation_id={conversation_id} not found in team {team_id}"))?;
+
+    Ok((team_id, slot_id))
 }
 
 #[cfg(test)]

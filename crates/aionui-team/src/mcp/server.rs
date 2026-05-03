@@ -421,7 +421,7 @@ async fn handle_tools_call(
 // Tool dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_tool(
+pub(crate) async fn dispatch_tool(
     tool_name: &str,
     arguments: &Value,
     scheduler: &TeammateManager,
