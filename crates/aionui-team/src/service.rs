@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    AddAgentRequest, CreateConversationRequest, CreateTeamRequest, TeamAgentResponse, TeamMcpPhase,
+    AddAgentRequest, CreateConversationRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase,
     TeamMcpStatusPayload, TeamResponse, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id, now_ms};
@@ -47,6 +47,10 @@ pub struct TeamSessionService {
     /// the service that owns it. Set once during [`TeamSessionService::new`]
     /// via [`Arc::new_cyclic`].
     self_ref: Weak<TeamSessionService>,
+    /// Guide MCP server config used to refresh the leader's persisted
+    /// `guide_mcp_config` on backend restart (port/token change each restart).
+    /// `None` when the Guide server failed to start.
+    guide_mcp_config: Option<GuideMcpConfig>,
 }
 
 impl TeamSessionService {
@@ -56,6 +60,7 @@ impl TeamSessionService {
         broadcaster: Arc<dyn EventBroadcaster>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         backend_binary_path: Arc<PathBuf>,
+        guide_mcp_config: Option<GuideMcpConfig>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             repo,
@@ -67,6 +72,7 @@ impl TeamSessionService {
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
             self_ref: weak.clone(),
+            guide_mcp_config,
         })
     }
 
@@ -83,6 +89,35 @@ impl TeamSessionService {
         for team in &teams {
             if let Err(e) = self.ensure_session(&team.id).await {
                 tracing::warn!(team_id = %team.id, error = %e, "failed to restore session on startup");
+                continue;
+            }
+            // Patch the leader's persisted guide_mcp_config so it points at the
+            // current restart's port/token (the Guide server picks a new random
+            // port on every start).
+            if let Some(ref cfg) = self.guide_mcp_config {
+                let row = match self.repo.get_team(&team.id).await {
+                    Ok(Some(r)) => r,
+                    _ => continue,
+                };
+                let team_data = match Team::from_row(&row) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if let Some(leader) = team_data.agents.iter().find(|a| a.role == TeammateRole::Lead) {
+                    let patch = serde_json::json!({ "guide_mcp_config": cfg });
+                    if let Err(e) = self
+                        .conversation_service
+                        .update_extra(&leader.conversation_id, patch)
+                        .await
+                    {
+                        warn!(
+                            team_id = %team.id,
+                            conversation_id = %leader.conversation_id,
+                            error = %e,
+                            "failed to patch leader guide_mcp_config on restore"
+                        );
+                    }
+                }
             }
         }
         if !teams.is_empty() {
