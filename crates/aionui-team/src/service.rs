@@ -37,6 +37,10 @@ pub struct TeamSessionService {
     /// read-modify-write the `agents` JSON with stale state (last-writer-wins
     /// would otherwise drop entries).
     add_agent_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-team mutex serializing `ensure_session` so concurrent callers
+    /// (e.g. create_team + frontend POST /session) cannot race and start
+    /// two sessions for the same team.
+    ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -61,6 +65,7 @@ impl TeamSessionService {
             backend_binary_path,
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
+            ensure_session_locks: Arc::new(DashMap::new()),
             self_ref: weak.clone(),
         })
     }
@@ -115,6 +120,15 @@ impl TeamSessionService {
                     )
                     .await
                     .map_err(|e| TeamError::InvalidRequest(format!("failed to adopt conversation: {e}")))?;
+                // Notify frontend that this conversation moved into a team so
+                // the sidebar can remove it from the standalone list.
+                self.broadcaster.broadcast(WebSocketMessage::new(
+                    "conversation.listChanged",
+                    serde_json::json!({
+                        "conversation_id": existing_id,
+                        "action": "updated",
+                    }),
+                ));
                 existing_id.clone()
             } else {
                 let agent_type = parse_agent_type(&input.backend)?;
@@ -182,6 +196,11 @@ impl TeamSessionService {
         };
 
         info!(team_id = %team.id, "Team created");
+
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "team.created",
+            serde_json::json!({ "team_id": team.id, "team_name": team.name }),
+        ));
 
         // Auto-start session so MCP is injected immediately after team creation.
         // Failure only logs — the team is persisted and frontend can retry
@@ -440,6 +459,18 @@ impl TeamSessionService {
             return Ok(());
         }
 
+        let lock = self
+            .ensure_session_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        // Re-check after acquiring lock (another caller may have completed).
+        if self.sessions.contains_key(team_id) {
+            return Ok(());
+        }
+
         let row = match self.repo.get_team(team_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -533,7 +564,10 @@ impl TeamSessionService {
     ) -> Result<(), TeamError> {
         for agent in agents {
             let cfg = session.mcp_stdio_config(&agent.slot_id);
-            let patch = serde_json::json!({ "team_mcp_stdio_config": cfg });
+            let patch = serde_json::json!({
+                "team_mcp_stdio_config": cfg,
+                "session_mode": "bypassPermissions",
+            });
 
             if let Err(e) = self
                 .conversation_service
@@ -673,6 +707,10 @@ impl TeamSessionService {
         }
     }
 
+    pub async fn get_session_user_id(&self, team_id: &str) -> Option<String> {
+        self.sessions.get(team_id).map(|e| e.session.user_id().to_owned())
+    }
+
     pub fn stop_session(&self, team_id: &str) {
         if let Some((_, entry)) = self.sessions.remove(team_id) {
             for handle in &entry.finish_subscribers {
@@ -760,6 +798,11 @@ impl TeamSessionService {
 
         let task_mgr = self.task_manager.clone();
         let slot_id_owned = slot_id.to_owned();
+        let sessions = self.sessions.clone();
+        let team_id_owned = team_id.to_owned();
+        let repo = Arc::clone(self.conversation_service.repo());
+        let broadcaster = self.broadcaster.clone();
+        let user_id_owned = user_id;
         tokio::spawn(async move {
             let input = match input {
                 Ok(Some(i)) if i.should_send => i,
@@ -768,22 +811,52 @@ impl TeamSessionService {
                     return;
                 }
             };
-            let Some(handle) = task_mgr.get_task(&input.conversation_id) else {
+            let conv_id = input.conversation_id.clone();
+            let Some(handle) = task_mgr.get_task(&conv_id) else {
                 scheduler.release_wake_lock(&slot_id_owned);
                 return;
             };
+            let msg_id = aionui_common::generate_id();
             let data = aionui_ai_agent::SendMessageData {
                 content: input.first_message,
-                msg_id: aionui_common::generate_id(),
+                msg_id: msg_id.clone(),
                 files: Vec::new(),
                 inject_skills: Vec::new(),
             };
-            // Release the wake lock after send_message returns (success or
-            // failure). The ACP session processes this message next; the
-            // subsequent Finish event will then be allowed through
-            // on_agent_finish.
+
+            let rx = handle.subscribe();
+            let relay = aionui_conversation::stream_relay::StreamRelay::new(
+                conv_id.clone(),
+                msg_id,
+                user_id_owned,
+                repo,
+                broadcaster,
+                None,
+            );
+            tokio::spawn(async move { relay.consume(rx).await });
+
             let _ = handle.send_message(data).await;
             scheduler.release_wake_lock(&slot_id_owned);
+
+            // The Finish event was emitted inside send_message (before it
+            // returned), so on_agent_finish already ran but skipped finalization
+            // because is_wake_active was still true at that point. Now that the
+            // lock is released, we must finalize the turn ourselves.
+            if let Some(entry) = sessions.get(&team_id_owned) {
+                match entry.session.on_agent_finish(&conv_id, false).await {
+                    Ok(Some(wake_target)) => {
+                        entry.session.try_wake(&wake_target, None).await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            conversation_id = %conv_id,
+                            error = %e,
+                            "on_agent_finish after wake_lock release failed"
+                        );
+                    }
+                }
+            }
         });
         Ok(())
     }

@@ -128,6 +128,10 @@ impl ConversationService {
     pub fn mint_msg_id() -> String {
         generate_short_id()
     }
+
+    pub fn repo(&self) -> &Arc<dyn IConversationRepository> {
+        &self.repo
+    }
 }
 
 // ── Conversation CRUD ───────────────────────────────────────────────
