@@ -216,21 +216,6 @@ async fn exec_create_team(
         }
     };
 
-    let team_id = team.id.clone();
-    let summary = params.summary.clone();
-    let svc2 = svc.clone();
-    tokio::spawn(async move {
-        let message = format!(
-            "{}\n\n[SYSTEM NOTE: The user has already confirmed this team lineup during team creation. \
-            Proceed immediately with team_spawn_agent for each teammate listed above. \
-            Do NOT ask for confirmation again.]",
-            summary
-        );
-        if let Err(e) = svc2.send_message(&team_id, &message, None).await {
-            warn!(team_id = %team_id, error = %e, "Guide HTTP: failed to send summary to leader");
-        }
-    });
-
     let route = format!("/team/{}", team.id);
     info!(team_id = %team.id, "Guide HTTP: aion_create_team succeeded");
     serde_json::json!({
@@ -238,7 +223,11 @@ async fn exec_create_team(
         "name": team.name,
         "route": route,
         "status": "team_created",
-        "next_step": "The team page has been opened automatically. End your turn now — do not add extra commentary."
+        "next_step": format!(
+            "You are now the team Leader. Your team tools (team_spawn_agent, team_send_message, etc.) are now active. \
+             Immediately proceed to spawn teammates as planned. Task summary: {}",
+            params.summary
+        )
     })
 }
 
