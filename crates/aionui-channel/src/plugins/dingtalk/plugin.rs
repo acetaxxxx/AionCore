@@ -29,7 +29,7 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
 /// DingTalk standard AI card template ID.
-const AI_CARD_TEMPLATE_ID: &str = "StandardCard";
+const AI_CARD_TEMPLATE_ID: &str = "382e4302-551d-4880-bf29-a30acfab2e71.schema";
 
 /// DingTalk platform plugin.
 ///
@@ -322,8 +322,8 @@ async fn send_via_open_api(api: &Arc<DingtalkApi>, chat_id: &str, text: &str) ->
     let (is_group, raw_id) = decode_chat_id(chat_id);
 
     let req = SendRobotMessageRequest {
-        msg_key: "sampleText".into(),
-        msg_param: serde_json::json!({ "content": text }).to_string(),
+        msg_key: "sampleMarkdown".into(),
+        msg_param: serde_json::json!({ "title": "Message", "text": text }).to_string(),
         robot_code: api.client_id().to_string(),
         open_conversation_id: if is_group { Some(raw_id.to_string()) } else { None },
         user_ids: if !is_group {
@@ -611,7 +611,11 @@ async fn handle_bot_message(data_str: &str, message_tx: &mpsc::Sender<UnifiedInc
         .or(cb.sender_id.as_deref())
         .unwrap_or("unknown");
 
-    let chat_id = encode_chat_id(cb.conversation_id.as_deref(), sender_staff_id);
+    let chat_id = encode_chat_id(
+        cb.conversation_type.as_deref(),
+        cb.conversation_id.as_deref(),
+        sender_staff_id,
+    );
 
     let user = UnifiedUser {
         id: sender_staff_id.to_string(),
