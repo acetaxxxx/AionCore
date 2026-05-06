@@ -5,6 +5,7 @@ use crate::cli_process::CliAgentProcess;
 use crate::factory::acp_assembler::AcpSessionParams;
 use crate::first_message_injector::{InjectionConfig, inject_first_message_prefix};
 use crate::manager::acp::{AcpSession, AcpSessionEvent, PermissionRouter, PersistedSessionState};
+use crate::shared_kernel::{ModeId, ModelId, SessionId as DomainSessionId};
 use crate::skill_manager::AcpSkillManager;
 use crate::stream_event::{
     AgentStreamEvent, AvailableCommandsEventData, FinishEventData, SessionAssignedEventData, StartEventData,
@@ -108,46 +109,6 @@ fn sdk_to_snake_value<T: serde::Serialize>(value: &T) -> Option<Value> {
     Some(v)
 }
 
-/// Project an `AgentStreamEvent` onto the subset of `AgentHandshake`
-/// fields the catalog cares about. Returns `None` for unrelated
-/// events — the forwarder filters on that.
-///
-/// Event payloads may arrive here either already snake_case (from
-/// `emit_snapshot_events`) or camelCase (from `SessionUpdate::*`
-/// translation in `stream_event.rs`). We re-normalise unconditionally
-/// so the persisted handshake blob is uniform; `camel_to_snake` is
-/// idempotent on snake_case input.
-fn catalog_partial_from_event(event: &AgentStreamEvent) -> Option<AgentHandshake> {
-    fn snake(mut v: Value) -> Value {
-        normalize_keys_to_snake_case(&mut v);
-        v
-    }
-    match event {
-        AgentStreamEvent::AcpModeInfo(v) => Some(AgentHandshake {
-            available_modes: Some(snake(v.clone())),
-            ..Default::default()
-        }),
-        AgentStreamEvent::AcpModelInfo(v) => Some(AgentHandshake {
-            available_models: Some(snake(v.clone())),
-            ..Default::default()
-        }),
-        AgentStreamEvent::AcpConfigOption(v) => Some(AgentHandshake {
-            config_options: Some(snake(v.clone())),
-            ..Default::default()
-        }),
-        AgentStreamEvent::AvailableCommands(data) => {
-            // `AvailableCommand` is an ACP SDK struct — normalise on
-            // the way into the catalog so the stored blob is snake_case.
-            let cmds = sdk_to_snake_value(&data.commands)?;
-            Some(AgentHandshake {
-                available_commands: Some(cmds),
-                ..Default::default()
-            })
-        }
-        _ => None,
-    }
-}
-
 /// Manages a single ACP Agent instance.
 ///
 /// ACP is the most complex agent type, supporting 20+ CLI sub-backends
@@ -209,7 +170,7 @@ impl AcpAgentManager {
 
     async fn update_cached_mode(&self, mode: &str) {
         let mut session = self.session.write().await;
-        session.apply_partial_mode_update(mode);
+        session.apply_partial_mode_update(ModeId::new(mode));
     }
 
     /// Execute reconcile actions produced by `AcpSession::plan_reconcile`.
@@ -228,8 +189,8 @@ impl AcpAgentManager {
 
         for action in actions {
             match action {
-                ReconcileAction::SetMode { mode_id } => {
-                    let normalized = normalize_requested_mode(&self.params.metadata, mode_id.as_str());
+                ReconcileAction::SetMode { mode } => {
+                    let normalized = normalize_requested_mode(&self.params.metadata, mode.as_str());
                     if normalized.is_empty() {
                         continue;
                     }
@@ -251,23 +212,21 @@ impl AcpAgentManager {
                     }
                     self.update_cached_mode(&normalized).await;
                     let mut session = self.session.write().await;
-                    session.apply_observed_mode(&normalized);
+                    session.apply_observed_mode(ModeId::new(normalized));
                 }
-                ReconcileAction::SetConfigOption { config_id, value } => {
-                    let cid_str = config_id.into_inner();
-                    let val_str = value.into_inner();
+                ReconcileAction::SetConfigOption { key, value } => {
                     if let Err(err) = self
                         .protocol
                         .set_config_option(SetSessionConfigOptionRequest::new(
                             SessionId::new(session_id),
-                            cid_str.clone(),
-                            val_str.clone(),
+                            key.as_str().to_owned(),
+                            value.as_str().to_owned(),
                         ))
                         .await
                     {
                         info!(
-                            config_id = %cid_str,
-                            desired = %val_str,
+                            config_id = %key,
+                            desired = %value,
                             error = %err,
                             "reconcile_session: set_config_option failed; skipping"
                         );
@@ -295,7 +254,7 @@ impl AcpAgentManager {
         // CurrentModelUpdate notification for model changes.
         {
             let mut session = self.session.write().await;
-            session.update_current_model(model_id);
+            session.update_current_model(ModelId::new(model_id));
         }
 
         Ok(())
@@ -349,8 +308,8 @@ impl AcpAgentManager {
     /// `params` is the pre-computed, immutable session bundle assembled by
     /// `assemble_acp_params` in the factory layer. `catalog_tx` is the
     /// MPSC sender used for the one-shot initialize handshake write;
-    /// session-driven fields flow through the forwarder started via
-    /// `start_catalog_sync`.
+    /// session-driven fields flow through the `CatalogForwarder` the
+    /// factory spawns after construction.
     pub async fn new(
         params: Arc<AcpSessionParams>,
         skill_manager: Arc<AcpSkillManager>,
@@ -384,7 +343,8 @@ impl AcpAgentManager {
         // Push the static handshake payloads (agent_capabilities +
         // auth_methods) through the catalog sync channel. Session-driven
         // fields — modes, models, config_options, commands — flow
-        // through the forwarder started in `start_catalog_sync`.
+        // through the `CatalogForwarder` the factory spawns after
+        // construction.
         let init_handshake = AgentHandshake {
             agent_capabilities: protocol.agent_capabilities().and_then(|c| sdk_to_snake_value(&c)),
             auth_methods: protocol.auth_methods().and_then(|m| sdk_to_snake_value(&m)),
@@ -399,7 +359,8 @@ impl AcpAgentManager {
             .session_mode
             .as_ref()
             .map(|m| normalize_requested_mode(&params.metadata, m))
-            .filter(|m| !m.is_empty());
+            .filter(|m| !m.is_empty())
+            .map(ModeId::new);
         let mut session = AcpSession::new(initial_mode, HashMap::new());
         if let Some(agent_capabilities) = protocol.agent_capabilities() {
             session.apply_advertised_capabilities(agent_capabilities);
@@ -463,7 +424,7 @@ impl AcpAgentManager {
                     self.commit_session_changes(&mut s).await;
                 } else if let Some(current_id) = value.get("currentModeId").and_then(|v: &Value| v.as_str()) {
                     let mut s = self.session.write().await;
-                    s.apply_observed_mode(current_id);
+                    s.apply_observed_mode(ModeId::new(current_id));
                     self.commit_session_changes(&mut s).await;
                 }
             }
@@ -491,33 +452,6 @@ impl AcpAgentManager {
         }
     }
 
-    /// Forward session-driven ACP events into the catalog sync channel
-    /// so the `agent_metadata` row stays in sync with what the CLI is
-    /// actually reporting. Runs as a subscriber on this manager's
-    /// broadcast bus; the registry owns the single consumer that drains
-    /// the resulting MPSC.
-    ///
-    /// `catalog_tx` is passed in rather than stored on the manager — the
-    /// spawned task is the sole consumer of the sender for session-driven
-    /// updates after initialization.
-    pub fn start_catalog_sync(self: &Arc<Self>, catalog_tx: CatalogSender) {
-        let id = self.params.metadata.id.clone();
-        let mut rx = self.event_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if let Some(partial) = catalog_partial_from_event(&event) {
-                            catalog_tx.send_partial(id.clone(), partial);
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        });
-    }
-
     /// Drain pending domain events from the session aggregate and
     /// forward them to the persistence consumer via the mpsc channel.
     async fn commit_session_changes(&self, session: &mut AcpSession) {
@@ -533,14 +467,14 @@ impl AcpAgentManager {
     pub async fn preload_snapshot(&self, state: PersistedSessionState) {
         let mut session = self.session.write().await;
         session.preload_persisted(&state);
-        if let Some(mode_id) = &state.current_mode_id {
-            let normalized = normalize_requested_mode(&self.params.metadata, mode_id);
+        if let Some(mode) = &state.current_mode_id {
+            let normalized = normalize_requested_mode(&self.params.metadata, mode.as_str());
             if !normalized.is_empty() {
-                session.set_desired_mode(normalized);
+                session.set_desired_mode(ModeId::new(normalized));
             }
         }
-        for (config_id, value) in &state.config_selections {
-            session.set_desired_config(config_id.clone(), value.clone());
+        for (key, value) in &state.config_selections {
+            session.set_desired_config(key.clone(), value.clone());
         }
         // Preload events are discarded — the DB already has these values.
         session.drain_events();
@@ -624,7 +558,7 @@ impl AcpAgentManager {
             if let Some(config_options) = session_response.config_options {
                 session.apply_advertised_config_options(config_options);
             }
-            session.assign_session_id(sid.clone());
+            session.assign_session_id(DomainSessionId::new(sid.clone()));
             self.commit_session_changes(&mut session).await;
         }
         self.emit_snapshot_events().await;
@@ -717,7 +651,7 @@ impl AcpAgentManager {
                     if let Some(config_options) = session_response.config_options {
                         session.apply_advertised_config_options(config_options);
                     }
-                    session.assign_session_id(new_sid.clone());
+                    session.assign_session_id(DomainSessionId::new(new_sid.clone()));
                     self.commit_session_changes(&mut session).await;
                 }
                 self.emit_snapshot_events().await;
@@ -769,7 +703,7 @@ impl AcpAgentManager {
         if let Some(sid) = session_id {
             {
                 let mut session = self.session.write().await;
-                session.assign_session_id(sid.to_owned());
+                session.assign_session_id(DomainSessionId::new(sid));
                 self.commit_session_changes(&mut session).await;
             }
             self.reconcile_session(sid).await;
@@ -892,7 +826,7 @@ impl AcpAgentManager {
     /// turns — once the resume handshake has run — take the short path.
     pub async fn restore_session_id(&self, sid: String) {
         let mut session = self.session.write().await;
-        session.assign_session_id(sid);
+        session.assign_session_id(DomainSessionId::new(sid));
         // Discarded — the session_id already came from DB, no need to re-persist.
         session.drain_events();
     }
@@ -1109,11 +1043,11 @@ impl IAgentManager for AcpAgentManager {
                 .map_err(AppError::from)?;
             self.update_cached_mode(&normalized_mode).await;
             let mut session = self.session.write().await;
-            session.apply_observed_mode(&normalized_mode);
+            session.apply_observed_mode(ModeId::new(&normalized_mode));
         }
 
         let mut session = self.session.write().await;
-        session.set_desired_mode(normalized_mode);
+        session.set_desired_mode(ModeId::new(normalized_mode));
         self.commit_session_changes(&mut session).await;
         Ok(())
     }
@@ -1316,29 +1250,5 @@ mod tests {
     fn normalize_requested_mode_trims_and_returns_empty_for_blank() {
         let meta = metadata_with_yolo_id(Some("full-access"));
         assert_eq!(normalize_requested_mode(&meta, "   "), "");
-    }
-
-    /// Each session-driven event projects onto exactly one handshake
-    /// field. Unrelated events produce `None` so the forwarder sends
-    /// nothing for them.
-    #[test]
-    fn catalog_partial_covers_session_fields() {
-        let modes = catalog_partial_from_event(&AgentStreamEvent::AcpModeInfo(json!({"x": 1})))
-            .expect("mode event must project");
-        assert_eq!(modes.available_modes, Some(json!({"x": 1})));
-        assert!(modes.available_models.is_none());
-
-        let models =
-            catalog_partial_from_event(&AgentStreamEvent::AcpModelInfo(json!([1]))).expect("model event must project");
-        assert_eq!(models.available_models, Some(json!([1])));
-
-        let cfg = catalog_partial_from_event(&AgentStreamEvent::AcpConfigOption(json!([
-            {"id":"mode"}
-        ])))
-        .expect("config event must project");
-        assert_eq!(cfg.config_options, Some(json!([{"id":"mode"}])));
-
-        // An unrelated event emits no update.
-        assert!(catalog_partial_from_event(&AgentStreamEvent::Start(StartEventData { session_id: None })).is_none());
     }
 }
