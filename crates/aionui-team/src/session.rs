@@ -15,6 +15,7 @@ use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
+use crate::service::spawn_support::resolve_full_auto_mode;
 use crate::task_board::TaskBoard;
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 
@@ -815,7 +816,7 @@ impl TeamSession {
     ) -> Result<(), TeamError> {
         let patch = serde_json::json!({
             "team_mcp_stdio_config": mcp_stdio_cfg,
-            "session_mode": "bypassPermissions",
+            "session_mode": resolve_full_auto_mode(&agent.backend),
         });
 
         service
