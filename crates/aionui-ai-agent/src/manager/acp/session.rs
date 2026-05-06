@@ -7,6 +7,20 @@ use agent_client_protocol::schema::{
 
 use super::events::AcpSessionEvent;
 use super::reconcile::ReconcileAction;
+use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId};
+
+/// Decoded per-session runtime state loaded from `acp_session.session_config.runtime`.
+///
+/// Only carries the user's last *choices* — the enumerations of what
+/// the agent supports (mode list, model list, config schema) come from
+/// the CLI's session response after initialization.
+#[derive(Debug, Clone, Default)]
+pub struct PersistedSessionState {
+    pub current_mode_id: Option<String>,
+    pub current_model_id: Option<String>,
+    pub config_selections: HashMap<String, String>,
+    pub context_usage: Option<UsageUpdate>,
+}
 
 /// What the user wants the session to be (intent).
 #[derive(Debug, Clone, Default)]
@@ -139,8 +153,9 @@ impl AcpSession {
             return;
         }
         self.session_id = Some(sid.clone());
-        self.pending_events
-            .push(AcpSessionEvent::SessionAssigned { session_id: sid });
+        self.pending_events.push(AcpSessionEvent::SessionAssigned {
+            session_id: SessionId::new(sid),
+        });
     }
 
     /// Mark the session as opened with the CLI (first turn handshake complete).
@@ -165,8 +180,9 @@ impl AcpSession {
             return false;
         }
         self.desired.mode_id = Some(mode_id.clone());
-        self.pending_events
-            .push(AcpSessionEvent::DesiredModeChanged { mode_id });
+        self.pending_events.push(AcpSessionEvent::DesiredModeChanged {
+            mode_id: ModeId::new(mode_id),
+        });
         true
     }
 
@@ -175,9 +191,14 @@ impl AcpSession {
         let changed = self.desired.config_selections.get(&config_id) != Some(&value);
         self.desired.config_selections.insert(config_id, value);
         if changed {
-            self.pending_events.push(AcpSessionEvent::DesiredConfigChanged {
-                selections: self.desired.config_selections.clone(),
-            });
+            let selections = self
+                .desired
+                .config_selections
+                .iter()
+                .map(|(k, v)| (ConfigKey::new(k), ConfigValue::new(v)))
+                .collect();
+            self.pending_events
+                .push(AcpSessionEvent::DesiredConfigChanged { selections });
         }
     }
 
@@ -188,7 +209,7 @@ impl AcpSession {
         self.observed.mode_id = Some(mode_id.to_owned());
         if changed {
             self.pending_events.push(AcpSessionEvent::ObservedModeSynced {
-                mode_id: mode_id.to_owned(),
+                mode_id: ModeId::new(mode_id),
             });
         }
     }
@@ -198,7 +219,7 @@ impl AcpSession {
         self.observed.model_id = Some(model_id.to_owned());
         if changed {
             self.pending_events.push(AcpSessionEvent::ObservedModelSynced {
-                model_id: model_id.to_owned(),
+                model_id: ModelId::new(model_id),
             });
         }
     }
@@ -238,6 +259,46 @@ impl AcpSession {
         self.advertised.context_usage = Some(usage);
     }
 
+    /// Update the model's current_model_id in place without replacing
+    /// the available models list. Used after a successful `set_model` call.
+    pub fn update_current_model(&mut self, model_id: &str) {
+        if let Some(info) = &self.advertised.models {
+            let updated = SessionModelState::new(model_id.to_owned(), info.available_models.clone());
+            self.advertised.models = Some(updated);
+        }
+        self.observed.model_id = Some(model_id.to_owned());
+    }
+
+    /// Seed the aggregate with persisted user choices from DB.
+    /// Called on resume paths before the CLI session/load response arrives.
+    pub fn preload_persisted(&mut self, state: &PersistedSessionState) {
+        if let Some(mode_id) = &state.current_mode_id {
+            self.advertised.modes = Some(SessionModeState::new(mode_id.clone(), Vec::new()));
+            self.observed.mode_id = Some(mode_id.clone());
+        }
+        if let Some(model_id) = &state.current_model_id {
+            self.advertised.models = Some(SessionModelState::new(model_id.clone(), Vec::new()));
+            self.observed.model_id = Some(model_id.clone());
+        }
+        if !state.config_selections.is_empty() {
+            self.observed.config_current = state.config_selections.clone();
+        }
+        if let Some(usage) = &state.context_usage {
+            self.advertised.context_usage = Some(usage.clone());
+        }
+    }
+
+    /// Apply a partial mode update (only currentModeId changed, keep available_modes).
+    pub fn apply_partial_mode_update(&mut self, current_mode_id: &str) {
+        if let Some(existing) = &self.advertised.modes {
+            let available = existing.available_modes.clone();
+            self.advertised.modes = Some(SessionModeState::new(current_mode_id.to_owned(), available));
+        } else {
+            self.advertised.modes = Some(SessionModeState::new(current_mode_id.to_owned(), Vec::new()));
+        }
+        self.observed.mode_id = Some(current_mode_id.to_owned());
+    }
+
     // ─── Reconcile ─────────────────────────────────────────────────────
 
     /// Produce a list of actions needed to align CLI state with user intent.
@@ -249,15 +310,15 @@ impl AcpSession {
             && self.observed.mode_id.as_deref() != Some(desired_mode)
         {
             actions.push(ReconcileAction::SetMode {
-                mode_id: desired_mode.clone(),
+                mode_id: ModeId::new(desired_mode),
             });
         }
 
         for (config_id, desired_value) in &self.desired.config_selections {
             if self.observed.config_current.get(config_id) != Some(desired_value) {
                 actions.push(ReconcileAction::SetConfigOption {
-                    config_id: config_id.clone(),
-                    value: desired_value.clone(),
+                    config_id: ConfigKey::new(config_id),
+                    value: ConfigValue::new(desired_value),
                 });
             }
         }
