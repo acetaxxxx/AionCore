@@ -1110,6 +1110,82 @@ mod tests {
         assert!(result.is_none(), "Non-ping SYSTEM frames should not return ack");
     }
 
+    // -- handle_stream_frame: CALLBACK flow ---------------------------------
+
+    #[tokio::test]
+    async fn handle_stream_frame_callback_emits_message() {
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = tokio::sync::mpsc::channel(16);
+
+        let callback_frame = serde_json::json!({
+            "type": "CALLBACK",
+            "headers": {
+                "contentType": "application/json",
+                "messageId": "cb_msg_001",
+                "topic": "/v1.0/im/bot/messages/get"
+            },
+            "data": serde_json::json!({
+                "msgId": "dt_msg_123",
+                "msgtype": "text",
+                "text": { "content": "hello bot" },
+                "senderStaffId": "staff_abc",
+                "senderNick": "Alice",
+                "conversationType": "1",
+                "createAt": 1700000000000_i64
+            }).to_string()
+        });
+
+        let result = handle_stream_frame(
+            &callback_frame.to_string(),
+            &msg_tx,
+            &confirm_tx,
+        ).await;
+
+        assert!(result.is_some());
+        let ack = result.unwrap();
+        assert_eq!(ack.code, 200);
+        assert_eq!(ack.headers.message_id, "cb_msg_001");
+
+        let msg = msg_rx.try_recv().unwrap();
+        assert_eq!(msg.id, "dt_msg_123");
+        assert_eq!(msg.chat_id, "user:staff_abc");
+        assert_eq!(msg.content.text, "hello bot");
+        assert_eq!(msg.user.display_name, "Alice");
+        assert_eq!(msg.platform, PluginType::Dingtalk);
+    }
+
+    #[tokio::test]
+    async fn handle_stream_frame_card_action_emits_confirm() {
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(16);
+        let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel(16);
+
+        let card_frame = serde_json::json!({
+            "type": "CALLBACK",
+            "headers": {
+                "contentType": "application/json",
+                "messageId": "cb_card_001",
+                "topic": "/v1.0/card/instances/callback"
+            },
+            "data": serde_json::json!({
+                "userId": "user_xyz",
+                "openConversationId": "",
+                "content": r#"{"action":"chat:system.confirm:callId=call_123,value=yes"}"#
+            }).to_string()
+        });
+
+        let result = handle_stream_frame(
+            &card_frame.to_string(),
+            &msg_tx,
+            &confirm_tx,
+        ).await;
+
+        assert!(result.is_some());
+
+        let (call_id, value) = confirm_rx.try_recv().unwrap();
+        assert_eq!(call_id, "call_123");
+        assert_eq!(value, "yes");
+    }
+
     // -- DingtalkPlugin constructor -----------------------------------------
 
     #[test]
