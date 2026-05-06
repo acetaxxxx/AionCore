@@ -6,6 +6,7 @@ pub mod acp_routes;
 pub mod agent_manager;
 pub mod agent_registry;
 pub mod agent_routes;
+pub mod agent_task;
 pub mod aionrs_agent;
 pub mod auxiliary_routes;
 pub mod backend_output_sink;
@@ -27,9 +28,12 @@ pub mod types;
 
 pub use acp_agent::AcpAgentManager;
 pub use acp_routes::{AcpRouterState, acp_routes};
-pub use agent_manager::{AgentManagerHandle, IAgentManager, approval_key};
+pub use agent_manager::approval_key;
 pub use agent_registry::AgentRegistry;
 pub use agent_routes::{AgentRouterState, agent_routes};
+#[cfg(any(test, feature = "test-support"))]
+pub use agent_task::IMockAgent;
+pub use agent_task::{AgentInstance, IAgentTask};
 pub use aionrs_agent::AionrsAgentManager;
 pub use aionui_api_types::{
     AcpBuildExtra, AcpModelInfo, AcpSessionConfigOption, AionrsBuildExtra, OpenClawBuildExtra, OpenClawGatewayConfig,

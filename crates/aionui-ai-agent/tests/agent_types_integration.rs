@@ -1,7 +1,7 @@
 //! Integration tests for agent type implementations and auxiliary features.
 //!
 //! These tests validate:
-//! - Each agent manager implements IAgentManager correctly
+//! - Each agent manager implements IAgentTask correctly
 //! - Agent factory can build all agent types
 //! - Idle scanner finds eligible tasks
 //! - Workspace browsing works with real filesystem
@@ -10,9 +10,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::*;
-use aionui_common::{
-    AgentKillReason, AgentType, Confirmation, ConversationStatus, ProviderWithModel, TimestampMs, now_ms,
-};
+use aionui_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel, TimestampMs, now_ms};
 use serde_json::json;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::broadcast;
@@ -50,18 +48,18 @@ impl TypedMockAgent {
 }
 
 #[async_trait::async_trait]
-impl IAgentManager for TypedMockAgent {
+impl IAgentTask for TypedMockAgent {
     fn agent_type(&self) -> AgentType {
         self.agent_type
     }
-    fn status(&self) -> Option<ConversationStatus> {
-        self.status
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
     }
     fn workspace(&self) -> &str {
         &self.workspace
     }
-    fn conversation_id(&self) -> &str {
-        &self.conversation_id
+    fn status(&self) -> Option<ConversationStatus> {
+        self.status
     }
     fn last_activity_at(&self) -> TimestampMs {
         self.last_activity.load(Ordering::Relaxed)
@@ -75,28 +73,12 @@ impl IAgentManager for TypedMockAgent {
     async fn stop(&self) -> Result<(), aionui_common::AppError> {
         Ok(())
     }
-    fn confirm(
-        &self,
-        _msg_id: &str,
-        _call_id: &str,
-        _data: serde_json::Value,
-        _always_allow: bool,
-    ) -> Result<(), aionui_common::AppError> {
-        Ok(())
-    }
-    fn get_confirmations(&self) -> Vec<Confirmation> {
-        vec![]
-    }
-    fn check_approval(&self, _action: &str, _command_type: Option<&str>) -> bool {
-        false
-    }
     fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_common::AppError> {
         Ok(())
     }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
+
+impl IMockAgent for TypedMockAgent {}
 
 // ---------------------------------------------------------------------------
 // Aionrs agent tests (real implementation with AgentEngine)
@@ -131,6 +113,9 @@ async fn aionrs_agent_confirm_succeeds() {
     let agent = AionrsAgentManager::new("conv-1".into(), "/proj".into(), make_aionrs_config(), None)
         .await
         .unwrap();
+    // `confirm` is an inherent method on `AionrsAgentManager` (reached via
+    // `AgentInstance::Aionrs(..)` in production); the test calls it
+    // directly on the concrete manager.
     let result = agent.confirm("msg", "call", json!({}), false);
     assert!(result.is_ok());
 }
@@ -166,7 +151,7 @@ async fn collect_idle_ignores_non_acp_agent_types() {
                 Some(ConversationStatus::Finished),
             )
             .with_last_activity(old_ts);
-            Ok(Arc::new(mock) as AgentManagerHandle)
+            Ok(AgentInstance::Mock(Arc::new(mock)))
         }
         .boxed()
     });
