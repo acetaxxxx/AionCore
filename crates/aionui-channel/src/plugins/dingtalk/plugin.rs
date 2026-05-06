@@ -524,16 +524,34 @@ async fn handle_stream_frame(
 
     match frame.frame_type.as_str() {
         "SYSTEM" => {
-            if let Some(ref data_str) = frame.data
-                && let Ok(sys) = serde_json::from_str::<SystemEvent>(data_str)
-            {
-                debug!(
-                    code = sys.code,
-                    message = sys.message.as_deref().unwrap_or(""),
-                    "DingTalk system event"
-                );
+            let topic = frame.headers.topic.as_deref().unwrap_or("");
+            match topic {
+                "ping" => {
+                    debug!("DingTalk system ping received, sending pong");
+                    Some(StreamAck {
+                        code: 200,
+                        headers: super::types::AckHeaders {
+                            content_type: "application/json".into(),
+                            message_id: message_id.clone(),
+                        },
+                        message: "OK".into(),
+                        data: frame.data.unwrap_or_else(|| "{}".into()),
+                    })
+                }
+                _ => {
+                    if let Some(ref data_str) = frame.data
+                        && let Ok(sys) = serde_json::from_str::<SystemEvent>(data_str)
+                    {
+                        debug!(
+                            code = sys.code,
+                            message = sys.message.as_deref().unwrap_or(""),
+                            topic,
+                            "DingTalk system event"
+                        );
+                    }
+                    None
+                }
             }
-            None
         }
         "CALLBACK" => {
             let topic = frame.headers.topic.as_deref().unwrap_or("");
@@ -750,7 +768,7 @@ fn build_ack(message_id: &str) -> StreamAck {
             message_id: message_id.to_string(),
         },
         message: "OK".into(),
-        data: "{}".into(),
+        data: r#"{"response":"SUCCESS"}"#.into(),
     }
 }
 
@@ -953,6 +971,16 @@ mod tests {
         assert_eq!(ack.code, 200);
         assert_eq!(ack.headers.message_id, "msg_123");
         assert_eq!(ack.message, "OK");
+        assert_eq!(ack.data, r#"{"response":"SUCCESS"}"#);
+    }
+
+    #[test]
+    fn build_ack_data_contains_response_success() {
+        let ack = build_ack("msg_456");
+        assert_eq!(ack.code, 200);
+        assert_eq!(ack.headers.message_id, "msg_456");
+        let data: serde_json::Value = serde_json::from_str(&ack.data).unwrap();
+        assert_eq!(data["response"], "SUCCESS");
     }
 
     // -- build_card_param_map for update (empty text, buttons only) ----------
@@ -1018,6 +1046,55 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not initialized"), "expected init error: {err}");
+    }
+
+    // -- handle_stream_frame: SYSTEM ping -----------------------------------
+
+    #[tokio::test]
+    async fn handle_stream_frame_system_ping_returns_ack() {
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = tokio::sync::mpsc::channel(16);
+
+        let ping_frame = serde_json::json!({
+            "type": "SYSTEM",
+            "headers": {
+                "contentType": "application/json",
+                "messageId": "ping_001",
+                "topic": "ping"
+            },
+            "data": "{}"
+        });
+
+        let result = handle_stream_frame(
+            &ping_frame.to_string(),
+            &msg_tx,
+            &confirm_tx,
+        ).await;
+
+        assert!(result.is_some(), "SYSTEM ping should return an ack");
+        let ack = result.unwrap();
+        assert_eq!(ack.code, 200);
+        assert_eq!(ack.headers.message_id, "ping_001");
+    }
+
+    #[tokio::test]
+    async fn handle_stream_frame_system_connected_returns_none() {
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = tokio::sync::mpsc::channel(16);
+
+        let connected_frame = serde_json::json!({
+            "type": "SYSTEM",
+            "headers": { "topic": "CONNECTED" },
+            "data": "{\"code\":200,\"message\":\"OK\"}"
+        });
+
+        let result = handle_stream_frame(
+            &connected_frame.to_string(),
+            &msg_tx,
+            &confirm_tx,
+        ).await;
+
+        assert!(result.is_none(), "Non-ping SYSTEM frames should not return ack");
     }
 
     // -- DingtalkPlugin constructor -----------------------------------------
