@@ -16,7 +16,11 @@ use crate::types::{
 };
 
 use super::api::LarkApi;
-use super::types::{BotMenuEvent, CardActionEvent, MessageEvent, WsFrame, build_interactive_card, parse_lark_callback};
+use super::frame::{
+    build_ack_frame, build_ping_frame, decode_frame, encode_frame, get_header, METHOD_CONTROL, METHOD_DATA,
+};
+use super::types::{BotMenuEvent, CardActionEvent, MessageEvent, build_interactive_card, parse_lark_callback};
+use super::ws_session::{FragmentCache, parse_pong_config};
 
 /// Maximum reconnect attempts before giving up.
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
@@ -261,7 +265,6 @@ async fn ws_loop(
             break;
         }
 
-        // Get WebSocket endpoint URL
         let ws_url = match api.get_ws_endpoint().await {
             Ok(data) => data.url,
             Err(e) => {
@@ -279,21 +282,17 @@ async fn ws_loop(
             }
         };
 
-        debug!(url = %ws_url, "Connecting to Lark WebSocket");
+        let service_id = extract_service_id(&ws_url);
+        debug!(url = %ws_url, service_id, "Connecting to Lark WebSocket");
 
-        match connect_and_listen(&ws_url, &message_tx, &confirm_tx, &dedup_cache, &mut shutdown_rx).await {
+        match connect_and_listen(&ws_url, service_id, &message_tx, &confirm_tx, &dedup_cache, &mut shutdown_rx).await {
             Ok(()) => {
-                // Clean shutdown
                 debug!("Lark WS connection closed cleanly");
                 break;
             }
             Err(e) => {
                 consecutive_errors += 1;
-                warn!(
-                    error = %e,
-                    consecutive_errors,
-                    "Lark WS connection error"
-                );
+                warn!(error = %e, consecutive_errors, "Lark WS connection error");
                 if consecutive_errors >= MAX_RECONNECT_ATTEMPTS {
                     error!("Lark max reconnect attempts reached");
                     break;
@@ -310,15 +309,16 @@ async fn ws_loop(
     debug!("Lark WS loop exited");
 }
 
-/// Connect to the WebSocket and listen for frames until disconnected.
+/// Connect to the WebSocket and listen for binary protobuf frames.
 async fn connect_and_listen(
     ws_url: &str,
+    service_id: i32,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
     dedup_cache: &Arc<Mutex<HashMap<String, Instant>>>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), ChannelError> {
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -328,17 +328,63 @@ async fn connect_and_listen(
 
     info!("Lark WebSocket connected");
 
-    let (_, mut read) = ws_stream.split();
+    let (mut write, mut read) = ws_stream.split();
+    let mut fragment_cache = FragmentCache::new();
+    let mut ping_duration = Duration::from_secs(120);
+    let mut ping_deadline = tokio::time::Instant::now() + ping_duration;
 
     loop {
         tokio::select! {
             msg = read.next() => {
                 match msg {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        handle_ws_text(&text, message_tx, confirm_tx, dedup_cache).await;
-                    }
-                    Some(Ok(WsMessage::Ping(_))) => {
-                        // tungstenite auto-responds with pong
+                    Some(Ok(WsMessage::Binary(data))) => {
+                        let frame = match decode_frame(&data) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(error = %e, "Failed to decode Lark protobuf frame");
+                                continue;
+                            }
+                        };
+
+                        match frame.method {
+                            METHOD_CONTROL => {
+                                if let Some(new_duration) = handle_control_frame(&frame) {
+                                    ping_duration = new_duration;
+                                    ping_deadline = tokio::time::Instant::now() + ping_duration;
+                                }
+                            }
+                            METHOD_DATA => {
+                                let ack = build_ack_frame(&frame);
+                                let ack_bytes = encode_frame(&ack);
+                                if let Err(e) = write.send(WsMessage::Binary(ack_bytes.into())).await {
+                                    warn!(error = %e, "Failed to send Lark ack frame");
+                                }
+
+                                let message_id = get_header(&frame.headers, "message_id")
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let sum: usize = get_header(&frame.headers, "sum")
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(1);
+                                let seq: usize = get_header(&frame.headers, "seq")
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+
+                                if let Some(merged) = fragment_cache.push(&message_id, sum, seq, &frame.payload) {
+                                    let msg_type = get_header(&frame.headers, "type").unwrap_or("");
+                                    if msg_type == "event" || msg_type == "card" {
+                                        if let Ok(text) = String::from_utf8(merged) {
+                                            handle_ws_text(&text, msg_type, message_tx, confirm_tx, dedup_cache).await;
+                                        } else {
+                                            warn!("Lark frame payload is not valid UTF-8");
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                debug!(method = frame.method, "Lark unknown frame method");
+                            }
+                        }
                     }
                     Some(Ok(WsMessage::Close(_))) => {
                         debug!("Lark WS received close frame");
@@ -350,13 +396,23 @@ async fn connect_and_listen(
                         ));
                     }
                     None => {
-                        // Stream ended
                         return Err(ChannelError::ConnectionFailed(
                             "Lark WS stream ended unexpectedly".into()
                         ));
                     }
-                    _ => {} // Binary, Frame — ignore
+                    _ => {}
                 }
+            }
+            _ = tokio::time::sleep_until(ping_deadline) => {
+                let ping = build_ping_frame(service_id);
+                let ping_bytes = encode_frame(&ping);
+                if let Err(e) = write.send(WsMessage::Binary(ping_bytes.into())).await {
+                    warn!(error = %e, "Failed to send Lark ping frame");
+                    return Err(ChannelError::ConnectionFailed("Lark ping send failed".into()));
+                }
+                debug!("Lark ping sent");
+                ping_deadline = tokio::time::Instant::now() + ping_duration;
+                fragment_cache.cleanup(Duration::from_secs(300));
             }
             _ = shutdown_rx.changed() => {
                 debug!("Lark WS shutdown during listen");
@@ -366,46 +422,70 @@ async fn connect_and_listen(
     }
 }
 
-/// Handle a text WebSocket frame from Lark.
+/// Handle a control frame (ping/pong). Returns updated ping duration if pong contains config.
+fn handle_control_frame(frame: &super::frame::PbFrame) -> Option<Duration> {
+    let frame_type = get_header(&frame.headers, "type").unwrap_or("");
+    match frame_type {
+        "pong" => {
+            if !frame.payload.is_empty()
+                && let Some(config) = parse_pong_config(&frame.payload)
+            {
+                debug!(interval_secs = config.ping_interval_secs, "Lark ping interval updated from pong");
+                return Some(Duration::from_secs(config.ping_interval_secs));
+            }
+            None
+        }
+        "ping" => None,
+        _ => {
+            debug!(frame_type, "Lark unknown control frame type");
+            None
+        }
+    }
+}
+
+/// Handle a decoded and reassembled Lark event payload.
 async fn handle_ws_text(
     text: &str,
+    frame_type: &str,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
     dedup_cache: &Arc<Mutex<HashMap<String, Instant>>>,
 ) {
-    let frame: WsFrame = match serde_json::from_str(text) {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(error = %e, "Failed to parse Lark WS frame");
-            return;
-        }
-    };
-
-    match frame.frame_type.as_str() {
+    match frame_type {
         "event" => {
-            // Deduplicate by event_id
-            if let Some(ref header) = frame.header
-                && let Some(ref event_id) = header.event_id
-                && is_duplicate(dedup_cache, event_id).await
+            let envelope: serde_json::Value = match serde_json::from_str(text) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "Failed to parse Lark event JSON");
+                    return;
+                }
+            };
+
+            let event_id = envelope
+                .get("header")
+                .and_then(|h| h.get("event_id"))
+                .and_then(|v| v.as_str());
+            if let Some(eid) = event_id
+                && is_duplicate(dedup_cache, eid).await
             {
-                debug!(event_id, "Lark duplicate event, skipping");
+                debug!(event_id = eid, "Lark duplicate event, skipping");
                 return;
             }
 
-            let event_type = frame
-                .header
-                .as_ref()
-                .and_then(|h| h.event_type.as_deref())
+            let event_type = envelope
+                .get("header")
+                .and_then(|h| h.get("event_type"))
+                .and_then(|v| v.as_str())
                 .unwrap_or("");
 
             match event_type {
                 "im.message.receive_v1" => {
-                    if let Some(event_data) = frame.event {
+                    if let Some(event_data) = envelope.get("event").cloned() {
                         handle_message_event(event_data, message_tx).await;
                     }
                 }
                 "application.bot.menu_v6" => {
-                    if let Some(event_data) = frame.event {
+                    if let Some(event_data) = envelope.get("event").cloned() {
                         handle_bot_menu_event(event_data, message_tx).await;
                     }
                 }
@@ -415,15 +495,17 @@ async fn handle_ws_text(
             }
         }
         "card" => {
-            if let Some(data) = frame.data {
-                handle_card_action(data, message_tx, confirm_tx).await;
-            }
+            let data: serde_json::Value = match serde_json::from_str(text) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "Failed to parse Lark card action JSON");
+                    return;
+                }
+            };
+            handle_card_action(data, message_tx, confirm_tx).await;
         }
-        "pong" => {
-            debug!("Lark WS pong received");
-        }
-        other => {
-            debug!(frame_type = other, "Lark unhandled WS frame type");
+        _ => {
+            debug!(frame_type, "Lark unhandled payload type");
         }
     }
 }
@@ -738,6 +820,23 @@ fn chrono_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Extract service_id from a WebSocket URL query string.
+fn extract_service_id(url: &str) -> i32 {
+    url.split('?')
+        .nth(1)
+        .unwrap_or("")
+        .split('&')
+        .find_map(|param| {
+            let (k, v) = param.split_once('=')?;
+            if k == "service_id" {
+                v.parse().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -891,6 +990,20 @@ mod tests {
         let map = cache.lock().await;
         assert!(!map.contains_key("old"));
         assert!(map.contains_key("recent"));
+    }
+
+    // -- extract_service_id ---------------------------------------------------
+
+    #[test]
+    fn extract_service_id_from_url() {
+        let url = "wss://open.feishu.cn/ws/abc?service_id=7&device_id=xxx";
+        assert_eq!(extract_service_id(url), 7);
+    }
+
+    #[test]
+    fn extract_service_id_missing_returns_zero() {
+        let url = "wss://open.feishu.cn/ws/abc";
+        assert_eq!(extract_service_id(url), 0);
     }
 
     // -- LarkPlugin constructor ---------------------------------------------
