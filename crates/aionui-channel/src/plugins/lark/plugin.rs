@@ -537,10 +537,10 @@ async fn handle_ws_text(
 
 /// Handle an `im.message.receive_v1` event.
 async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::Sender<UnifiedIncomingMessage>) {
-    let evt: MessageEvent = match serde_json::from_value(event_data) {
+    let evt: MessageEvent = match serde_json::from_value(event_data.clone()) {
         Ok(e) => e,
         Err(e) => {
-            warn!(error = %e, "Failed to parse Lark message event");
+            warn!(error = %e, raw = %event_data, "Failed to parse Lark message event");
             return;
         }
     };
