@@ -46,10 +46,17 @@ pub(crate) struct RobotInfoResponse {
 // ---------------------------------------------------------------------------
 
 /// Request body for registering a WebSocket Stream connection.
+///
+/// Note: This endpoint uses clientId/clientSecret directly in the body,
+/// NOT the access token header used by other DingTalk APIs.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RegisterStreamRequest {
+    pub client_id: String,
+    pub client_secret: String,
     pub subscriptions: Vec<StreamSubscription>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ua: Option<String>,
 }
 
 /// A subscription entry for stream registration.
@@ -749,14 +756,46 @@ mod tests {
     #[test]
     fn register_stream_request_serializes() {
         let req = RegisterStreamRequest {
+            client_id: "key_1".into(),
+            client_secret: "secret_1".into(),
             subscriptions: vec![StreamSubscription {
-                sub_type: "EVENT".into(),
+                sub_type: "CALLBACK".into(),
                 topic: "/v1.0/im/bot/messages/get".into(),
             }],
+            ua: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["subscriptions"][0]["type"], "EVENT");
+        assert_eq!(json["clientId"], "key_1");
+        assert_eq!(json["clientSecret"], "secret_1");
+        assert_eq!(json["subscriptions"][0]["type"], "CALLBACK");
         assert_eq!(json["subscriptions"][0]["topic"], "/v1.0/im/bot/messages/get");
+        assert!(json.get("ua").is_none());
+    }
+
+    #[test]
+    fn register_stream_request_includes_credentials() {
+        let req = RegisterStreamRequest {
+            client_id: "my_client_id".into(),
+            client_secret: "my_secret".into(),
+            subscriptions: vec![
+                StreamSubscription {
+                    sub_type: "EVENT".into(),
+                    topic: "*".into(),
+                },
+                StreamSubscription {
+                    sub_type: "CALLBACK".into(),
+                    topic: "/v1.0/im/bot/messages/get".into(),
+                },
+            ],
+            ua: Some("aionui-backend".into()),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["clientId"], "my_client_id");
+        assert_eq!(json["clientSecret"], "my_secret");
+        assert_eq!(json["ua"], "aionui-backend");
+        assert_eq!(json["subscriptions"][0]["type"], "EVENT");
+        assert_eq!(json["subscriptions"][0]["topic"], "*");
+        assert_eq!(json["subscriptions"][1]["type"], "CALLBACK");
     }
 
     #[test]
