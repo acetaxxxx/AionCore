@@ -9,8 +9,8 @@ use tracing::{debug, error, info, warn};
 
 use aionui_common::CommandSpec;
 
-use crate::cli_process::CliAgentProcess;
-use crate::stream_event::AgentStreamEvent;
+use crate::capability::cli_process::CliAgentProcess;
+use crate::protocol::events::AgentStreamEvent;
 use crate::types::SendMessageData;
 use std::path::PathBuf;
 

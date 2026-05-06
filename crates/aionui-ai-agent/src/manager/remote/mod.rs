@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
-use crate::stream_event::AgentStreamEvent;
+use crate::protocol::events::AgentStreamEvent;
 use crate::types::SendMessageData;
 
 /// Internal mutable state for the Remote agent.
@@ -257,7 +257,7 @@ impl RemoteAgentManager {
     }
 }
 
-use crate::agent_manager::approval_key;
+use crate::shared_kernel::approval_key;
 
 #[async_trait::async_trait]
 impl crate::agent_task::IAgentTask for RemoteAgentManager {
