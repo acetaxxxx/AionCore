@@ -44,6 +44,16 @@ pub(crate) struct BotInfoData {
 // WebSocket endpoint
 // ---------------------------------------------------------------------------
 
+/// Request body for the WebSocket endpoint URL request.
+/// Note: This endpoint uses AppID/AppSecret directly, NOT Bearer token auth.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WsEndpointRequest {
+    #[serde(rename = "AppID")]
+    pub app_id: String,
+    #[serde(rename = "AppSecret")]
+    pub app_secret: String,
+}
+
 /// Response from the WebSocket endpoint URL request.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct WsEndpointResponse {
@@ -52,11 +62,27 @@ pub(crate) struct WsEndpointResponse {
     pub data: Option<WsEndpointData>,
 }
 
-/// Data containing the WebSocket URL.
+/// Data containing the WebSocket URL and client configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct WsEndpointData {
     #[serde(rename = "URL")]
     pub url: String,
+    #[serde(rename = "ClientConfig")]
+    pub client_config: Option<WsClientConfig>,
+}
+
+/// Client configuration returned by the WS endpoint API.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct WsClientConfig {
+    #[serde(rename = "ReconnectCount")]
+    pub reconnect_count: Option<i32>,
+    #[serde(rename = "ReconnectInterval")]
+    pub reconnect_interval: Option<u64>,
+    #[serde(rename = "ReconnectNonce")]
+    pub reconnect_nonce: Option<u64>,
+    #[serde(rename = "PingInterval")]
+    pub ping_interval: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +460,33 @@ mod tests {
         });
         let resp: WsEndpointResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(resp.code, 0);
-        assert_eq!(resp.data.unwrap().url, "wss://open.feishu.cn/ws/xxx");
+        let data = resp.data.unwrap();
+        assert_eq!(data.url, "wss://open.feishu.cn/ws/xxx");
+        assert!(data.client_config.is_none());
+    }
+
+    #[test]
+    fn ws_endpoint_response_with_client_config() {
+        let raw = json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "URL": "wss://open.feishu.cn/ws/abc?device_id=d1&service_id=7",
+                "ClientConfig": {
+                    "ReconnectCount": -1,
+                    "ReconnectInterval": 120,
+                    "ReconnectNonce": 30,
+                    "PingInterval": 120
+                }
+            }
+        });
+        let resp: WsEndpointResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(resp.code, 0);
+        let data = resp.data.unwrap();
+        assert_eq!(data.url, "wss://open.feishu.cn/ws/abc?device_id=d1&service_id=7");
+        let config = data.client_config.unwrap();
+        assert_eq!(config.reconnect_count, Some(-1));
+        assert_eq!(config.ping_interval, Some(120));
     }
 
     // -- MessageEvent -------------------------------------------------------
