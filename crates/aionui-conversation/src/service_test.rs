@@ -1511,7 +1511,10 @@ async fn send_message_returns_accepted() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let msg_id = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await.unwrap();
+    let msg_id = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
 
     assert!(!msg_id.is_empty(), "msg_id must be non-empty");
     assert_eq!(msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
@@ -1526,7 +1529,10 @@ async fn send_message_broadcasts_user_created_event() {
     // Clear events from create
     broadcaster.take_events();
 
-    let msg_id = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await.unwrap();
+    let msg_id = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
 
     let events = broadcaster.take_events();
     let user_created = events

@@ -145,7 +145,10 @@ async fn send_message(
         .conversation_service
         .send_message(&user.id, &id, req, &state.worker_task_manager)
         .await?;
-    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(SendMessageResponse { msg_id }))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::ok(SendMessageResponse { msg_id })),
+    ))
 }
 
 async fn list_artifacts(
