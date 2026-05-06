@@ -172,11 +172,14 @@ impl ChannelPlugin for DingtalkPlugin {
 
         let text = truncate_message(message.text.as_deref().unwrap_or(""), DINGTALK_MESSAGE_LIMIT);
 
-        // Try AI Card first
-        match send_via_ai_card(api, chat_id, &text, message.buttons.as_deref()).await {
-            Ok(card_id) => return Ok(card_id),
-            Err(e) => {
-                warn!(error = %e, "AI Card send failed, falling back to Open API");
+        // Only use AI Card for streaming (messages without buttons).
+        // Messages with buttons are one-shot and should go via Open API.
+        if message.buttons.is_none() {
+            match send_via_ai_card(api, chat_id).await {
+                Ok(card_id) => return Ok(card_id),
+                Err(e) => {
+                    warn!(error = %e, "AI Card send failed, falling back to Open API");
+                }
             }
         }
 
@@ -253,16 +256,10 @@ impl ChannelPlugin for DingtalkPlugin {
 // AI Card operations
 // ---------------------------------------------------------------------------
 
-/// Send a message via AI Card (create + deliver).
+/// Create an empty AI Card for streaming (create + deliver + set INPUTING).
 ///
-/// The initial "Thinking..." state is implied by the streaming card template.
 /// Returns the `outTrackId` which is used as the message ID for subsequent streaming writes.
-async fn send_via_ai_card(
-    api: &Arc<DingtalkApi>,
-    chat_id: &str,
-    _text: &str,
-    _buttons: Option<&[Vec<crate::types::ActionButton>]>,
-) -> Result<String, ChannelError> {
+async fn send_via_ai_card(api: &Arc<DingtalkApi>, chat_id: &str) -> Result<String, ChannelError> {
     let (is_group, _) = decode_chat_id(chat_id);
 
     let out_track_id = generate_out_track_id();
@@ -304,6 +301,20 @@ async fn send_via_ai_card(
     };
 
     api.deliver_card(&deliver_req).await?;
+
+    // Transition card to INPUTING state so streaming writes are accepted.
+    let inputing_req = UpdateCardRequest {
+        out_track_id: out_track_id.clone(),
+        card_data: CardData {
+            card_param_map: Some(serde_json::json!({
+                "flowStatus": "2",
+                "msgContent": "",
+                "staticMsgContent": "",
+                "sys_full_json_obj": serde_json::json!({"order": ["msgContent"]}).to_string(),
+            })),
+        },
+    };
+    api.update_card(&inputing_req).await?;
 
     debug!(card_id = %out_track_id, "DingTalk AI Card delivered");
     Ok(out_track_id)
