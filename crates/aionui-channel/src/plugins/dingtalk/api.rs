@@ -176,18 +176,18 @@ impl DingtalkApi {
             .map_err(|e| ChannelError::ConnectionFailed(format!("DingTalk stream registration failed: {e}")))?;
 
         let status = raw_resp.status();
-        let body_text = raw_resp
-            .text()
-            .await
-            .map_err(|e| ChannelError::ConnectionFailed(format!("DingTalk stream registration read body failed: {e}")))?;
+        let body_text = raw_resp.text().await.map_err(|e| {
+            ChannelError::ConnectionFailed(format!("DingTalk stream registration read body failed: {e}"))
+        })?;
 
         debug!(status = %status, body_len = body_text.len(), "DingTalk stream registration response received");
 
-        let resp: RegisterStreamResponse = serde_json::from_str(&body_text)
-            .map_err(|e| ChannelError::ConnectionFailed(format!(
+        let resp: RegisterStreamResponse = serde_json::from_str(&body_text).map_err(|e| {
+            ChannelError::ConnectionFailed(format!(
                 "DingTalk stream registration parse failed: {e}, body: {}",
                 &body_text[..body_text.len().min(200)]
-            )))?;
+            ))
+        })?;
 
         Ok(resp)
     }
