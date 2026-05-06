@@ -1,4 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a string that may be null into an empty string.
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
 
 // ---------------------------------------------------------------------------
 // Tenant access token
@@ -111,11 +119,11 @@ pub(crate) struct MessageSender {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct SenderIdContainer {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub open_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub user_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub union_id: String,
 }
 
@@ -123,15 +131,15 @@ pub(crate) struct SenderIdContainer {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct MessageBody {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub message_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub chat_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub chat_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub message_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub content: String,
     #[serde(default)]
     pub parent_id: Option<String>,
