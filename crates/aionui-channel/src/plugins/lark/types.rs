@@ -59,34 +59,6 @@ pub(crate) struct WsEndpointData {
     pub url: String,
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket frame
-// ---------------------------------------------------------------------------
-
-/// A frame received over the Lark WebSocket connection.
-///
-/// Lark sends JSON frames with a `type` field indicating the frame kind.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct WsFrame {
-    /// Frame type: "event", "card", "pong", etc.
-    #[serde(rename = "type")]
-    pub frame_type: String,
-    /// Header containing metadata (event type, event ID, token).
-    pub header: Option<WsFrameHeader>,
-    /// Event-specific payload.
-    pub event: Option<serde_json::Value>,
-    /// Card action payload.
-    pub data: Option<serde_json::Value>,
-}
-
-/// Header metadata in a WebSocket frame.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct WsFrameHeader {
-    pub event_id: Option<String>,
-    pub event_type: Option<String>,
-    pub token: Option<String>,
-}
 
 // ---------------------------------------------------------------------------
 // Message event (im.message.receive_v1)
@@ -464,34 +436,6 @@ mod tests {
         let resp: WsEndpointResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(resp.code, 0);
         assert_eq!(resp.data.unwrap().url, "wss://open.feishu.cn/ws/xxx");
-    }
-
-    // -- WsFrame ------------------------------------------------------------
-
-    #[test]
-    fn ws_frame_event_parses() {
-        let raw = json!({
-            "type": "event",
-            "header": {
-                "event_id": "ev_123",
-                "event_type": "im.message.receive_v1",
-                "token": "tok_abc"
-            },
-            "event": { "sender": {}, "message": {} }
-        });
-        let frame: WsFrame = serde_json::from_value(raw).unwrap();
-        assert_eq!(frame.frame_type, "event");
-        let header = frame.header.unwrap();
-        assert_eq!(header.event_id.as_deref(), Some("ev_123"));
-        assert_eq!(header.event_type.as_deref(), Some("im.message.receive_v1"));
-    }
-
-    #[test]
-    fn ws_frame_pong_parses() {
-        let raw = json!({ "type": "pong" });
-        let frame: WsFrame = serde_json::from_value(raw).unwrap();
-        assert_eq!(frame.frame_type, "pong");
-        assert!(frame.header.is_none());
     }
 
     // -- MessageEvent -------------------------------------------------------
