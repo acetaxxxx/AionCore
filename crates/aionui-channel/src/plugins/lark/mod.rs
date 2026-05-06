@@ -1,4 +1,5 @@
 mod api;
+mod frame;
 mod plugin;
 mod types;
 
