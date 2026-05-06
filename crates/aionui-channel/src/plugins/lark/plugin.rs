@@ -265,8 +265,8 @@ async fn ws_loop(
             break;
         }
 
-        let ws_url = match api.get_ws_endpoint().await {
-            Ok(data) => data.url,
+        let endpoint_data = match api.get_ws_endpoint().await {
+            Ok(data) => data,
             Err(e) => {
                 consecutive_errors += 1;
                 warn!(error = %e, consecutive_errors, "Lark WS endpoint fetch failed");
@@ -282,12 +282,20 @@ async fn ws_loop(
             }
         };
 
-        let service_id = extract_service_id(&ws_url);
-        debug!(url = %ws_url, service_id, "Connecting to Lark WebSocket");
+        let ws_url = &endpoint_data.url;
+        let initial_ping_secs = endpoint_data
+            .client_config
+            .as_ref()
+            .and_then(|c| c.ping_interval)
+            .unwrap_or(120);
+
+        let service_id = extract_service_id(ws_url);
+        debug!(url = %ws_url, service_id, initial_ping_secs, "Connecting to Lark WebSocket");
 
         match connect_and_listen(
-            &ws_url,
+            ws_url,
             service_id,
+            initial_ping_secs,
             &message_tx,
             &confirm_tx,
             &dedup_cache,
@@ -322,6 +330,7 @@ async fn ws_loop(
 async fn connect_and_listen(
     ws_url: &str,
     service_id: i32,
+    initial_ping_secs: u64,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
     dedup_cache: &Arc<Mutex<HashMap<String, Instant>>>,
@@ -339,7 +348,7 @@ async fn connect_and_listen(
 
     let (mut write, mut read) = ws_stream.split();
     let mut fragment_cache = FragmentCache::new();
-    let mut ping_duration = Duration::from_secs(120);
+    let mut ping_duration = Duration::from_secs(initial_ping_secs);
     let mut ping_deadline = tokio::time::Instant::now() + ping_duration;
 
     loop {
