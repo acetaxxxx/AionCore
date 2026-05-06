@@ -294,7 +294,12 @@ impl DingtalkApi {
         request: &SendRobotMessageRequest,
     ) -> Result<SendRobotMessageResponse, ChannelError> {
         let token = self.get_token().await?;
-        let url = format!("{DINGTALK_API_BASE}/v1.0/robot/oToMessages/batchSend");
+
+        let url = if request.open_conversation_id.is_some() {
+            format!("{DINGTALK_API_BASE}/v1.0/robot/groupMessages/send")
+        } else {
+            format!("{DINGTALK_API_BASE}/v1.0/robot/oToMessages/batchSend")
+        };
 
         let resp: SendRobotMessageResponse = self
             .client

@@ -509,11 +509,21 @@ pub(crate) fn parse_dingtalk_callback(data: &str) -> Option<ParsedCallback> {
 
 /// Encode a chat ID for DingTalk.
 ///
-/// - Private chat: `user:{staffId}`
-/// - Group chat: `group:{conversationId}`
-pub(crate) fn encode_chat_id(conversation_id: Option<&str>, sender_staff_id: &str) -> String {
-    match conversation_id {
-        Some(cid) if !cid.is_empty() => format!("group:{cid}"),
+/// - Private chat (`conversationType == "1"`): `user:{staffId}`
+/// - Group chat (`conversationType == "2"`): `group:{conversationId}`
+///
+/// DingTalk sends a `conversationId` for BOTH private and group chats,
+/// so we must rely on `conversationType` to distinguish them.
+pub(crate) fn encode_chat_id(
+    conversation_type: Option<&str>,
+    conversation_id: Option<&str>,
+    sender_staff_id: &str,
+) -> String {
+    match conversation_type {
+        Some("2") => {
+            let cid = conversation_id.unwrap_or("");
+            format!("group:{cid}")
+        }
         _ => format!("user:{sender_staff_id}"),
     }
 }
@@ -931,19 +941,19 @@ mod tests {
 
     #[test]
     fn encode_chat_id_group() {
-        let result = encode_chat_id(Some("conv_123"), "staff_1");
+        let result = encode_chat_id(Some("2"), Some("conv_123"), "staff_1");
         assert_eq!(result, "group:conv_123");
     }
 
     #[test]
     fn encode_chat_id_private() {
-        let result = encode_chat_id(None, "staff_1");
+        let result = encode_chat_id(Some("1"), Some("cid_private_xyz"), "staff_1");
         assert_eq!(result, "user:staff_1");
     }
 
     #[test]
-    fn encode_chat_id_empty_conversation() {
-        let result = encode_chat_id(Some(""), "staff_1");
+    fn encode_chat_id_no_conversation_type() {
+        let result = encode_chat_id(None, Some("cid_whatever"), "staff_1");
         assert_eq!(result, "user:staff_1");
     }
 
