@@ -1078,11 +1078,7 @@ mod tests {
             "data": "{}"
         });
 
-        let result = handle_stream_frame(
-            &ping_frame.to_string(),
-            &msg_tx,
-            &confirm_tx,
-        ).await;
+        let result = handle_stream_frame(&ping_frame.to_string(), &msg_tx, &confirm_tx).await;
 
         assert!(result.is_some(), "SYSTEM ping should return an ack");
         let ack = result.unwrap();
@@ -1101,11 +1097,7 @@ mod tests {
             "data": "{\"code\":200,\"message\":\"OK\"}"
         });
 
-        let result = handle_stream_frame(
-            &connected_frame.to_string(),
-            &msg_tx,
-            &confirm_tx,
-        ).await;
+        let result = handle_stream_frame(&connected_frame.to_string(), &msg_tx, &confirm_tx).await;
 
         assert!(result.is_none(), "Non-ping SYSTEM frames should not return ack");
     }
@@ -1135,11 +1127,7 @@ mod tests {
             }).to_string()
         });
 
-        let result = handle_stream_frame(
-            &callback_frame.to_string(),
-            &msg_tx,
-            &confirm_tx,
-        ).await;
+        let result = handle_stream_frame(&callback_frame.to_string(), &msg_tx, &confirm_tx).await;
 
         assert!(result.is_some());
         let ack = result.unwrap();
@@ -1173,11 +1161,7 @@ mod tests {
             }).to_string()
         });
 
-        let result = handle_stream_frame(
-            &card_frame.to_string(),
-            &msg_tx,
-            &confirm_tx,
-        ).await;
+        let result = handle_stream_frame(&card_frame.to_string(), &msg_tx, &confirm_tx).await;
 
         assert!(result.is_some());
 
