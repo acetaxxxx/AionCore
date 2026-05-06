@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::agent_manager::AgentManagerHandle;
 use crate::agent_registry::AgentRegistry;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
-use crate::manager::acp::AcpSessionSyncService;
+use crate::manager::acp::{AcpSessionSyncService, CatalogForwarder};
 use crate::manager::remote::RemoteAgentConfig;
 use crate::skill_manager::AcpSkillManager;
 use crate::task_manager::AgentFactory;
@@ -172,15 +172,28 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
             let arc = Arc::new(agent);
             arc.start_permission_handler();
             arc.start_session_event_tracker();
-            arc.start_catalog_sync(catalog_tx);
+            CatalogForwarder::spawn(
+                arc.agent_metadata_id().to_owned(),
+                crate::IAgentManager::subscribe(arc.as_ref()),
+                catalog_tx,
+            );
+
+            // Seed the aggregate with persisted runtime choices and
+            // (if present) the CLI-assigned session id, so the first
+            // turn after a task rebuild takes the resume path.
+            if let Some(state) = deps.acp_agent_service.load_snapshot_state(&conversation_id).await {
+                arc.preload_snapshot(state).await;
+            }
+            if let Some(sid) = deps.acp_agent_service.load_session_id(&conversation_id).await {
+                arc.restore_session_id(sid).await;
+            }
+
             let handle: AgentManagerHandle = arc.clone();
 
             // Hand the service the domain event receiver so it can
             // persist user intent changes without reverse-engineering
             // them from CLI observations.
-            deps.acp_agent_service
-                .attach(conversation_id, handle.clone(), domain_rx)
-                .await;
+            deps.acp_agent_service.attach(conversation_id, domain_rx).await;
 
             Ok(handle)
         }
