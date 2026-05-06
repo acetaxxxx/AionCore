@@ -17,9 +17,9 @@ use crate::types::{
 use super::api::DingtalkApi;
 use super::types::{
     BotMessageCallback, CardActionCallback, CardData, CreateCardInstanceRequest, DeliverCardRequest,
-    ImGroupDeliverModel, ImRobotDeliverModel, SendRobotMessageRequest, StreamAck, StreamFrame, StreamingWriteRequest,
-    SystemEvent, UpdateCardRequest, build_open_space_id, decode_chat_id, encode_chat_id, format_dingtalk_callback,
-    parse_dingtalk_callback,
+    ImGroupDeliverModel, ImRobotDeliverModel, SendRobotMessageRequest, SpaceModel, StreamAck, StreamFrame,
+    StreamingWriteRequest, SystemEvent, UpdateCardRequest, build_open_space_id, decode_chat_id, encode_chat_id,
+    format_dingtalk_callback, parse_dingtalk_callback,
 };
 
 /// Maximum reconnect attempts before giving up.
@@ -200,20 +200,22 @@ impl ChannelPlugin for DingtalkPlugin {
         // Presence of buttons signals the final message in a streaming sequence.
         let is_final = message.buttons.is_some();
 
-        // AI Card streaming write
+        // AI Card streaming write (always send full content, not deltas)
         let req = StreamingWriteRequest {
             out_track_id: message_id.to_string(),
-            key: "content".into(),
-            content: text,
-            is_eof: is_final,
-            is_last: is_final,
+            key: "msgContent".into(),
+            content: text.clone(),
+            is_full: true,
+            is_finalize: is_final,
+            is_error: false,
+            guid: generate_guid(),
         };
 
         api.streaming_write(&req).await?;
 
-        // When finalizing, update the card with button actions.
-        if let Some(ref button_rows) = message.buttons {
-            let card_param_map = build_card_param_map("", Some(button_rows));
+        // When finalizing, update the card status to FINISHED.
+        if is_final {
+            let card_param_map = build_final_card_param_map(&text, message.buttons.as_deref());
             let update_req = UpdateCardRequest {
                 out_track_id: message_id.to_string(),
                 card_data: CardData {
@@ -252,49 +254,39 @@ impl ChannelPlugin for DingtalkPlugin {
 // ---------------------------------------------------------------------------
 
 /// Send a message via AI Card (create + deliver).
+///
+/// The initial "Thinking..." state is implied by the streaming card template.
+/// Returns the `outTrackId` which is used as the message ID for subsequent streaming writes.
 async fn send_via_ai_card(
     api: &Arc<DingtalkApi>,
     chat_id: &str,
-    text: &str,
-    buttons: Option<&[Vec<crate::types::ActionButton>]>,
+    _text: &str,
+    _buttons: Option<&[Vec<crate::types::ActionButton>]>,
 ) -> Result<String, ChannelError> {
     let (is_group, _) = decode_chat_id(chat_id);
 
-    let card_param_map = build_card_param_map(text, buttons);
+    let out_track_id = generate_out_track_id();
 
     let create_req = CreateCardInstanceRequest {
         card_template_id: AI_CARD_TEMPLATE_ID.into(),
+        out_track_id: out_track_id.clone(),
+        callback_type: "STREAM".into(),
         card_data: CardData {
-            card_param_map: Some(card_param_map),
+            card_param_map: Some(serde_json::json!({})),
         },
-        im_group_open_deliver_model: if is_group {
-            Some(ImGroupDeliverModel {
-                robot_code: api.client_id().to_string(),
-            })
-        } else {
-            None
-        },
-        im_robot_open_deliver_model: if !is_group {
-            Some(ImRobotDeliverModel {
-                robot_code: api.client_id().to_string(),
-            })
-        } else {
-            None
-        },
+        im_group_open_space_model: Some(SpaceModel { support_forward: true }),
+        im_robot_open_space_model: Some(SpaceModel { support_forward: true }),
     };
 
-    let create_resp = api.create_card_instance(&create_req).await?;
-    let card_id = create_resp
-        .result
-        .and_then(|r| r.out_track_id)
-        .ok_or_else(|| ChannelError::MessageSendFailed("DingTalk card create returned no outTrackId".into()))?;
+    api.create_card_instance(&create_req).await?;
 
     // Deliver the card
     let open_space_id = build_open_space_id(chat_id);
 
     let deliver_req = DeliverCardRequest {
-        out_track_id: card_id.clone(),
+        out_track_id: out_track_id.clone(),
         open_space_id,
+        user_id_type: 1,
         im_group_open_deliver_model: if is_group {
             Some(ImGroupDeliverModel {
                 robot_code: api.client_id().to_string(),
@@ -304,7 +296,7 @@ async fn send_via_ai_card(
         },
         im_robot_open_deliver_model: if !is_group {
             Some(ImRobotDeliverModel {
-                robot_code: api.client_id().to_string(),
+                space_type: "IM_ROBOT".into(),
             })
         } else {
             None
@@ -313,8 +305,8 @@ async fn send_via_ai_card(
 
     api.deliver_card(&deliver_req).await?;
 
-    debug!(card_id = %card_id, "DingTalk AI Card delivered");
-    Ok(card_id)
+    debug!(card_id = %out_track_id, "DingTalk AI Card delivered");
+    Ok(out_track_id)
 }
 
 /// Send a message via DingTalk Open API (fallback).
@@ -340,10 +332,13 @@ async fn send_via_open_api(api: &Arc<DingtalkApi>, chat_id: &str, text: &str) ->
     Ok(msg_id)
 }
 
-/// Build the card_param_map for an AI Card.
-fn build_card_param_map(text: &str, buttons: Option<&[Vec<crate::types::ActionButton>]>) -> serde_json::Value {
+/// Build the card_param_map for finalizing an AI Card (status = FINISHED).
+fn build_final_card_param_map(text: &str, buttons: Option<&[Vec<crate::types::ActionButton>]>) -> serde_json::Value {
     let mut map = serde_json::json!({
-        "content": text
+        "flowStatus": "3",
+        "msgContent": text,
+        "staticMsgContent": "",
+        "sys_full_json_obj": serde_json::json!({"order": ["msgContent"]}).to_string(),
     });
 
     if let Some(button_rows) = buttons {
@@ -363,6 +358,32 @@ fn build_card_param_map(text: &str, buttons: Option<&[Vec<crate::types::ActionBu
     }
 
     map
+}
+
+/// Generate a unique outTrackId for AI Card instances.
+fn generate_out_track_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("aion_{}_{}", ts, seq)
+}
+
+/// Generate a unique GUID for streaming write operations.
+fn generate_guid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}", ts, seq)
 }
 
 // ---------------------------------------------------------------------------
@@ -956,25 +977,27 @@ mod tests {
         assert!(text.contains("Unsupported"));
     }
 
-    // -- build_card_param_map -----------------------------------------------
+    // -- build_final_card_param_map -------------------------------------------
 
     #[test]
-    fn build_card_param_map_text_only() {
-        let map = build_card_param_map("Hello", None);
-        assert_eq!(map["content"], "Hello");
+    fn build_final_card_param_map_text_only() {
+        let map = build_final_card_param_map("Hello", None);
+        assert_eq!(map["flowStatus"], "3");
+        assert_eq!(map["msgContent"], "Hello");
         assert!(map.get("actions").is_none());
     }
 
     #[test]
-    fn build_card_param_map_with_buttons() {
+    fn build_final_card_param_map_with_buttons() {
         use crate::types::ActionButton;
         let buttons = vec![vec![ActionButton {
             label: "Yes".into(),
             action: "system.confirm".into(),
             params: None,
         }]];
-        let map = build_card_param_map("Choose:", Some(&buttons));
-        assert_eq!(map["content"], "Choose:");
+        let map = build_final_card_param_map("Choose:", Some(&buttons));
+        assert_eq!(map["flowStatus"], "3");
+        assert_eq!(map["msgContent"], "Choose:");
         let actions = map["actions"].as_array().unwrap();
         assert_eq!(actions[0]["label"], "Yes");
         assert!(actions[0]["action"].as_str().unwrap().contains("system.confirm"));
@@ -1000,18 +1023,19 @@ mod tests {
         assert_eq!(data["response"], "SUCCESS");
     }
 
-    // -- build_card_param_map for update (empty text, buttons only) ----------
+    // -- build_final_card_param_map for update (empty text, buttons only) ----
 
     #[test]
-    fn build_card_param_map_empty_text_with_buttons() {
+    fn build_final_card_param_map_empty_text_with_buttons() {
         use crate::types::ActionButton;
         let buttons = vec![vec![ActionButton {
             label: "Confirm".into(),
             action: "system.confirm".into(),
             params: None,
         }]];
-        let map = build_card_param_map("", Some(&buttons));
-        assert_eq!(map["content"], "");
+        let map = build_final_card_param_map("", Some(&buttons));
+        assert_eq!(map["flowStatus"], "3");
+        assert_eq!(map["msgContent"], "");
         let actions = map["actions"].as_array().unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0]["label"], "Confirm");
