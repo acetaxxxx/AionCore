@@ -41,6 +41,7 @@ pub struct LarkPlugin {
     bot_info: Option<BotInfo>,
     last_error: Option<String>,
     api: Option<Arc<LarkApi>>,
+    callbacks: Option<PluginCallbacks>,
     ws_handle: Option<JoinHandle<()>>,
     cleanup_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
@@ -55,6 +56,7 @@ impl Default for LarkPlugin {
             bot_info: None,
             last_error: None,
             api: None,
+            callbacks: None,
             ws_handle: None,
             cleanup_handle: None,
             shutdown_tx: None,
@@ -127,13 +129,25 @@ impl ChannelPlugin for LarkPlugin {
         );
 
         self.api = Some(api);
+        self.callbacks = Some(callbacks);
+        self.status = PluginStatus::Ready;
+        Ok(())
+    }
+
+    async fn start(&mut self) -> Result<(), ChannelError> {
+        self.status = PluginStatus::Starting;
+
+        let callbacks = self.callbacks.take().ok_or_else(|| {
+            self.status = PluginStatus::Error;
+            ChannelError::ConnectionFailed("Plugin not initialized".into())
+        })?;
 
         // Set up shutdown channel
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
         // Spawn the WebSocket connection loop
-        let api_clone = Arc::clone(self.api.as_ref().expect("api just set"));
+        let api_clone = Arc::clone(self.api.as_ref().expect("api set in initialize"));
         let dedup_cache = Arc::clone(&self.dedup_cache);
         self.ws_handle = Some(tokio::spawn(ws_loop(
             api_clone,
@@ -159,12 +173,6 @@ impl ChannelPlugin for LarkPlugin {
             }
         }));
 
-        self.status = PluginStatus::Ready;
-        Ok(())
-    }
-
-    async fn start(&mut self) -> Result<(), ChannelError> {
-        self.status = PluginStatus::Starting;
         self.status = PluginStatus::Running;
         info!("Lark plugin started");
         Ok(())
