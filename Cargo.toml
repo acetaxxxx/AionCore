@@ -99,7 +99,7 @@ reqwest = { version = "0.12", features = ["json", "multipart"] }
 dashmap = "6"
 
 # WebSocket
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 # Protobuf
 prost = "0.13"
