@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use aionui_ai_agent::{IWorkerTaskManager, SendMessageData};
+use aionui_ai_agent::IWorkerTaskManager;
+use aionui_ai_agent::types::SendMessageData;
 use aionui_common::AgentKillReason;
 use aionui_conversation::ConversationService;
 use aionui_db::ITeamRepository;
@@ -882,9 +883,9 @@ mod tests {
     use super::*;
     use crate::test_utils::MockTeamRepo;
     use crate::types::{Team, TeamAgent, TeammateRole};
-    use aionui_ai_agent::agent_manager::approval_key;
     use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
-    use aionui_ai_agent::stream_event::AgentStreamEvent;
+    use aionui_ai_agent::shared_kernel::approval_key;
+    use aionui_ai_agent::protocol::events::AgentStreamEvent;
     use aionui_ai_agent::types::BuildTaskOptions;
     use aionui_api_types::{AgentModeResponse, WebSocketMessage};
     use aionui_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs, now_ms};

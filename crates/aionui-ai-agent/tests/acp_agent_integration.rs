@@ -16,9 +16,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use aionui_ai_agent::acp_agent::AcpAgentManager;
-use aionui_ai_agent::agent_registry::AgentRegistry;
 use aionui_ai_agent::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
+use aionui_ai_agent::manager::acp::AcpAgentManager;
+use aionui_ai_agent::registry::AgentRegistry;
 use aionui_ai_agent::{AgentStreamEvent, IAgentTask};
 use aionui_common::ConversationStatus;
 use aionui_db::{SqliteAgentMetadataRepository, init_database_memory};
@@ -75,7 +75,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
         tmp_skills.path(),
         tmp_skills.path(),
     ));
-    let skill_manager = aionui_ai_agent::skill_manager::AcpSkillManager::new(skill_paths);
+    let skill_manager = aionui_ai_agent::capability::skill_manager::AcpSkillManager::new(skill_paths);
 
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
