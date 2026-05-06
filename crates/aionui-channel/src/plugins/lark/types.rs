@@ -123,10 +123,15 @@ pub(crate) struct SenderIdContainer {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct MessageBody {
+    #[serde(default)]
     pub message_id: String,
+    #[serde(default)]
     pub chat_id: String,
+    #[serde(default)]
     pub chat_type: String,
+    #[serde(default)]
     pub message_type: String,
+    #[serde(default)]
     pub content: String,
     #[serde(default)]
     pub parent_id: Option<String>,
