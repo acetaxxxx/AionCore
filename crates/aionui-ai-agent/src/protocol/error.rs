@@ -6,7 +6,7 @@ use aionui_common::AppError;
 /// This error is internal to the `aionui-ai-agent` crate. External callers
 /// see it only after conversion to [`AppError`] via the `From` impl.
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Variants constructed as error paths mature; kept for complete ACP error model.
 pub(crate) enum AcpError {
     // ── Process lifecycle ──────────────────────────────────────────
     /// CLI binary not found or not executable.
@@ -62,7 +62,7 @@ pub(crate) enum AcpError {
 
 impl AcpError {
     /// Whether the caller may retry the operation.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Will be used once retry logic is wired into the send path.
     pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self,
