@@ -104,10 +104,9 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
         config,
     ));
 
-    let (manager, _domain_rx, _notification_rx) =
-        AcpAgentManager::new(params, skill_manager, &catalog_tx)
-            .await
-            .expect("Failed to spawn mock ACP agent");
+    let (manager, _domain_rx, _notification_rx) = AcpAgentManager::new(params, skill_manager, &catalog_tx)
+        .await
+        .expect("Failed to spawn mock ACP agent");
 
     let arc = Arc::new(manager);
 
