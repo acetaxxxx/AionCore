@@ -228,6 +228,7 @@ fn parse_states_from_bytes(path: &Path, bytes: &[u8]) -> Result<HashMap<String, 
         .into_iter()
         .map(|(name, state)| {
             let version = state.last_version.unwrap_or_default();
+            let installed_at = if state.installed == Some(true) { Some(0) } else { None };
 
             (
                 name.clone(),
@@ -235,7 +236,7 @@ fn parse_states_from_bytes(path: &Path, bytes: &[u8]) -> Result<HashMap<String, 
                     name,
                     version,
                     enabled: state.enabled,
-                    installed_at: None,
+                    installed_at,
                     last_activated_at: None,
                 },
             )
@@ -415,7 +416,7 @@ mod tests {
         assert_eq!(loaded["ext-a"].version, "1.2.3");
         assert!(!loaded["ext-b"].enabled);
         assert_eq!(loaded["ext-b"].version, "");
-        assert!(loaded["ext-a"].installed_at.is_none());
+        assert!(loaded["ext-a"].installed_at.is_some());
         assert!(loaded["ext-a"].last_activated_at.is_none());
     }
 
