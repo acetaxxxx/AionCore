@@ -94,6 +94,18 @@ push *ARGS:
     cargo test --workspace
     git push {{ ARGS }}
 
+# Update aionrs dependency (e.g. just update-aionrs or just update-aionrs v0.1.19)
+update-aionrs *TAG:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag="{{ TAG }}"
+    if [ -z "$tag" ]; then
+        tag=$(git ls-remote --tags ssh://git@github.com/iOfficeAI/aionrs.git | awk -F/ '{print $NF}' | grep -v '\\^{}' | sort -V | tail -1)
+        echo "Using latest tag: $tag"
+    fi
+    sed -i '' "s|git = \"ssh://git@github.com/iOfficeAI/aionrs.git\", tag = \"[^\"]*\"|git = \"ssh://git@github.com/iOfficeAI/aionrs.git\", tag = \"$tag\"|g" Cargo.toml
+    cargo update -p aion-agent -p aion-types -p aion-protocol -p aion-config -p aion-mcp
+
 # Security audit
 audit:
     cargo audit
