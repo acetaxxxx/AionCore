@@ -106,7 +106,7 @@ dependencies = [
 [[package]]
 name = "aion-agent"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -135,7 +135,7 @@ dependencies = [
 [[package]]
 name = "aion-compact"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "regex",
  "serde",
@@ -145,7 +145,7 @@ dependencies = [
 [[package]]
 name = "aion-config"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "aion-compact",
  "aion-types",
@@ -165,7 +165,7 @@ dependencies = [
 [[package]]
 name = "aion-mcp"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -185,7 +185,7 @@ dependencies = [
 [[package]]
 name = "aion-memory"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "aion-config",
  "chrono",
@@ -198,7 +198,7 @@ dependencies = [
 [[package]]
 name = "aion-protocol"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "aion-types",
  "serde",
@@ -210,7 +210,7 @@ dependencies = [
 [[package]]
 name = "aion-providers"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -237,7 +237,7 @@ dependencies = [
 [[package]]
 name = "aion-skills"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -262,7 +262,7 @@ dependencies = [
 [[package]]
 name = "aion-tools"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -281,7 +281,7 @@ dependencies = [
 [[package]]
 name = "aion-types"
 version = "0.1.18"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6120,7 +6120,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6571,7 +6571,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?branch=main#6600b522b1e6809467e31495b3b6dc6340e533c1"
+source = "git+ssh://git@github.com/iOfficeAI/aionrs.git?tag=v0.1.18#6600b522b1e6809467e31495b3b6dc6340e533c1"
 
 [[package]]
 name = "writeable"
