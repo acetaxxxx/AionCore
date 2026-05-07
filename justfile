@@ -94,6 +94,10 @@ push *ARGS:
     cargo test --workspace
     git push {{ ARGS }}
 
+# Security audit
+audit:
+    cargo audit
+
 # Clean build artifacts
 clean:
     cargo clean
