@@ -89,7 +89,7 @@ pub struct AcpProtocol {
     initialize_response: Arc<RwLock<Option<InitializeResponse>>>,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Full ACP method set; some methods await wiring (fork, close, list, auth, ext).
 impl AcpProtocol {
     /// Connect to a running CLI process and execute the ACP initialize handshake.
     ///
