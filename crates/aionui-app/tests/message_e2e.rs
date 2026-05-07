@@ -333,7 +333,7 @@ async fn t9_1_search_keyword_match() {
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["conversation_name"], "Search Conv");
+    assert_eq!(items[0]["conversation"]["name"], "Search Conv");
 }
 
 #[tokio::test]
