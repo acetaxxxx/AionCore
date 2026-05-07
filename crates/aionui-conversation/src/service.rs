@@ -794,7 +794,11 @@ impl ConversationService {
             .search_messages(user_id, &query.keyword, page, page_size)
             .await?;
 
-        let items = result.items.into_iter().map(search_row_to_item).collect();
+        let items = result
+            .items
+            .into_iter()
+            .map(|row| search_row_to_item(row, &self.workspace_root))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(PaginatedResult {
             items,
