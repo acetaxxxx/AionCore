@@ -104,7 +104,7 @@ update-aionrs *TAG:
         echo "Using latest tag: $tag"
     fi
     sed -i '' "s|git = \"ssh://git@github.com/iOfficeAI/aionrs.git\", tag = \"[^\"]*\"|git = \"ssh://git@github.com/iOfficeAI/aionrs.git\", tag = \"$tag\"|g" Cargo.toml
-    cargo update -p aion-agent -p aion-types -p aion-protocol -p aion-config -p aion-mcp
+    cargo check --workspace
 
 # Security audit
 audit:
