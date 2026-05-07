@@ -36,6 +36,8 @@ jobs:
           toolchain: "1.95.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
       - run: cargo clippy --workspace -- -D warnings
 
   test:
@@ -47,6 +49,8 @@ jobs:
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
       - run: cargo test --workspace
 
   changes:
