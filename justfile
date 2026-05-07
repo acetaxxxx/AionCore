@@ -87,6 +87,29 @@ run *ARGS:
 run-release *ARGS:
     cargo run --release --bin aionui-backend -- {{ARGS}}
 
+# Pre-push gate: format, lint, test, then push
+push *ARGS:
+    cargo fmt --all
+    cargo clippy --workspace -- -D warnings
+    cargo test --workspace
+    git push {{ ARGS }}
+
+# Update aionrs dependency (e.g. just update-aionrs or just update-aionrs v0.1.19)
+update-aionrs *TAG:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag="{{ TAG }}"
+    if [ -z "$tag" ]; then
+        tag=$(git ls-remote --tags https://github.com/iOfficeAI/aionrs.git | awk -F/ '{print $NF}' | grep -v '\\^{}' | sort -V | tail -1)
+        echo "Using latest tag: $tag"
+    fi
+    sed -i '' "s|git = \"https://github.com/iOfficeAI/aionrs.git\", tag = \"[^\"]*\"|git = \"https://github.com/iOfficeAI/aionrs.git\", tag = \"$tag\"|g" Cargo.toml
+    cargo check --workspace
+
+# Security audit
+audit:
+    cargo audit
+
 # Clean build artifacts
 clean:
     cargo clean

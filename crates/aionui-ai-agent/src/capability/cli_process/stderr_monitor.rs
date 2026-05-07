@@ -1,5 +1,4 @@
 use aionui_common::AppError;
-use tracing::{debug, error};
 
 /// Send SIGKILL to a process by PID.
 ///
@@ -8,6 +7,7 @@ use tracing::{debug, error};
 pub(super) fn force_kill(pid: u32) -> Result<(), AppError> {
     #[cfg(unix)]
     {
+        use tracing::{debug, error};
         let result = std::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
             .output();
