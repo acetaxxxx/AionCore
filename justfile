@@ -100,10 +100,10 @@ update-aionrs *TAG:
     set -euo pipefail
     tag="{{ TAG }}"
     if [ -z "$tag" ]; then
-        tag=$(git ls-remote --tags ssh://git@github.com/iOfficeAI/aionrs.git | awk -F/ '{print $NF}' | grep -v '\\^{}' | sort -V | tail -1)
+        tag=$(git ls-remote --tags https://github.com/iOfficeAI/aionrs.git | awk -F/ '{print $NF}' | grep -v '\\^{}' | sort -V | tail -1)
         echo "Using latest tag: $tag"
     fi
-    sed -i '' "s|git = \"ssh://git@github.com/iOfficeAI/aionrs.git\", tag = \"[^\"]*\"|git = \"ssh://git@github.com/iOfficeAI/aionrs.git\", tag = \"$tag\"|g" Cargo.toml
+    sed -i '' "s|git = \"https://github.com/iOfficeAI/aionrs.git\", tag = \"[^\"]*\"|git = \"https://github.com/iOfficeAI/aionrs.git\", tag = \"$tag\"|g" Cargo.toml
     cargo check --workspace
 
 # Security audit
