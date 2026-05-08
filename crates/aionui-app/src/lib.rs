@@ -663,7 +663,7 @@ mod tests {
         };
         assert_eq!(
             config.database_path(),
-            std::path::PathBuf::from("/tmp/aionui/aionui.db")
+            std::path::PathBuf::from("/tmp/aionui/aionui-backend.db")
         );
     }
 
