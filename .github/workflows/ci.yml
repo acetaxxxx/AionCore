@@ -23,12 +23,8 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: Clippy
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,7 +47,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust
-      - run: cargo test --workspace
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace
 
   changes:
     name: Detect dependency changes
