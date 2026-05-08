@@ -339,3 +339,44 @@ fn copy_legacy_overwrites_leftover_tmp() {
     let content = std::fs::read(&target).unwrap();
     assert_eq!(content, b"real data");
 }
+
+#[tokio::test]
+async fn copy_legacy_then_init_database_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("aionui-backend.db");
+    let legacy = dir.path().join("aionui.db");
+
+    let legacy_db = init_database(&legacy).await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('test_user', 'alice', 'hash', 1000, 1000)",
+    )
+    .execute(legacy_db.pool())
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(legacy_db.pool())
+        .await
+        .unwrap();
+    legacy_db.close().await;
+
+    maybe_copy_legacy_database(&target).unwrap();
+
+    let db = init_database(&target).await.unwrap();
+
+    let row = sqlx::query("SELECT username FROM users WHERE id = 'test_user'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("username"), "alice");
+
+    let legacy_db2 = init_database(&legacy).await.unwrap();
+    let row2 = sqlx::query("SELECT username FROM users WHERE id = 'test_user'")
+        .fetch_one(legacy_db2.pool())
+        .await
+        .unwrap();
+    assert_eq!(row2.get::<String, _>("username"), "alice");
+
+    db.close().await;
+    legacy_db2.close().await;
+}
