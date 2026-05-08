@@ -303,7 +303,10 @@ fn copy_legacy_copies_when_target_missing() {
     assert_eq!(content, b"legacy database content", "content should match legacy");
 
     let legacy_content = std::fs::read(&legacy).unwrap();
-    assert_eq!(legacy_content, b"legacy database content", "legacy must not be modified");
+    assert_eq!(
+        legacy_content, b"legacy database content",
+        "legacy must not be modified"
+    );
 }
 
 #[test]
@@ -318,8 +321,14 @@ fn copy_legacy_removes_wal_sidecars() {
 
     maybe_copy_legacy_database(&target).unwrap();
 
-    assert!(!target.with_extension("db-wal").exists(), "WAL sidecar should be removed");
-    assert!(!target.with_extension("db-shm").exists(), "SHM sidecar should be removed");
+    assert!(
+        !target.with_extension("db-wal").exists(),
+        "WAL sidecar should be removed"
+    );
+    assert!(
+        !target.with_extension("db-shm").exists(),
+        "SHM sidecar should be removed"
+    );
 }
 
 #[test]
