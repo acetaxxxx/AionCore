@@ -59,7 +59,7 @@ build-debug *FLAGS:
 
 # Run all tests
 test:
-    cargo test --workspace
+    cargo nextest run --workspace
 
 # Lint (warnings = errors)
 lint:
@@ -91,7 +91,7 @@ run-release *ARGS:
 push *ARGS:
     cargo fmt --all
     cargo clippy --workspace -- -D warnings
-    cargo test --workspace
+    cargo nextest run --workspace
     git push {{ ARGS }}
 
 # Update aionrs dependency (e.g. just update-aionrs or just update-aionrs v0.1.19)
