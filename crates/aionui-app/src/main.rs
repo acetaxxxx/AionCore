@@ -106,8 +106,10 @@ async fn main() -> Result<ExitCode> {
     let boot = Instant::now();
 
     // Initialize database and all services
-    info!("Initializing database at {}", config.database_path().display());
-    let database = aionui_db::init_database(&config.database_path()).await?;
+    let db_path = config.database_path();
+    aionui_db::maybe_copy_legacy_database(&db_path)?;
+    info!("Initializing database at {}", db_path.display());
+    let database = aionui_db::init_database(&db_path).await?;
     info!(elapsed_ms = boot.elapsed().as_millis(), "startup: database initialized");
 
     // Materialize the embedded builtin-skills corpus to disk before any
