@@ -43,7 +43,7 @@ impl AcpAgentManager {
             if let Some(config_options) = session_response.config_options {
                 session.apply_advertised_config_options(config_options);
             }
-            session.assign_session_id(DomainSessionId::new(sid.clone()));
+            session.set_session_id(DomainSessionId::new(sid.clone()));
             self.commit_session_changes(&mut session).await;
         }
         self.emit_snapshot_events().await;
@@ -88,10 +88,10 @@ impl AcpAgentManager {
 
     /// Resume an existing session and send a message.
     ///
-    /// Assumes `preload_snapshot` has already been called by the
-    /// caller (conversation service) on resume paths — the session
-    /// aggregate may therefore already carry `current_mode_id` / `current_model_id`
-    /// from `acp_session.session_config.runtime`. When the CLI's
+    /// The session aggregate is seeded during `AcpAgentManager::new`
+    /// from `params.session_snapshot` — on resume paths it already
+    /// carries `current_mode_id` / `current_model_id` from
+    /// `acp_session.session_config.runtime`. When the CLI's
     /// `session/load` response arrives, we merge it in but keep the
     /// preloaded `current_*` values because they reflect the user's
     /// last explicit choice; the CLI's own `current_*` is only used
@@ -138,7 +138,7 @@ impl AcpAgentManager {
                     if let Some(config_options) = session_response.config_options {
                         session.apply_advertised_config_options(config_options);
                     }
-                    session.assign_session_id(DomainSessionId::new(new_sid.clone()));
+                    session.set_session_id(DomainSessionId::new(new_sid.clone()));
                     self.commit_session_changes(&mut session).await;
                 }
                 self.emit_snapshot_events().await;
@@ -190,7 +190,7 @@ impl AcpAgentManager {
         if let Some(sid) = session_id {
             {
                 let mut session = self.session.write().await;
-                session.assign_session_id(DomainSessionId::new(sid));
+                session.set_session_id(DomainSessionId::new(sid));
                 self.commit_session_changes(&mut session).await;
             }
             self.reconcile_session(sid).await;
