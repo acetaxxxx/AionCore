@@ -68,8 +68,8 @@ impl AionrsAgentManager {
             project_dir: Some(PathBuf::from(&workspace)),
         };
 
-        let mut config = Config::resolve(&cli_args)
-            .map_err(|e| AppError::Internal(format!("Config resolve failed: {e}")))?;
+        let mut config =
+            Config::resolve(&cli_args).map_err(|e| AppError::Internal(format!("Config resolve failed: {e}")))?;
 
         // Backend-specific overrides
         config.session.enabled = true;
@@ -173,7 +173,7 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
             "Aionrs send_message started"
         );
         self.runtime.bump_activity();
-        self.runtime.transition_to(ConversationStatus::Running);
+        self.runtime.reset_for_new_turn(ConversationStatus::Running);
 
         let mut engine = self.engine.lock().await;
         let result = engine.run(&data.content, &data.msg_id).await;
