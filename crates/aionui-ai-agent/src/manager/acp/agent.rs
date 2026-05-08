@@ -2,14 +2,14 @@ use crate::agent_runtime::AgentRuntime;
 use crate::capability::cli_process::CliAgentProcess;
 use crate::capability::skill_manager::AcpSkillManager;
 use crate::factory::acp_assembler::AcpSessionParams;
-use crate::manager::acp::{AcpSession, AcpSessionEvent, PermissionRouter, PersistedSessionState};
+use crate::manager::acp::{AcpSession, AcpSessionEvent, PermissionRouter};
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::events::AgentStreamEvent;
 use crate::registry::CatalogSender;
 use crate::shared_kernel::{ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::{
-    AgentCapabilities, AvailableCommand, CancelNotification, SessionConfigOption, SessionId, SessionModeState,
+    AgentCapabilities, AuthMethod, AvailableCommand, CancelNotification, SessionConfigOption, SessionId,
     SessionModelState, SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
     SetSessionModelRequest, UsageUpdate,
 };
@@ -18,7 +18,6 @@ use aionui_common::{
     AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs, normalize_keys_to_snake_case,
 };
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -84,160 +83,12 @@ pub struct AcpAgentManager {
     session_lock: Mutex<()>,
     /// Routes permission requests from the protocol layer to the user
     /// and back. Owns the receiver channel, pending map, and closing flag.
-    permission_router: Arc<PermissionRouter>,
+    pub(super) permission_router: Arc<PermissionRouter>,
     /// Shared skill manager — used to discover skills for first-message injection.
     pub(super) skill_manager: Arc<AcpSkillManager>,
     /// Domain event sender — session aggregate events are forwarded here
     /// for the persistence consumer (`AcpSessionSyncService`).
     pub(super) domain_event_tx: mpsc::Sender<AcpSessionEvent>,
-}
-
-impl AcpAgentManager {
-    /// Current session mode state. Reading a cached session is infallible.
-    pub async fn modes(&self) -> Option<SessionModeState> {
-        self.session.read().await.modes().cloned()
-    }
-
-    async fn desired_mode(&self) -> Option<String> {
-        self.session
-            .read()
-            .await
-            .desired_mode()
-            .map(ToOwned::to_owned)
-            .filter(|mode| !mode.is_empty())
-    }
-
-    async fn update_cached_mode(&self, mode: &str) {
-        let mut session = self.session.write().await;
-        session.apply_partial_mode_update(ModeId::new(mode));
-    }
-
-    /// Execute reconcile actions produced by `AcpSession::plan_reconcile`.
-    ///
-    /// Compares the aggregate's desired state against what the CLI has
-    /// reported as current, then issues the minimal set of SDK calls
-    /// (set_mode, set_config_option) to bring the CLI into alignment.
-    /// Best-effort: individual failures are logged but do not abort.
-    pub(super) async fn reconcile_session(&self, session_id: &str) {
-        use crate::manager::acp::ReconcileAction;
-
-        let actions = {
-            let session = self.session.read().await;
-            session.plan_reconcile()
-        };
-
-        for action in actions {
-            match action {
-                ReconcileAction::SetMode { mode } => {
-                    let normalized = normalize_requested_mode(&self.params.metadata, mode.as_str());
-                    if normalized.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = self
-                        .protocol
-                        .set_mode(SetSessionModeRequest::new(
-                            SessionId::new(session_id),
-                            normalized.clone(),
-                        ))
-                        .await
-                    {
-                        error!(
-                            conversation_id = %self.params.conversation_id,
-                            mode_id = %normalized,
-                            error = %e,
-                            "reconcile_session: set_mode failed"
-                        );
-                        continue;
-                    }
-                    self.update_cached_mode(&normalized).await;
-                    let mut session = self.session.write().await;
-                    session.apply_observed_mode(ModeId::new(normalized));
-                }
-                ReconcileAction::SetConfigOption { key, value } => {
-                    if let Err(err) = self
-                        .protocol
-                        .set_config_option(SetSessionConfigOptionRequest::new(
-                            SessionId::new(session_id),
-                            key.as_str().to_owned(),
-                            value.as_str().to_owned(),
-                        ))
-                        .await
-                    {
-                        info!(
-                            config_id = %key,
-                            desired = %value,
-                            error = %err,
-                            "reconcile_session: set_config_option failed; skipping"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Cached model info from the ACP backend, if any has been received.
-    pub async fn model_info(&self) -> Option<SessionModelState> {
-        self.session.read().await.model_info().cloned()
-    }
-
-    /// Set the model for the current session.
-    pub async fn set_model_info(&self, model_id: &str) -> Result<(), AppError> {
-        let sid = self.require_session_id().await?;
-
-        self.protocol
-            .set_model(SetSessionModelRequest::new(SessionId::new(sid), model_id.to_owned()))
-            .await
-            .map_err(AppError::from)?;
-
-        // Update the session immediately since SDK does not send a
-        // CurrentModelUpdate notification for model changes.
-        {
-            let mut session = self.session.write().await;
-            session.update_current_model(ModelId::new(model_id));
-        }
-
-        Ok(())
-    }
-
-    /// Cached session configuration options.
-    pub async fn config_options(&self) -> Vec<SessionConfigOption> {
-        self.session
-            .read()
-            .await
-            .config_options()
-            .map(<[SessionConfigOption]>::to_vec)
-            .unwrap_or_default()
-    }
-
-    /// Set a session configuration option.
-    pub async fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), AppError> {
-        let sid = self.require_session_id().await?;
-
-        self.protocol
-            .set_config_option(SetSessionConfigOptionRequest::new(
-                SessionId::new(sid),
-                config_id.to_owned(),
-                value.to_owned(),
-            ))
-            .await
-            .map_err(AppError::from)
-            .map(|_| ())
-    }
-
-    /// Cached context usage info from the ACP backend.
-    pub async fn usage(&self) -> Option<UsageUpdate> {
-        self.session.read().await.context_usage().cloned()
-    }
-
-    /// Agent capabilities captured during the ACP initialize handshake.
-    pub async fn agent_capabilities(&self) -> Option<AgentCapabilities> {
-        self.session.read().await.agent_capabilities().cloned()
-    }
-
-    /// Cached available commands from the ACP backend.
-    pub async fn available_commands(&self) -> Option<Vec<AvailableCommand>> {
-        self.session.read().await.available_commands().map(|c| c.to_vec())
-    }
 }
 
 impl AcpAgentManager {
@@ -277,7 +128,6 @@ impl AcpAgentManager {
         // events that were broadcast for the UI (e.g. from emit_snapshot_events).
         let (notification_tx, notification_rx) = mpsc::channel::<SessionNotification>(256);
 
-        // Connect via ACP SDK — executes initialize handshake
         let protocol = AcpProtocol::connect(stdin, stdout, runtime.event_sender(), permission_tx, notification_tx)
             .await
             .map_err(|e| {
@@ -289,11 +139,6 @@ impl AcpAgentManager {
                 AppError::from(e)
             })?;
 
-        // Push the static handshake payloads (agent_capabilities +
-        // auth_methods) through the catalog sync channel. Session-driven
-        // fields — modes, models, config_options, commands — flow
-        // through the `CatalogForwarder` the factory spawns after
-        // construction.
         let init_handshake = AgentHandshake {
             agent_capabilities: protocol.agent_capabilities().and_then(|c| sdk_to_snake_value(&c)),
             auth_methods: protocol.auth_methods().and_then(|m| sdk_to_snake_value(&m)),
@@ -303,14 +148,37 @@ impl AcpAgentManager {
             catalog_tx.send_partial(params.metadata.id.clone(), init_handshake);
         }
 
-        let initial_mode = params
-            .config
-            .session_mode
-            .as_ref()
-            .map(|m| normalize_requested_mode(&params.metadata, m))
+        let snapshot = params.session_snapshot.as_ref();
+
+        // Prefer the last-persisted mode; for brand-new conversations
+        // fall back to `AcpBuildExtra::session_mode` so the first turn
+        // still honours the caller's choice.
+        let initial_mode = snapshot
+            .and_then(|s| s.current_mode_id.as_ref())
+            .map(|m| normalize_requested_mode(&params.metadata, m.as_str()))
+            .or_else(|| {
+                params
+                    .config
+                    .session_mode
+                    .as_ref()
+                    .map(|m| normalize_requested_mode(&params.metadata, m))
+            })
             .filter(|m| !m.is_empty())
             .map(ModeId::new);
-        let mut session = AcpSession::new(initial_mode, HashMap::new());
+
+        let initial_model = snapshot.and_then(|s| s.current_model_id.clone());
+        let initial_config = snapshot.map(|s| s.config_selections.clone()).unwrap_or_default();
+
+        let mut session = AcpSession::new(initial_mode, initial_model, initial_config);
+        // Seed the observed/advertised layers (observed mode/model, cached
+        // context_usage) from the persisted snapshot. Desired fields are
+        // already populated via `AcpSession::new`.
+        if let Some(snapshot) = snapshot {
+            session.preload_persisted(snapshot);
+            // Preload did not come from the user this turn — drain so the
+            // persistence consumer doesn't echo the DB back into itself.
+            session.drain_events();
+        }
         if let Some(agent_capabilities) = protocol.agent_capabilities() {
             session.apply_advertised_capabilities(agent_capabilities);
         }
@@ -334,41 +202,284 @@ impl AcpAgentManager {
 
         Ok((manager, domain_event_rx, notification_rx))
     }
+}
 
-    /// Start the permission handler loop. Must be called after the manager
-    /// is wrapped in Arc. Delegates to `PermissionRouter::start`.
-    pub fn start_permission_handler(self: &Arc<Self>) {
-        self.permission_router.start(self.runtime.clone());
-    }
+impl AcpAgentManager {
+    /// Execute reconcile actions produced by `AcpSession::plan_reconcile`.
+    ///
+    /// Compares the aggregate's desired state against what the CLI has
+    /// reported as current, then issues the minimal set of SDK calls
+    /// (set_mode, set_config_option) to bring the CLI into alignment.
+    /// Best-effort: individual failures are logged but do not abort.
+    pub(super) async fn reconcile_session(&self, session_id: &str) {
+        use crate::manager::acp::ReconcileAction;
 
-    /// Drain pending domain events from the session aggregate and
-    /// forward them to the persistence consumer via the mpsc channel.
-    pub(super) async fn commit_session_changes(&self, session: &mut AcpSession) {
-        for event in session.drain_events() {
-            let _ = self.domain_event_tx.send(event).await;
-        }
-    }
+        let actions = {
+            let session = self.session.read().await;
+            session.plan_reconcile()
+        };
 
-    /// Seed the session aggregate with the user's last choices. Called
-    /// by `ConversationService` on resume paths, before dispatching
-    /// `send_message`. `None` fields are ignored — the CLI's
-    /// `session/load` response fills in whatever the preload omits.
-    pub async fn preload_snapshot(&self, state: PersistedSessionState) {
-        let mut session = self.session.write().await;
-        session.preload_persisted(&state);
-        if let Some(mode) = &state.current_mode_id {
-            let normalized = normalize_requested_mode(&self.params.metadata, mode.as_str());
-            if !normalized.is_empty() {
-                session.set_desired_mode(ModeId::new(normalized));
+        for action in actions {
+            match action {
+                ReconcileAction::SetMode { mode } => {
+                    let normalized = normalize_requested_mode(&self.params.metadata, mode.as_str());
+                    if normalized.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .protocol
+                        .set_mode(SetSessionModeRequest::new(
+                            SessionId::new(session_id),
+                            normalized.clone(),
+                        ))
+                        .await
+                    {
+                        error!(
+                            conversation_id = %self.params.conversation_id,
+                            mode_id = %normalized,
+                            error = %e,
+                            "reconcile_session: set_mode failed"
+                        );
+                        continue;
+                    }
+                    // SDK does not push a notification after a successful
+                    // set_mode — sync observed/advertised ourselves so the
+                    // next plan_reconcile is a no-op.
+                    let mut session = self.session.write().await;
+                    session.apply_observed_mode(ModeId::new(normalized));
+                    self.commit_session_changes(&mut session).await;
+                }
+                ReconcileAction::SetModel { model } => {
+                    if let Err(e) = self
+                        .protocol
+                        .set_model(SetSessionModelRequest::new(
+                            SessionId::new(session_id),
+                            model.as_str().to_owned(),
+                        ))
+                        .await
+                    {
+                        error!(
+                            conversation_id = %self.params.conversation_id,
+                            model_id = %model,
+                            error = %e,
+                            "reconcile_session: set_model failed"
+                        );
+                        continue;
+                    }
+                    // SDK does not push a CurrentModelUpdate notification —
+                    // sync observed/advertised ourselves.
+                    let mut session = self.session.write().await;
+                    session.apply_observed_model(model);
+                    self.commit_session_changes(&mut session).await;
+                }
+                ReconcileAction::SetConfigOption { key, value } => {
+                    if let Err(err) = self
+                        .protocol
+                        .set_config_option(SetSessionConfigOptionRequest::new(
+                            SessionId::new(session_id),
+                            key.as_str().to_owned(),
+                            value.as_str().to_owned(),
+                        ))
+                        .await
+                    {
+                        info!(
+                            config_id = %key,
+                            desired = %value,
+                            error = %err,
+                            "reconcile_session: set_config_option failed; skipping"
+                        );
+                        continue;
+                    }
+                    // Sync observed ourselves so the next plan_reconcile
+                    // does not replay this action. CLI does not push a
+                    // config-update notification after set_config_option.
+                    let mut session = self.session.write().await;
+                    session.apply_observed_config(key, value);
+                    self.commit_session_changes(&mut session).await;
+                }
             }
         }
-        for (key, value) in &state.config_selections {
-            session.set_desired_config(key.clone(), value.clone());
+    }
+}
+
+impl AcpAgentManager {
+    pub async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
+        let desired = self
+            .session
+            .read()
+            .await
+            .desired_mode()
+            .map(|mode| normalize_requested_mode(&self.params.metadata, mode))
+            .filter(|mode| !mode.is_empty());
+        Ok(aionui_api_types::AgentModeResponse {
+            mode: self
+                .session
+                .read()
+                .await
+                .modes()
+                .map(|modes| modes.current_mode_id.to_string())
+                .or(desired)
+                .unwrap_or_else(|| normalize_requested_mode(&self.params.metadata, "default")),
+            initialized: self.session_id().await.is_some(),
+        })
+    }
+
+    /// Cached model info from the ACP backend, if any has been received.
+    pub async fn model(&self) -> Option<SessionModelState> {
+        self.session.read().await.model_info().cloned()
+    }
+
+    /// Cached session configuration options.
+    pub async fn config_options(&self) -> Vec<SessionConfigOption> {
+        self.session
+            .read()
+            .await
+            .config_options()
+            .map(<[SessionConfigOption]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// Cached context usage info from the ACP backend.
+    pub async fn usage(&self) -> Option<UsageUpdate> {
+        self.session.read().await.context_usage().cloned()
+    }
+
+    /// Authentication methods captured during the ACP initialize handshake.
+    pub async fn auth_methods(&self) -> Option<Vec<AuthMethod>> {
+        self.session.read().await.auth_methods().map(|methods| methods.to_vec())
+    }
+
+    /// Agent capabilities captured during the ACP initialize handshake.
+    pub async fn agent_capabilities(&self) -> Option<AgentCapabilities> {
+        self.session.read().await.agent_capabilities().cloned()
+    }
+
+    /// Cached available commands from the ACP backend.
+    pub async fn available_commands(&self) -> Option<Vec<AvailableCommand>> {
+        self.session.read().await.available_commands().map(|c| c.to_vec())
+    }
+
+    /// Set the mode for the current session.
+    pub async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
+        let normalized_mode = normalize_requested_mode(&self.params.metadata, mode);
+        if normalized_mode.is_empty() {
+            return Ok(());
         }
-        // Preload events are discarded — the DB already has these values.
+        let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
+
+        // Write desired — the aggregate root's legitimate intent write-point.
+        {
+            let mut session = self.session.write().await;
+            session.set_desired_mode(ModeId::new(&normalized_mode));
+            self.commit_session_changes(&mut session).await;
+        }
+
+        // If a session is open, reconcile to the CLI. `reconcile_session`
+        // is the sole call-site of `protocol.set_mode` and the sole
+        // observed/advertised write-point — on success it calls
+        // `apply_observed_mode`, which syncs both layers and emits
+        // `ObservedModeSynced`. `get_mode()` reflects the change as soon
+        // as the SDK call returns.
+        if let Some(sid) = session_id {
+            self.reconcile_session(&sid).await;
+        }
+        Ok(())
+    }
+
+    /// Set the model for the current session.
+    ///
+    /// Mirrors `set_mode`: writes user intent into the aggregate's Desired
+    /// layer, then delegates to `reconcile_session` for the SDK call.
+    /// `reconcile_session` is the sole call-site of `protocol.set_model` —
+    /// it also handles the observed sync since the CLI does not emit a
+    /// CurrentModelUpdate notification after `session/set_model`.
+    pub async fn set_model(&self, model_id: &str) -> Result<(), AppError> {
+        let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
+
+        {
+            let mut session = self.session.write().await;
+            session.set_desired_model(ModelId::new(model_id));
+            self.commit_session_changes(&mut session).await;
+        }
+
+        if let Some(sid) = session_id {
+            self.reconcile_session(&sid).await;
+        } else {
+            return Err(AppError::BadRequest("No active session".into()));
+        }
+        Ok(())
+    }
+
+    /// Set a session configuration option.
+    pub async fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), AppError> {
+        let sid = self.require_session_id().await?;
+
+        self.protocol
+            .set_config_option(SetSessionConfigOptionRequest::new(
+                SessionId::new(sid),
+                config_id.to_owned(),
+                value.to_owned(),
+            ))
+            .await
+            .map_err(AppError::from)
+            .map(|_| ())
+    }
+
+    /// Return available slash commands from the session aggregate.
+    pub async fn load_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AppError> {
+        let session = self.session.read().await;
+        let items = session
+            .available_commands()
+            .map(|cmds| {
+                cmds.iter()
+                    .map(|c| SlashCommandItem {
+                        command: c.name.clone(),
+                        description: c.description.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(items)
+    }
+}
+
+impl AcpAgentManager {
+    /// Current ACP session ID, if a session has been established.
+    pub async fn session_id(&self) -> Option<String> {
+        self.session.read().await.session_id().map(ToOwned::to_owned)
+    }
+
+    /// Restore a previously persisted session_id (e.g. from DB on task rebuild).
+    /// Enables resume path on next send_message instead of creating a fresh session.
+    ///
+    /// Deliberately leaves `opened = false`: the CLI child process is
+    /// brand new and still needs `session/load` (or claude-meta-resume) to
+    /// re-attach to the persisted session before the next prompt. Subsequent
+    /// turns — once the resume handshake has run — take the short path.
+    pub async fn restore_session_id(&self, sid: String) {
+        let mut session = self.session.write().await;
+        session.set_session_id(DomainSessionId::new(sid));
+        // Discarded — the session_id already came from DB, no need to re-persist.
         session.drain_events();
     }
 
+    /// Vendor label this session was spawned as (e.g. "claude"), if any.
+    pub fn backend(&self) -> Option<&str> {
+        self.params.metadata.backend.as_deref()
+    }
+
+    /// Agent metadata id this session was spawned from.
+    pub fn agent_metadata_id(&self) -> &str {
+        &self.params.metadata.id
+    }
+
+    /// Whether the configured agent supports side questions.
+    pub fn supports_side_question(&self) -> bool {
+        self.params.metadata.behavior_policy.supports_side_question
+    }
+}
+
+impl AcpAgentManager {
     /// Initialize or resume a session, then send the user message.
     ///
     /// Three paths:
@@ -414,57 +525,6 @@ impl AcpAgentManager {
         self.runtime.transition_to(ConversationStatus::Running);
 
         Ok(())
-    }
-
-    /// Return available slash commands from the session aggregate.
-    pub async fn load_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AppError> {
-        let session = self.session.read().await;
-        let items = session
-            .available_commands()
-            .map(|cmds| {
-                cmds.iter()
-                    .map(|c| SlashCommandItem {
-                        command: c.name.clone(),
-                        description: c.description.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(items)
-    }
-
-    /// Current ACP session ID, if a session has been established.
-    pub async fn session_id(&self) -> Option<String> {
-        self.session.read().await.session_id().map(ToOwned::to_owned)
-    }
-
-    /// Restore a previously persisted session_id (e.g. from DB on task rebuild).
-    /// Enables resume path on next send_message instead of creating a fresh session.
-    ///
-    /// Deliberately leaves `opened = false`: the CLI child process is
-    /// brand new and still needs `session/load` (or claude-meta-resume) to
-    /// re-attach to the persisted session before the next prompt. Subsequent
-    /// turns — once the resume handshake has run — take the short path.
-    pub async fn restore_session_id(&self, sid: String) {
-        let mut session = self.session.write().await;
-        session.assign_session_id(DomainSessionId::new(sid));
-        // Discarded — the session_id already came from DB, no need to re-persist.
-        session.drain_events();
-    }
-
-    /// Vendor label this session was spawned as (e.g. "claude"), if any.
-    pub fn backend(&self) -> Option<&str> {
-        self.params.metadata.backend.as_deref()
-    }
-
-    /// Agent metadata id this session was spawned from.
-    pub fn agent_metadata_id(&self) -> &str {
-        &self.params.metadata.id
-    }
-
-    /// Whether the configured agent supports side questions.
-    pub fn supports_side_question(&self) -> bool {
-        self.params.metadata.behavior_policy.supports_side_question
     }
 
     /// Whether the agent supports `session/load` — read from the ACP
@@ -646,52 +706,6 @@ impl AcpAgentManager {
     /// every tool request round-trips through the CLI.
     pub fn check_approval(&self, _action: &str, _command_type: Option<&str>) -> bool {
         false
-    }
-
-    pub async fn get_mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
-        let desired = self
-            .desired_mode()
-            .await
-            .map(|mode| normalize_requested_mode(&self.params.metadata, &mode))
-            .filter(|mode| !mode.is_empty());
-        Ok(aionui_api_types::AgentModeResponse {
-            mode: self
-                .modes()
-                .await
-                .map(|modes| modes.current_mode_id.to_string())
-                .or(desired)
-                .unwrap_or_else(|| normalize_requested_mode(&self.params.metadata, "default")),
-            initialized: self.session_id().await.is_some(),
-        })
-    }
-
-    pub async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
-        let normalized_mode = normalize_requested_mode(&self.params.metadata, mode);
-        if normalized_mode.is_empty() {
-            return Ok(());
-        }
-        let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
-
-        // Write desired — the aggregate root's legitimate intent write-point.
-        {
-            let mut session = self.session.write().await;
-            session.set_desired_mode(ModeId::new(&normalized_mode));
-            self.commit_session_changes(&mut session).await;
-        }
-
-        // Optimistically update advertised.modes.current_mode_id so get_mode()
-        // reflects the user's choice immediately. reconcile_session pushes the
-        // actual SDK call; the advertised state is then confirmed (or corrected)
-        // when the CLI's next SessionNotification arrives via event_tracker.
-        self.update_cached_mode(&normalized_mode).await;
-
-        // If a session is open, reconcile to the CLI. After this change, this is
-        // the SOLE call-site of `protocol.set_mode` in the crate — the aggregate
-        // root's reconcile path owns SDK alignment end-to-end.
-        if let Some(sid) = session_id {
-            self.reconcile_session(&sid).await;
-        }
-        Ok(())
     }
 }
 
