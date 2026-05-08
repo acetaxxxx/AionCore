@@ -83,6 +83,32 @@ pub async fn init_database_memory() -> Result<Database, DbError> {
     Ok(Database { pool })
 }
 
+/// Copy the legacy `aionui.db` to the new target path if the target does not exist.
+///
+/// This enables safe upgrades: the old database remains untouched and the backend
+/// operates exclusively on the copy. The copy is atomic (write to `.tmp`, then rename)
+/// so a crash mid-copy leaves no half-written target file.
+pub fn maybe_copy_legacy_database(target: &Path) -> Result<(), DbError> {
+    if target.exists() {
+        return Ok(());
+    }
+
+    let legacy = target.with_file_name("aionui.db");
+    if !legacy.exists() {
+        return Ok(());
+    }
+
+    let tmp = target.with_extension("db.tmp");
+    std::fs::copy(&legacy, &tmp).map_err(|e| DbError::Init(format!("Failed to copy legacy database: {e}")))?;
+    std::fs::rename(&tmp, target).map_err(|e| DbError::Init(format!("Failed to rename temp database: {e}")))?;
+
+    let _ = std::fs::remove_file(target.with_extension("db-wal"));
+    let _ = std::fs::remove_file(target.with_extension("db-shm"));
+
+    info!("Copied legacy database {} -> {}", legacy.display(), target.display());
+    Ok(())
+}
+
 async fn try_init_file(path: &Path) -> Result<Database, DbError> {
     let opts = SqliteConnectOptions::new()
         .filename(path)

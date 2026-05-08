@@ -71,7 +71,7 @@ impl AppConfig {
 
     /// Path to the SQLite database file.
     pub fn database_path(&self) -> std::path::PathBuf {
-        std::path::Path::new(&self.data_dir).join("aionui.db")
+        std::path::Path::new(&self.data_dir).join("aionui-backend.db")
     }
 }
 
@@ -663,7 +663,7 @@ mod tests {
         };
         assert_eq!(
             config.database_path(),
-            std::path::PathBuf::from("/tmp/aionui/aionui.db")
+            std::path::PathBuf::from("/tmp/aionui/aionui-backend.db")
         );
     }
 
