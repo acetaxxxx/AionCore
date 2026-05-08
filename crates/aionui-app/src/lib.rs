@@ -71,7 +71,7 @@ impl AppConfig {
 
     /// Path to the SQLite database file.
     pub fn database_path(&self) -> std::path::PathBuf {
-        std::path::Path::new(&self.data_dir).join("aionui.db")
+        std::path::Path::new(&self.data_dir).join("aionui-backend.db")
     }
 }
 
