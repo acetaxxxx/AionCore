@@ -82,6 +82,10 @@ impl AionrsAgentManager {
             config.compat.api_path = Some(path);
         }
 
+        if !config_extra.extra_mcp_servers.is_empty() {
+            config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
+        }
+
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
@@ -327,6 +331,7 @@ mod tests {
             compat_overrides: Default::default(),
             session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
             session_mode: None,
+            extra_mcp_servers: std::collections::HashMap::new(),
         }
     }
 

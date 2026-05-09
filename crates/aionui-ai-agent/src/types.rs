@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -65,6 +66,8 @@ pub struct AionrsResolvedConfig {
     pub session_directory: PathBuf,
     /// Session mode (default, auto_edit, yolo).
     pub session_mode: Option<String>,
+    /// Extra MCP servers to inject (team coordination or guide).
+    pub extra_mcp_servers: HashMap<String, aion_config::config::McpServerConfig>,
 }
 
 #[cfg(test)]
