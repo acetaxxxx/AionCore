@@ -13,8 +13,7 @@ use aionui_api_types::{
     AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AcpModelInfo, AgentMetadata, AgentModeResponse,
     DetectCliRequest, DetectCliResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest,
     SetConfigOptionRequest, SetConfigOptionsRequest, SetModeRequest, SetModelRequest, SideQuestionRequest,
-    SideQuestionResponse, SlashCommandItem, TestCustomAgentRequest, TestCustomAgentResponse, WorkspaceBrowseQuery,
-    WorkspaceEntry,
+    SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_common::AppError;
 use aionui_db::IConversationRepository;
@@ -48,6 +47,10 @@ impl AgentService {
             conversation_repo,
             acp_session_sync,
         })
+    }
+
+    pub(crate) fn registry(&self) -> &std::sync::Arc<crate::registry::AgentRegistry> {
+        &self.registry
     }
 
     // Private helper — move logic from routes::session_ops::get_task verbatim
@@ -370,10 +373,6 @@ impl AgentService {
     pub async fn refresh_agents(&self) -> Result<Vec<AgentMetadata>, AppError> {
         self.registry.refresh_availability().await;
         Ok(self.registry.list_all().await)
-    }
-
-    pub fn test_custom_agent(&self, req: TestCustomAgentRequest) -> Result<TestCustomAgentResponse, AppError> {
-        crate::protocol::cli_detect::test_custom_agent(&req.command, &req.acp_args, &req.env)
     }
 }
 
