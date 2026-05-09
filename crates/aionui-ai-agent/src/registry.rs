@@ -20,6 +20,7 @@ use std::sync::Arc;
 use aionui_api_types::{AgentEnvEntry, AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};
 use aionui_common::{AgentType, AppError};
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
+use aionui_runtime::resolve_command_path;
 use serde_json::Value;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
@@ -141,8 +142,13 @@ impl AgentRegistry {
             };
             map.insert(meta.id.clone(), meta);
         }
+        // Capture len before the write-lock await so the debug! macro arg
+        // doesn't hold a RwLockReadGuard / Arguments<'_> across an await
+        // point (both !Send, which would poison handler futures via
+        // invalidate_and_rehydrate).
+        let row_count = map.len();
         *self.by_id.write().await = map;
-        debug!(rows = self.by_id.read().await.len(), "AgentRegistry hydrated");
+        debug!(rows = row_count, "AgentRegistry hydrated");
         Ok(())
     }
 
@@ -155,6 +161,19 @@ impl AgentRegistry {
             meta.available = meta.resolved_command.is_some()
                 || (meta.enabled && meta.command.is_none() && meta.agent_source == AgentSource::Internal);
         }
+    }
+
+    /// Refetch every row from the repository, then re-resolve PATH.
+    ///
+    /// Called after any mutation that changed the set of rows on disk
+    /// (create/delete) or the spawn command of an existing row
+    /// (update). Pure refresh with no DB writes — just rebuilds the
+    /// in-memory snapshot so `list_all()` and `get()` return the latest
+    /// catalog state without waiting for the next process restart.
+    pub async fn invalidate_and_rehydrate(&self) -> Result<(), AppError> {
+        self.hydrate().await?;
+        self.refresh_availability().await;
+        Ok(())
     }
 
     pub async fn get(&self, id: &str) -> Option<AgentMetadata> {
@@ -212,6 +231,13 @@ impl AgentRegistry {
         let mut rows: Vec<AgentMetadata> = self.by_id.read().await.values().cloned().collect();
         rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
         rows
+    }
+
+    /// Clone-cheap handle to the underlying repo, for service-layer
+    /// helpers that need direct CRUD access without going through the
+    /// registry cache.
+    pub fn repo_handle(&self) -> &Arc<dyn IAgentMetadataRepository> {
+        &self.repo
     }
 }
 
@@ -341,28 +367,6 @@ impl CatalogSender {
                 }
             }
         }
-    }
-}
-
-/// Resolve a command name to an absolute path.
-///
-/// For `bun` / `bunx` we go through `aionui_runtime` so the bundled
-/// runtime is used when present; everything else falls back to the
-/// user's `$PATH` via `which::which`.
-fn resolve_command_path(cmd: &str) -> Option<PathBuf> {
-    match cmd {
-        "bun" => aionui_runtime::resolve_bun().ok(),
-        "bunx" => {
-            let bunx_name = if cfg!(windows) { "bunx.exe" } else { "bunx" };
-            if let Some(dir) = aionui_runtime::bun_bin_dir() {
-                let p = dir.join(bunx_name);
-                if p.exists() {
-                    return Some(p);
-                }
-            }
-            which::which("bunx").ok()
-        }
-        other => which::which(other).ok(),
     }
 }
 
