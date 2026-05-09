@@ -169,6 +169,8 @@ async fn ensure_schema_columns(pool: &SqlitePool) -> Result<(), DbError> {
 ///
 /// Uses INSERT OR IGNORE so it is safe to call on every startup.
 /// The system user has an empty password hash, which signals "needs setup".
+/// Username defaults to `admin` — matches the legacy web-host login flow so
+/// users upgrading from pre-M6 builds keep the same login username.
 async fn ensure_system_user(pool: &SqlitePool) -> Result<(), DbError> {
     let now = aionui_common::now_ms();
     sqlx::query(
@@ -176,7 +178,7 @@ async fn ensure_system_user(pool: &SqlitePool) -> Result<(), DbError> {
          VALUES (?, ?, ?, ?, ?)",
     )
     .bind("system_default_user")
-    .bind("system")
+    .bind("admin")
     .bind("")
     .bind(now)
     .bind(now)

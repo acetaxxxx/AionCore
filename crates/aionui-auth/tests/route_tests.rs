@@ -60,10 +60,22 @@ struct TestContext {
     _db: aionui_db::Database,
 }
 
-/// Helper: create a user with known credentials and return the username.
+/// Helper: create a test user with known credentials.
+///
+/// The seeded `system_default_user` row already uses `username = "admin"` with
+/// an empty password hash. If the test asks for that username, update the seed
+/// row in place instead of trying to INSERT a duplicate. Any other username
+/// takes the normal create_user path.
 async fn create_test_user(ctx: &TestContext, username: &str, password: &str) {
     let hash = hash_password(password).unwrap();
-    ctx.user_repo.create_user(username, &hash).await.unwrap();
+    if username == "admin" {
+        ctx.user_repo
+            .set_system_user_credentials(username, &hash)
+            .await
+            .unwrap();
+    } else {
+        ctx.user_repo.create_user(username, &hash).await.unwrap();
+    }
 }
 
 /// Helper: perform a JSON POST request.
