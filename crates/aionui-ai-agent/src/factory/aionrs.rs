@@ -1,22 +1,62 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use aion_agent::session::SessionManager;
-use aionui_api_types::AionrsBuildExtra;
+use aion_config::config::{McpServerConfig, TransportType};
+use aionui_api_types::{AionrsBuildExtra, GuideMcpConfig, TeamMcpStdioConfig};
 use aionui_common::AppError;
 use tracing::{debug, info};
 
 use crate::agent_task::AgentInstance;
+use crate::capability::team_guide_prompt;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::AionrsAgentManager;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig, BuildTaskOptions};
+
+const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs", "codebuddy"];
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     options: BuildTaskOptions,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AppError> {
-    let overrides: AionrsBuildExtra = serde_json::from_value(options.extra).unwrap_or_default();
+    let mut overrides: AionrsBuildExtra = serde_json::from_value(options.extra).unwrap_or_default();
+
+    // Inject Guide MCP config for solo (non-team) sessions, mirroring acp.rs:39-55.
+    if overrides.team_mcp_stdio_config.is_none()
+        && overrides.guide_mcp_config.is_none()
+        && deps.guide_mcp_config.is_some()
+    {
+        overrides.guide_mcp_config.clone_from(&deps.guide_mcp_config);
+        overrides.backend.get_or_insert_with(|| "aionrs".to_owned());
+    }
+
+    let extra_mcp_servers = resolve_mcp_servers(&overrides, &ctx.conversation_id);
+
+    // Inject team guide system prompt for solo sessions with guide MCP
+    if overrides.team_mcp_stdio_config.is_none()
+        && overrides.guide_mcp_config.is_some()
+        && team_guide_prompt::is_solo_team_guide_backend(
+            overrides.backend.as_deref().unwrap_or("aionrs"),
+        )
+    {
+        let guide_prompt =
+            team_guide_prompt::build_solo_team_guide_prompt(overrides.backend.as_deref().unwrap_or("aionrs"));
+        overrides.system_prompt = Some(match overrides.system_prompt.take() {
+            Some(existing) => format!("{existing}\n\n{guide_prompt}"),
+            None => guide_prompt,
+        });
+    }
+
+    if !extra_mcp_servers.is_empty() {
+        info!(
+            conversation_id = %ctx.conversation_id,
+            mcp_count = extra_mcp_servers.len(),
+            mcp_names = ?extra_mcp_servers.keys().collect::<Vec<_>>(),
+            "Injecting MCP servers into aionrs session"
+        );
+    }
 
     let provider_id = &options.model.provider_id;
     let row = deps
@@ -76,6 +116,7 @@ pub(super) async fn build(
         compat_overrides,
         session_directory,
         session_mode: overrides.session_mode,
+        extra_mcp_servers,
     };
 
     let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
@@ -150,6 +191,74 @@ fn is_openai_host(url: &str) -> bool {
 fn normalize_aionrs_base_url(url: &str) -> String {
     let trimmed = url.trim_end_matches('/');
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned()
+}
+
+fn resolve_mcp_servers(
+    overrides: &AionrsBuildExtra,
+    conversation_id: &str,
+) -> HashMap<String, McpServerConfig> {
+    if let Some(cfg) = &overrides.team_mcp_stdio_config {
+        return team_mcp_to_config(cfg);
+    }
+    if let Some(guide_cfg) = &overrides.guide_mcp_config
+        && overrides
+            .backend
+            .as_deref()
+            .is_some_and(|b| TEAM_CAPABLE_BACKENDS.contains(&b))
+    {
+        return guide_mcp_to_config(guide_cfg, overrides, conversation_id);
+    }
+    HashMap::new()
+}
+
+fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConfig> {
+    let mut env = HashMap::new();
+    env.insert(TeamMcpStdioConfig::ENV_PORT.into(), cfg.port.to_string());
+    env.insert(TeamMcpStdioConfig::ENV_TOKEN.into(), cfg.token.clone());
+    env.insert(TeamMcpStdioConfig::ENV_SLOT_ID.into(), cfg.slot_id.clone());
+
+    let server = McpServerConfig {
+        transport: TransportType::Stdio,
+        command: Some(cfg.binary_path.clone()),
+        args: Some(vec!["mcp-team-stdio".into()]),
+        env: Some(env),
+        url: None,
+        headers: None,
+        deferred: Some(false),
+    };
+
+    HashMap::from([(format!("aionui-team-{}", cfg.team_id), server)])
+}
+
+fn guide_mcp_to_config(
+    cfg: &GuideMcpConfig,
+    overrides: &AionrsBuildExtra,
+    conversation_id: &str,
+) -> HashMap<String, McpServerConfig> {
+    let mut env = HashMap::new();
+    env.insert("AION_MCP_PORT".into(), cfg.port.to_string());
+    env.insert("AION_MCP_TOKEN".into(), cfg.token.clone());
+    env.insert(
+        "AION_MCP_BACKEND".into(),
+        overrides.backend.clone().unwrap_or_default(),
+    );
+    env.insert("AION_MCP_CONVERSATION_ID".into(), conversation_id.to_owned());
+    env.insert(
+        "AION_MCP_USER_ID".into(),
+        overrides.user_id.clone().unwrap_or_default(),
+    );
+
+    let server = McpServerConfig {
+        transport: TransportType::Stdio,
+        command: Some(cfg.binary_path.clone()),
+        args: Some(vec!["mcp-guide-stdio".into()]),
+        env: Some(env),
+        url: None,
+        headers: None,
+        deferred: Some(false),
+    };
+
+    HashMap::from([("aionui-team-guide".into(), server)])
 }
 
 #[cfg(test)]
@@ -265,5 +374,110 @@ mod tests {
         assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com"));
         assert!(compat.max_tokens_field.is_none());
         assert!(compat.api_path.is_none());
+    }
+
+    #[test]
+    fn resolve_mcp_servers_team_takes_priority() {
+        let overrides = AionrsBuildExtra {
+            team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                team_id: "team-42".into(),
+                port: 9000,
+                token: "tok".into(),
+                slot_id: "slot-1".into(),
+                binary_path: "/usr/bin/backend".into(),
+            }),
+            guide_mcp_config: Some(GuideMcpConfig {
+                port: 8000,
+                token: "guide-tok".into(),
+                binary_path: "/usr/bin/backend".into(),
+            }),
+            backend: Some("aionrs".into()),
+            ..Default::default()
+        };
+
+        let result = resolve_mcp_servers(&overrides, "conv-1");
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("aionui-team-team-42"));
+
+        let server = &result["aionui-team-team-42"];
+        assert_eq!(server.transport, TransportType::Stdio);
+        assert_eq!(server.command.as_deref(), Some("/usr/bin/backend"));
+        assert_eq!(server.args.as_deref(), Some(&["mcp-team-stdio".to_owned()][..]));
+        assert_eq!(server.deferred, Some(false));
+
+        let env = server.env.as_ref().unwrap();
+        assert_eq!(env.get("TEAM_MCP_PORT"), Some(&"9000".to_owned()));
+        assert_eq!(env.get("TEAM_MCP_TOKEN"), Some(&"tok".to_owned()));
+        assert_eq!(env.get("TEAM_AGENT_SLOT_ID"), Some(&"slot-1".to_owned()));
+    }
+
+    #[test]
+    fn resolve_mcp_servers_guide_when_no_team() {
+        let overrides = AionrsBuildExtra {
+            guide_mcp_config: Some(GuideMcpConfig {
+                port: 8000,
+                token: "guide-tok".into(),
+                binary_path: "/usr/bin/backend".into(),
+            }),
+            backend: Some("aionrs".into()),
+            user_id: Some("user-1".into()),
+            ..Default::default()
+        };
+
+        let result = resolve_mcp_servers(&overrides, "conv-2");
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("aionui-team-guide"));
+
+        let server = &result["aionui-team-guide"];
+        assert_eq!(server.transport, TransportType::Stdio);
+        assert_eq!(server.command.as_deref(), Some("/usr/bin/backend"));
+        assert_eq!(server.args.as_deref(), Some(&["mcp-guide-stdio".to_owned()][..]));
+        assert_eq!(server.deferred, Some(false));
+
+        let env = server.env.as_ref().unwrap();
+        assert_eq!(env.get("AION_MCP_PORT"), Some(&"8000".to_owned()));
+        assert_eq!(env.get("AION_MCP_TOKEN"), Some(&"guide-tok".to_owned()));
+        assert_eq!(env.get("AION_MCP_BACKEND"), Some(&"aionrs".to_owned()));
+        assert_eq!(env.get("AION_MCP_CONVERSATION_ID"), Some(&"conv-2".to_owned()));
+        assert_eq!(env.get("AION_MCP_USER_ID"), Some(&"user-1".to_owned()));
+    }
+
+    #[test]
+    fn resolve_mcp_servers_empty_when_no_config() {
+        let overrides = AionrsBuildExtra::default();
+        let result = resolve_mcp_servers(&overrides, "conv-3");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_mcp_servers_guide_skipped_for_unknown_backend() {
+        let overrides = AionrsBuildExtra {
+            guide_mcp_config: Some(GuideMcpConfig {
+                port: 8000,
+                token: "tok".into(),
+                binary_path: "/bin/x".into(),
+            }),
+            backend: Some("unknown-vendor".into()),
+            ..Default::default()
+        };
+
+        let result = resolve_mcp_servers(&overrides, "conv-4");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_mcp_servers_guide_skipped_when_backend_none() {
+        let overrides = AionrsBuildExtra {
+            guide_mcp_config: Some(GuideMcpConfig {
+                port: 8000,
+                token: "tok".into(),
+                binary_path: "/bin/x".into(),
+            }),
+            backend: None,
+            ..Default::default()
+        };
+
+        let result = resolve_mcp_servers(&overrides, "conv-5");
+        assert!(result.is_empty());
     }
 }
