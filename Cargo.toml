@@ -51,11 +51,11 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.20" }
-aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.20" }
-aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.20" }
-aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.20" }
-aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.20" }
+aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.21" }
+aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.21" }
+aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.21" }
+aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.21" }
+aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.21" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
@@ -149,8 +149,11 @@ sha2 = "0.10"
 
 # AWS
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-bedrock = "1"
-aws-sdk-bedrockruntime = "1"
+aws-sdk-bedrock = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+
+# Pin rustls-webpki to fix RUSTSEC-2026-{0098,0099,0104}
+rustls-webpki = "0.103.13"
 
 # OAuth / MCP
 oauth2 = "5.0.0-rc.1"
