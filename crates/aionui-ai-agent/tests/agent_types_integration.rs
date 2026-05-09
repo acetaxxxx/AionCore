@@ -100,6 +100,7 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         compat_overrides: Default::default(),
         session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,
+        extra_mcp_servers: Default::default(),
     }
 }
 
