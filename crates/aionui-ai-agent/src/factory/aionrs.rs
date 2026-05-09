@@ -37,9 +37,7 @@ pub(super) async fn build(
     // Inject team guide system prompt for solo sessions with guide MCP
     if overrides.team_mcp_stdio_config.is_none()
         && overrides.guide_mcp_config.is_some()
-        && team_guide_prompt::is_solo_team_guide_backend(
-            overrides.backend.as_deref().unwrap_or("aionrs"),
-        )
+        && team_guide_prompt::is_solo_team_guide_backend(overrides.backend.as_deref().unwrap_or("aionrs"))
     {
         let guide_prompt =
             team_guide_prompt::build_solo_team_guide_prompt(overrides.backend.as_deref().unwrap_or("aionrs"));
@@ -193,10 +191,7 @@ fn normalize_aionrs_base_url(url: &str) -> String {
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned()
 }
 
-fn resolve_mcp_servers(
-    overrides: &AionrsBuildExtra,
-    conversation_id: &str,
-) -> HashMap<String, McpServerConfig> {
+fn resolve_mcp_servers(overrides: &AionrsBuildExtra, conversation_id: &str) -> HashMap<String, McpServerConfig> {
     if let Some(cfg) = &overrides.team_mcp_stdio_config {
         return team_mcp_to_config(cfg);
     }
@@ -238,15 +233,9 @@ fn guide_mcp_to_config(
     let mut env = HashMap::new();
     env.insert("AION_MCP_PORT".into(), cfg.port.to_string());
     env.insert("AION_MCP_TOKEN".into(), cfg.token.clone());
-    env.insert(
-        "AION_MCP_BACKEND".into(),
-        overrides.backend.clone().unwrap_or_default(),
-    );
+    env.insert("AION_MCP_BACKEND".into(), overrides.backend.clone().unwrap_or_default());
     env.insert("AION_MCP_CONVERSATION_ID".into(), conversation_id.to_owned());
-    env.insert(
-        "AION_MCP_USER_ID".into(),
-        overrides.user_id.clone().unwrap_or_default(),
-    );
+    env.insert("AION_MCP_USER_ID".into(), overrides.user_id.clone().unwrap_or_default());
 
     let server = McpServerConfig {
         transport: TransportType::Stdio,
