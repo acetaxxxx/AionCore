@@ -117,7 +117,7 @@ async fn system_default_user_exists() {
         .unwrap();
 
     assert_eq!(row.get::<String, _>("id"), "system_default_user");
-    assert_eq!(row.get::<String, _>("username"), "system");
+    assert_eq!(row.get::<String, _>("username"), "admin");
     assert_eq!(
         row.get::<String, _>("password_hash"),
         "",

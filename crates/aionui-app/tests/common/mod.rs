@@ -225,6 +225,10 @@ pub fn delete_with_token(uri: &str, token: &str, csrf: &str) -> Request<Body> {
 }
 
 /// Set up a user and login, returning (session_token, csrf_token).
+///
+/// The seeded `system_default_user` row already uses `username = "admin"`; if
+/// the test asks for that username, overwrite the seed row's empty credentials
+/// in place instead of trying to INSERT a duplicate.
 pub async fn setup_and_login(
     app: &mut axum::Router,
     services: &AppServices,
@@ -232,7 +236,15 @@ pub async fn setup_and_login(
     password: &str,
 ) -> (String, String) {
     let hash = aionui_auth::hash_password(password).unwrap();
-    services.user_repo.create_user(username, &hash).await.unwrap();
+    if username == "admin" {
+        services
+            .user_repo
+            .set_system_user_credentials(username, &hash)
+            .await
+            .unwrap();
+    } else {
+        services.user_repo.create_user(username, &hash).await.unwrap();
+    }
 
     let resp = app.clone().oneshot(get_request("/api/auth/status")).await.unwrap();
     let csrf = extract_csrf_token(&resp).expect("CSRF cookie should be set");
