@@ -166,12 +166,6 @@ struct TaskUpdateParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
-struct TaskListParams {}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct MembersParams {}
-
-#[derive(Deserialize, schemars::JsonSchema)]
 struct RenameAgentParams {
     /// Slot ID of the team member to rename.
     slot_id: String,
@@ -307,7 +301,7 @@ impl GuideServer {
     }
 
     #[tool(name = "team_task_list", description = "List all tasks on the team task board.")]
-    async fn team_task_list(&self, Parameters(_params): Parameters<TaskListParams>) -> String {
+    async fn team_task_list(&self) -> String {
         eprintln!("[mcp-guide-stdio] tools/call: team_task_list");
         self.forward_tool("team_task_list", &serde_json::json!({})).await
     }
@@ -316,7 +310,7 @@ impl GuideServer {
         name = "team_members",
         description = "List all team members with their roles and current status."
     )]
-    async fn team_members(&self, Parameters(_params): Parameters<MembersParams>) -> String {
+    async fn team_members(&self) -> String {
         eprintln!("[mcp-guide-stdio] tools/call: team_members");
         self.forward_tool("team_members", &serde_json::json!({})).await
     }
@@ -379,6 +373,26 @@ impl GuideServer {
             }),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_tool_schemas_have_properties_field() {
+        let router = GuideServer::tool_router();
+        let tools = router.list_all();
+        assert!(!tools.is_empty());
+        for tool in &tools {
+            assert!(
+                tool.input_schema.contains_key("properties"),
+                "Tool '{}' schema missing 'properties' field: {:?}. OpenAI API rejects schemas without it.",
+                tool.name,
+                tool.input_schema,
+            );
+        }
     }
 }
 
