@@ -62,9 +62,9 @@ impl TeammateManager {
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
 
         // Check all other agents for name collision (exclude self).
-        let conflict = slots.iter().any(|(id, s)| {
-            id != slot_id && super::normalize_name(&s.agent.name) == normalized
-        });
+        let conflict = slots
+            .iter()
+            .any(|(id, s)| id != slot_id && super::normalize_name(&s.agent.name) == normalized);
         if conflict {
             return Err(TeamError::DuplicateAgentName(new_name.to_owned()));
         }
