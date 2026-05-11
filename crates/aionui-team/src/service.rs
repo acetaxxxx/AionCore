@@ -481,9 +481,10 @@ impl TeamSessionService {
         }
 
         // Uniqueness check against all other agents in the team.
-        let has_conflict = team.agents.iter().any(|a| {
-            a.slot_id != slot_id && crate::scheduler::normalize_name(&a.name) == normalized
-        });
+        let has_conflict = team
+            .agents
+            .iter()
+            .any(|a| a.slot_id != slot_id && crate::scheduler::normalize_name(&a.name) == normalized);
         if has_conflict {
             return Err(TeamError::DuplicateAgentName(name.to_owned()));
         }

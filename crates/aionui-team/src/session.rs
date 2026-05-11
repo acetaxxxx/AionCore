@@ -1371,12 +1371,7 @@ mod tests {
     async fn rename_agent_rejects_duplicate_in_session() {
         let session = start_session().await;
         let agents = session.scheduler.list_agents().await;
-        let lead_name = agents
-            .iter()
-            .find(|a| a.slot_id == "lead-1")
-            .unwrap()
-            .name
-            .clone();
+        let lead_name = agents.iter().find(|a| a.slot_id == "lead-1").unwrap().name.clone();
 
         // Rename worker-1 to the lead's name — should collide.
         let result = session.rename_agent("worker-1", &lead_name).await;
