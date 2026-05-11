@@ -935,14 +935,14 @@ impl TeamSessionService {
 
             if send_result.is_ok() && !msg_ids.is_empty() {
                 let session = sessions.get(&team_id_owned).map(|e| Arc::clone(&e.session));
-                if let Some(session) = session {
-                    if let Err(e) = session.mailbox().mark_read_batch(&msg_ids).await {
-                        warn!(
-                            slot_id = %slot_id_owned,
-                            error = %e,
-                            "mark_read_batch failed after successful send in wake_agent_in_session (non-fatal)"
-                        );
-                    }
+                if let Some(session) = session
+                    && let Err(e) = session.mailbox().mark_read_batch(&msg_ids).await
+                {
+                    warn!(
+                        slot_id = %slot_id_owned,
+                        error = %e,
+                        "mark_read_batch failed after successful send in wake_agent_in_session (non-fatal)"
+                    );
                 }
             }
 
