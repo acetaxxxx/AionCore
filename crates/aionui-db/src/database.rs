@@ -132,7 +132,22 @@ async fn try_init_file(path: &Path) -> Result<Database, DbError> {
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), DbError> {
     ensure_schema_columns(pool).await?;
-    sqlx::migrate!().run(pool).await.map_err(DbError::Migration)
+    // Migration 002 rebuilds tables via RENAME+DROP. Two pragmas are needed:
+    // - foreign_keys=OFF: prevents DROP TABLE from triggering ON DELETE CASCADE
+    // - legacy_alter_table=ON: prevents ALTER TABLE RENAME from rewriting FK
+    //   references in other tables (SQLite 3.26+ rewrites them by default)
+    // Both must be set outside a transaction (sqlx wraps each migration in one).
+    let mut conn = pool.acquire().await.map_err(DbError::Query)?;
+    sqlx::query("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON")
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::Query)?;
+    let result = sqlx::migrate!().run(&mut *conn).await.map_err(DbError::Migration);
+    sqlx::query("PRAGMA foreign_keys = ON; PRAGMA legacy_alter_table = OFF")
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::Query)?;
+    result
 }
 
 /// Ensure columns expected by Rust models exist in the database.
@@ -276,5 +291,20 @@ mod tests {
             should_attempt_recovery(&err),
             "corruption-like failures should trigger recovery"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_fk_references() {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool();
+
+        let fk_table: String = sqlx::query_scalar(
+            "SELECT \"table\" FROM pragma_foreign_key_list('messages') WHERE \"from\"='conversation_id'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        assert_eq!(fk_table, "conversations");
     }
 }
