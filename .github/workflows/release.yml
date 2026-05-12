@@ -1,6 +1,9 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_call:
     inputs:
       tag_name:
@@ -24,6 +27,7 @@ env:
   CARGO_NET_RETRY: "10"
   AIONUI_EMBED_BUN: "1"
   BUN_VARIANT: default
+  RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
 
 jobs:
   prepare-release:
@@ -34,13 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ inputs.tag_name }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Extract version from tag
         id: metadata
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag_name }}
         run: |
           version="${RELEASE_TAG#v}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -85,7 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ inputs.tag_name }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -173,7 +175,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
           release_url="https://github.com/${REPOSITORY}/releases/tag/${RELEASE_TAG}"
