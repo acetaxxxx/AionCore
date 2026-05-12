@@ -99,11 +99,11 @@ async fn setup() -> (ConversationService, Arc<TestBroadcaster>, Arc<dyn IWorkerT
         Arc::new(aionui_db::SqliteAgentMetadataRepository::new(db.pool().clone()));
     let acp_session_repo: Arc<dyn aionui_db::IAcpSessionRepository> =
         Arc::new(aionui_db::SqliteAcpSessionRepository::new(db.pool().clone()));
-    let svc = ConversationService::new_with_workspace_root(
-        repo,
-        broadcaster.clone(),
+    let svc = ConversationService::new(
         std::env::temp_dir(),
+        broadcaster.clone(),
         Arc::new(EmptySkillResolver),
+        repo,
         agent_metadata_repo,
         acp_session_repo,
     );
@@ -116,7 +116,6 @@ const USER_ID: &str = "system_default_user";
 fn make_create_req() -> CreateConversationRequest {
     serde_json::from_value(json!({
         "type": "acp",
-        "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
         "extra": { "workspace": "/home/user/project" }
     }))
     .unwrap()
@@ -140,10 +139,8 @@ async fn t1_1_create_with_defaults() {
     assert!(resp.created_at > 0);
     assert_eq!(resp.created_at, resp.modified_at);
 
-    // Model preserved
-    let model = resp.model.unwrap();
-    assert_eq!(model.provider_id, "p1");
-    assert_eq!(model.model, "claude-sonnet-4-20250514");
+    // Non-aionrs: top-level model is None.
+    assert!(resp.model.is_none(), "ACP response should not carry top-level model");
 
     // WebSocket event
     let events = broadcaster.take_events();
@@ -167,14 +164,26 @@ async fn t1_2_create_each_agent_type() {
     ];
 
     for (type_str, expected_type) in types {
-        let req: CreateConversationRequest = serde_json::from_value(json!({
-            "type": type_str,
-            "model": { "provider_id": "p1", "model": "m1" },
-            "extra": {}
-        }))
-        .unwrap();
+        let body = if type_str == "aionrs" {
+            json!({
+                "type": type_str,
+                "model": { "provider_id": "p1", "model": "m1" },
+                "extra": {}
+            })
+        } else {
+            json!({
+                "type": type_str,
+                "extra": {}
+            })
+        };
+        let req: CreateConversationRequest = serde_json::from_value(body).unwrap();
         let resp = svc.create(USER_ID, req).await.unwrap();
         assert_eq!(resp.r#type, expected_type, "Type mismatch for {type_str}");
+        if type_str == "aionrs" {
+            assert!(resp.model.is_some(), "aionrs should keep top-level model");
+        } else {
+            assert!(resp.model.is_none(), "{type_str} should have no top-level model");
+        }
     }
 }
 
@@ -185,7 +194,6 @@ async fn t1_3_create_with_optional_fields() {
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Custom Name",
-        "model": { "provider_id": "p1", "model": "m1" },
         "source": "telegram",
         "channel_chat_id": "user:123",
         "extra": { "workspace": "/path" }
@@ -282,7 +290,6 @@ async fn t2_4_source_filter() {
 
     let telegram_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "model": { "provider_id": "p1", "model": "m1" },
         "source": "telegram",
         "extra": {}
     }))
@@ -393,7 +400,6 @@ async fn t4_4_extra_merge_preserves_existing_keys() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "model": { "provider_id": "p1", "model": "m1" },
         "extra": { "workspace": "/old", "contextFileName": "ctx.md" }
     }))
     .unwrap();
@@ -411,7 +417,16 @@ async fn t4_4_extra_merge_preserves_existing_keys() {
 #[tokio::test]
 async fn t4_5_update_model() {
     let (svc, _, task_mgr) = setup().await;
-    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    // Top-level model updates are only valid on aionrs conversations
+    // (Task 8 enforces the aionrs-only rule in update).
+    let create_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "model": { "provider_id": "p1", "model": "m1" },
+        "extra": {}
+    }))
+    .unwrap();
+    let conv = svc.create(USER_ID, create_req).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({
         "model": { "provider_id": "p2", "model": "new-model" }
@@ -519,7 +534,6 @@ async fn t12_1_long_name() {
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": long_name,
-        "model": { "provider_id": "p1", "model": "m1" },
         "extra": {}
     }))
     .unwrap();
@@ -544,7 +558,6 @@ async fn t12_2_large_extra_json() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "model": { "provider_id": "p1", "model": "m1" },
         "extra": large_extra
     }))
     .unwrap();
@@ -613,4 +626,256 @@ async fn full_lifecycle_create_get_update_delete() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[1].data["action"], "updated");
     assert_eq!(events[2].data["action"], "deleted");
+}
+
+// ── Type-aware model rules ─────────────────────────────────────────
+
+#[tokio::test]
+async fn create_rejects_top_level_model_for_acp() {
+    let (svc, _, _task_mgr) = setup().await;
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
+        "extra": {}
+    }))
+    .unwrap();
+
+    let err = svc.create(USER_ID, req).await.unwrap_err();
+    match err {
+        AppError::BadRequest(msg) => {
+            assert!(msg.contains("model"), "error message should mention model: {msg}");
+            assert!(msg.contains("extra"), "error message should mention extra: {msg}");
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn create_rejects_top_level_model_for_remote() {
+    let (svc, _, _task_mgr) = setup().await;
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "remote",
+        "model": { "provider_id": "p1", "model": "m1" },
+        "extra": {}
+    }))
+    .unwrap();
+
+    assert!(matches!(svc.create(USER_ID, req).await, Err(AppError::BadRequest(_))));
+}
+
+#[tokio::test]
+async fn create_accepts_top_level_model_for_aionrs() {
+    let (svc, _, _task_mgr) = setup().await;
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "model": { "provider_id": "p1", "model": "gpt-4o" },
+        "extra": {}
+    }))
+    .unwrap();
+
+    let resp = svc.create(USER_ID, req).await.unwrap();
+    assert_eq!(resp.r#type, AgentType::Aionrs);
+    let model = resp.model.expect("aionrs response should carry top-level model");
+    assert_eq!(model.provider_id, "p1");
+    assert_eq!(model.model, "gpt-4o");
+}
+
+#[tokio::test]
+async fn create_aionrs_strips_extra_model_field() {
+    let (svc, _, _task_mgr) = setup().await;
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "model": { "provider_id": "p1", "model": "gpt-4o" },
+        "extra": {
+            "workspace": "/home/user/project",
+            "model": "bogus-from-legacy-client"
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create(USER_ID, req).await.unwrap();
+    assert!(
+        !resp.extra.as_object().unwrap().contains_key("model"),
+        "aionrs create must strip extra.model to avoid dual source of truth; got {:?}",
+        resp.extra
+    );
+    // Top-level model is still present and wins.
+    assert_eq!(resp.model.unwrap().model, "gpt-4o");
+}
+
+#[tokio::test]
+async fn update_rejects_top_level_model_for_acp() {
+    let (svc, _, task_mgr) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({
+        "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" }
+    }))
+    .unwrap();
+
+    let err = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap_err();
+    assert!(
+        matches!(err, AppError::BadRequest(_)),
+        "expected BadRequest, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn update_accepts_top_level_model_for_aionrs() {
+    let (svc, _, task_mgr) = setup().await;
+
+    let create_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "model": { "provider_id": "p1", "model": "gpt-4o" },
+        "extra": {}
+    }))
+    .unwrap();
+    let conv = svc.create(USER_ID, create_req).await.unwrap();
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({
+        "model": { "provider_id": "p1", "model": "gpt-4o-mini" }
+    }))
+    .unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
+    assert_eq!(updated.model.unwrap().model, "gpt-4o-mini");
+}
+
+#[tokio::test]
+async fn update_non_aionrs_extra_model_does_not_kill_task() {
+    // Verifies the explicit rule that `extra.model` changes for non-aionrs
+    // do NOT trigger task_manager.kill. Since our `NoopTaskManager::kill` is
+    // a no-op we can't assert the negative directly; we assert the update
+    // succeeds and the merged extra carries the new field, and that top-level
+    // model remains None.
+    let (svc, _, task_mgr) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "current_model_id": "claude-opus-4" }
+    }))
+    .unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
+    assert_eq!(updated.extra["current_model_id"], "claude-opus-4");
+    assert!(updated.model.is_none());
+}
+
+#[tokio::test]
+async fn update_aionrs_strips_extra_model_from_patch() {
+    let (svc, _, task_mgr) = setup().await;
+
+    let create_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "model": { "provider_id": "p1", "model": "gpt-4o" },
+        "extra": {}
+    }))
+    .unwrap();
+    let conv = svc.create(USER_ID, create_req).await.unwrap();
+
+    // Client mistakenly sends extra.model on an aionrs PATCH. It should be
+    // silently stripped from the merged extra, not persisted.
+    let req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "model": "legacy-value", "last_token_usage": { "total_tokens": 42 } }
+    }))
+    .unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
+
+    assert!(
+        !updated.extra.as_object().unwrap().contains_key("model"),
+        "aionrs PATCH must strip extra.model; got {:?}",
+        updated.extra
+    );
+    // Other extra keys from the patch are merged as usual.
+    assert_eq!(updated.extra["last_token_usage"]["total_tokens"], 42);
+    // Top-level model unchanged by the extra-only patch.
+    assert_eq!(updated.model.unwrap().model, "gpt-4o");
+}
+
+#[tokio::test]
+async fn create_acp_seeds_acp_session_runtime_from_extra() {
+    use aionui_db::{SqliteAcpSessionRepository, init_database_memory};
+
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone()));
+    let broadcaster = Arc::new(TestBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn aionui_db::IAgentMetadataRepository> =
+        Arc::new(aionui_db::SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let acp_session_repo: Arc<dyn aionui_db::IAcpSessionRepository> =
+        Arc::new(SqliteAcpSessionRepository::new(db.pool().clone()));
+    let svc = aionui_conversation::ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        Arc::new(EmptySkillResolver),
+        repo,
+        agent_metadata_repo,
+        acp_session_repo.clone(),
+    );
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "backend": "claude",
+            "current_mode_id": "bypassPermissions",
+            "current_model_id": "claude-opus-4"
+        }
+    }))
+    .unwrap();
+    let conv = svc.create(USER_ID, req).await.unwrap();
+
+    let runtime = acp_session_repo
+        .load_runtime_state(&conv.id)
+        .await
+        .unwrap()
+        .expect("acp_session runtime state should exist after create");
+    assert_eq!(
+        runtime.current_mode_id.as_deref(),
+        Some("bypassPermissions"),
+        "extra.current_mode_id must be seeded into acp_session on create"
+    );
+    assert_eq!(
+        runtime.current_model_id.as_deref(),
+        Some("claude-opus-4"),
+        "extra.current_model_id must be seeded into acp_session on create"
+    );
+}
+
+#[tokio::test]
+async fn create_acp_skips_seed_when_extra_has_empty_runtime_fields() {
+    use aionui_db::{SqliteAcpSessionRepository, init_database_memory};
+
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone()));
+    let broadcaster = Arc::new(TestBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn aionui_db::IAgentMetadataRepository> =
+        Arc::new(aionui_db::SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let acp_session_repo: Arc<dyn aionui_db::IAcpSessionRepository> =
+        Arc::new(SqliteAcpSessionRepository::new(db.pool().clone()));
+    let svc = aionui_conversation::ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        Arc::new(EmptySkillResolver),
+        repo,
+        agent_metadata_repo,
+        acp_session_repo.clone(),
+    );
+
+    // Both fields present but empty — treated as absent, no save_runtime_state call.
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "backend": "claude", "current_mode_id": "", "current_model_id": "" }
+    }))
+    .unwrap();
+    let conv = svc.create(USER_ID, req).await.unwrap();
+
+    let runtime = acp_session_repo.load_runtime_state(&conv.id).await.unwrap();
+    // Either `None` (no runtime key yet) or Some(default) — both mean "nothing seeded".
+    assert!(
+        runtime
+            .as_ref()
+            .map_or(true, |r| r.current_mode_id.is_none() && r.current_model_id.is_none()),
+        "empty runtime fields should not produce a seed: got {runtime:?}"
+    );
 }
