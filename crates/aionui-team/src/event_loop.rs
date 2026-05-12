@@ -158,14 +158,18 @@ async fn run_event_loop(
                 break;
             }
 
-            let finish_ok = execute_turn(&ctx, &input).await;
-            finalize_turn(&ctx, finish_ok).await;
+            match execute_turn(&ctx, &input).await {
+                Some(finish_ok) => finalize_turn(&ctx, finish_ok).await,
+                None => break, // Turn not started (guard/warmup); retry on next signal
+            }
         }
     }
 }
 
 /// Execute one agent turn: warmup → guard → set Working → StreamRelay → send → await finish.
-async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput) -> bool {
+/// Returns `Some(true)` on successful finish, `Some(false)` on error finish,
+/// `None` if the turn was not started (guard hit, warmup fail, etc.).
+async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput) -> Option<bool> {
     ctx.session.mirror_unread_to_conversation(input).await;
 
     // Ensure agent task exists
@@ -184,7 +188,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                     error = %e,
                     "event loop: warmup failed"
                 );
-                return false;
+                return None;
             }
             match ctx.task_manager.get_task(&input.conversation_id) {
                 Some(h) => h,
@@ -195,7 +199,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                         conversation_id = %input.conversation_id,
                         "event loop: no task after warmup"
                     );
-                    return false;
+                    return None;
                 }
             }
         }
@@ -203,13 +207,13 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
 
     // Guard: skip if already running
     if handle.status() == Some(ConversationStatus::Running) {
-        return false;
+        return None;
     }
     let repo = ctx.conversation_service.conversation_repo();
     if let Ok(Some(row)) = repo.get(&input.conversation_id).await
         && row.status.as_deref() == Some("running")
     {
-        return false;
+        return None;
     }
 
     // Point-of-no-return: set Working + claim DB running
@@ -234,11 +238,19 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
     );
     tokio::spawn(async move { relay.consume(rx).await });
 
-    // Send message to agent
+    // Collect files from unread messages (user-attached files)
+    let files: Vec<String> = input
+        .unread
+        .iter()
+        .filter_map(|m| m.files.as_ref())
+        .flatten()
+        .cloned()
+        .collect();
+
     let data = SendMessageData {
         content: input.first_message.clone(),
         msg_id,
-        files: Vec::new(),
+        files,
         inject_skills: Vec::new(),
     };
 
@@ -257,7 +269,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
             ..Default::default()
         };
         let _ = repo.update(&input.conversation_id, &update).await;
-        return false;
+        return None; // Turn aborted, skip finalization
     }
 
     // Mark messages as read
@@ -274,7 +286,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
     }
 
     // Await Finish/Error from agent
-    await_agent_finish(&handle.subscribe(), &ctx.team_id, &ctx.slot_id).await
+    Some(await_agent_finish(&handle.subscribe(), &ctx.team_id, &ctx.slot_id).await)
 }
 
 /// Wait for the agent's turn to complete by listening for Finish/Error events.
@@ -307,8 +319,11 @@ async fn await_agent_finish(
     }
 }
 
-/// Finalize a completed turn: mark idle and cascade to leader if needed.
-async fn finalize_turn(ctx: &AgentLoopContext, _finish_ok: bool) {
+/// Finalize a completed turn: mark idle (or error) and cascade to leader if needed.
+async fn finalize_turn(ctx: &AgentLoopContext, finish_ok: bool) {
+    if !finish_ok {
+        let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
+    }
     match ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await {
         Ok(Some(wake_target)) => {
             if wake_target != ctx.slot_id {
