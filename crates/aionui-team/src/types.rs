@@ -191,6 +191,8 @@ pub struct MailboxMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
     pub read: bool,
     pub created_at: TimestampMs,
 }
@@ -287,6 +289,11 @@ impl Team {
 impl MailboxMessage {
     pub fn from_row(row: &MailboxMessageRow) -> Option<Self> {
         let msg_type = MailboxMessageType::parse(&row.msg_type)?;
+        let files = row
+            .files
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .filter(|v| !v.is_empty());
         Some(Self {
             id: row.id.clone(),
             team_id: row.team_id.clone(),
@@ -295,6 +302,7 @@ impl MailboxMessage {
             msg_type,
             content: row.content.clone(),
             summary: row.summary.clone(),
+            files,
             read: row.read,
             created_at: row.created_at,
         })
@@ -765,6 +773,7 @@ mod tests {
             msg_type: MailboxMessageType::Message,
             content: "hello".into(),
             summary: None,
+            files: None,
             read: false,
             created_at: 1000,
         };

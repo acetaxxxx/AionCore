@@ -255,13 +255,9 @@ impl TeamSession {
                 .ok_or_else(|| TeamError::AgentNotFound(format!("no agent with conversation_id={conversation_id}")))?
         };
 
-        // If a wake is actively in-flight (try_wake or wake_agent_in_session
-        // holds the lock), the finish_subscriber should still finalize this
-        // turn. The wake lock prevents duplicate StreamRelays; begin_finalize
-        // dedup prevents double finalization from the manual on_agent_finish
-        // call after lock release.
-        // (Previously this checked is_wake_active and skipped — removed because
-        // it caused missed finalizations when try_wake held the lock.)
+        // The event loop's `finalize_turn` handles most cases, but
+        // `on_agent_finish` remains callable for aionrs resume and test scenarios.
+        // `begin_finalize` dedup prevents double finalization.
 
         if is_error {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
@@ -302,13 +298,14 @@ impl TeamSession {
         let lead_conv_id = self.scheduler.get_agent(&lead_slot_id).await?.conversation_id;
 
         self.mailbox
-            .write(
+            .write_with_files(
                 &self.team.id,
                 &lead_slot_id,
                 "user",
                 MailboxMessageType::Message,
                 content,
                 None,
+                files.as_deref(),
             )
             .await?;
 
@@ -355,13 +352,14 @@ impl TeamSession {
         let agent = self.scheduler.get_agent(slot_id).await?;
 
         self.mailbox
-            .write(
+            .write_with_files(
                 &self.team.id,
                 slot_id,
                 "user",
                 MailboxMessageType::Message,
                 content,
                 None,
+                files.as_deref(),
             )
             .await?;
 
@@ -590,6 +588,7 @@ impl TeamSession {
     }
 
     pub async fn remove_agent(&self, slot_id: &str) -> Result<(), TeamError> {
+        self.event_loops.remove(slot_id);
         let conversation_id = self.scheduler.remove_agent(slot_id).await?;
         if let Some(conv_id) = conversation_id
             && let Err(e) = self.task_manager.kill(&conv_id, Some(AgentKillReason::TeamDeleted))

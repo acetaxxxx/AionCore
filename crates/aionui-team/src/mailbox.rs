@@ -26,6 +26,24 @@ impl Mailbox {
         content: &str,
         summary: Option<&str>,
     ) -> Result<MailboxMessage, TeamError> {
+        self.write_with_files(team_id, to_agent_id, from_agent_id, msg_type, content, summary, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_with_files(
+        &self,
+        team_id: &str,
+        to_agent_id: &str,
+        from_agent_id: &str,
+        msg_type: MailboxMessageType,
+        content: &str,
+        summary: Option<&str>,
+        files: Option<&[String]>,
+    ) -> Result<MailboxMessage, TeamError> {
+        let files_json = files
+            .filter(|f| !f.is_empty())
+            .map(|f| serde_json::to_string(f).unwrap_or_default());
         let row = MailboxMessageRow {
             id: generate_id(),
             team_id: team_id.to_owned(),
@@ -34,7 +52,7 @@ impl Mailbox {
             msg_type: msg_type.to_string(),
             content: content.to_owned(),
             summary: summary.map(str::to_owned),
-            files: None,
+            files: files_json,
             read: false,
             created_at: now_ms(),
         };

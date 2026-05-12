@@ -468,6 +468,7 @@ impl TeamSessionService {
 
         if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
             session.add_agent(&agent).await;
+            self.register_event_loop(team_id, &agent.slot_id);
         }
 
         self.build_agent_response(&agent).await
@@ -572,8 +573,7 @@ impl TeamSessionService {
     ///    `conversation.extra` → `task_manager.kill(conv_id, TeamMcpRebuild)`
     ///    → `conversation_service.warmup(...)` rebuilds the ACP process with
     ///    the new extra.
-    /// 3. Subscribe to each agent's stream and forward `Finish` / `Error`
-    ///    events to `session.on_agent_finish`.
+    /// 3. Spawn per-agent event loops that drain the mailbox whenever notified.
     /// 4. Only insert into `sessions` after every step above succeeds — on
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
