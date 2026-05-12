@@ -8,7 +8,7 @@ use axum::routing::{get, post};
 
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CreateTeamRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, TeamAgentResponse, TeamListResponse, TeamResponse,
+    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::AppError;
@@ -34,6 +34,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
         .route("/api/teams/{id}/session", post(ensure_session).delete(stop_session))
+        .route("/api/teams/{id}/session-mode", post(set_session_mode))
         .with_state(state)
 }
 
@@ -141,6 +142,16 @@ async fn send_message_to_agent(
         .service
         .send_message_to_agent(&params.id, &params.slot_id, &req.content, req.files)
         .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn set_session_mode(
+    State(state): State<TeamRouterState>,
+    Path(id): Path<String>,
+    body: Result<Json<SetModeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    state.service.set_session_mode(&id, &req.mode).await?;
     Ok(Json(ApiResponse::success()))
 }
 
