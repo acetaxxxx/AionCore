@@ -465,6 +465,7 @@ dependencies = [
  "aionui-realtime",
  "async-trait",
  "axum",
+ "base64",
  "dashmap",
  "futures-util",
  "getrandom 0.2.17",
@@ -477,6 +478,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

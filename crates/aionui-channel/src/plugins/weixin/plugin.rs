@@ -1,33 +1,31 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use reqwest::Client;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use crate::constants::{WEIXIN_MAX_RETRIES, WEIXIN_RETRY_DELAY};
+use crate::constants::{WEIXIN_BACKOFF_DELAY, WEIXIN_MAX_RETRIES, WEIXIN_POLL_TIMEOUT, WEIXIN_RETRY_DELAY};
 use crate::error::ChannelError;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{
-    BotInfo, MessageContentType, PluginConfig, PluginStatus, PluginType, UnifiedAttachment, UnifiedIncomingMessage,
-    UnifiedMessageContent, UnifiedOutgoingMessage, UnifiedUser,
+    BotInfo, MessageContentType, PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessage, UnifiedMessageContent,
+    UnifiedOutgoingMessage, UnifiedUser,
 };
 
 use super::api::WeixinApi;
-use super::types::{SendMessageRequest, WxMessage};
-
-/// iLink Bot long-polling timeout in seconds.
-const POLL_TIMEOUT: u32 = 25;
+use super::types::{ITEM_TYPE_TEXT, ITEM_TYPE_VOICE, WeixinRawItem, WeixinRawMessage};
 
 /// Default base URL for the iLink Bot API.
-const DEFAULT_BASE_URL: &str = "https://api.ilink.bot";
+const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 
 /// WeChat (iLink Bot) platform plugin.
 ///
-/// Connects via long-polling (`getupdates`), handles text/voice/image/
-/// file/card messages. Does not support editing messages (WeChat
-/// limitation); `edit_message` sends a new reply instead.
+/// Connects via long-polling (buffer-based `getupdates`), handles text/voice
+/// messages. Does not support editing messages (WeChat limitation);
+/// `edit_message` sends a new reply instead.
 pub struct WeixinPlugin {
     status: PluginStatus,
     bot_info: Option<BotInfo>,
@@ -35,6 +33,7 @@ pub struct WeixinPlugin {
     api: Option<Arc<WeixinApi>>,
     poll_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    context_tokens: Arc<DashMap<String, String>>,
 }
 
 impl Default for WeixinPlugin {
@@ -46,6 +45,7 @@ impl Default for WeixinPlugin {
             api: None,
             poll_handle: None,
             shutdown_tx: None,
+            context_tokens: Arc::new(DashMap::new()),
         }
     }
 }
@@ -83,7 +83,6 @@ impl ChannelPlugin for WeixinPlugin {
                 ChannelError::InvalidConfig("Missing WeChat account_id".into())
             })?;
 
-        // Use base URL from extra config, or the default iLink Bot URL.
         let base_url = config
             .credentials
             .extra
@@ -92,7 +91,7 @@ impl ChannelPlugin for WeixinPlugin {
             .unwrap_or(DEFAULT_BASE_URL);
 
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(POLL_TIMEOUT as u64 + 10))
+            .timeout(Duration::from_secs(WEIXIN_POLL_TIMEOUT.as_secs() + 10))
             .build()
             .map_err(|e| {
                 self.status = PluginStatus::Error;
@@ -112,16 +111,16 @@ impl ChannelPlugin for WeixinPlugin {
 
         self.api = Some(api);
 
-        // Set up shutdown channel and spawn the long-polling task
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
         let api_clone = Arc::clone(self.api.as_ref().expect("api just set"));
+        let context_tokens = Arc::clone(&self.context_tokens);
         self.poll_handle = Some(tokio::spawn(poll_loop(
             api_clone,
             callbacks.message_tx,
-            callbacks.confirm_tx,
             shutdown_rx,
+            context_tokens,
         )));
 
         self.status = PluginStatus::Ready;
@@ -130,7 +129,6 @@ impl ChannelPlugin for WeixinPlugin {
 
     async fn start(&mut self) -> Result<(), ChannelError> {
         self.status = PluginStatus::Starting;
-        // Polling task was spawned in initialize; start just transitions status.
         self.status = PluginStatus::Running;
         info!("WeChat plugin started");
         Ok(())
@@ -148,6 +146,7 @@ impl ChannelPlugin for WeixinPlugin {
         }
 
         self.api = None;
+        self.context_tokens.clear();
         self.status = PluginStatus::Stopped;
         info!("WeChat plugin stopped");
         Ok(())
@@ -160,19 +159,13 @@ impl ChannelPlugin for WeixinPlugin {
             .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
 
         let text = message.text.as_deref().unwrap_or("").to_string();
+        let context_token = self.context_tokens.get(chat_id).map(|v| v.clone());
 
-        let req = SendMessageRequest {
-            chat_id: chat_id.to_string(),
-            text: Some(text),
-            msg_type: Some("text".into()),
-        };
-
-        let data = api.send_message(&req).await?;
-        Ok(data.message_id.unwrap_or_default())
+        api.send_message(chat_id, &text, context_token.as_deref()).await?;
+        Ok(String::new())
     }
 
     /// WeChat does not support editing messages.
-    /// Fallback: send a new message as a reply.
     async fn edit_message(
         &self,
         chat_id: &str,
@@ -184,7 +177,6 @@ impl ChannelPlugin for WeixinPlugin {
     }
 
     fn active_user_count(&self) -> usize {
-        // Tracked externally by ChannelManager via SessionManager
         0
     }
 
@@ -206,21 +198,17 @@ impl ChannelPlugin for WeixinPlugin {
 }
 
 // ---------------------------------------------------------------------------
-// Long-polling loop
+// Long-polling loop (buffer-based protocol)
 // ---------------------------------------------------------------------------
 
-/// Background task that continuously polls iLink Bot for updates.
-///
-/// Retries on error up to `WEIXIN_MAX_RETRIES` consecutive failures
-/// with `WEIXIN_RETRY_DELAY` between attempts.
 async fn poll_loop(
     api: Arc<WeixinApi>,
     message_tx: tokio::sync::mpsc::Sender<UnifiedIncomingMessage>,
-    _confirm_tx: tokio::sync::mpsc::Sender<(String, String)>,
     mut shutdown_rx: watch::Receiver<bool>,
+    context_tokens: Arc<DashMap<String, String>>,
 ) {
-    let mut offset: Option<i64> = None;
-    let mut consecutive_errors: u32 = 0;
+    let mut buf = String::new();
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -228,36 +216,70 @@ async fn poll_loop(
             break;
         }
 
-        match api.get_updates(offset, POLL_TIMEOUT).await {
-            Ok(updates) => {
-                consecutive_errors = 0;
+        match api.get_updates(&buf).await {
+            Ok(resp) => {
+                let is_api_error = resp.ret.unwrap_or(0) != 0 || resp.errcode.unwrap_or(0) != 0;
 
-                for update in updates {
-                    offset = Some(update.update_id + 1);
+                if is_api_error {
+                    consecutive_failures += 1;
+                    warn!(
+                        ret = resp.ret,
+                        errcode = resp.errcode,
+                        consecutive_failures,
+                        "WeChat getupdates API error"
+                    );
 
-                    if let Some(msg) = update.message {
-                        handle_message(&msg, &message_tx).await;
+                    if consecutive_failures >= WEIXIN_MAX_RETRIES {
+                        consecutive_failures = 0;
+                        tokio::select! {
+                            _ = tokio::time::sleep(WEIXIN_BACKOFF_DELAY) => {}
+                            _ = shutdown_rx.changed() => {
+                                debug!("WeChat poll loop shutdown during backoff");
+                                break;
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            _ = tokio::time::sleep(WEIXIN_RETRY_DELAY) => {}
+                            _ = shutdown_rx.changed() => {
+                                debug!("WeChat poll loop shutdown during retry");
+                                break;
+                            }
+                        }
                     }
+                    continue;
+                }
+
+                consecutive_failures = 0;
+
+                if let Some(new_buf) = resp.get_updates_buf {
+                    buf = new_buf;
+                }
+
+                for msg in resp.msgs.unwrap_or_default() {
+                    handle_message(&msg, &message_tx, &context_tokens).await;
                 }
             }
             Err(e) => {
-                consecutive_errors += 1;
-                warn!(
-                    error = %e,
-                    consecutive_errors,
-                    "WeChat poll error"
-                );
+                consecutive_failures += 1;
+                warn!(error = %e, consecutive_failures, "WeChat poll error");
 
-                if consecutive_errors >= WEIXIN_MAX_RETRIES {
-                    error!("WeChat max retry attempts reached, stopping poll loop");
-                    break;
-                }
-
-                tokio::select! {
-                    _ = tokio::time::sleep(WEIXIN_RETRY_DELAY) => {}
-                    _ = shutdown_rx.changed() => {
-                        debug!("WeChat poll loop shutdown during backoff");
-                        break;
+                if consecutive_failures >= WEIXIN_MAX_RETRIES {
+                    consecutive_failures = 0;
+                    tokio::select! {
+                        _ = tokio::time::sleep(WEIXIN_BACKOFF_DELAY) => {}
+                        _ = shutdown_rx.changed() => {
+                            debug!("WeChat poll loop shutdown during backoff");
+                            break;
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        _ = tokio::time::sleep(WEIXIN_RETRY_DELAY) => {}
+                        _ = shutdown_rx.changed() => {
+                            debug!("WeChat poll loop shutdown during retry");
+                            break;
+                        }
                     }
                 }
             }
@@ -271,33 +293,52 @@ async fn poll_loop(
 // Message handling
 // ---------------------------------------------------------------------------
 
-/// Convert a WeChat message into a `UnifiedIncomingMessage` and forward it.
-async fn handle_message(msg: &WxMessage, message_tx: &tokio::sync::mpsc::Sender<UnifiedIncomingMessage>) {
-    let from = match &msg.from {
-        Some(u) => u,
-        None => return, // system messages without a sender
+async fn handle_message(
+    msg: &WeixinRawMessage,
+    message_tx: &tokio::sync::mpsc::Sender<UnifiedIncomingMessage>,
+    context_tokens: &DashMap<String, String>,
+) {
+    let from_user_id = match &msg.from_user_id {
+        Some(id) if !id.is_empty() => id.clone(),
+        _ => return,
     };
 
-    let user = UnifiedUser {
-        id: from.id.clone(),
-        username: None,
-        display_name: from.name.clone().unwrap_or_else(|| from.id.clone()),
-        avatar_url: from.avatar.clone(),
-    };
+    // Store context_token for reply use
+    if let Some(ctx) = &msg.context_token
+        && !ctx.is_empty()
+    {
+        context_tokens.insert(from_user_id.clone(), ctx.clone());
+    }
 
-    let (content_type, text, attachments) = extract_content(msg);
+    let items = msg.item_list.as_deref().unwrap_or_default();
+    let (content_type, text, _has_media) = extract_content(items);
+
+    if text.is_empty() {
+        return;
+    }
+
+    let display_name = if from_user_id.len() > 6 {
+        from_user_id[from_user_id.len() - 6..].to_string()
+    } else {
+        from_user_id.clone()
+    };
 
     let unified = UnifiedIncomingMessage {
-        id: msg.message_id.clone(),
+        id: msg.msg_id.clone().unwrap_or_default(),
         platform: PluginType::Weixin,
-        chat_id: msg.chat_id.clone(),
-        user,
+        chat_id: from_user_id.clone(),
+        user: UnifiedUser {
+            id: from_user_id,
+            username: None,
+            display_name,
+            avatar_url: None,
+        },
         content: UnifiedMessageContent {
             content_type,
             text,
-            attachments,
+            attachments: None,
         },
-        timestamp: msg.date,
+        timestamp: chrono_now(),
         reply_to_message_id: None,
         action: None,
         raw: None,
@@ -306,72 +347,54 @@ async fn handle_message(msg: &WxMessage, message_tx: &tokio::sync::mpsc::Sender<
     let _ = message_tx.send(unified).await;
 }
 
-/// Extract content type, text, and attachments from a WeChat message.
-fn extract_content(msg: &WxMessage) -> (MessageContentType, String, Option<Vec<UnifiedAttachment>>) {
-    let msg_type = msg.msg_type.as_deref().unwrap_or("text");
+/// Extract text content from item_list.
+///
+/// Returns (content_type, combined_text, has_media_items).
+fn extract_content(items: &[WeixinRawItem]) -> (MessageContentType, String, bool) {
+    let mut text_parts: Vec<&str> = Vec::new();
+    let mut has_media = false;
 
-    match msg_type {
-        "image" => {
-            let attachments = msg.file.as_ref().map(|f| {
-                vec![UnifiedAttachment {
-                    file_id: f.file_id.clone(),
-                    file_name: f.file_name.clone(),
-                    mime_type: f.mime_type.clone().or(Some("image/jpeg".into())),
-                    file_size: f.file_size,
-                    url: f.url.clone(),
-                }]
-            });
-            let text = msg.text.clone().unwrap_or_default();
-            (MessageContentType::Photo, text, attachments)
-        }
-        "voice" => {
-            let attachments = msg.file.as_ref().map(|f| {
-                vec![UnifiedAttachment {
-                    file_id: f.file_id.clone(),
-                    file_name: f.file_name.clone(),
-                    mime_type: f.mime_type.clone(),
-                    file_size: f.file_size,
-                    url: f.url.clone(),
-                }]
-            });
-            let text = msg.text.clone().unwrap_or_default();
-            (MessageContentType::Voice, text, attachments)
-        }
-        "file" => {
-            let attachments = msg.file.as_ref().map(|f| {
-                vec![UnifiedAttachment {
-                    file_id: f.file_id.clone(),
-                    file_name: f.file_name.clone(),
-                    mime_type: f.mime_type.clone(),
-                    file_size: f.file_size,
-                    url: f.url.clone(),
-                }]
-            });
-            let text = msg.text.clone().unwrap_or_default();
-            (MessageContentType::Document, text, attachments)
-        }
-        "card" => {
-            let text = msg
-                .card
-                .as_ref()
-                .and_then(|c| c.description.clone())
-                .or_else(|| msg.card.as_ref().and_then(|c| c.title.clone()))
-                .unwrap_or_default();
-            (MessageContentType::Text, text, None)
-        }
-        // Default: text
-        _ => {
-            let text = msg.text.clone().unwrap_or_default();
-            if text.starts_with('/') {
-                return (MessageContentType::Command, text, None);
+    for item in items {
+        match item.item_type {
+            Some(ITEM_TYPE_TEXT) => {
+                if let Some(ref ti) = item.text_item
+                    && let Some(ref t) = ti.text
+                {
+                    let trimmed = t.trim();
+                    if !trimmed.is_empty() {
+                        text_parts.push(trimmed);
+                    }
+                }
             }
-            (MessageContentType::Text, text, None)
+            Some(ITEM_TYPE_VOICE) => {
+                if let Some(ref vi) = item.voice_item
+                    && let Some(ref t) = vi.text
+                {
+                    let trimmed = t.trim();
+                    if !trimmed.is_empty() {
+                        text_parts.push(trimmed);
+                    }
+                }
+            }
+            Some(2) | Some(4) => {
+                has_media = true;
+            }
+            _ => {}
         }
     }
+
+    let text = text_parts.join("\n\n");
+
+    let content_type = if text.starts_with('/') {
+        MessageContentType::Command
+    } else {
+        MessageContentType::Text
+    };
+
+    (content_type, text, has_media)
 }
 
-/// Current unix timestamp in seconds.
-fn _chrono_now() -> i64 {
+fn chrono_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -391,107 +414,76 @@ mod tests {
     // -- extract_content -------------------------------------------------------
 
     #[test]
-    fn extract_text_message() {
-        let msg = make_wx_message("text", Some("Hello world"), None, None);
-        let (ct, text, att) = extract_content(&msg);
+    fn extract_text_only() {
+        let items = vec![make_text_item("Hello world")];
+        let (ct, text, has_media) = extract_content(&items);
         assert_eq!(ct, MessageContentType::Text);
         assert_eq!(text, "Hello world");
-        assert!(att.is_none());
+        assert!(!has_media);
     }
 
     #[test]
-    fn extract_command_message() {
-        let msg = make_wx_message("text", Some("/start"), None, None);
-        let (ct, text, _) = extract_content(&msg);
+    fn extract_command() {
+        let items = vec![make_text_item("/start")];
+        let (ct, text, _) = extract_content(&items);
         assert_eq!(ct, MessageContentType::Command);
         assert_eq!(text, "/start");
     }
 
     #[test]
-    fn extract_image_message() {
-        let file = super::super::types::WxFile {
-            file_id: Some("img_1".into()),
-            file_name: Some("photo.jpg".into()),
-            mime_type: Some("image/jpeg".into()),
-            file_size: Some(5000),
-            url: Some("https://example.com/img_1".into()),
-        };
-        let msg = make_wx_message("image", None, Some(file), None);
-        let (ct, _, att) = extract_content(&msg);
-        assert_eq!(ct, MessageContentType::Photo);
-        let atts = att.unwrap();
-        assert_eq!(atts.len(), 1);
-        assert_eq!(atts[0].file_id.as_deref(), Some("img_1"));
-    }
-
-    #[test]
-    fn extract_voice_message() {
-        let file = super::super::types::WxFile {
-            file_id: Some("voice_1".into()),
-            file_name: None,
-            mime_type: Some("audio/amr".into()),
-            file_size: Some(3000),
-            url: None,
-        };
-        let msg = make_wx_message("voice", None, Some(file), None);
-        let (ct, _, att) = extract_content(&msg);
-        assert_eq!(ct, MessageContentType::Voice);
-        assert!(att.is_some());
-    }
-
-    #[test]
-    fn extract_file_message() {
-        let file = super::super::types::WxFile {
-            file_id: Some("doc_1".into()),
-            file_name: Some("report.pdf".into()),
-            mime_type: Some("application/pdf".into()),
-            file_size: Some(10240),
-            url: None,
-        };
-        let msg = make_wx_message("file", None, Some(file), None);
-        let (ct, _, att) = extract_content(&msg);
-        assert_eq!(ct, MessageContentType::Document);
-        let atts = att.unwrap();
-        assert_eq!(atts[0].file_name.as_deref(), Some("report.pdf"));
-    }
-
-    #[test]
-    fn extract_card_message() {
-        let card = super::super::types::WxCard {
-            title: Some("Alert".into()),
-            description: Some("Something happened".into()),
-        };
-        let msg = make_wx_message("card", None, None, Some(card));
-        let (ct, text, _) = extract_content(&msg);
+    fn extract_voice_text() {
+        let items = vec![WeixinRawItem {
+            item_type: Some(ITEM_TYPE_VOICE),
+            voice_item: Some(super::super::types::VoiceItem {
+                text: Some("transcribed text".into()),
+            }),
+            ..Default::default()
+        }];
+        let (ct, text, _) = extract_content(&items);
         assert_eq!(ct, MessageContentType::Text);
-        assert_eq!(text, "Something happened");
+        assert_eq!(text, "transcribed text");
     }
 
     #[test]
-    fn extract_card_message_fallback_to_title() {
-        let card = super::super::types::WxCard {
-            title: Some("Alert Title".into()),
-            description: None,
-        };
-        let msg = make_wx_message("card", None, None, Some(card));
-        let (_, text, _) = extract_content(&msg);
-        assert_eq!(text, "Alert Title");
+    fn extract_mixed_text_and_voice() {
+        let items = vec![
+            make_text_item("Hello"),
+            WeixinRawItem {
+                item_type: Some(ITEM_TYPE_VOICE),
+                voice_item: Some(super::super::types::VoiceItem {
+                    text: Some("voice part".into()),
+                }),
+                ..Default::default()
+            },
+        ];
+        let (_, text, _) = extract_content(&items);
+        assert_eq!(text, "Hello\n\nvoice part");
     }
 
     #[test]
-    fn extract_unknown_type_defaults_to_text() {
-        let msg = make_wx_message("unknown_type", Some("data"), None, None);
-        let (ct, text, _) = extract_content(&msg);
-        assert_eq!(ct, MessageContentType::Text);
-        assert_eq!(text, "data");
+    fn extract_media_items_detected() {
+        let items = vec![WeixinRawItem {
+            item_type: Some(2),
+            image_item: Some(super::super::types::MediaItemData {
+                media: Some(super::super::types::MediaEncryptInfo {
+                    encrypt_query_param: Some("enc".into()),
+                    aes_key: Some("key".into()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let (_, text, has_media) = extract_content(&items);
+        assert!(text.is_empty());
+        assert!(has_media);
     }
 
     #[test]
-    fn extract_image_without_file_has_no_attachments() {
-        let msg = make_wx_message("image", None, None, None);
-        let (ct, _, att) = extract_content(&msg);
-        assert_eq!(ct, MessageContentType::Photo);
-        assert!(att.is_none());
+    fn extract_empty_items() {
+        let items: Vec<WeixinRawItem> = vec![];
+        let (_, text, has_media) = extract_content(&items);
+        assert!(text.is_empty());
+        assert!(!has_media);
     }
 
     // -- WeixinPlugin constructor -----------------------------------------------
@@ -542,25 +534,13 @@ mod tests {
 
     // -- Test helpers -----------------------------------------------------------
 
-    fn make_wx_message(
-        msg_type: &str,
-        text: Option<&str>,
-        file: Option<super::super::types::WxFile>,
-        card: Option<super::super::types::WxCard>,
-    ) -> WxMessage {
-        WxMessage {
-            message_id: "msg_test".into(),
-            chat_id: "chat_test".into(),
-            from: Some(super::super::types::WxUser {
-                id: "user_1".into(),
-                name: Some("TestUser".into()),
-                avatar: None,
+    fn make_text_item(text: &str) -> WeixinRawItem {
+        WeixinRawItem {
+            item_type: Some(ITEM_TYPE_TEXT),
+            text_item: Some(super::super::types::TextItem {
+                text: Some(text.into()),
             }),
-            date: 1700000000,
-            text: text.map(String::from),
-            msg_type: Some(msg_type.into()),
-            file,
-            card,
+            ..Default::default()
         }
     }
 

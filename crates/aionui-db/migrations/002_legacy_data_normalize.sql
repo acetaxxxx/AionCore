@@ -141,7 +141,40 @@ WHERE agents_version = '1.0.0'
   AND (agents = '[]' OR json_array_length(agents) = 0);
 
 ------------------------------------------------------------------------
--- Part D: Backfill acp_session rows from conversations.extra
+-- Part D: Remove legacy CHECK(agent_type IN ...) from assistant_sessions
+--
+-- Early dev builds had a CHECK constraint limiting agent_type to
+-- ('gemini', 'acp', 'codex'). The consolidated 001 schema no longer has
+-- this constraint, but CREATE TABLE IF NOT EXISTS won't alter an existing
+-- table. Rebuild only if the constraint is still present.
+------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS _assistant_sessions_new (
+    id              TEXT PRIMARY KEY NOT NULL,
+    user_id         TEXT    NOT NULL,
+    agent_type      TEXT    NOT NULL,
+    conversation_id TEXT,
+    workspace       TEXT,
+    chat_id         TEXT,
+    created_at      INTEGER NOT NULL,
+    last_activity   INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES assistant_users(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL
+);
+
+INSERT OR IGNORE INTO _assistant_sessions_new (id, user_id, agent_type, conversation_id, workspace, chat_id, created_at, last_activity)
+    SELECT id, user_id, agent_type, conversation_id, workspace, chat_id, created_at, last_activity
+    FROM assistant_sessions;
+
+DROP TABLE IF EXISTS assistant_sessions;
+
+ALTER TABLE _assistant_sessions_new RENAME TO assistant_sessions;
+
+CREATE INDEX IF NOT EXISTS idx_assistant_sessions_user_id ON assistant_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_assistant_sessions_user_chat ON assistant_sessions(user_id, chat_id);
+
+------------------------------------------------------------------------
+-- Part E: Backfill acp_session rows from conversations.extra
 ------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO acp_session (

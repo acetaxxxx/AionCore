@@ -8,7 +8,7 @@ use super::api::WeixinApi;
 use super::types::{SseDoneEvent, SseErrorEvent, SseQrEvent};
 
 /// Default base URL for the iLink Bot login API.
-const LOGIN_BASE_URL: &str = "https://api.ilink.bot";
+const LOGIN_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 
 /// Polling interval for checking QR code scan status.
 const QR_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -71,15 +71,6 @@ impl WeixinLoginEvent {
 }
 
 /// Start the WeChat QR code login flow, returning a channel of SSE events.
-///
-/// The flow:
-/// 1. Fetch QR code from iLink Bot API → emit `qr` event
-/// 2. Poll scan status every 2s → emit `scanned` when user scans
-/// 3. On confirmation → emit `done` with bot credentials
-/// 4. On error/timeout → emit `error`
-///
-/// The returned receiver should be consumed by an SSE endpoint handler
-/// (wired in the routes layer, task 10.12).
 pub fn weixin_login_stream() -> mpsc::Receiver<WeixinLoginEvent> {
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(login_flow(tx));
@@ -88,7 +79,7 @@ pub fn weixin_login_stream() -> mpsc::Receiver<WeixinLoginEvent> {
 
 /// Internal login flow that drives the SSE event sequence.
 async fn login_flow(tx: mpsc::Sender<WeixinLoginEvent>) {
-    let client = match Client::builder().timeout(Duration::from_secs(30)).build() {
+    let client = match Client::builder().timeout(Duration::from_secs(40)).build() {
         Ok(c) => c,
         Err(e) => {
             let _ = tx
@@ -98,8 +89,6 @@ async fn login_flow(tx: mpsc::Sender<WeixinLoginEvent>) {
         }
     };
 
-    // The login API uses a temporary token-less client; bot_token is
-    // received on successful login.
     let api = WeixinApi::new(client, LOGIN_BASE_URL, "");
 
     // Step 1: Fetch QR code
@@ -124,9 +113,21 @@ async fn login_flow(tx: mpsc::Sender<WeixinLoginEvent>) {
         }
     };
 
+    let qr_content = match qr_data.qrcode_img_content {
+        Some(ref url) if !url.is_empty() => url.clone(),
+        _ => {
+            let _ = tx
+                .send(WeixinLoginEvent::Error(
+                    "QR code response missing qrcode_img_content".into(),
+                ))
+                .await;
+            return;
+        }
+    };
+
     info!("WeChat QR code generated, waiting for scan");
-    if tx.send(WeixinLoginEvent::Qr(ticket.clone())).await.is_err() {
-        return; // receiver dropped
+    if tx.send(WeixinLoginEvent::Qr(qr_content)).await.is_err() {
+        return;
     }
 
     // Step 2: Poll for scan status
@@ -147,16 +148,17 @@ async fn login_flow(tx: mpsc::Sender<WeixinLoginEvent>) {
                 debug!(status = state, "WeChat QR code status");
 
                 match state {
-                    "scanned" if !scanned_sent => {
+                    // NOTE: The API returns "scaned" (missing an 'n') — this is intentional.
+                    "scaned" if !scanned_sent => {
                         scanned_sent = true;
                         if tx.send(WeixinLoginEvent::Scanned).await.is_err() {
                             return;
                         }
                     }
                     "confirmed" => {
-                        let account_id = status.account_id.unwrap_or_default();
+                        let account_id = status.ilink_bot_id.unwrap_or_default();
                         let bot_token = status.bot_token.unwrap_or_default();
-                        let base_url = status.base_url.unwrap_or_else(|| LOGIN_BASE_URL.into());
+                        let base_url = status.baseurl.unwrap_or_else(|| LOGIN_BASE_URL.into());
 
                         info!(
                             account_id = %account_id,
@@ -175,11 +177,16 @@ async fn login_flow(tx: mpsc::Sender<WeixinLoginEvent>) {
                         let _ = tx.send(WeixinLoginEvent::Error("QR code expired".into())).await;
                         return;
                     }
-                    // "wait" or unknown → keep polling
                     _ => {}
                 }
             }
             Err(e) => {
+                // Timeout on long-poll is expected — treat as "wait" and retry
+                let err_str = e.to_string();
+                if err_str.contains("timed out") || err_str.contains("Timeout") {
+                    debug!("QR status poll timeout, retrying");
+                    continue;
+                }
                 error!(error = %e, "Failed to poll QR code status");
                 let _ = tx
                     .send(WeixinLoginEvent::Error(format!("Status poll failed: {e}")))
@@ -233,7 +240,7 @@ mod tests {
         let evt = WeixinLoginEvent::Done {
             account_id: "acc_1".into(),
             bot_token: "tok_1".into(),
-            base_url: "https://api.example.com".into(),
+            base_url: "https://ilinkai.weixin.qq.com".into(),
         };
         let json = evt.to_json_data();
         assert!(json.contains("accountId"));

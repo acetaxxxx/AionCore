@@ -59,7 +59,103 @@ impl ChannelStreamRelay {
     }
 
     /// Run the relay loop until the agent stream ends.
-    pub async fn run(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
+    pub async fn run(self, rx: broadcast::Receiver<AgentStreamEvent>) {
+        if is_weixin_platform(self.config.platform) {
+            self.run_weixin(rx).await;
+        } else {
+            self.run_editable(rx).await;
+        }
+    }
+
+    /// WeChat-specific relay: no edit support, accumulate text then send once.
+    async fn run_weixin(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
+        let mut text_buffer = String::new();
+        let mut has_content = false;
+
+        loop {
+            match rx.recv().await {
+                Ok(event) => match ChannelMessageService::process_stream_event(&event) {
+                    Some(StreamAction::AppendText(chunk)) => {
+                        text_buffer.push_str(&chunk);
+                        has_content = true;
+                    }
+                    Some(StreamAction::Thinking(_)) => {}
+                    Some(StreamAction::ToolCall { .. }) if has_content && !text_buffer.trim().is_empty() => {
+                        let formatted = format_text_for_platform(&text_buffer, self.config.platform);
+                        let flush_msg = ChannelMessageService::build_streaming_message(&formatted);
+                        let _ = self
+                            .sender
+                            .send_message(&self.config.plugin_id, &self.config.chat_id, flush_msg)
+                            .await;
+                        text_buffer.clear();
+                        has_content = false;
+                    }
+                    Some(StreamAction::ToolCall { .. }) => {}
+                    Some(StreamAction::Finish) => {
+                        if has_content && !text_buffer.trim().is_empty() {
+                            let formatted = format_text_for_platform(&text_buffer, self.config.platform);
+                            let final_msg = ChannelMessageService::build_final_message(&formatted);
+                            let _ = self
+                                .sender
+                                .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
+                                .await;
+                        }
+                        info!(
+                            plugin_id = %self.config.plugin_id,
+                            chat_id = %self.config.chat_id,
+                            text_len = text_buffer.len(),
+                            "channel stream relay finished (weixin)"
+                        );
+                        break;
+                    }
+                    Some(StreamAction::Error(msg)) => {
+                        let error_msg = UnifiedOutgoingMessage {
+                            message_type: OutgoingMessageType::Text,
+                            text: Some(format!("\u{274c} {msg}")),
+                            parse_mode: None,
+                            buttons: None,
+                            keyboard: None,
+                            image_url: None,
+                            file_url: None,
+                            file_name: None,
+                            media_actions: None,
+                            reply_to_message_id: None,
+                            silent: None,
+                        };
+                        let _ = self
+                            .sender
+                            .send_message(&self.config.plugin_id, &self.config.chat_id, error_msg)
+                            .await;
+                        break;
+                    }
+                    None => {}
+                },
+                Err(broadcast::error::RecvError::Closed) => {
+                    if has_content && !text_buffer.trim().is_empty() {
+                        let formatted = format_text_for_platform(&text_buffer, self.config.platform);
+                        let final_msg = ChannelMessageService::build_final_message(&formatted);
+                        let _ = self
+                            .sender
+                            .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
+                            .await;
+                    }
+                    break;
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(lagged = n, "channel stream relay lagged (weixin)");
+                }
+            }
+        }
+
+        debug!(
+            plugin_id = %self.config.plugin_id,
+            chat_id = %self.config.chat_id,
+            "channel stream relay exited (weixin)"
+        );
+    }
+
+    /// Standard relay for platforms that support edit (Telegram, Lark, DingTalk).
+    async fn run_editable(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
         let throttle = Duration::from_millis(self.config.throttle_ms);
 
         let thinking_msg = ChannelMessageService::build_thinking_message();
@@ -97,21 +193,6 @@ impl ChannelStreamRelay {
                     }
                     Some(StreamAction::Thinking(_)) => {}
                     Some(StreamAction::ToolCall { name, .. }) => {
-                        // Weixin parity with TS commit 406a62665: before rendering
-                        // a silent/non-text event (tool call), flush any pending
-                        // assistant text to the user as an independent message so
-                        // it doesn't get overwritten or deferred until Finish.
-                        if is_weixin_platform(self.config.platform) && has_content && !text_buffer.trim().is_empty() {
-                            let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                            let flush_msg = ChannelMessageService::build_streaming_message(&formatted);
-                            let _ = self
-                                .sender
-                                .send_message(&self.config.plugin_id, &self.config.chat_id, flush_msg)
-                                .await;
-                            text_buffer.clear();
-                            has_content = false;
-                            last_edit = Instant::now();
-                        }
                         let msg = ChannelMessageService::build_streaming_message(&format!("\u{23f3} {name}..."));
                         let _ = self
                             .sender
@@ -119,7 +200,7 @@ impl ChannelStreamRelay {
                             .await;
                     }
                     Some(StreamAction::Finish) => {
-                        self.send_final(&text_buffer, has_content, &thinking_msg_id).await;
+                        self.send_final_edit(&text_buffer, has_content, &thinking_msg_id).await;
                         info!(
                             plugin_id = %self.config.plugin_id,
                             chat_id = %self.config.chat_id,
@@ -157,7 +238,7 @@ impl ChannelStreamRelay {
                 },
                 Err(broadcast::error::RecvError::Closed) => {
                     warn!("channel stream relay: broadcast closed without terminal event");
-                    self.send_final(&text_buffer, has_content, &thinking_msg_id).await;
+                    self.send_final_edit(&text_buffer, has_content, &thinking_msg_id).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -173,7 +254,7 @@ impl ChannelStreamRelay {
         );
     }
 
-    async fn send_final(&self, text_buffer: &str, has_content: bool, msg_id: &str) {
+    async fn send_final_edit(&self, text_buffer: &str, has_content: bool, msg_id: &str) {
         if has_content {
             let formatted = format_text_for_platform(text_buffer, self.config.platform);
             let final_msg = ChannelMessageService::build_final_message(&formatted);
