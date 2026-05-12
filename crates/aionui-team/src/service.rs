@@ -870,6 +870,36 @@ impl TeamSessionService {
         session.send_message_to_agent(slot_id, content, files).await
     }
 
+    pub async fn set_session_mode(&self, team_id: &str, mode: &str) -> Result<(), TeamError> {
+        let row = self
+            .repo
+            .get_team(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        let team = Team::from_row(&row)?;
+
+        for agent in &team.agents {
+            if let Some(instance) = self.task_manager.get_task(&agent.conversation_id)
+                && let Err(e) = instance.set_mode(mode).await
+            {
+                warn!(
+                    team_id,
+                    slot_id = %agent.slot_id,
+                    conversation_id = %agent.conversation_id,
+                    error = %e,
+                    "failed to set session mode on agent"
+                );
+            }
+            let patch = serde_json::json!({ "session_mode": mode });
+            let _ = self
+                .conversation_service
+                .update_extra(&agent.conversation_id, patch)
+                .await;
+        }
+
+        Ok(())
+    }
+
     /// Wake a specific agent in a team session (trigger it to read mailbox).
     /// Called by MCP dispatch after `team_send_message` writes to mailbox.
     pub async fn wake_agent_in_session(&self, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
@@ -885,9 +915,6 @@ impl TeamSessionService {
             return Ok(());
         }
 
-        scheduler
-            .set_status(slot_id, crate::types::TeammateStatus::Working)
-            .await?;
         let input = session.compute_wake_input(slot_id).await;
 
         if let Ok(Some(ref i)) = input
@@ -939,6 +966,20 @@ impl TeamSessionService {
                 scheduler.release_wake_lock(&slot_id_owned);
                 return;
             };
+
+            // Guard: skip if agent runtime or conversation DB already shows Running
+            // to avoid creating a duplicate StreamRelay on the same broadcast channel.
+            if handle.status() == Some(aionui_common::ConversationStatus::Running) {
+                scheduler.release_wake_lock(&slot_id_owned);
+                return;
+            }
+            if let Ok(Some(row)) = repo.get(&conv_id).await
+                && row.status.as_deref() == Some("running")
+            {
+                scheduler.release_wake_lock(&slot_id_owned);
+                return;
+            }
+
             let msg_id = aionui_common::generate_id();
             let data = aionui_ai_agent::types::SendMessageData {
                 content: input.first_message,
@@ -947,12 +988,26 @@ impl TeamSessionService {
                 inject_skills: Vec::new(),
             };
 
+            // Mark Working at point-of-no-return to prevent status-stuck deadlock.
+            let _ = scheduler
+                .set_status(&slot_id_owned, crate::types::TeammateStatus::Working)
+                .await;
+
+            // Claim conversation as Running in DB to block ConversationService
+            // from starting a parallel turn.
+            let update = aionui_db::ConversationRowUpdate {
+                status: Some("running".to_owned()),
+                updated_at: Some(aionui_common::now_ms()),
+                ..Default::default()
+            };
+            let _ = repo.update(&conv_id, &update).await;
+
             let rx = handle.subscribe();
             let relay = aionui_conversation::stream_relay::StreamRelay::new(
                 conv_id.clone(),
                 msg_id,
                 user_id_owned,
-                repo,
+                repo.clone(),
                 broadcaster,
                 None,
             );
@@ -974,6 +1029,17 @@ impl TeamSessionService {
                         "mark_read_batch failed after successful send in wake_agent_in_session (non-fatal)"
                     );
                 }
+            } else if send_result.is_err() {
+                let _ = scheduler
+                    .set_status(&slot_id_owned, crate::types::TeammateStatus::Idle)
+                    .await;
+                // Reset DB status so future attempts are not blocked.
+                let update = aionui_db::ConversationRowUpdate {
+                    status: Some("finished".to_owned()),
+                    updated_at: Some(aionui_common::now_ms()),
+                    ..Default::default()
+                };
+                let _ = repo.update(&conv_id, &update).await;
             }
 
             scheduler.release_wake_lock(&slot_id_owned);

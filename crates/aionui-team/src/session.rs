@@ -348,10 +348,6 @@ impl TeamSession {
             }
         }
 
-        self.scheduler
-            .set_status(&lead_slot_id, TeammateStatus::Working)
-            .await?;
-
         self.try_wake(&lead_slot_id, files).await;
         Ok(())
     }
@@ -403,8 +399,6 @@ impl TeamSession {
                 );
             }
         }
-
-        self.scheduler.set_status(slot_id, TeammateStatus::Working).await?;
 
         self.try_wake(slot_id, files).await;
         Ok(())
@@ -508,6 +502,44 @@ impl TeamSession {
             return;
         }
 
+        // Double-check conversation DB status to cover the TOCTOU gap: the agent
+        // runtime sets Running only inside send_message, but ConversationService
+        // sets the DB status to Running before calling send_message. Without this
+        // check, both paths can create a StreamRelay on the same broadcast channel
+        // causing duplicate streaming output to the frontend.
+        if let Some(svc) = self.service.upgrade() {
+            let repo = svc.conversation_service_ref().repo();
+            if let Ok(Some(row)) = repo.get(&input.conversation_id).await
+                && row.status.as_deref() == Some("running")
+            {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %input.conversation_id,
+                    "try_wake: conversation DB status is running, skipping to avoid duplicate StreamRelay"
+                );
+                self.scheduler.release_wake_lock(slot_id);
+                return;
+            }
+        }
+
+        // Mark Working only at point-of-no-return: we are about to start an
+        // actual agent turn. All early-return paths above stay Idle naturally,
+        // preventing the status-stuck-in-Working deadlock.
+        let _ = self.scheduler.set_status(slot_id, TeammateStatus::Working).await;
+
+        // Claim the conversation as Running in DB so ConversationService::send_message
+        // (which checks DB status) cannot start a parallel turn with its own relay.
+        if let Some(svc) = self.service.upgrade() {
+            let repo = svc.conversation_service_ref().repo();
+            let update = aionui_db::ConversationRowUpdate {
+                status: Some("running".to_owned()),
+                updated_at: Some(aionui_common::now_ms()),
+                ..Default::default()
+            };
+            let _ = repo.update(&input.conversation_id, &update).await;
+        }
+
         // Set up a StreamRelay so the agent's response is persisted to the
         // conversation messages table and forwarded to WebSocket (making the
         // output visible in the team panel). Turn completion is enabled so the
@@ -534,6 +566,17 @@ impl TeamSession {
                 "agent.send_message failed; mailbox retained, wake will be retried on next trigger"
             );
             // Messages stay unread — next wake attempt will pick them up.
+            let _ = self.scheduler.set_status(slot_id, TeammateStatus::Idle).await;
+            // Reset DB status so future attempts are not blocked.
+            if let Some(svc) = self.service.upgrade() {
+                let repo = svc.conversation_service_ref().repo();
+                let update = aionui_db::ConversationRowUpdate {
+                    status: Some("finished".to_owned()),
+                    updated_at: Some(aionui_common::now_ms()),
+                    ..Default::default()
+                };
+                let _ = repo.update(&input.conversation_id, &update).await;
+            }
             self.scheduler.release_wake_lock(slot_id);
             return;
         }
