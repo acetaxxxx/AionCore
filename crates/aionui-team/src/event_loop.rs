@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_ai_agent::protocol::events::AgentStreamEvent;
 use aionui_ai_agent::types::SendMessageData;
 use aionui_common::ConversationStatus;
 use aionui_conversation::ConversationService;
@@ -18,7 +17,6 @@ use crate::session::TeamSession;
 use crate::types::TeammateStatus;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-const FINISH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Registry of per-agent Notify handles. Used by any trigger source to poke
 /// an agent's event loop without needing to know its internals.
@@ -104,7 +102,7 @@ pub struct AgentLoopContext {
 ///
 /// Flow:
 /// 1. Wait for signal (notify) or heartbeat timeout.
-/// 2. Drain loop: compute_wake_input → if has messages → execute turn → await finish → repeat.
+/// 2. Drain loop: compute_wake_input → has messages → send_message (blocking) → finalize → repeat.
 /// 3. When mailbox empty → back to step 1.
 async fn run_event_loop(
     notify: Arc<Notify>,
@@ -159,15 +157,15 @@ async fn run_event_loop(
             }
 
             match execute_turn(&ctx, &input).await {
-                Some(finish_ok) => finalize_turn(&ctx, finish_ok).await,
+                Some(finish_ok) => finalize_turn(&ctx, finish_ok, &input.conversation_id).await,
                 None => break, // Turn not started (guard/warmup); retry on next signal
             }
         }
     }
 }
 
-/// Execute one agent turn: warmup → guard → set Working → StreamRelay → send → await finish.
-/// Returns `Some(true)` on successful finish, `Some(false)` on error finish,
+/// Execute one agent turn: warmup → guard → set Working → StreamRelay → send_message (blocking).
+/// Returns `Some(true)` on success, `Some(false)` on error,
 /// `None` if the turn was not started (guard hit, warmup fail, etc.).
 async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput) -> Option<bool> {
     ctx.session.mirror_unread_to_conversation(input).await;
@@ -254,25 +252,21 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
         inject_skills: Vec::new(),
     };
 
-    if let Err(e) = handle.send_message(data).await {
-        warn!(
-            team_id = %ctx.team_id,
-            slot_id = %ctx.slot_id,
-            conversation_id = %input.conversation_id,
-            error = %e,
-            "event loop: send_message failed"
-        );
-        let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
-        let update = aionui_db::ConversationRowUpdate {
-            status: Some("finished".to_owned()),
-            updated_at: Some(aionui_common::now_ms()),
-            ..Default::default()
-        };
-        let _ = repo.update(&input.conversation_id, &update).await;
-        return None; // Turn aborted, skip finalization
-    }
+    let turn_ok = match handle.send_message(data).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                team_id = %ctx.team_id,
+                slot_id = %ctx.slot_id,
+                conversation_id = %input.conversation_id,
+                error = %e,
+                "event loop: send_message failed"
+            );
+            false
+        }
+    };
 
-    // Mark messages as read
+    // Mark messages as read regardless of turn outcome
     let msg_ids: Vec<String> = input.unread.iter().map(|m| m.id.clone()).collect();
     if !msg_ids.is_empty()
         && let Err(e) = ctx.mailbox.mark_read_batch(&msg_ids).await
@@ -285,42 +279,21 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
         );
     }
 
-    // Await Finish/Error from agent
-    Some(await_agent_finish(&handle.subscribe(), &ctx.team_id, &ctx.slot_id).await)
+    Some(turn_ok)
 }
 
-/// Wait for the agent's turn to complete by listening for Finish/Error events.
-async fn await_agent_finish(
-    rx: &tokio::sync::broadcast::Receiver<AgentStreamEvent>,
-    team_id: &str,
-    slot_id: &str,
-) -> bool {
-    let mut rx = rx.resubscribe();
 
-    tokio::select! {
-        result = async {
-            loop {
-                match rx.recv().await {
-                    Ok(AgentStreamEvent::Finish(_)) => return true,
-                    Ok(AgentStreamEvent::Error(_)) => return false,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(team_id, slot_id, skipped = n, "event loop: broadcast lagged");
-                        continue;
-                    }
-                    Ok(_) => continue,
-                }
-            }
-        } => result,
-        _ = tokio::time::sleep(FINISH_TIMEOUT) => {
-            warn!(team_id, slot_id, "event loop: await_finish timed out");
-            false
-        }
-    }
-}
+/// Finalize a completed turn: reset DB status, mark idle (or error), cascade to leader.
+async fn finalize_turn(ctx: &AgentLoopContext, finish_ok: bool, conversation_id: &str) {
+    // Reset conversation DB status so future turns pass the guard check.
+    let repo = ctx.conversation_service.conversation_repo();
+    let update = aionui_db::ConversationRowUpdate {
+        status: Some("finished".to_owned()),
+        updated_at: Some(aionui_common::now_ms()),
+        ..Default::default()
+    };
+    let _ = repo.update(conversation_id, &update).await;
 
-/// Finalize a completed turn: mark idle (or error) and cascade to leader if needed.
-async fn finalize_turn(ctx: &AgentLoopContext, finish_ok: bool) {
     if !finish_ok {
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
     }
