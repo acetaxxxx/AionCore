@@ -871,9 +871,6 @@ impl TeamSessionService {
             return Ok(());
         }
 
-        scheduler
-            .set_status(slot_id, crate::types::TeammateStatus::Working)
-            .await?;
         let input = session.compute_wake_input(slot_id).await;
 
         if let Ok(Some(ref i)) = input
@@ -933,6 +930,11 @@ impl TeamSessionService {
                 inject_skills: Vec::new(),
             };
 
+            // Mark Working at point-of-no-return to prevent status-stuck deadlock.
+            let _ = scheduler
+                .set_status(&slot_id_owned, crate::types::TeammateStatus::Working)
+                .await;
+
             let rx = handle.subscribe();
             let relay = aionui_conversation::stream_relay::StreamRelay::new(
                 conv_id.clone(),
@@ -960,6 +962,10 @@ impl TeamSessionService {
                         "mark_read_batch failed after successful send in wake_agent_in_session (non-fatal)"
                     );
                 }
+            } else if send_result.is_err() {
+                let _ = scheduler
+                    .set_status(&slot_id_owned, crate::types::TeammateStatus::Idle)
+                    .await;
             }
 
             scheduler.release_wake_lock(&slot_id_owned);
