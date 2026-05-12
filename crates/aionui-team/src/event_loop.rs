@@ -282,7 +282,6 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
     Some(turn_ok)
 }
 
-
 /// Finalize a completed turn: reset DB status, mark idle (or error), cascade to leader.
 async fn finalize_turn(ctx: &AgentLoopContext, finish_ok: bool, conversation_id: &str) {
     // Reset conversation DB status so future turns pass the guard check.
