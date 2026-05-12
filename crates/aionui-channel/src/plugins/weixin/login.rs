@@ -117,7 +117,9 @@ async fn login_flow(tx: mpsc::Sender<WeixinLoginEvent>) {
         Some(ref url) if !url.is_empty() => url.clone(),
         _ => {
             let _ = tx
-                .send(WeixinLoginEvent::Error("QR code response missing qrcode_img_content".into()))
+                .send(WeixinLoginEvent::Error(
+                    "QR code response missing qrcode_img_content".into(),
+                ))
                 .await;
             return;
         }

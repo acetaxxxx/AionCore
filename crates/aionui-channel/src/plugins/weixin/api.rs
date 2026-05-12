@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use base64::Engine;
 use reqwest::Client;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -11,8 +11,8 @@ use crate::constants::{WEIXIN_API_TIMEOUT, WEIXIN_POLL_TIMEOUT};
 use crate::error::ChannelError;
 
 use super::types::{
-    GetUpdatesRequest, GetUpdatesResponse, ILinkResponse, QrCodeData, QrCodeStatusData, SendMessageItem,
-    SendMessageMsg, SendMessageRequest, SendTextItem, ITEM_TYPE_TEXT,
+    GetUpdatesRequest, GetUpdatesResponse, ILinkResponse, ITEM_TYPE_TEXT, QrCodeData, QrCodeStatusData,
+    SendMessageItem, SendMessageMsg, SendMessageRequest, SendTextItem,
 };
 
 /// HTTP client for the WeChat iLink Bot API.
@@ -85,11 +85,7 @@ impl WeixinApi {
             .map_err(|e| ChannelError::PlatformApi(format!("{endpoint} parse failed: {e}")))
     }
 
-    async fn ilink_get<T: DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        query: &[(&str, &str)],
-    ) -> Result<T, ChannelError> {
+    async fn ilink_get<T: DeserializeOwned>(&self, endpoint: &str, query: &[(&str, &str)]) -> Result<T, ChannelError> {
         let url = format!("{}/{}", self.base_url, endpoint);
 
         let resp = self
@@ -123,8 +119,7 @@ impl WeixinApi {
         debug!("Fetching WeChat QR code");
 
         // Try direct response first, then wrapped
-        let result: Result<QrCodeData, _> =
-            self.ilink_get("ilink/bot/get_bot_qrcode", &[("bot_type", "3")]).await;
+        let result: Result<QrCodeData, _> = self.ilink_get("ilink/bot/get_bot_qrcode", &[("bot_type", "3")]).await;
 
         match result {
             Ok(data) if data.qrcode.is_some() => Ok(data),
@@ -143,14 +138,16 @@ impl WeixinApi {
     /// `GET /ilink/bot/get_qrcode_status?qrcode=<ticket>`
     pub async fn get_qrcode_status(&self, qrcode: &str) -> Result<QrCodeStatusData, ChannelError> {
         // Try direct response first, then wrapped
-        let result: Result<QrCodeStatusData, _> =
-            self.ilink_get("ilink/bot/get_qrcode_status", &[("qrcode", qrcode)]).await;
+        let result: Result<QrCodeStatusData, _> = self
+            .ilink_get("ilink/bot/get_qrcode_status", &[("qrcode", qrcode)])
+            .await;
 
         match result {
             Ok(data) if data.status.is_some() => Ok(data),
             _ => {
-                let wrapped: ILinkResponse<QrCodeStatusData> =
-                    self.ilink_get("ilink/bot/get_qrcode_status", &[("qrcode", qrcode)]).await?;
+                let wrapped: ILinkResponse<QrCodeStatusData> = self
+                    .ilink_get("ilink/bot/get_qrcode_status", &[("qrcode", qrcode)])
+                    .await?;
                 wrapped
                     .data
                     .ok_or_else(|| ChannelError::PlatformApi("get_qrcode_status returned no data".into()))
