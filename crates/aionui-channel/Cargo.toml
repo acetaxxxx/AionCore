@@ -6,8 +6,8 @@ edition.workspace = true
 [features]
 default = []
 telegram = ["dep:reqwest"]
-lark = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:prost"]
-dingtalk = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
+lark = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:prost", "dep:rustls", "dep:rustls-native-certs"]
+dingtalk = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
 weixin = ["dep:reqwest", "dep:futures-util", "dep:base64", "dep:uuid"]
 
 [dependencies]
@@ -32,5 +32,7 @@ reqwest = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
