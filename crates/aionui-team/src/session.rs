@@ -348,10 +348,6 @@ impl TeamSession {
             }
         }
 
-        self.scheduler
-            .set_status(&lead_slot_id, TeammateStatus::Working)
-            .await?;
-
         self.try_wake(&lead_slot_id, files).await;
         Ok(())
     }
@@ -403,8 +399,6 @@ impl TeamSession {
                 );
             }
         }
-
-        self.scheduler.set_status(slot_id, TeammateStatus::Working).await?;
 
         self.try_wake(slot_id, files).await;
         Ok(())
@@ -508,6 +502,11 @@ impl TeamSession {
             return;
         }
 
+        // Mark Working only at point-of-no-return: we are about to start an
+        // actual agent turn. All early-return paths above stay Idle naturally,
+        // preventing the status-stuck-in-Working deadlock.
+        let _ = self.scheduler.set_status(slot_id, TeammateStatus::Working).await;
+
         // Set up a StreamRelay so the agent's response is persisted to the
         // conversation messages table and forwarded to WebSocket (making the
         // output visible in the team panel). Turn completion is enabled so the
@@ -534,6 +533,7 @@ impl TeamSession {
                 "agent.send_message failed; mailbox retained, wake will be retried on next trigger"
             );
             // Messages stay unread — next wake attempt will pick them up.
+            let _ = self.scheduler.set_status(slot_id, TeammateStatus::Idle).await;
             self.scheduler.release_wake_lock(slot_id);
             return;
         }
