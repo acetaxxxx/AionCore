@@ -300,6 +300,7 @@ mod tests {
             msg_type,
             content: content.into(),
             summary: None,
+            files: None,
             read: false,
             created_at: 0,
         }
