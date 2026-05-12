@@ -15,19 +15,16 @@ use aionui_db::models::TeamRow;
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
-use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use self::spawn_support::{parse_agent_type, resolve_full_auto_mode};
 use crate::error::TeamError;
+use crate::event_loop::AgentLoopContext;
 use crate::session::TeamSession;
 use crate::types::{Team, TeamAgent, TeammateRole};
 
 struct SessionEntry {
     session: Arc<TeamSession>,
-    /// Background tasks that forward `Finish` / `Error` stream events to
-    /// `session.on_agent_finish`. Aborted in `stop_session`.
-    finish_subscribers: Vec<JoinHandle<()>>,
 }
 
 pub struct TeamSessionService {
@@ -650,13 +647,21 @@ impl TeamSessionService {
             return Err(e);
         }
 
-        let finish_subscribers = self.spawn_finish_subscribers(team_id, &agents_snapshot);
+        let session = Arc::new(session);
+
+        // Spawn per-agent event loops
+        self.spawn_event_loops(&session, &user_id, &agents_snapshot);
 
         let entry = SessionEntry {
-            session: Arc::new(session),
-            finish_subscribers,
+            session: session.clone(),
         };
         self.sessions.insert(team_id.to_owned(), entry);
+
+        // Notify all agents so they drain any pre-existing mailbox messages
+        // (e.g. from a prior session or backend restart).
+        for agent in &agents_snapshot {
+            session.notify_agent(&agent.slot_id);
+        }
 
         let active_count = if skip_leader {
             agents_snapshot.iter().filter(|a| a.role != TeammateRole::Lead).count()
@@ -746,115 +751,53 @@ impl TeamSessionService {
         Ok(())
     }
 
-    /// Spawn one background task per agent that drains the agent's stream
-    /// and forwards `Finish` / `Error` events to the session. The tasks
-    /// look up the live session via `team_id` each iteration, and exit
-    /// naturally when the entry is removed in `stop_session` (which also
-    /// aborts them as a belt-and-braces measure).
-    fn spawn_finish_subscribers(&self, team_id: &str, agents: &[TeamAgent]) -> Vec<JoinHandle<()>> {
-        use aionui_ai_agent::AgentStreamEvent;
+    /// Spawn per-agent event loops that drain the mailbox whenever notified.
+    /// Each agent gets its own tokio task that runs until the session shuts down.
+    fn spawn_event_loops(&self, session: &Arc<TeamSession>, user_id: &str, agents: &[TeamAgent]) {
+        let registry = session.event_loops();
 
-        let mut handles = Vec::with_capacity(agents.len());
         for agent in agents {
-            let Some(task) = self.task_manager.get_task(&agent.conversation_id) else {
-                warn!(
-                    conversation_id = %agent.conversation_id,
-                    "no agent task found after warmup, skipping finish subscription"
-                );
-                continue;
+            let ctx = AgentLoopContext {
+                team_id: session.team_id().to_owned(),
+                slot_id: agent.slot_id.clone(),
+                user_id: user_id.to_owned(),
+                session: session.clone(),
+                scheduler: session.scheduler().clone(),
+                mailbox: session.mailbox().clone(),
+                task_manager: self.task_manager.clone(),
+                conversation_service: self.conversation_service.clone(),
+                broadcaster: self.broadcaster.clone(),
+                registry: registry.clone(),
             };
-            let mut rx = task.subscribe();
-            let conv_id = agent.conversation_id.clone();
-            let team_id = team_id.to_owned();
-            let sessions = self.sessions.clone();
-            let handle = tokio::spawn(async move {
-                while let Ok(event) = rx.recv().await {
-                    let is_error = matches!(event, AgentStreamEvent::Error(_));
-                    if !is_error && !matches!(event, AgentStreamEvent::Finish(_)) {
-                        continue;
-                    }
-                    let session = {
-                        let Some(entry) = sessions.get(&team_id) else {
-                            break;
-                        };
-                        Arc::clone(&entry.session)
-                    };
-                    match session.on_agent_finish(&conv_id, is_error).await {
-                        Ok(Some(wake_target)) => {
-                            session.try_wake(&wake_target, None).await;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!(conversation_id = %conv_id, error = %e, "on_agent_finish failed");
-                        }
-                    }
-                }
-            });
-            handles.push(handle);
+            registry.spawn(&agent.slot_id, ctx);
         }
-        handles
     }
 
-    /// Register a finish subscriber for a dynamically spawned agent.
+    /// Register an event loop for a dynamically spawned agent.
     ///
     /// Called by [`TeamSession::spawn_agent`] after `attach_spawned_agent_process`
-    /// succeeds so that the newly booted agent's `Finish` / `Error` stream events
-    /// are forwarded to `session.on_agent_finish` — exactly as `spawn_finish_subscribers`
-    /// does for the initial members during `ensure_session`.
-    ///
-    /// If the agent task is not yet available in `task_manager` (rare race where
-    /// warmup hasn't propagated), the subscription is silently skipped and a
-    /// warning is emitted. The agent is already persisted and the welcome message
-    /// already in the mailbox; the next user-triggered wake will still fire.
-    pub(crate) fn register_finish_subscriber(&self, team_id: &str, conversation_id: &str) {
-        use aionui_ai_agent::AgentStreamEvent;
-
-        let Some(task) = self.task_manager.get_task(conversation_id) else {
-            warn!(
-                team_id,
-                conversation_id,
-                "register_finish_subscriber: no agent task found, skipping finish subscription for spawned agent"
-            );
+    /// succeeds so the newly booted agent gets its own drain loop — exactly as
+    /// `spawn_event_loops` does for the initial members during `ensure_session`.
+    pub(crate) fn register_event_loop(&self, team_id: &str, slot_id: &str) {
+        let Some(entry) = self.sessions.get(team_id) else {
             return;
         };
+        let session = Arc::clone(&entry.session);
+        let registry = session.event_loops();
 
-        let mut rx = task.subscribe();
-        let conv_id = conversation_id.to_owned();
-        let team_id_owned = team_id.to_owned();
-        let sessions = self.sessions.clone();
-
-        let handle = tokio::spawn(async move {
-            while let Ok(event) = rx.recv().await {
-                let is_error = matches!(event, AgentStreamEvent::Error(_));
-                if !is_error && !matches!(event, AgentStreamEvent::Finish(_)) {
-                    continue;
-                }
-                let session = {
-                    let Some(entry) = sessions.get(&team_id_owned) else {
-                        break;
-                    };
-                    Arc::clone(&entry.session)
-                };
-                match session.on_agent_finish(&conv_id, is_error).await {
-                    Ok(Some(wake_target)) => {
-                        session.try_wake(&wake_target, None).await;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!(conversation_id = %conv_id, error = %e, "on_agent_finish failed (spawned agent)");
-                    }
-                }
-            }
-        });
-
-        // Append the handle to the session entry's finish_subscribers so
-        // stop_session aborts it cleanly.
-        if let Some(mut entry) = self.sessions.get_mut(team_id) {
-            entry.finish_subscribers.push(handle);
-        } else {
-            // Session was stopped between spawn and here; abort immediately.
-            handle.abort();
-        }
+        let ctx = AgentLoopContext {
+            team_id: team_id.to_owned(),
+            slot_id: slot_id.to_owned(),
+            user_id: session.user_id().to_owned(),
+            session: session.clone(),
+            scheduler: session.scheduler().clone(),
+            mailbox: session.mailbox().clone(),
+            task_manager: self.task_manager.clone(),
+            conversation_service: self.conversation_service.clone(),
+            broadcaster: self.broadcaster.clone(),
+            registry: registry.clone(),
+        };
+        registry.spawn(slot_id, ctx);
     }
 
     pub async fn get_session_user_id(&self, team_id: &str) -> Option<String> {
@@ -867,9 +810,7 @@ impl TeamSessionService {
 
     pub fn stop_session(&self, team_id: &str) {
         if let Some((_, entry)) = self.sessions.remove(team_id) {
-            for handle in &entry.finish_subscribers {
-                handle.abort();
-            }
+            entry.session.event_loops().shutdown();
             entry.session.stop();
         }
     }
@@ -939,165 +880,14 @@ impl TeamSessionService {
 
     /// Wake a specific agent in a team session (trigger it to read mailbox).
     /// Called by MCP dispatch after `team_send_message` writes to mailbox.
+    ///
+    /// In the event-loop model this simply notifies the agent's event loop.
     pub async fn wake_agent_in_session(&self, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
-        let (session, scheduler) = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            (Arc::clone(&entry.session), entry.session.scheduler().clone())
-        };
-
-        if !scheduler.acquire_wake_lock(slot_id) {
-            return Ok(());
-        }
-
-        let input = session.compute_wake_input(slot_id).await;
-
-        if let Ok(Some(ref i)) = input
-            && i.should_send
-        {
-            session.mirror_unread_to_conversation(i).await;
-        }
-
-        let user_id = session.user_id().to_owned();
-
-        let conv_id = match &input {
-            Ok(Some(i)) if i.should_send => i.conversation_id.clone(),
-            _ => {
-                // No message to send — release the wake lock immediately.
-                scheduler.release_wake_lock(slot_id);
-                return Ok(());
-            }
-        };
-
-        // Ensure the agent task exists (mirrors AionUi's getOrBuildTask).
-        if self.task_manager.get_task(&conv_id).is_none()
-            && let Err(e) = self
-                .conversation_service
-                .warmup(&user_id, &conv_id, &self.task_manager)
-                .await
-        {
-            warn!(team_id, slot_id, conversation_id = %conv_id, error = %e, "warmup in wake failed");
-            scheduler.release_wake_lock(slot_id);
-            return Ok(());
-        }
-
-        let task_mgr = self.task_manager.clone();
-        let slot_id_owned = slot_id.to_owned();
-        let sessions = self.sessions.clone();
-        let team_id_owned = team_id.to_owned();
-        let repo = Arc::clone(self.conversation_service.conversation_repo());
-        let broadcaster = self.broadcaster.clone();
-        let user_id_owned = user_id;
-        tokio::spawn(async move {
-            let input = match input {
-                Ok(Some(i)) if i.should_send => i,
-                _ => {
-                    scheduler.release_wake_lock(&slot_id_owned);
-                    return;
-                }
-            };
-            let conv_id = input.conversation_id.clone();
-            let Some(handle) = task_mgr.get_task(&conv_id) else {
-                scheduler.release_wake_lock(&slot_id_owned);
-                return;
-            };
-
-            // Guard: skip if agent runtime or conversation DB already shows Running
-            // to avoid creating a duplicate StreamRelay on the same broadcast channel.
-            if handle.status() == Some(aionui_common::ConversationStatus::Running) {
-                scheduler.release_wake_lock(&slot_id_owned);
-                return;
-            }
-            if let Ok(Some(row)) = repo.get(&conv_id).await
-                && row.status.as_deref() == Some("running")
-            {
-                scheduler.release_wake_lock(&slot_id_owned);
-                return;
-            }
-
-            let msg_id = aionui_common::generate_id();
-            let data = aionui_ai_agent::types::SendMessageData {
-                content: input.first_message,
-                msg_id: msg_id.clone(),
-                files: Vec::new(),
-                inject_skills: Vec::new(),
-            };
-
-            // Mark Working at point-of-no-return to prevent status-stuck deadlock.
-            let _ = scheduler
-                .set_status(&slot_id_owned, crate::types::TeammateStatus::Working)
-                .await;
-
-            // Claim conversation as Running in DB to block ConversationService
-            // from starting a parallel turn.
-            let update = aionui_db::ConversationRowUpdate {
-                status: Some("running".to_owned()),
-                updated_at: Some(aionui_common::now_ms()),
-                ..Default::default()
-            };
-            let _ = repo.update(&conv_id, &update).await;
-
-            let rx = handle.subscribe();
-            let relay = aionui_conversation::stream_relay::StreamRelay::new(
-                conv_id.clone(),
-                msg_id,
-                user_id_owned,
-                repo.clone(),
-                broadcaster,
-                None,
-            );
-            tokio::spawn(async move { relay.consume(rx).await });
-
-            // Collect message IDs before sending (input will be consumed).
-            let msg_ids: Vec<String> = input.unread.iter().map(|m| m.id.clone()).collect();
-
-            let send_result = handle.send_message(data).await;
-
-            if send_result.is_ok() && !msg_ids.is_empty() {
-                let session = sessions.get(&team_id_owned).map(|e| Arc::clone(&e.session));
-                if let Some(session) = session
-                    && let Err(e) = session.mailbox().mark_read_batch(&msg_ids).await
-                {
-                    warn!(
-                        slot_id = %slot_id_owned,
-                        error = %e,
-                        "mark_read_batch failed after successful send in wake_agent_in_session (non-fatal)"
-                    );
-                }
-            } else if send_result.is_err() {
-                let _ = scheduler
-                    .set_status(&slot_id_owned, crate::types::TeammateStatus::Idle)
-                    .await;
-                // Reset DB status so future attempts are not blocked.
-                let update = aionui_db::ConversationRowUpdate {
-                    status: Some("finished".to_owned()),
-                    updated_at: Some(aionui_common::now_ms()),
-                    ..Default::default()
-                };
-                let _ = repo.update(&conv_id, &update).await;
-            }
-
-            scheduler.release_wake_lock(&slot_id_owned);
-
-            let session = sessions.get(&team_id_owned).map(|e| Arc::clone(&e.session));
-            if let Some(session) = session {
-                match session.on_agent_finish(&conv_id, false).await {
-                    Ok(Some(wake_target)) => {
-                        session.try_wake(&wake_target, None).await;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!(
-                            conversation_id = %conv_id,
-                            error = %e,
-                            "on_agent_finish after wake_lock release failed"
-                        );
-                    }
-                }
-            }
-        });
+        let entry = self
+            .sessions
+            .get(team_id)
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        entry.session.notify_agent(slot_id);
         Ok(())
     }
 }

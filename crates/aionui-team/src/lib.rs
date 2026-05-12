@@ -1,6 +1,7 @@
 //! Multi-agent team sessions with role-based prompts, task board, mailbox, and scheduling.
 pub mod crash_detection;
 pub mod error;
+pub mod event_loop;
 pub mod events;
 pub mod guide;
 pub mod mailbox;
