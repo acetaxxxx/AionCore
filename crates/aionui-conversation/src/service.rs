@@ -18,7 +18,7 @@ use aionui_common::{
 use aionui_db::models::MessageRow;
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IConversationRepository, SortOrder,
+    IAgentMetadataRepository, IConversationRepository, SaveRuntimeStateParams, SortOrder,
 };
 use aionui_realtime::EventBroadcaster;
 use tracing::{debug, info, warn};
@@ -30,6 +30,7 @@ use crate::convert::{
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::stream_relay::StreamRelay;
+use std::sync::RwLock;
 
 const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
 
@@ -40,12 +41,14 @@ pub trait OnConversationDelete: Send + Sync {
 
 #[derive(Clone)]
 pub struct ConversationService {
-    repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     delete_hooks: Vec<Arc<dyn OnConversationDelete>>,
     workspace_root: std::path::PathBuf,
     skill_resolver: Arc<dyn SkillResolver>,
-    cron_service: Arc<std::sync::RwLock<Option<Arc<dyn ICronService>>>>,
+    cron_service: Arc<RwLock<Option<Arc<dyn ICronService>>>>,
+
+    // Repos for conversation, acp_session and agent_metadata access.
+    conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
 }
@@ -54,65 +57,26 @@ pub struct ConversationService {
 
 impl ConversationService {
     pub fn new(
-        repo: Arc<dyn IConversationRepository>,
-        broadcaster: Arc<dyn EventBroadcaster>,
-        skill_resolver: Arc<dyn SkillResolver>,
-        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
-        acp_session_repo: Arc<dyn IAcpSessionRepository>,
-    ) -> Self {
-        Self {
-            repo,
-            broadcaster,
-            delete_hooks: Vec::new(),
-            workspace_root: std::path::PathBuf::from("data"),
-            skill_resolver,
-            cron_service: Arc::new(std::sync::RwLock::new(None)),
-            agent_metadata_repo,
-            acp_session_repo,
-        }
-    }
-
-    pub fn new_with_workspace_root(
-        repo: Arc<dyn IConversationRepository>,
-        broadcaster: Arc<dyn EventBroadcaster>,
         workspace_root: std::path::PathBuf,
+        broadcaster: Arc<dyn EventBroadcaster>,
         skill_resolver: Arc<dyn SkillResolver>,
+        conversation_repo: Arc<dyn IConversationRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
         acp_session_repo: Arc<dyn IAcpSessionRepository>,
     ) -> Self {
         Self {
-            repo,
+            conversation_repo,
             broadcaster,
             delete_hooks: Vec::new(),
             workspace_root,
             skill_resolver,
-            cron_service: Arc::new(std::sync::RwLock::new(None)),
+            cron_service: Arc::new(RwLock::new(None)),
             agent_metadata_repo,
             acp_session_repo,
         }
     }
 
-    pub fn with_delete_hooks(
-        repo: Arc<dyn IConversationRepository>,
-        broadcaster: Arc<dyn EventBroadcaster>,
-        delete_hooks: Vec<Arc<dyn OnConversationDelete>>,
-        skill_resolver: Arc<dyn SkillResolver>,
-        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
-        acp_session_repo: Arc<dyn IAcpSessionRepository>,
-    ) -> Self {
-        Self {
-            repo,
-            broadcaster,
-            delete_hooks,
-            workspace_root: std::path::PathBuf::from("data"),
-            skill_resolver,
-            cron_service: Arc::new(std::sync::RwLock::new(None)),
-            agent_metadata_repo,
-            acp_session_repo,
-        }
-    }
-
-    pub fn set_cron_service(&self, cron_service: Option<Arc<dyn ICronService>>) {
+    pub fn with_cron_service(&self, cron_service: Option<Arc<dyn ICronService>>) {
         if let Ok(mut guard) = self.cron_service.write() {
             *guard = cron_service;
         }
@@ -132,8 +96,8 @@ impl ConversationService {
         generate_short_id()
     }
 
-    pub fn repo(&self) -> &Arc<dyn IConversationRepository> {
-        &self.repo
+    pub fn conversation_repo(&self) -> &Arc<dyn IConversationRepository> {
+        &self.conversation_repo
     }
 }
 
@@ -153,7 +117,31 @@ impl ConversationService {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
+        // Type-aware rule: top-level `model` is aionrs-only. Other agent types
+        // carry model/mode via `extra` (see spec 2026-05-12). Reject early so
+        // clients that still ship the legacy shape get a loud 400 instead of
+        // a silent write to a column nobody reads.
+        if req.r#type != AgentType::Aionrs && req.model.is_some() {
+            return Err(AppError::BadRequest(format!(
+                "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
+                req.r#type.serde_name()
+            )));
+        }
+
         let mut extra = req.extra;
+
+        // aionrs source-of-truth rule: top-level `model` wins. If an older client
+        // still packs `extra.model`, strip it before persist so the stored row
+        // has a single canonical model representation.
+        if req.r#type == AgentType::Aionrs
+            && let Some(obj) = extra.as_object_mut()
+            && obj.remove("model").is_some()
+        {
+            warn!(
+                user_id = %user_id,
+                "aionrs create: stripped legacy `extra.model`; top-level `model` is canonical"
+            );
+        }
 
         // Determine whether the user chose this workspace ("custom") or we
         // auto-provision one under `{data_dir}/conversations/{label}-temp-{id}/`.
@@ -278,7 +266,7 @@ impl ConversationService {
             updated_at: now,
         };
 
-        self.repo.create(&row).await?;
+        self.conversation_repo.create(&row).await?;
 
         // ACP conversations own one `acp_session` row (1:1 by
         // conversation_id). Other agent types have no session-level
@@ -332,6 +320,31 @@ impl ConversationService {
             .create(&params)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create acp_session row: {e}")))?;
+
+        // Seed optional runtime state from create payload. Empty strings are
+        // treated as absent, matching the "send key only when value present"
+        // contract on the wire. Mode/model take effect on the first
+        // reconcile right after session/new.
+        let mode = extra
+            .get("current_mode_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let model = extra
+            .get("current_model_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        if mode.is_some() || model.is_some() {
+            let params = SaveRuntimeStateParams {
+                current_mode_id: mode.map(Some),
+                current_model_id: model.map(Some),
+                config_selections_json: None,
+                context_usage_json: None,
+            };
+            self.acp_session_repo
+                .save_runtime_state(conversation_id, &params)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to seed acp_session runtime state: {e}")))?;
+        }
         Ok(())
     }
 
@@ -341,7 +354,7 @@ impl ConversationService {
     /// belong to the given user (avoids leaking existence to other users).
     pub async fn get(&self, user_id: &str, id: &str) -> Result<ConversationResponse, AppError> {
         let row = self
-            .repo
+            .conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -367,7 +380,7 @@ impl ConversationService {
             pinned: query.pinned,
         };
 
-        let result = self.repo.list_paginated(user_id, &filters).await?;
+        let result = self.conversation_repo.list_paginated(user_id, &filters).await?;
 
         // Tolerate per-row deserialization failures — a single legacy row
         // (e.g. an abandoned agent_type='gemini' conversation post-migration)
@@ -418,7 +431,7 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, AppError> {
         let existing = self
-            .repo
+            .conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -433,13 +446,34 @@ impl ConversationService {
             return Err(AppError::BadRequest("extra.skills is immutable post-creation".into()));
         }
 
+        // Type-aware rule: top-level `model` is aionrs-only. For non-aionrs
+        // conversations, model/mode must be updated via `extra` (see spec
+        // 2026-05-12).
+        let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+        if existing_type != AgentType::Aionrs && req.model.is_some() {
+            return Err(AppError::BadRequest(format!(
+                "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
+                existing.r#type
+            )));
+        }
+
         let now = now_ms();
 
-        // Merge extra if provided
+        // Merge extra if provided. For aionrs, strip `extra.model` post-merge
+        // so the row keeps a single canonical model source (top-level column).
         let merged_extra = if let Some(new_extra) = &req.extra {
             let mut existing_extra: serde_json::Value =
                 serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
             merge_json(&mut existing_extra, new_extra);
+            if existing_type == AgentType::Aionrs
+                && let Some(obj) = existing_extra.as_object_mut()
+                && obj.remove("model").is_some()
+            {
+                warn!(
+                    conversation_id = %id,
+                    "aionrs update: stripped legacy `extra.model` from merged extra"
+                );
+            }
             Some(
                 serde_json::to_string(&existing_extra)
                     .map_err(|e| AppError::Internal(format!("Failed to serialize merged extra: {e}")))?,
@@ -476,7 +510,7 @@ impl ConversationService {
             updated_at: Some(now),
         };
 
-        self.repo.update(id, &updates).await?;
+        self.conversation_repo.update(id, &updates).await?;
 
         if model_changed {
             let _ = task_manager.kill(id, None);
@@ -484,7 +518,7 @@ impl ConversationService {
 
         // Re-fetch to return the updated version
         let updated = self
-            .repo
+            .conversation_repo
             .get(id)
             .await?
             .ok_or_else(|| AppError::Internal("Conversation vanished after update".into()))?;
@@ -503,7 +537,7 @@ impl ConversationService {
     /// on a spurious model comparison.
     pub async fn update_extra(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), AppError> {
         let existing = self
-            .repo
+            .conversation_repo
             .get(conversation_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
@@ -520,7 +554,7 @@ impl ConversationService {
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        self.repo.update(conversation_id, &updates).await?;
+        self.conversation_repo.update(conversation_id, &updates).await?;
         Ok(())
     }
 
@@ -530,7 +564,7 @@ impl ConversationService {
     pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), AppError> {
         // Get existing to retrieve source for broadcast and verify ownership
         let existing = self
-            .repo
+            .conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -541,7 +575,7 @@ impl ConversationService {
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
 
-        self.repo.delete(id).await?;
+        self.conversation_repo.delete(id).await?;
         // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
         // conversations that used to be ACP (shouldn't happen but is
         // cheap to cover) still drop their orphaned session row.
@@ -577,7 +611,7 @@ impl ConversationService {
 
         if let Some(source_id) = &req.source_conversation_id {
             let source_row = self
-                .repo
+                .conversation_repo
                 .get(source_id)
                 .await?
                 .filter(|r| r.user_id == user_id)
@@ -621,15 +655,15 @@ impl ConversationService {
     /// Reset a conversation: clear messages and set status back to pending.
     pub async fn reset(&self, user_id: &str, id: &str) -> Result<(), AppError> {
         // Verify existence and ownership
-        self.repo
+        self.conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
 
         // Delete all messages
-        self.repo.delete_messages_by_conversation(id).await?;
-        self.repo.delete_artifacts_by_conversation(id).await?;
+        self.conversation_repo.delete_messages_by_conversation(id).await?;
+        self.conversation_repo.delete_artifacts_by_conversation(id).await?;
 
         // Reset status to pending
         let now = now_ms();
@@ -638,14 +672,14 @@ impl ConversationService {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.repo.update(id, &updates).await?;
+        self.conversation_repo.update(id, &updates).await?;
 
         Ok(())
     }
 
     /// List conversations associated by the same workspace.
     pub async fn list_associated(&self, user_id: &str, id: &str) -> Result<Vec<ConversationResponse>, AppError> {
-        let rows = self.repo.list_associated(user_id, id).await?;
+        let rows = self.conversation_repo.list_associated(user_id, id).await?;
         rows.into_iter()
             .map(|row| row_to_response(row, &self.workspace_root))
             .collect()
@@ -657,7 +691,7 @@ impl ConversationService {
         user_id: &str,
         cron_job_id: &str,
     ) -> Result<Vec<ConversationResponse>, AppError> {
-        let rows = self.repo.list_by_cron_job(user_id, cron_job_id).await?;
+        let rows = self.conversation_repo.list_by_cron_job(user_id, cron_job_id).await?;
         rows.into_iter()
             .map(|row| row_to_response(row, &self.workspace_root))
             .collect()
@@ -675,7 +709,7 @@ impl ConversationService {
         query: ListMessagesQuery,
     ) -> Result<MessageListResponse, AppError> {
         // Verify conversation exists and belongs to user
-        self.repo
+        self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -688,7 +722,10 @@ impl ConversationService {
             _ => SortOrder::Asc,
         };
 
-        let result = self.repo.get_messages(conversation_id, page, page_size, order).await?;
+        let result = self
+            .conversation_repo
+            .get_messages(conversation_id, page, page_size, order)
+            .await?;
 
         let items: Vec<MessageResponse> = result
             .items
@@ -709,14 +746,14 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) -> Result<ConversationArtifactListResponse, AppError> {
-        self.repo
+        self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
 
         let mut items = self
-            .repo
+            .conversation_repo
             .list_artifacts(conversation_id)
             .await?
             .into_iter()
@@ -724,7 +761,7 @@ impl ConversationService {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut legacy_items = self
-            .repo
+            .conversation_repo
             .list_legacy_cron_trigger_messages(conversation_id)
             .await?
             .into_iter()
@@ -749,7 +786,7 @@ impl ConversationService {
         artifact_id: &str,
         req: UpdateConversationArtifactRequest,
     ) -> Result<ConversationArtifactResponse, AppError> {
-        self.repo
+        self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -761,7 +798,7 @@ impl ConversationService {
             .ok_or_else(|| AppError::Internal("Failed to serialize artifact status".into()))?;
 
         let row = self
-            .repo
+            .conversation_repo
             .update_artifact_status(conversation_id, artifact_id, &status, now_ms())
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Artifact {artifact_id} not found")))?;
@@ -790,7 +827,7 @@ impl ConversationService {
         let page_size = query.page_size.unwrap_or(20);
 
         let result = self
-            .repo
+            .conversation_repo
             .search_messages(user_id, &query.keyword, page, page_size)
             .await?;
 
@@ -818,7 +855,7 @@ impl ConversationService {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConfirmationListResponse, AppError> {
-        self.repo
+        self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -844,7 +881,7 @@ impl ConversationService {
         req: ConfirmRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), AppError> {
-        self.repo
+        self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -883,7 +920,7 @@ impl ConversationService {
         command_type: Option<&str>,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ApprovalCheckResponse, AppError> {
-        self.repo
+        self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -921,7 +958,7 @@ impl ConversationService {
 
         // Verify conversation exists and belongs to user
         let row = self
-            .repo
+            .conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -968,7 +1005,7 @@ impl ConversationService {
             hidden: req.hidden,
             created_at: now_ms(),
         };
-        self.repo.insert_message(&user_msg).await?;
+        self.conversation_repo.insert_message(&user_msg).await?;
 
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.userCreated",
@@ -1000,9 +1037,9 @@ impl ConversationService {
             ..Default::default()
         };
 
-        self.repo.update(conversation_id, &update).await?;
+        self.conversation_repo.update(conversation_id, &update).await?;
         let conv_id = conversation_id.to_owned();
-        let repo = Arc::clone(&self.repo);
+        let repo = Arc::clone(&self.conversation_repo);
         let broadcaster = Arc::clone(&self.broadcaster);
         let cron_service = self.current_cron_service();
         let user_id_owned = user_id.to_owned();
@@ -1095,7 +1132,7 @@ impl ConversationService {
     /// scheduler writing an incoming teammate message as a left bubble in the
     /// target agent's conversation so the UI shows who spoke).
     pub async fn insert_raw_message(&self, row: &MessageRow) -> Result<(), AppError> {
-        self.repo.insert_message(row).await?;
+        self.conversation_repo.insert_message(row).await?;
 
         let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
         let content_value: serde_json::Value =
@@ -1116,14 +1153,14 @@ impl ConversationService {
     }
 
     /// Stop the current streaming response for a conversation.
-    pub async fn stop_stream(
+    pub async fn cancel(
         &self,
         user_id: &str,
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), AppError> {
         // Verify conversation exists and belongs to user
-        self.repo
+        self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -1150,7 +1187,7 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), AppError> {
         let row = self
-            .repo
+            .conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -1228,7 +1265,7 @@ impl ConversationService {
 
         // Fetch latest extra, merge the resolved workspace path in, and persist.
         let row = self
-            .repo
+            .conversation_repo
             .get(conversation_id)
             .await?
             .ok_or_else(|| AppError::Internal("Conversation vanished during workspace sync".into()))?;
@@ -1244,7 +1281,7 @@ impl ConversationService {
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        self.repo.update(conversation_id, &update).await?;
+        self.conversation_repo.update(conversation_id, &update).await?;
 
         debug!(
             conversation_id,
@@ -1298,7 +1335,7 @@ impl ConversationService {
             extra: Some(serialized),
             ..Default::default()
         };
-        if let Err(e) = self.repo.update(conversation_id, &update).await {
+        if let Err(e) = self.conversation_repo.update(conversation_id, &update).await {
             warn!(
                 conversation_id,
                 error = %e,
