@@ -345,10 +345,11 @@ async fn connect_and_listen(
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), ChannelError> {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::connect_async_tls_with_config;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-    let (ws_stream, _) = connect_async(ws_url)
+    let connector = build_ws_tls_connector()?;
+    let (ws_stream, _) = connect_async_tls_with_config(ws_url, None, false, Some(connector))
         .await
         .map_err(|e| ChannelError::ConnectionFailed(format!("Lark WS connect failed: {e}")))?;
 
@@ -847,6 +848,33 @@ fn chrono_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Build a TLS connector for WebSocket connections.
+///
+/// Explicitly sets ALPN to `http/1.1` only — WebSocket requires an HTTP/1.1
+/// upgrade handshake and is incompatible with h2. Without this, some servers
+/// negotiate h2 via ALPN and the WebSocket upgrade never completes.
+fn build_ws_tls_connector() -> Result<tokio_tungstenite::Connector, ChannelError> {
+    use std::sync::Arc;
+    use tokio_tungstenite::Connector;
+
+    let certs = rustls_native_certs::load_native_certs();
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add_parsable_certificates(certs.certs);
+
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ChannelError::ConnectionFailed(format!("TLS config error: {e}")))?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    Ok(Connector::Rustls(Arc::new(config)))
 }
 
 /// Extract service_id from a WebSocket URL query string.
