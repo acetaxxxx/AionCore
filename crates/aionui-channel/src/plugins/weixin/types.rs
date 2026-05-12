@@ -289,10 +289,16 @@ mod tests {
         let items = msgs[0].item_list.as_ref().unwrap();
         assert_eq!(items[0].item_type, Some(2));
         let img = items[0].image_item.as_ref().unwrap();
-        assert_eq!(img.media.as_ref().unwrap().encrypt_query_param.as_deref(), Some("enc_param"));
+        assert_eq!(
+            img.media.as_ref().unwrap().encrypt_query_param.as_deref(),
+            Some("enc_param")
+        );
         assert_eq!(img.aeskey.as_deref(), Some("hex_key"));
         assert_eq!(items[1].item_type, Some(4));
-        assert_eq!(items[1].file_item.as_ref().unwrap().file_name.as_deref(), Some("doc.pdf"));
+        assert_eq!(
+            items[1].file_item.as_ref().unwrap().file_name.as_deref(),
+            Some("doc.pdf")
+        );
     }
 
     #[test]
@@ -353,7 +359,9 @@ mod tests {
 
     #[test]
     fn serialize_sse_qr_event() {
-        let evt = SseQrEvent { qrcode_data: "ticket_abc".into() };
+        let evt = SseQrEvent {
+            qrcode_data: "ticket_abc".into(),
+        };
         let json = serde_json::to_string(&evt).unwrap();
         assert!(json.contains(r#""qrcodeData":"ticket_abc"#));
     }
@@ -373,7 +381,9 @@ mod tests {
 
     #[test]
     fn serialize_sse_error_event() {
-        let evt = SseErrorEvent { message: "timeout".into() };
+        let evt = SseErrorEvent {
+            message: "timeout".into(),
+        };
         let json = serde_json::to_string(&evt).unwrap();
         assert!(json.contains(r#""message":"timeout"#));
     }

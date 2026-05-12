@@ -16,7 +16,7 @@ use crate::types::{
 };
 
 use super::api::WeixinApi;
-use super::types::{WeixinRawItem, WeixinRawMessage, ITEM_TYPE_TEXT, ITEM_TYPE_VOICE};
+use super::types::{ITEM_TYPE_TEXT, ITEM_TYPE_VOICE, WeixinRawItem, WeixinRawMessage};
 
 /// Default base URL for the iLink Bot API.
 const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
@@ -218,8 +218,7 @@ async fn poll_loop(
 
         match api.get_updates(&buf).await {
             Ok(resp) => {
-                let is_api_error =
-                    resp.ret.unwrap_or(0) != 0 || resp.errcode.unwrap_or(0) != 0;
+                let is_api_error = resp.ret.unwrap_or(0) != 0 || resp.errcode.unwrap_or(0) != 0;
 
                 if is_api_error {
                     consecutive_failures += 1;

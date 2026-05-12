@@ -80,9 +80,7 @@ impl ChannelStreamRelay {
                         has_content = true;
                     }
                     Some(StreamAction::Thinking(_)) => {}
-                    Some(StreamAction::ToolCall { .. })
-                        if has_content && !text_buffer.trim().is_empty() =>
-                    {
+                    Some(StreamAction::ToolCall { .. }) if has_content && !text_buffer.trim().is_empty() => {
                         let formatted = format_text_for_platform(&text_buffer, self.config.platform);
                         let flush_msg = ChannelMessageService::build_streaming_message(&formatted);
                         let _ = self
