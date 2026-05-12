@@ -136,11 +136,11 @@ async fn weixin_flushes_pending_text_before_tool_call() {
     relay.run(rx).await;
 
     let sends = recorder.take_sends();
-    // First send is the "Thinking..." placeholder; the second must be the
-    // flushed assistant text triggered by the ToolCall silent event.
-    assert!(sends.len() >= 2, "expected flush send_message, got {:?}", sends);
-    assert!(sends[0].text.as_deref().unwrap().contains("Thinking"));
-    let flushed = &sends[1];
+    // WeChat relay does NOT send a "Thinking..." placeholder. The first
+    // send_message should be the flushed assistant text triggered by the
+    // ToolCall event.
+    assert!(!sends.is_empty(), "expected flush send_message, got {:?}", sends);
+    let flushed = &sends[0];
     assert!(
         flushed.text.as_deref().unwrap().contains("Here is the plan"),
         "expected flushed text, got {:?}",
@@ -225,7 +225,9 @@ async fn weixin_skips_flush_when_buffer_is_empty() {
     relay.run(rx).await;
 
     let sends = recorder.take_sends();
-    assert_eq!(sends.len(), 1, "only Thinking placeholder expected: {:?}", sends);
+    // WeChat relay does NOT send Thinking placeholder, and with no buffered
+    // text there should be zero sends (no flush needed).
+    assert_eq!(sends.len(), 0, "no sends expected for empty buffer: {:?}", sends);
 }
 
 #[tokio::test]
