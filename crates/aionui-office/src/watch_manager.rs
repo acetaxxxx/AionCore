@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(last.data["state"], "error");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn port_timeout_on_no_listener() {
         let spawner = Arc::new(MockSpawner::new());
         spawner.start_listener.store(false, Ordering::SeqCst);
@@ -716,7 +716,6 @@ mod tests {
         let file = dir.path().join("test.docx");
         std::fs::write(&file, b"test").unwrap();
 
-        // Override poll to 3 attempts to avoid slow test
         let resolved = resolve_path(file.to_str().unwrap()).unwrap();
         let port = allocate_port().unwrap();
         let result = mgr.poll_port_ready(port, &resolved).await;
