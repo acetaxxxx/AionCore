@@ -88,9 +88,17 @@ run *ARGS:
 run-release *ARGS:
     cargo run --release --bin aionui-backend -- {{ARGS}}
 
-# Pre-push gate: format, lint, test, then push
-push *ARGS: lint-fix fmt test
+# Pre-push gate: format, lint, auto-commit fixes, test, then push
+push *ARGS: lint-fix fmt _auto-commit-fixes test
     git push {{ ARGS }}
+
+# Auto-commit any formatting/lint fixes if there are changes
+_auto-commit-fixes:
+    #!/usr/bin/env bash
+    if [ -n "$(git diff --name-only)" ]; then
+        git add -A
+        git commit -m "chore: apply auto-fixes (fmt + clippy)"
+    fi
 
 # Update aionrs dependency (e.g. just update-aionrs or just update-aionrs v0.1.19)
 update-aionrs *TAG:
