@@ -371,9 +371,10 @@ impl StreamRelay {
             .await
             .unwrap_or(None);
 
-        if existing.is_some() {
+        if let Some(existing_row) = existing {
+            let merged_content = Self::merge_json_content(&existing_row.content, &content);
             let update = aionui_db::MessageRowUpdate {
-                content: Some(content),
+                content: Some(merged_content),
                 status: Some(Some(status.to_owned())),
                 hidden: None,
             };
@@ -434,8 +435,9 @@ impl StreamRelay {
                 }
             }
             AcpToolCallSessionUpdateKind::ToolCallUpdate => {
+                let merged_content = self.merge_acp_tool_call_content(tool_call_id, &value).await;
                 let update = aionui_db::MessageRowUpdate {
-                    content: Some(content),
+                    content: Some(merged_content),
                     status: Some(Some(status.to_owned())),
                     hidden: None,
                 };
@@ -444,6 +446,50 @@ impl StreamRelay {
                 }
             }
         }
+    }
+
+    /// Merge two JSON content strings: overlays non-null fields from `new_json`
+    /// onto `existing_json`, preserving fields only present in the original.
+    fn merge_json_content(existing_json: &str, new_json: &str) -> String {
+        let mut base: serde_json::Value = serde_json::from_str(existing_json).unwrap_or_default();
+        let new_value: serde_json::Value = serde_json::from_str(new_json).unwrap_or_default();
+        if let (Some(base_obj), Some(new_obj)) = (base.as_object_mut(), new_value.as_object()) {
+            for (key, val) in new_obj {
+                if !val.is_null() {
+                    base_obj.insert(key.clone(), val.clone());
+                }
+            }
+        }
+        base.to_string()
+    }
+
+    /// Merge an AcpToolCall update into the existing DB record.
+    /// Reads the stored content, overlays non-null fields from the update,
+    /// preserving fields like `raw_input` that the update event omits.
+    async fn merge_acp_tool_call_content(&self, tool_call_id: &str, update_value: &serde_json::Value) -> String {
+        let existing = self
+            .repo
+            .get_message_by_msg_id(&self.conversation_id, tool_call_id, "acp_tool_call")
+            .await
+            .ok()
+            .flatten();
+
+        let Some(existing_row) = existing else {
+            return update_value.to_string();
+        };
+
+        let mut base: serde_json::Value = serde_json::from_str(&existing_row.content).unwrap_or_default();
+        if let (Some(base_update), Some(new_update)) = (
+            base.get_mut("update").and_then(|v| v.as_object_mut()),
+            update_value.get("update").and_then(|v| v.as_object()),
+        ) {
+            for (key, val) in new_update {
+                if !val.is_null() {
+                    base_update.insert(key.clone(), val.clone());
+                }
+            }
+        }
+        base.to_string()
     }
 
     /// Persist a tool_group event (array of tool summaries).
@@ -833,6 +879,18 @@ mod tests {
 
         let rx = tx.subscribe();
 
+        // First event: Running with input but no output
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tc-001".into(),
+            name: "image_gen".into(),
+            args: json!({"prompt": "a cat"}),
+            status: ToolCallStatus::Running,
+            input: Some(json!({"prompt": "a cat", "size": "1024x1024"})),
+            output: None,
+            description: Some("Generate image".into()),
+        }))
+        .unwrap();
+        // Second event: Completed with output but no input
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: "tc-001".into(),
             name: "image_gen".into(),
@@ -840,7 +898,7 @@ mod tests {
             status: ToolCallStatus::Completed,
             input: None,
             output: Some("image.png".into()),
-            description: Some("Generate image".into()),
+            description: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -852,11 +910,22 @@ mod tests {
         assert!(tool_msg.is_some());
         let msg = tool_msg.unwrap();
         assert_eq!(msg.id, "tc-001");
-        assert_eq!(msg.status.as_deref(), Some("finish"));
+        assert_eq!(msg.status.as_deref(), Some("work"));
 
-        let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
-        assert_eq!(content["name"], "image_gen");
-        assert_eq!(content["status"], "completed");
+        let updates = repo.take_updates();
+        let tool_update = updates.iter().find(|(id, _)| id == "tc-001");
+        assert!(tool_update.is_some());
+        let (_, upd) = tool_update.unwrap();
+        assert_eq!(upd.status, Some(Some("finish".to_owned())));
+
+        // Verify merge: input from first event preserved, output from second event added
+        let merged: serde_json::Value = serde_json::from_str(upd.content.as_deref().unwrap()).unwrap();
+        assert_eq!(merged["name"], "image_gen");
+        assert_eq!(merged["status"], "completed");
+        assert!(merged.get("input").is_some() && !merged["input"].is_null(), "input must be preserved after merge");
+        assert_eq!(merged["input"]["prompt"], "a cat");
+        assert_eq!(merged["output"], "image.png");
+        assert_eq!(merged["description"], "Generate image");
     }
 
     #[tokio::test]
@@ -887,9 +956,9 @@ mod tests {
                 session_update: AcpToolCallSessionUpdateKind::ToolCall,
                 tool_call_id: "atc-001".into(),
                 status: Some(AcpToolCallStatus::InProgress),
-                title: Some("Read file".into()),
+                title: Some("Bash".into()),
                 kind: None,
-                raw_input: None,
+                raw_input: Some(json!({"command": "mv /tmp/a /tmp/b", "description": "Move file"})),
                 raw_output: None,
                 content: None,
                 locations: None,
@@ -904,10 +973,10 @@ mod tests {
                 session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
                 tool_call_id: "atc-001".into(),
                 status: Some(AcpToolCallStatus::Completed),
-                title: Some("Read file".into()),
+                title: None,
                 kind: None,
                 raw_input: None,
-                raw_output: Some(json!("file content")),
+                raw_output: Some(json!("Exit code: 0\nSTDOUT:\nSTDERR:")),
                 content: None,
                 locations: None,
             },
@@ -931,6 +1000,16 @@ mod tests {
         assert!(acp_update.is_some());
         let (_, upd) = acp_update.unwrap();
         assert_eq!(upd.status, Some(Some("finish".to_owned())));
+
+        // Verify merge: raw_input from ToolCall is preserved, raw_output from ToolCallUpdate is added
+        let merged: serde_json::Value = serde_json::from_str(upd.content.as_deref().unwrap()).unwrap();
+        let update_obj = merged.get("update").unwrap();
+        assert!(update_obj.get("raw_input").is_some(), "raw_input must be preserved after merge");
+        assert_eq!(
+            update_obj.get("raw_input").unwrap().get("command").unwrap().as_str().unwrap(),
+            "mv /tmp/a /tmp/b"
+        );
+        assert!(update_obj.get("raw_output").is_some(), "raw_output must be present after merge");
     }
 
     #[tokio::test]
@@ -1131,10 +1210,14 @@ mod tests {
         async fn get_message_by_msg_id(
             &self,
             _conv_id: &str,
-            _msg_id: &str,
-            _msg_type: &str,
+            msg_id: &str,
+            msg_type: &str,
         ) -> Result<Option<MessageRow>, DbError> {
-            Ok(None)
+            let inserts = self.inserts.lock().unwrap();
+            Ok(inserts
+                .iter()
+                .find(|m| m.msg_id.as_deref() == Some(msg_id) && m.r#type == msg_type)
+                .cloned())
         }
         async fn search_messages(
             &self,
