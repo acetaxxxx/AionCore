@@ -354,10 +354,7 @@ impl StreamRelay {
     }
 
     /// Persist a Gemini-style tool_call event.
-    async fn persist_tool_call(
-        &self,
-        data: &aionui_ai_agent::protocol::events::tool_call::ToolCallEventData,
-    ) {
+    async fn persist_tool_call(&self, data: &aionui_ai_agent::protocol::events::tool_call::ToolCallEventData) {
         let status = match data.status {
             ToolCallStatus::Running => "work",
             ToolCallStatus::Completed => "finish",
@@ -401,10 +398,7 @@ impl StreamRelay {
 
     /// Persist an ACP (Claude CLI) tool call event.
     /// First event (ToolCall) inserts; subsequent events (ToolCallUpdate) update.
-    async fn persist_acp_tool_call(
-        &self,
-        data: &aionui_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-    ) {
+    async fn persist_acp_tool_call(&self, data: &aionui_ai_agent::protocol::events::tool_call::AcpToolCallEventData) {
         let tool_call_id = &data.update.tool_call_id;
         let status = match data.update.status {
             Some(AcpToolCallStatus::Pending) | None => "work",
@@ -493,10 +487,7 @@ impl StreamRelay {
     }
 
     /// Persist a tool_group event (array of tool summaries).
-    async fn persist_tool_group(
-        &self,
-        entries: &[aionui_ai_agent::protocol::events::tool_call::ToolGroupEntry],
-    ) {
+    async fn persist_tool_group(&self, entries: &[aionui_ai_agent::protocol::events::tool_call::ToolGroupEntry]) {
         let all_done = entries
             .iter()
             .all(|e| matches!(e.status, ToolCallStatus::Completed | ToolCallStatus::Error));
@@ -922,7 +913,10 @@ mod tests {
         let merged: serde_json::Value = serde_json::from_str(upd.content.as_deref().unwrap()).unwrap();
         assert_eq!(merged["name"], "image_gen");
         assert_eq!(merged["status"], "completed");
-        assert!(merged.get("input").is_some() && !merged["input"].is_null(), "input must be preserved after merge");
+        assert!(
+            merged.get("input").is_some() && !merged["input"].is_null(),
+            "input must be preserved after merge"
+        );
         assert_eq!(merged["input"]["prompt"], "a cat");
         assert_eq!(merged["output"], "image.png");
         assert_eq!(merged["description"], "Generate image");
@@ -931,8 +925,7 @@ mod tests {
     #[tokio::test]
     async fn run_acp_tool_call_inserts_then_updates() {
         use aionui_ai_agent::protocol::events::tool_call::{
-            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
-            AcpToolCallUpdateData,
+            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallUpdateData,
         };
 
         let repo = Arc::new(RecordingRepo::new());
@@ -1004,12 +997,24 @@ mod tests {
         // Verify merge: raw_input from ToolCall is preserved, raw_output from ToolCallUpdate is added
         let merged: serde_json::Value = serde_json::from_str(upd.content.as_deref().unwrap()).unwrap();
         let update_obj = merged.get("update").unwrap();
-        assert!(update_obj.get("raw_input").is_some(), "raw_input must be preserved after merge");
+        assert!(
+            update_obj.get("raw_input").is_some(),
+            "raw_input must be preserved after merge"
+        );
         assert_eq!(
-            update_obj.get("raw_input").unwrap().get("command").unwrap().as_str().unwrap(),
+            update_obj
+                .get("raw_input")
+                .unwrap()
+                .get("command")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "mv /tmp/a /tmp/b"
         );
-        assert!(update_obj.get("raw_output").is_some(), "raw_output must be present after merge");
+        assert!(
+            update_obj.get("raw_output").is_some(),
+            "raw_output must be present after merge"
+        );
     }
 
     #[tokio::test]
