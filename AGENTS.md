@@ -1,5 +1,9 @@
 # AGENTS.md
 
+<!-- Maintenance rule: Only add content that tells AI assistants WHAT TO DO or WHAT NOT TO DO.
+     Implementation details, design rationale, and "how the system works" belong in ARCHITECTURE.md.
+     If a section doesn't contain an actionable rule or constraint, it doesn't belong here. -->
+
 Project-specific rules and conventions for AI assistants and contributors.
 
 ## High-Priority Rules
@@ -20,14 +24,7 @@ Only after exhausting the above — and explicitly documenting why each option i
 
 > For detailed background and design decisions, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-Cargo workspace with 19 crates under `crates/`. Dependencies flow downward through four layers:
-
-**Foundation:** `aionui-common`, `aionui-api-types`, `aionui-db`, `aionui-assets`, `aionui-runtime`
-**Capability:** `aionui-auth`, `aionui-realtime`
-**Domain:** `aionui-conversation`, `aionui-channel`, `aionui-team`, `aionui-cron`, `aionui-file`, `aionui-office`, `aionui-shell`, `aionui-mcp`, `aionui-ai-agent`, `aionui-extension`, `aionui-system`, `aionui-assistant`
-**Composition:** `aionui-app` — top-level binary, composes all crates into the axum server
-
-Binary name: `aionui-backend` (produced by `crates/aionui-app`).
+Cargo workspace organized in four layers: Foundation → Capability → Domain → Composition. Dependencies flow strictly downward.
 
 ### Crate Hierarchy & Dependencies
 
@@ -82,31 +79,6 @@ Every domain crate must follow:
 - Error responses must not leak internal details
 - Secrets must never be hardcoded
 
-## Route Map
-
-| Prefix                                                                                                                                                           | Crate               | Auth                  |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | --------------------- |
-| `POST /login`, `/api/auth/*`                                                                                                                                     | aionui-auth         | Public (rate-limited) |
-| `POST /logout`, `/api/auth/user`, `/api/auth/change-password`, `/api/ws-token`                                                                                   | aionui-auth         | Yes                   |
-| `/api/conversations/*`, `/api/messages/*`                                                                                                                        | aionui-conversation | Yes                   |
-| `/api/agents`, `/api/agents/refresh`, `/api/agents/test`                                                                                                         | aionui-ai-agent     | Yes                   |
-| `/api/acp/*`, `/api/conversations/{id}/acp/*`                                                                                                                    | aionui-ai-agent     | Yes                   |
-| `/api/bedrock/*`, `/api/gemini/*`                                                                                                                                | aionui-ai-agent     | Yes                   |
-| `/api/conversations/{id}/workspace`, `/api/conversations/{id}/side-question`, `/api/conversations/{id}/slash-commands`, `/api/conversations/{id}/reload-context` | aionui-ai-agent     | Yes                   |
-| `/api/remote-agents/*`                                                                                                                                           | aionui-ai-agent     | Yes                   |
-| `/api/settings/*`, `/api/providers/*`, `/api/system/*`                                                                                                           | aionui-system       | Yes                   |
-| `/api/fs/*`                                                                                                                                                      | aionui-file         | Yes                   |
-| `/api/mcp/*`                                                                                                                                                     | aionui-mcp          | Yes                   |
-| `/api/extensions/*`, `/api/hub/*`, `/api/skills/*`                                                                                                               | aionui-extension    | Yes                   |
-| `/api/channel/*`                                                                                                                                                 | aionui-channel      | Yes                   |
-| `/api/teams/*`                                                                                                                                                   | aionui-team         | Yes                   |
-| `/api/cron/*`                                                                                                                                                    | aionui-cron         | Yes                   |
-| `/api/word-preview/*`, `/api/excel-preview/*`, `/api/ppt-preview/*`, `/api/preview-history/*`, `/api/star-office/*`, `/api/document/*`                           | aionui-office       | Yes                   |
-| `/api/ppt-proxy/*`, `/api/office-watch-proxy/*`                                                                                                                  | aionui-office       | Public (iframe)       |
-| `/api/shell/*`, `/api/stt`                                                                                                                                       | aionui-shell        | Yes                   |
-| `/ws`                                                                                                                                                            | aionui-realtime     | Token callback        |
-| `/health`                                                                                                                                                        | aionui-app          | Public                |
-
 ## Code Style
 
 - Rust 2024 edition, stable toolchain (pinned in `rust-toolchain.toml`)
@@ -116,53 +88,9 @@ Every domain crate must follow:
 
 ## Development Workflow
 
-### Bundled bun Runtime
+### Subprocess Spawning
 
-The backend embeds a bun runtime for self-contained distribution. Relevant env vars:
-
-- `AIONUI_EMBED_BUN=1` — enable bun download + embed during `cargo build`.
-  Release CI sets this; local dev builds skip it (faster, no network).
-- `BUN_VARIANT=default|baseline` — select which Linux x64 variant to
-  embed. `baseline` targets CPUs without AVX2.
-- `AIONUI_BUN_PATH=/abs/path/to/bun` — runtime override. When set and
-  pointing to an executable file, `resolve_bun()` returns it verbatim,
-  skipping the embedded + `which` fallback chain. Useful for testing
-  custom bun builds or bisecting bun regressions.
-
-The bun version is pinned in
-`crates/aionui-runtime/Cargo.toml` under
-`[package.metadata.aionui-runtime] bun_version = "..."`. Upgrading bun is
-a one-line change — no source edits required.
-
-### Startup PATH Enhancement
-
-`fn main()` calls `aionui_runtime::enhance_process_path()` **before** the
-tokio runtime starts, so every downstream `which::which(...)` and
-`Command::new(...)` — including the existing spawn sites across the
-workspace — inherits an enriched `PATH`. Three layers are merged in priority
-order: bundled bun directory → platform extra bins (`~/.bun/bin`,
-`~/.cargo/bin`, `~/.local/bin`, Windows `%APPDATA%\npm`, Git, Scoop, …) →
-current PATH → login-shell `$PATH` (Unix, 3 s timeout). The call is
-`unsafe` because Rust 2024 requires a single-threaded precondition for
-`env::set_var`; `main()` runs this as its very first statement to
-satisfy the invariant. A `startup: PATH ready path_segments=… path_len=…`
-info log confirms the enhancement at each run (no full PATH content is
-logged at `info` level).
-
-### Subprocess Spawn Builder
-
-New subprocess spawn sites should go through
-`aionui_runtime::Builder::agent(program)` (for long-running agent CLIs
-whose stdio the caller owns) or `aionui_runtime::Builder::clean_cli(program)`
-(for short-lived tools whose output we parse). Both set
-`kill_on_drop(true)` and strip `NODE_OPTIONS`/`NODE_INSPECT`/`NODE_DEBUG`/
-`CLAUDECODE` so debug-profile env doesn't leak into the child.
-`clean_cli` additionally pipes stdio and sets `NO_COLOR=1` + `TERM=dumb`
-to keep ANSI codes out of captured output.
-
-Do NOT manually re-implement these behaviours with raw
-`tokio::process::Command` — the centralised builder is the one place to
-update policies (e.g. future `CARGO_*` cleanup, sandbox flags).
+New subprocess spawn sites must use `aionui_runtime::Builder::agent(program)` or `aionui_runtime::Builder::clean_cli(program)`. Do NOT use raw `tokio::process::Command`. See [ARCHITECTURE.md § Runtime Infrastructure](./ARCHITECTURE.md#runtime-infrastructure) for details.
 
 ### Pushing Code
 

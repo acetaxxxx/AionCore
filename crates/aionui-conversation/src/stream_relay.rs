@@ -1,6 +1,12 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::{AgentStreamEvent, protocol::events::ThinkingEventData};
+use aionui_ai_agent::{
+    AgentStreamEvent,
+    protocol::events::{
+        ThinkingEventData,
+        tool_call::{AcpToolCallSessionUpdateKind, AcpToolCallStatus, ToolCallStatus},
+    },
+};
 
 use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
 use aionui_api_types::WebSocketMessage;
@@ -129,6 +135,18 @@ impl StreamRelay {
                                 Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
                             }
                             break outcome;
+                        }
+                        AgentStreamEvent::ToolCall(data) => {
+                            self.forward_to_websocket(&event);
+                            self.persist_tool_call(data).await;
+                        }
+                        AgentStreamEvent::AcpToolCall(data) => {
+                            self.forward_to_websocket(&event);
+                            self.persist_acp_tool_call(data).await;
+                        }
+                        AgentStreamEvent::ToolGroup(entries) => {
+                            self.forward_to_websocket(&event);
+                            self.persist_tool_group(entries).await;
                         }
                         _ => {
                             self.forward_to_websocket(&event);
@@ -332,6 +350,185 @@ impl StreamRelay {
         };
         if let Err(e) = self.repo.insert_message(&row).await {
             error!(error = %e, "Failed to persist thinking message");
+        }
+    }
+
+    /// Persist a Gemini-style tool_call event.
+    async fn persist_tool_call(&self, data: &aionui_ai_agent::protocol::events::tool_call::ToolCallEventData) {
+        let status = match data.status {
+            ToolCallStatus::Running => "work",
+            ToolCallStatus::Completed => "finish",
+            ToolCallStatus::Error => "error",
+        };
+        let content = serde_json::to_string(data).unwrap_or_default();
+
+        let existing = self
+            .repo
+            .get_message_by_msg_id(&self.conversation_id, &data.call_id, "tool_call")
+            .await
+            .unwrap_or(None);
+
+        if let Some(existing_row) = existing {
+            let merged_content = Self::merge_json_content(&existing_row.content, &content);
+            let update = aionui_db::MessageRowUpdate {
+                content: Some(merged_content),
+                status: Some(Some(status.to_owned())),
+                hidden: None,
+            };
+            if let Err(e) = self.repo.update_message(&data.call_id, &update).await {
+                error!(error = %e, "Failed to update tool_call message");
+            }
+        } else {
+            let row = MessageRow {
+                id: data.call_id.clone(),
+                conversation_id: self.conversation_id.clone(),
+                msg_id: Some(data.call_id.clone()),
+                r#type: "tool_call".into(),
+                content,
+                position: Some("left".into()),
+                status: Some(status.to_owned()),
+                hidden: false,
+                created_at: now_ms(),
+            };
+            if let Err(e) = self.repo.insert_message(&row).await {
+                error!(error = %e, "Failed to persist tool_call message");
+            }
+        }
+    }
+
+    /// Persist an ACP (Claude CLI) tool call event.
+    /// First event (ToolCall) inserts; subsequent events (ToolCallUpdate) update.
+    async fn persist_acp_tool_call(&self, data: &aionui_ai_agent::protocol::events::tool_call::AcpToolCallEventData) {
+        let tool_call_id = &data.update.tool_call_id;
+        let status = match data.update.status {
+            Some(AcpToolCallStatus::Pending) | None => "work",
+            Some(AcpToolCallStatus::InProgress) => "work",
+            Some(AcpToolCallStatus::Completed) => "finish",
+            Some(AcpToolCallStatus::Failed) => "error",
+        };
+
+        let mut value = serde_json::to_value(data).unwrap_or_default();
+        normalize_keys_to_snake_case(&mut value);
+        let content = value.to_string();
+
+        match data.update.session_update {
+            AcpToolCallSessionUpdateKind::ToolCall => {
+                let row = MessageRow {
+                    id: tool_call_id.clone(),
+                    conversation_id: self.conversation_id.clone(),
+                    msg_id: Some(tool_call_id.clone()),
+                    r#type: "acp_tool_call".into(),
+                    content,
+                    position: Some("left".into()),
+                    status: Some(status.to_owned()),
+                    hidden: false,
+                    created_at: now_ms(),
+                };
+                if let Err(e) = self.repo.insert_message(&row).await {
+                    error!(error = %e, "Failed to persist acp_tool_call message");
+                }
+            }
+            AcpToolCallSessionUpdateKind::ToolCallUpdate => {
+                let merged_content = self.merge_acp_tool_call_content(tool_call_id, &value).await;
+                let update = aionui_db::MessageRowUpdate {
+                    content: Some(merged_content),
+                    status: Some(Some(status.to_owned())),
+                    hidden: None,
+                };
+                if let Err(e) = self.repo.update_message(tool_call_id, &update).await {
+                    error!(error = %e, "Failed to update acp_tool_call message");
+                }
+            }
+        }
+    }
+
+    /// Merge two JSON content strings: overlays non-null fields from `new_json`
+    /// onto `existing_json`, preserving fields only present in the original.
+    fn merge_json_content(existing_json: &str, new_json: &str) -> String {
+        let mut base: serde_json::Value = serde_json::from_str(existing_json).unwrap_or_default();
+        let new_value: serde_json::Value = serde_json::from_str(new_json).unwrap_or_default();
+        if let (Some(base_obj), Some(new_obj)) = (base.as_object_mut(), new_value.as_object()) {
+            for (key, val) in new_obj {
+                if !val.is_null() {
+                    base_obj.insert(key.clone(), val.clone());
+                }
+            }
+        }
+        base.to_string()
+    }
+
+    /// Merge an AcpToolCall update into the existing DB record.
+    /// Reads the stored content, overlays non-null fields from the update,
+    /// preserving fields like `raw_input` that the update event omits.
+    async fn merge_acp_tool_call_content(&self, tool_call_id: &str, update_value: &serde_json::Value) -> String {
+        let existing = self
+            .repo
+            .get_message_by_msg_id(&self.conversation_id, tool_call_id, "acp_tool_call")
+            .await
+            .ok()
+            .flatten();
+
+        let Some(existing_row) = existing else {
+            return update_value.to_string();
+        };
+
+        let mut base: serde_json::Value = serde_json::from_str(&existing_row.content).unwrap_or_default();
+        if let (Some(base_update), Some(new_update)) = (
+            base.get_mut("update").and_then(|v| v.as_object_mut()),
+            update_value.get("update").and_then(|v| v.as_object()),
+        ) {
+            for (key, val) in new_update {
+                if !val.is_null() {
+                    base_update.insert(key.clone(), val.clone());
+                }
+            }
+        }
+        base.to_string()
+    }
+
+    /// Persist a tool_group event (array of tool summaries).
+    async fn persist_tool_group(&self, entries: &[aionui_ai_agent::protocol::events::tool_call::ToolGroupEntry]) {
+        let all_done = entries
+            .iter()
+            .all(|e| matches!(e.status, ToolCallStatus::Completed | ToolCallStatus::Error));
+        let status = if all_done { "finish" } else { "work" };
+        let content = serde_json::to_string(entries).unwrap_or_default();
+
+        let group_id = entries
+            .first()
+            .map(|e| e.call_id.clone())
+            .unwrap_or_else(ConversationService::mint_msg_id);
+
+        let existing = self
+            .repo
+            .get_message_by_msg_id(&self.conversation_id, &group_id, "tool_group")
+            .await
+            .unwrap_or(None);
+
+        if existing.is_some() {
+            let update = aionui_db::MessageRowUpdate {
+                content: Some(content),
+                status: Some(Some(status.to_owned())),
+                hidden: None,
+            };
+            if let Err(e) = self.repo.update_message(&group_id, &update).await {
+                error!(error = %e, "Failed to update tool_group message");
+            }
+        } else {
+            let row = MessageRow {
+                id: group_id.clone(),
+                conversation_id: self.conversation_id.clone(),
+                msg_id: Some(group_id),
+                r#type: "tool_group".into(),
+                content,
+                position: Some("left".into()),
+                status: Some(status.to_owned()),
+                hidden: false,
+                created_at: now_ms(),
+            };
+            if let Err(e) = self.repo.insert_message(&row).await {
+                error!(error = %e, "Failed to persist tool_group message");
+            }
         }
     }
 
@@ -652,6 +849,224 @@ mod tests {
         );
     }
 
+    // ── Tool persistence tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_tool_call_persists_message() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+
+        // First event: Running with input but no output
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tc-001".into(),
+            name: "image_gen".into(),
+            args: json!({"prompt": "a cat"}),
+            status: ToolCallStatus::Running,
+            input: Some(json!({"prompt": "a cat", "size": "1024x1024"})),
+            output: None,
+            description: Some("Generate image".into()),
+        }))
+        .unwrap();
+        // Second event: Completed with output but no input
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tc-001".into(),
+            name: "image_gen".into(),
+            args: json!({"prompt": "a cat"}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some("image.png".into()),
+            description: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let tool_msg = inserts.iter().find(|m| m.r#type == "tool_call");
+        assert!(tool_msg.is_some());
+        let msg = tool_msg.unwrap();
+        assert_eq!(msg.id, "tc-001");
+        assert_eq!(msg.status.as_deref(), Some("work"));
+
+        let updates = repo.take_updates();
+        let tool_update = updates.iter().find(|(id, _)| id == "tc-001");
+        assert!(tool_update.is_some());
+        let (_, upd) = tool_update.unwrap();
+        assert_eq!(upd.status, Some(Some("finish".to_owned())));
+
+        // Verify merge: input from first event preserved, output from second event added
+        let merged: serde_json::Value = serde_json::from_str(upd.content.as_deref().unwrap()).unwrap();
+        assert_eq!(merged["name"], "image_gen");
+        assert_eq!(merged["status"], "completed");
+        assert!(
+            merged.get("input").is_some() && !merged["input"].is_null(),
+            "input must be preserved after merge"
+        );
+        assert_eq!(merged["input"]["prompt"], "a cat");
+        assert_eq!(merged["output"], "image.png");
+        assert_eq!(merged["description"], "Generate image");
+    }
+
+    #[tokio::test]
+    async fn run_acp_tool_call_inserts_then_updates() {
+        use aionui_ai_agent::protocol::events::tool_call::{
+            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallUpdateData,
+        };
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCall,
+                tool_call_id: "atc-001".into(),
+                status: Some(AcpToolCallStatus::InProgress),
+                title: Some("Bash".into()),
+                kind: None,
+                raw_input: Some(json!({"command": "mv /tmp/a /tmp/b", "description": "Move file"})),
+                raw_output: None,
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
+                tool_call_id: "atc-001".into(),
+                status: Some(AcpToolCallStatus::Completed),
+                title: None,
+                kind: None,
+                raw_input: None,
+                raw_output: Some(json!("Exit code: 0\nSTDOUT:\nSTDERR:")),
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let acp_msg = inserts.iter().find(|m| m.r#type == "acp_tool_call");
+        assert!(acp_msg.is_some());
+        let msg = acp_msg.unwrap();
+        assert_eq!(msg.id, "atc-001");
+        assert_eq!(msg.status.as_deref(), Some("work"));
+
+        let updates = repo.take_updates();
+        let acp_update = updates.iter().find(|(id, _)| id == "atc-001");
+        assert!(acp_update.is_some());
+        let (_, upd) = acp_update.unwrap();
+        assert_eq!(upd.status, Some(Some("finish".to_owned())));
+
+        // Verify merge: raw_input from ToolCall is preserved, raw_output from ToolCallUpdate is added
+        let merged: serde_json::Value = serde_json::from_str(upd.content.as_deref().unwrap()).unwrap();
+        let update_obj = merged.get("update").unwrap();
+        assert!(
+            update_obj.get("raw_input").is_some(),
+            "raw_input must be preserved after merge"
+        );
+        assert_eq!(
+            update_obj
+                .get("raw_input")
+                .unwrap()
+                .get("command")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "mv /tmp/a /tmp/b"
+        );
+        assert!(
+            update_obj.get("raw_output").is_some(),
+            "raw_output must be present after merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_group_persists_message() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallStatus, ToolGroupEntry};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::ToolGroup(vec![
+            ToolGroupEntry {
+                call_id: "tg-001".into(),
+                name: "search".into(),
+                status: ToolCallStatus::Completed,
+                description: Some("Web search".into()),
+            },
+            ToolGroupEntry {
+                call_id: "tg-002".into(),
+                name: "read_file".into(),
+                status: ToolCallStatus::Completed,
+                description: None,
+            },
+        ]))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let group_msg = inserts.iter().find(|m| m.r#type == "tool_group");
+        assert!(group_msg.is_some());
+        let msg = group_msg.unwrap();
+        assert_eq!(msg.id, "tg-001");
+        assert_eq!(msg.status.as_deref(), Some("finish"));
+
+        let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
+        assert!(content.is_array());
+        assert_eq!(content.as_array().unwrap().len(), 2);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────
 
     struct MockCronService;
@@ -800,10 +1215,14 @@ mod tests {
         async fn get_message_by_msg_id(
             &self,
             _conv_id: &str,
-            _msg_id: &str,
-            _msg_type: &str,
+            msg_id: &str,
+            msg_type: &str,
         ) -> Result<Option<MessageRow>, DbError> {
-            Ok(None)
+            let inserts = self.inserts.lock().unwrap();
+            Ok(inserts
+                .iter()
+                .find(|m| m.msg_id.as_deref() == Some(msg_id) && m.r#type == msg_type)
+                .cloned())
         }
         async fn search_messages(
             &self,

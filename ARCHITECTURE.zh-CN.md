@@ -26,11 +26,11 @@ aionui-backend 是 AionUi 的后端服务，使用 Rust 构建（Axum + Tokio + 
 │   aionui-auth          aionui-realtime           │
 │  （JWT、CSRF、中间件）  （WebSocket、事件广播）      │
 ├─────────────────────────────────────────────────┤
-│   aionui-db            aionui-api-types          │
-│  （仓库层）             （请求/响应类型）            │
+│  aionui-db    aionui-api-types   aionui-runtime  │
+│  （仓库层）    （API 契约）       （子进程/bun）    │
 ├─────────────────────────────────────────────────┤
-│              aionui-common                       │
-│     （错误类型、枚举、加密、分页）                   │
+│       aionui-common          aionui-assets       │
+│  （错误类型、枚举、加密）      （嵌入式数据）        │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -39,7 +39,7 @@ aionui-common 没有任何内部依赖。
 
 ## Crate 层级
 
-项目采用 Cargo workspace 组织，共 17 个 crate，分为四层：
+项目采用 Cargo workspace 组织，共 20 个 crate，分为四层：
 
 ### 基础层（Foundation）
 
@@ -50,6 +50,8 @@ aionui-common 没有任何内部依赖。
 | `aionui-common` | 共享错误类型（AppError）、枚举、ID 生成、加密工具、时间戳、分页 |
 | `aionui-api-types` | 所有 HTTP/WebSocket 的请求和响应类型，是 API 契约的唯一定义处 |
 | `aionui-db` | SQLite 数据库层，定义 Repository trait 和实现 |
+| `aionui-assets` | 嵌入式静态资源（Agent 元数据、提示词） |
+| `aionui-runtime` | 子进程管理、bun 运行时解析、PATH 增强 |
 
 ### 能力层（Capability）
 
@@ -77,6 +79,7 @@ aionui-common 没有任何内部依赖。
 | `aionui-ai-agent` | Agent 生命周期管理、Worker 任务队列、ACP/辅助技能 |
 | `aionui-extension` | 扩展注册中心、Hub 管理、技能发现与安装 |
 | `aionui-shell` | Shell 命令执行、语音转文字 |
+| `aionui-assistant` | Assistant 配置与管理 |
 
 ### 组装层（Composition）
 
@@ -345,9 +348,16 @@ pub struct AppServices {
     pub ws_manager: Arc<WebSocketManager>,
     pub event_bus: Arc<BroadcastEventBus>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
+    pub agent_registry: Arc<AgentRegistry>,
+    pub conversation_repo: Arc<dyn IConversationRepository>,
+    pub acp_session_sync: Arc<AcpSessionSyncService>,
     pub jwt_secret_raw: String,
     pub data_dir: String,
     pub local: bool,
+    pub app_version: String,
+    pub skill_paths: Arc<SkillPaths>,
+    pub guide_mcp_config: Option<GuideMcpConfig>,
+    // ...
 }
 ```
 
@@ -671,3 +681,46 @@ crates/aionui-my-feature/
 - [ ] 路由使用 `/api/` 前缀，资源名 kebab-case
 - [ ] 包含对应的测试文件
 - [ ] WebSocket 事件遵循 `domain.camelCaseAction` 命名
+
+## 运行时基础设施
+
+### 内嵌 bun 运行时
+
+后端内嵌 bun 运行时以实现自包含分发。相关环境变量：
+
+- `AIONUI_EMBED_BUN=1` — 在 `cargo build` 时启用 bun 下载和嵌入。
+  Release CI 会设置此变量；本地开发构建跳过（更快，无网络依赖）。
+- `BUN_VARIANT=default|baseline` — 选择嵌入哪个 Linux x64 变体。
+  `baseline` 适用于不支持 AVX2 的 CPU。
+- `AIONUI_BUN_PATH=/abs/path/to/bun` — 运行时覆盖。设置后若指向
+  可执行文件，`resolve_bun()` 直接返回该路径，跳过内嵌 + `which` 回退链。
+  用于测试自定义 bun 构建或二分定位 bun 问题。
+
+bun 版本固定在 `crates/aionui-runtime/Cargo.toml` 的
+`[package.metadata.aionui-runtime] bun_version = "..."` 中。
+升级 bun 只需修改这一行，无需改动源码。
+
+### 启动时 PATH 增强
+
+`fn main()` 在 tokio 运行时启动**之前**调用
+`aionui_runtime::enhance_process_path()`，使后续所有
+`which::which(...)` 和 `Command::new(...)` 继承增强后的 `PATH`。
+三层合并优先级：内嵌 bun 目录 → 平台额外 bin 目录（`~/.bun/bin`、
+`~/.cargo/bin`、`~/.local/bin`、Windows `%APPDATA%\npm`、Git、Scoop 等）→
+当前 PATH → login-shell `$PATH`（Unix，3 秒超时）。
+该调用标记为 `unsafe`，因为 Rust 2024 要求 `env::set_var` 在单线程环境执行；
+`main()` 将其作为第一条语句以满足此不变量。
+启动时会输出 `startup: PATH ready path_segments=… path_len=…` info 日志。
+
+### 子进程 Spawn Builder
+
+新的子进程启动点应通过
+`aionui_runtime::Builder::agent(program)`（长期运行的 Agent CLI，
+调用者拥有 stdio）或 `aionui_runtime::Builder::clean_cli(program)`
+（短期工具，解析输出）创建。两者都设置 `kill_on_drop(true)`
+并清除 `NODE_OPTIONS`/`NODE_INSPECT`/`NODE_DEBUG`/`CLAUDECODE`
+防止调试环境泄露到子进程。`clean_cli` 额外设置管道 stdio
+和 `NO_COLOR=1` + `TERM=dumb` 以避免 ANSI 码干扰输出解析。
+
+禁止使用原始 `tokio::process::Command` 手动实现这些行为——
+集中化的 Builder 是更新策略的唯一位置。
