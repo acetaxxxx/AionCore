@@ -77,7 +77,10 @@ struct LogGuards {
 fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> LogGuards {
     std::fs::create_dir_all(log_dir).expect("failed to create log directory");
 
-    let console_layer = fmt::layer().with_target(true).with_filter(build_env_filter(log_level));
+    let console_layer = fmt::layer()
+        .with_target(true)
+        .with_ansi(false)
+        .with_filter(build_env_filter(log_level));
 
     // Backend file layer — excludes aion_* targets
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
