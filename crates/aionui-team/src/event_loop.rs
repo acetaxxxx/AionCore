@@ -16,8 +16,6 @@ use crate::scheduler::TeammateManager;
 use crate::session::TeamSession;
 use crate::types::TeammateStatus;
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-
 /// Registry of per-agent Notify handles. Used by any trigger source to poke
 /// an agent's event loop without needing to know its internals.
 pub struct EventLoopRegistry {
@@ -101,7 +99,7 @@ pub struct AgentLoopContext {
 /// The event loop for one agent slot. Spawned as a tokio task.
 ///
 /// Flow:
-/// 1. Wait for signal (notify) or heartbeat timeout.
+/// 1. Wait for signal (notify) or shutdown.
 /// 2. Drain loop: compute_wake_input → has messages → send_message (blocking) → finalize → repeat.
 /// 3. When mailbox empty → back to step 1.
 async fn run_event_loop(
@@ -116,7 +114,7 @@ async fn run_event_loop(
     );
 
     loop {
-        // Step 1: wait for signal, heartbeat, or shutdown
+        // Step 1: wait for signal or shutdown
         tokio::select! {
             biased;
             _ = shutdown_rx.wait_for(|v| *v) => {
@@ -128,7 +126,6 @@ async fn run_event_loop(
                 return;
             }
             _ = notify.notified() => {}
-            _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {}
         }
 
         // Drain loop: keep processing until mailbox is empty
