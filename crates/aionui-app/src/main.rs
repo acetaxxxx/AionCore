@@ -65,7 +65,11 @@ fn build_env_filter(log_level: Option<&str>) -> EnvFilter {
 fn build_backend_filter(log_level: Option<&str>) -> EnvFilter {
     let user_directives = log_level.unwrap_or("info");
     let suppressions = NOISE_SUPPRESSIONS.join(",");
-    let aionrs_off: String = AIONRS_TARGETS.iter().map(|t| format!("{t}=off")).collect::<Vec<_>>().join(",");
+    let aionrs_off: String = AIONRS_TARGETS
+        .iter()
+        .map(|t| format!("{t}=off"))
+        .collect::<Vec<_>>()
+        .join(",");
     EnvFilter::new(format!("{suppressions},{aionrs_off},{user_directives}"))
 }
 
@@ -100,7 +104,11 @@ fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> LogGuards {
     // Aionrs file layer — only aion_* targets
     let aionrs_level = {
         let level = log_level.unwrap_or("info");
-        AIONRS_TARGETS.iter().map(|t| format!("{t}={level}")).collect::<Vec<_>>().join(",")
+        AIONRS_TARGETS
+            .iter()
+            .map(|t| format!("{t}={level}"))
+            .collect::<Vec<_>>()
+            .join(",")
     };
     let aionrs_resolved = aion_config::logging::ResolvedLogging {
         enabled: true,
