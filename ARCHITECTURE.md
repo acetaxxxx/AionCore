@@ -26,11 +26,11 @@ It provides HTTP REST APIs and WebSocket real-time events for the AionUi desktop
 │   aionui-auth          aionui-realtime           │
 │  (JWT, CSRF, middleware) (WebSocket, events)     │
 ├─────────────────────────────────────────────────┤
-│   aionui-db            aionui-api-types          │
-│  (repositories)        (request/response types)  │
+│  aionui-db    aionui-api-types   aionui-runtime  │
+│ (repositories) (API contracts)  (subprocess/bun) │
 ├─────────────────────────────────────────────────┤
-│              aionui-common                       │
-│     (error types, enums, crypto, pagination)     │
+│       aionui-common          aionui-assets       │
+│  (error types, enums, crypto)  (embedded data)   │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -39,7 +39,7 @@ and aionui-common has zero internal dependencies.
 
 ## Crate Hierarchy
 
-The project is organized as a Cargo workspace with 17 crates across four layers:
+The project is organized as a Cargo workspace with 20 crates across four layers:
 
 ### Foundation
 
@@ -50,6 +50,8 @@ Depended on by nearly all other crates. Changes require careful impact assessmen
 | `aionui-common` | Shared error types (AppError), enums, ID generation, crypto utilities, timestamps, pagination |
 | `aionui-api-types` | All HTTP/WebSocket request and response types — the single source of truth for API contracts |
 | `aionui-db` | SQLite database layer, defines Repository traits and implementations |
+| `aionui-assets` | Embedded static assets (agent metadata, prompts) |
+| `aionui-runtime` | Subprocess spawning, bun runtime resolution, PATH enhancement |
 
 ### Capability
 
@@ -77,6 +79,7 @@ Each crate owns an independent business domain. They remain loosely coupled from
 | `aionui-ai-agent` | Agent lifecycle management, worker task queues, ACP/auxiliary skills |
 | `aionui-extension` | Extension registry, hub management, skill discovery and installation |
 | `aionui-shell` | Shell command execution, speech-to-text |
+| `aionui-assistant` | Assistant configuration and management |
 
 ### Composition
 
@@ -345,9 +348,16 @@ pub struct AppServices {
     pub ws_manager: Arc<WebSocketManager>,
     pub event_bus: Arc<BroadcastEventBus>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
+    pub agent_registry: Arc<AgentRegistry>,
+    pub conversation_repo: Arc<dyn IConversationRepository>,
+    pub acp_session_sync: Arc<AcpSessionSyncService>,
     pub jwt_secret_raw: String,
     pub data_dir: String,
     pub local: bool,
+    pub app_version: String,
+    pub skill_paths: Arc<SkillPaths>,
+    pub guide_mcp_config: Option<GuideMcpConfig>,
+    // ...
 }
 ```
 
@@ -671,3 +681,53 @@ Before adding a new crate, confirm:
 - [ ] Routes use `/api/` prefix with kebab-case resource names
 - [ ] Includes corresponding test files
 - [ ] WebSocket events follow `domain.camelCaseAction` naming convention
+
+## Runtime Infrastructure
+
+### Bundled bun Runtime
+
+The backend embeds a bun runtime for self-contained distribution. Relevant env vars:
+
+- `AIONUI_EMBED_BUN=1` — enable bun download + embed during `cargo build`.
+  Release CI sets this; local dev builds skip it (faster, no network).
+- `BUN_VARIANT=default|baseline` — select which Linux x64 variant to
+  embed. `baseline` targets CPUs without AVX2.
+- `AIONUI_BUN_PATH=/abs/path/to/bun` — runtime override. When set and
+  pointing to an executable file, `resolve_bun()` returns it verbatim,
+  skipping the embedded + `which` fallback chain. Useful for testing
+  custom bun builds or bisecting bun regressions.
+
+The bun version is pinned in
+`crates/aionui-runtime/Cargo.toml` under
+`[package.metadata.aionui-runtime] bun_version = "..."`. Upgrading bun is
+a one-line change — no source edits required.
+
+### Startup PATH Enhancement
+
+`fn main()` calls `aionui_runtime::enhance_process_path()` **before** the
+tokio runtime starts, so every downstream `which::which(...)` and
+`Command::new(...)` — including the existing spawn sites across the
+workspace — inherits an enriched `PATH`. Three layers are merged in priority
+order: bundled bun directory → platform extra bins (`~/.bun/bin`,
+`~/.cargo/bin`, `~/.local/bin`, Windows `%APPDATA%\npm`, Git, Scoop, …) →
+current PATH → login-shell `$PATH` (Unix, 3 s timeout). The call is
+`unsafe` because Rust 2024 requires a single-threaded precondition for
+`env::set_var`; `main()` runs this as its very first statement to
+satisfy the invariant. A `startup: PATH ready path_segments=… path_len=…`
+info log confirms the enhancement at each run (no full PATH content is
+logged at `info` level).
+
+### Subprocess Spawn Builder
+
+New subprocess spawn sites should go through
+`aionui_runtime::Builder::agent(program)` (for long-running agent CLIs
+whose stdio the caller owns) or `aionui_runtime::Builder::clean_cli(program)`
+(for short-lived tools whose output we parse). Both set
+`kill_on_drop(true)` and strip `NODE_OPTIONS`/`NODE_INSPECT`/`NODE_DEBUG`/
+`CLAUDECODE` so debug-profile env doesn't leak into the child.
+`clean_cli` additionally pipes stdio and sets `NO_COLOR=1` + `TERM=dumb`
+to keep ANSI codes out of captured output.
+
+Do NOT manually re-implement these behaviours with raw
+`tokio::process::Command` — the centralised builder is the one place to
+update policies (e.g. future `CARGO_*` cleanup, sandbox flags).
