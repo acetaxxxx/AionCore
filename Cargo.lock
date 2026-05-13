@@ -105,8 +105,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -129,23 +129,25 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-compact"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
 name = "aion-config"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "aion-compact",
  "aion-types",
@@ -159,13 +161,16 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-mcp"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -179,38 +184,41 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-memory"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "aion-config",
  "chrono",
  "serde",
  "serde_yaml",
  "thiserror 2.0.18",
+ "tracing",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-protocol"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "aion-types",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-providers"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -230,14 +238,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "url",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-skills"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -255,14 +264,15 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "unicode-width",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-tools"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -275,13 +285,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-types"
-version = "0.1.21"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+version = "0.1.22"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -342,6 +353,7 @@ dependencies = [
 name = "aionui-app"
 version = "0.1.0"
 dependencies = [
+ "aion-config",
  "aionui-ai-agent",
  "aionui-api-types",
  "aionui-assets",
@@ -6344,7 +6356,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.21#4cc7ff222339ab8a91bbeeedc73cafd588bd5214"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.22#14e408b2bca4ed0d138acecf1d300c0abfe0f2b1"
 
 [[package]]
 name = "writeable"
