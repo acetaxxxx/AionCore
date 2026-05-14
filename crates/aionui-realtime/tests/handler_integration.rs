@@ -373,8 +373,6 @@ async fn multiple_concurrent_connections() {
 
     let mut handles = Vec::new();
     for _ in 0..10 {
-        #[allow(clippy::redundant_locals)] // rebind to Copy-move into async block
-        let addr = addr;
         handles.push(tokio::spawn(
             async move { connect_with_token(addr, "valid-token").await },
         ));

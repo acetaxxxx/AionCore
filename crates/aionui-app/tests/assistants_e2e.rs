@@ -13,7 +13,7 @@ mod common;
 
 use std::sync::Arc;
 
-use aionui_app::{AppServices, ModuleStates, build_module_states, create_router_with_states};
+use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
 use aionui_assistant::{AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
 use aionui_db::{
     IAssistantOverrideRepository, IAssistantRepository, SqliteAssistantOverrideRepository, SqliteAssistantRepository,
@@ -130,7 +130,7 @@ async fn fixture() -> Fixture {
 
     // Bring up in-memory DB + services + default module states.
     let db = init_database_memory().await.unwrap();
-    let services = AppServices::from_database(db).await.unwrap();
+    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
     let (mut states, _): (ModuleStates, _) = build_module_states(&services).await;
 
     // Replace the extension + hub + skill states with freshly-constructed
