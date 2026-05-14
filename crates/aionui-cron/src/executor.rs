@@ -72,6 +72,7 @@ pub struct JobExecutor {
 }
 
 impl JobExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         task_manager: Arc<dyn IWorkerTaskManager>,
         conversation_repo: Arc<dyn IConversationRepository>,
