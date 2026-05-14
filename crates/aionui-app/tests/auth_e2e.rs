@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use aionui_app::AppServices;
+use aionui_app::{AppConfig, AppServices};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -17,7 +17,7 @@ use aionui_app::AppServices;
 
 async fn build_app() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_database(db).await.unwrap();
+    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
     let router = aionui_app::create_router(&services).await;
     (router, services)
 }
