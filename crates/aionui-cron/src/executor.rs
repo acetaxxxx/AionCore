@@ -64,6 +64,7 @@ pub struct JobExecutor {
     conversation_repo: Arc<dyn IConversationRepository>,
     conversation_service: Arc<ConversationService>,
     busy_guard: Arc<CronBusyGuard>,
+    work_dir: PathBuf,
     data_dir: PathBuf,
     broadcaster: Arc<dyn EventBroadcaster>,
     agent_registry: Arc<AgentRegistry>,
@@ -76,6 +77,7 @@ impl JobExecutor {
         conversation_repo: Arc<dyn IConversationRepository>,
         conversation_service: Arc<ConversationService>,
         busy_guard: Arc<CronBusyGuard>,
+        work_dir: PathBuf,
         data_dir: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
         agent_registry: Arc<AgentRegistry>,
@@ -87,6 +89,7 @@ impl JobExecutor {
             conversation_repo,
             conversation_service,
             busy_guard,
+            work_dir,
             data_dir,
             broadcaster,
             agent_registry,
@@ -428,7 +431,7 @@ impl JobExecutor {
             .unwrap_or_default();
 
         if response_workspace.is_empty() {
-            let fallback_workspace = default_temp_workspace_path(&self.data_dir, &agent_type, job, &response.id);
+            let fallback_workspace = default_temp_workspace_path(&self.work_dir, &agent_type, job, &response.id);
             std::fs::create_dir_all(&fallback_workspace).map_err(|err| {
                 CronError::Scheduler(format!(
                     "create fallback cron workspace {}: {err}",
@@ -2120,6 +2123,7 @@ mod tests {
             conv_service,
             guard,
             std::env::temp_dir(),
+            std::env::temp_dir(),
             Arc::new(StubBroadcaster),
             agent_registry,
         )
@@ -2723,6 +2727,7 @@ mod tests {
             repo,
             conversation_service,
             Arc::new(CronBusyGuard::new()),
+            std::env::temp_dir(),
             std::env::temp_dir(),
             broadcaster,
             agent_registry,

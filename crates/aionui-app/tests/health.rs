@@ -3,7 +3,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use aionui_app::AppServices;
+use aionui_app::{AppConfig, AppServices};
 
 fn build_request(method: &str, uri: &str) -> Request<Body> {
     Request::builder()
@@ -20,7 +20,7 @@ async fn response_json(body: Body) -> serde_json::Value {
 
 async fn build_app() -> axum::Router {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_database(db).await.unwrap();
+    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
     aionui_app::create_router(&services).await
 }
 

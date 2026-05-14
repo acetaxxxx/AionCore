@@ -50,7 +50,8 @@ use aionui_system::{ConnectionTestRouterState, SystemRouterState, connection_tes
 use aionui_team::{GuideMcpServer, TeamRouterState, team_routes};
 
 pub use state_builders::{
-    ChannelOrchestratorComponents, build_assistant_state, build_extension_states, build_module_states, build_ws_state,
+    ChannelOrchestratorComponents, build_assistant_state, build_conversation_state, build_extension_states,
+    build_module_states, build_ws_state,
 };
 
 /// Application configuration parsed from CLI arguments.
@@ -59,6 +60,7 @@ pub struct AppConfig {
     pub host: String,
     pub port: u16,
     pub data_dir: PathBuf,
+    pub work_dir: PathBuf,
     pub app_version: String,
     /// Run in local embedded mode (skip authentication, use system_default_user).
     pub local: bool,
@@ -82,6 +84,7 @@ impl Default for AppConfig {
             host: aionui_common::constants::DEFAULT_HOST.to_string(),
             port: aionui_common::constants::DEFAULT_PORT,
             data_dir: PathBuf::from("data"),
+            work_dir: PathBuf::from("data"),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             local: false,
         }
@@ -104,6 +107,7 @@ pub struct AppServices {
     /// Raw JWT secret string, used to derive encryption keys.
     pub jwt_secret_raw: String,
     pub data_dir: PathBuf,
+    pub work_dir: PathBuf,
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
     pub app_version: String,
@@ -135,40 +139,11 @@ impl AppServices {
         }
     }
 
-    /// Build application services from an initialized database.
-    ///
-    /// Resolves JWT secret (env → db → generate), constructs all shared
-    /// services, and persists a newly generated secret to the database.
-    pub async fn from_database(database: Database) -> anyhow::Result<Self> {
-        Self::from_database_with_data_dir_and_app_version(
-            database,
-            PathBuf::from("data"),
-            false,
-            env!("CARGO_PKG_VERSION").to_string(),
-        )
-        .await
-    }
-
-    pub async fn from_database_with_data_dir(
-        database: Database,
-        data_dir: PathBuf,
-        local: bool,
-    ) -> anyhow::Result<Self> {
-        Self::from_database_with_data_dir_and_app_version(
-            database,
-            data_dir,
-            local,
-            env!("CARGO_PKG_VERSION").to_string(),
-        )
-        .await
-    }
-
-    pub async fn from_database_with_data_dir_and_app_version(
-        database: Database,
-        data_dir: PathBuf,
-        local: bool,
-        app_version: String,
-    ) -> anyhow::Result<Self> {
+    pub async fn from_config(database: Database, config: &AppConfig) -> anyhow::Result<Self> {
+        let data_dir = config.data_dir.clone();
+        let work_dir = config.work_dir.clone();
+        let local = config.local;
+        let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
         // Resolve JWT secret: env var → system user db field → random generation
@@ -279,6 +254,7 @@ impl AppServices {
             acp_session_sync: acp_agent_service,
             jwt_secret_raw: secret,
             data_dir,
+            work_dir,
             local,
             app_version,
             skill_paths,
@@ -640,9 +616,7 @@ mod tests {
         let config = AppConfig {
             host: "0.0.0.0".to_string(),
             port: 3000,
-            data_dir: PathBuf::from("data"),
-            app_version: "1.2.3".to_string(),
-            local: false,
+            ..Default::default()
         };
         assert_eq!(config.socket_addr(), "0.0.0.0:3000");
     }
@@ -650,11 +624,8 @@ mod tests {
     #[test]
     fn test_app_config_database_path() {
         let config = AppConfig {
-            host: "127.0.0.1".to_string(),
-            port: 25808,
             data_dir: PathBuf::from("/tmp/aionui"),
-            app_version: "1.2.3".to_string(),
-            local: false,
+            ..Default::default()
         };
         assert_eq!(config.database_path(), PathBuf::from("/tmp/aionui/aionui-backend.db"));
     }
@@ -662,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn test_app_services_from_memory_db() {
         let db = aionui_db::init_database_memory().await.unwrap();
-        let services = AppServices::from_database(db).await.unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
 
         // JWT service should be functional
         let token = services.jwt_service.sign("test_user", "testuser").unwrap();
@@ -679,7 +650,7 @@ mod tests {
     #[tokio::test]
     async fn test_jwt_secret_persisted_to_db() {
         let db = aionui_db::init_database_memory().await.unwrap();
-        let services = AppServices::from_database(db).await.unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
 
         // System user should now have a jwt_secret persisted
         let system_user = services.user_repo.get_system_user().await.unwrap();
@@ -693,14 +664,11 @@ mod tests {
     #[tokio::test]
     async fn test_app_services_uses_supplied_app_version() {
         let db = aionui_db::init_database_memory().await.unwrap();
-        let services = AppServices::from_database_with_data_dir_and_app_version(
-            db,
-            PathBuf::from("data"),
-            false,
-            "9.9.9".to_string(),
-        )
-        .await
-        .unwrap();
+        let config = AppConfig {
+            app_version: "9.9.9".to_string(),
+            ..Default::default()
+        };
+        let services = AppServices::from_config(db, &config).await.unwrap();
 
         assert_eq!(services.app_version, "9.9.9");
 

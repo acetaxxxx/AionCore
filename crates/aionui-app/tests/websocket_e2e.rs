@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aionui_api_types::WebSocketMessage;
-use aionui_app::{AppServices, create_router};
+use aionui_app::{AppConfig, AppServices, create_router};
 use aionui_realtime::WebSocketManager;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -26,7 +26,7 @@ struct TestApp {
 
 async fn start_app() -> TestApp {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_database(db).await.unwrap();
+    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
     let router = create_router(&services).await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -25,6 +25,11 @@ struct Cli {
     #[arg(long, default_value = "data")]
     data_dir: PathBuf,
 
+    /// Working directory for conversation workspaces.
+    /// Falls back to AIONUI_WORK_DIR env, then to data-dir.
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+
     /// Host application version used for extension engine compatibility.
     #[arg(long, default_value_t = env!("CARGO_PKG_VERSION").to_string())]
     app_version: String,
@@ -181,10 +186,24 @@ async fn async_main(merged_path: String, mcp_subcommand: Option<&str>, cli: Opti
         "startup: PATH ready"
     );
 
+    let work_dir = cli.work_dir.unwrap_or_else(|| {
+        std::env::var("AIONUI_WORK_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cli.data_dir.clone())
+    });
+
+    // SAFETY: called before any service initialization; no concurrent reads.
+    unsafe {
+        std::env::set_var("AIONUI_WORK_DIR", &work_dir);
+    }
+
     let config = AppConfig {
         host: cli.host,
         port: cli.port,
         data_dir: cli.data_dir,
+        work_dir,
         app_version: cli.app_version,
         local: cli.local,
     };
@@ -239,13 +258,7 @@ async fn async_main(merged_path: String, mcp_subcommand: Option<&str>, cli: Opti
         "startup: builtin skills materialized"
     );
 
-    let services = AppServices::from_database_with_data_dir_and_app_version(
-        database,
-        config.data_dir.clone(),
-        config.local,
-        config.app_version.clone(),
-    )
-    .await?;
+    let services = AppServices::from_config(database, &config).await?;
     info!(elapsed_ms = boot.elapsed().as_millis(), "startup: services constructed");
 
     if config.local {
