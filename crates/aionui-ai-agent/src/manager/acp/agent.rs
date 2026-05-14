@@ -25,6 +25,21 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
+/// The user-visible body inside an [`AppError`].
+///
+/// `AppError`'s `Display` prefixes every variant with its HTTP status name
+/// (`"Bad gateway: ..."`, `"Not found: ..."`, etc.). That's correct for HTTP
+/// response bodies, but the WebSocket `error` event we broadcast goes straight
+/// to the renderer and gets shown verbatim — the prefix only adds noise. Strip
+/// it so the user sees the upstream message.
+fn user_facing_message(err: &AppError) -> String {
+    let full = err.to_string();
+    // Each variant's Display starts with `"<Tag>: "`. Find the first ": " and
+    // return what follows. Variants without a colon (e.g. `RateLimited` →
+    // "Rate limited") fall through to the full string.
+    full.split_once(": ").map(|(_, rest)| rest.to_owned()).unwrap_or(full)
+}
+
 use super::mode_normalize::normalize_requested_mode;
 
 /// Grace period before force-killing an ACP process (ms).
@@ -498,8 +513,14 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                 self.runtime.emit_finish(None);
             }
             Err(err) => {
-                warn!(error = %ErrorChain(err), "ACP send_message failed");
-                self.runtime.emit_error(err.to_string());
+                let augmented = self.augment_with_stderr(err).await;
+                if let Some(d) = augmented.as_deref() {
+                    warn!(error = %ErrorChain(err), augmented = %d, "ACP send_message failed");
+                } else {
+                    warn!(error = %ErrorChain(err), "ACP send_message failed");
+                }
+                let payload = augmented.unwrap_or_else(|| user_facing_message(err));
+                self.runtime.emit_error(payload);
             }
         }
         result
@@ -593,5 +614,156 @@ impl AcpAgentManager {
 
         self.permission_router
             .confirm(call_id, option_id, &self.params.conversation_id)
+    }
+}
+
+impl AcpAgentManager {
+    /// If `err` is the "SDK gave us default Internal error with no data" shape,
+    /// peek the child's recent stderr and try to surface a more informative
+    /// message. Returns `None` when augmentation does not apply or finds nothing.
+    ///
+    /// Why string-matching: `AppError::BadGateway(String)` has discarded the
+    /// structured `AcpError` by the time we see it. The default-message
+    /// signature is narrow and stable enough that matching on the inner string
+    /// is cheaper than threading typed errors through the manager API. Keep
+    /// this in sync with `AcpError::Display` in
+    /// `crates/aionui-ai-agent/src/protocol/error.rs` if its fallback wording
+    /// changes.
+    async fn augment_with_stderr(&self, err: &AppError) -> Option<String> {
+        const SDK_DEFAULT_BAD_GATEWAY_PREFIX: &str = "Bad gateway: Agent internal error (code ";
+        /// How many trailing stderr lines we hand to the extractor.
+        /// 32 lines is well below the 8 KiB ring-buffer cap and comfortably
+        /// covers a tracing event with its preceding context.
+        const STDERR_PEEK_LINES: usize = 32;
+
+        let display = err.to_string();
+        // Match the Display produced by Task 1 for `AgentInternal` whenever the
+        // SDK gave us its default "Internal error" message — with or without
+        // `data`. When `data=Some`, Display ends in ") ({json})" which still
+        // satisfies `ends_with(')')`, so we augment in that case too. That is
+        // intentional: stderr context is generally more user-friendly than the
+        // raw `data` JSON, and the operator log retains both via `ErrorChain`.
+        // Examples that match:  "Bad gateway: Agent internal error (code -32603)"
+        //                       "Bad gateway: Agent internal error (code -32099)"
+        // Do NOT match anything that has a real upstream message after the prefix.
+        let is_default_internal = display.starts_with(SDK_DEFAULT_BAD_GATEWAY_PREFIX) && display.ends_with(')');
+        if !is_default_internal {
+            return None;
+        }
+
+        // Read the last STDERR_PEEK_LINES lines of the child's stderr (cheap;
+        // ring buffer is bounded to 8 KiB ≈ a few hundred lines max).
+        let tail = self.process.peek_stderr_tail(STDERR_PEEK_LINES).await;
+        super::stderr_error_extractor::extract_error_message(&tail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_facing_message;
+    use aionui_common::AppError;
+
+    #[test]
+    fn strips_bad_gateway_prefix() {
+        let err = AppError::BadGateway("API Error: Internal server error".into());
+        assert_eq!(user_facing_message(&err), "API Error: Internal server error");
+    }
+
+    #[test]
+    fn strips_not_found_prefix() {
+        let err = AppError::NotFound("user 42".into());
+        assert_eq!(user_facing_message(&err), "user 42");
+    }
+
+    #[test]
+    fn rate_limited_has_no_colon_returns_full_string() {
+        let err = AppError::RateLimited;
+        assert_eq!(user_facing_message(&err), "Rate limited");
+    }
+
+    #[test]
+    fn nested_colons_only_strip_first() {
+        // "Bad gateway: Internal error: API Error: ..." → keep everything after the first ": "
+        let err = AppError::BadGateway("Internal error: API Error: Internal server error".into());
+        assert_eq!(
+            user_facing_message(&err),
+            "Internal error: API Error: Internal server error"
+        );
+    }
+
+    // ---- augment_with_stderr behavioral tests ------------------------------
+    //
+    // We can't easily construct a real AcpAgentManager in a unit test (it
+    // needs the full ACP plumbing). Instead we test the *composition* of
+    // Task 3's peek_stderr_tail + Task 4's extract_error_message + this
+    // task's "SDK default Display" shape detection by spawning a real
+    // CliAgentProcess that writes the chosen stderr, then running the same
+    // detection+peek+extract pipeline against it.
+    //
+    // The helper below MIRRORS `AcpAgentManager::augment_with_stderr`. If
+    // you change the production helper (e.g. the prefix string, peek line
+    // count, or extractor module path) update this helper to match.
+
+    use super::CliAgentProcess;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn spawn_with_stderr(stderr_payload: &str) -> Arc<CliAgentProcess> {
+        use aionui_common::CommandSpec;
+        // Heredoc lets us embed apostrophes etc. without quoting headaches.
+        let script = format!("cat <<'EOF' >&2\n{stderr_payload}\nEOF");
+        let config = CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            env: vec![],
+            cwd: None,
+        };
+        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), proc.wait_for_exit())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Arc::new(proc)
+    }
+
+    async fn augment_via_process(proc: &Arc<CliAgentProcess>, err: &AppError) -> Option<String> {
+        const SDK_DEFAULT_BAD_GATEWAY_PREFIX: &str = "Bad gateway: Agent internal error (code ";
+        let display = err.to_string();
+        let is_default_internal = display.starts_with(SDK_DEFAULT_BAD_GATEWAY_PREFIX) && display.ends_with(')');
+        if !is_default_internal {
+            return None;
+        }
+        // Mirror the production STDERR_PEEK_LINES (32). If you change one, change both.
+        let tail = proc.peek_stderr_tail(32).await;
+        super::super::stderr_error_extractor::extract_error_message(&tail)
+    }
+
+    #[tokio::test]
+    async fn augments_when_codex_usage_limit_in_stderr() {
+        let stderr = "\u{1b}[2m2026-05-13T20:01:21Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m codex_acp::thread: Unhandled error during turn: You've hit your usage limit. Try again later. Some(UsageLimitExceeded)";
+        let proc = spawn_with_stderr(stderr).await;
+        let err = AppError::BadGateway("Agent internal error (code -32603)".into());
+
+        let augmented = augment_via_process(&proc, &err).await;
+        let msg = augmented.expect("must augment when stderr matches allowlist");
+        assert!(msg.to_lowercase().contains("usage limit"), "got {msg}");
+    }
+
+    #[tokio::test]
+    async fn does_not_augment_when_message_is_specific() {
+        // 1BF case: SDK already gave us a real message → don't second-guess.
+        let proc = spawn_with_stderr("ERROR something: usage limit exceeded").await;
+        let err = AppError::BadGateway("Internal error: API Error: Internal server error".into());
+
+        assert!(augment_via_process(&proc, &err).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_stderr_has_no_allowlisted_keywords() {
+        let stderr = "ERROR widget_loader: failed to load module 'foo'";
+        let proc = spawn_with_stderr(stderr).await;
+        let err = AppError::BadGateway("Agent internal error (code -32603)".into());
+
+        assert!(augment_via_process(&proc, &err).await.is_none());
     }
 }

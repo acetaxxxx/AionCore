@@ -200,6 +200,34 @@ impl CliAgentProcess {
         let mut buf = self.stderr_buffer.lock().await;
         std::mem::take(&mut *buf)
     }
+
+    /// Peek the last `max_lines` newline-delimited lines from the stderr ring
+    /// buffer **without draining**.
+    ///
+    /// Used by error-augmentation paths (`AcpAgentManager::send_message`) that
+    /// need to surface tracing-level error context the SDK didn't include in
+    /// its JSON-RPC response. Returns an owned `String`; the buffer lock is
+    /// held for the duration of this call (microseconds at the bounded sizes
+    /// we read) and dropped before the result is returned.
+    ///
+    /// `max_lines == 0` returns an empty string. The returned string has no
+    /// trailing newline — the caller may append one if they want.
+    #[allow(dead_code)] // Called by error-augmentation path in AcpAgentManager::send_message (Task 5)
+    pub async fn peek_stderr_tail(&self, max_lines: usize) -> String {
+        if max_lines == 0 {
+            return String::new();
+        }
+        let buf = self.stderr_buffer.lock().await;
+        let trimmed = buf.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        // `rsplit('\n')` walks lines from the end. Take up to `max_lines`,
+        // then re-collect into the original top-to-bottom order.
+        let mut tail: Vec<&str> = trimmed.rsplit('\n').take(max_lines).collect();
+        tail.reverse();
+        tail.join("\n")
+    }
 }
 
 #[cfg(test)]
