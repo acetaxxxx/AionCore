@@ -55,7 +55,9 @@ async fn fixture_embedded() -> Fixture {
         .expect("failed to materialize embedded builtin skills for test fixture");
 
     let db = init_database_memory().await.unwrap();
-    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default()).await.unwrap();
+    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
+        .await
+        .unwrap();
     let (mut states, _): (ModuleStates, _) = build_module_states(&services).await;
 
     // Replace the skill state with a deterministic one rooted at tmp.
