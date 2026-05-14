@@ -567,6 +567,7 @@ async fn setup_with_conv_repo() -> (
         conv_service,
         busy_guard,
         data_dir.clone(),
+        data_dir.clone(),
         bc.clone() as Arc<dyn EventBroadcaster>,
         agent_registry,
     ));

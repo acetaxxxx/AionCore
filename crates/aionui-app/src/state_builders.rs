@@ -156,7 +156,7 @@ pub fn build_conversation_state(
         services.skill_paths.clone(),
     ));
     let conversation_service = ConversationService::new(
-        services.data_dir.clone(),
+        services.work_dir.clone(),
         services.event_bus.clone(),
         skill_resolver,
         services.worker_task_manager.clone(),
@@ -293,7 +293,7 @@ pub async fn build_channel_state(
         aionui_db::SqliteAcpSessionRepository::new(services.database.pool().clone()),
     );
     let conversation_svc = Arc::new(ConversationService::new(
-        services.data_dir.clone(),
+        services.work_dir.clone(),
         services.event_bus.clone(),
         skill_resolver,
         services.worker_task_manager.clone(),
@@ -368,7 +368,7 @@ pub fn build_team_state(
         services.skill_paths.clone(),
     ));
     let conv_service = ConversationService::new(
-        services.data_dir.clone(),
+        services.work_dir.clone(),
         services.event_bus.clone(),
         skill_resolver,
         services.worker_task_manager.clone(),
@@ -406,7 +406,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         services.skill_paths.clone(),
     ));
     let conv_service = ConversationService::new(
-        services.data_dir.clone(),
+        services.work_dir.clone(),
         services.event_bus.clone(),
         skill_resolver,
         services.worker_task_manager.clone(),
@@ -421,6 +421,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         conv_repo,
         Arc::new(conv_service.clone()),
         busy_guard,
+        services.work_dir.clone(),
         services.data_dir.clone(),
         services.event_bus.clone(),
         services.agent_registry.clone(),
@@ -568,6 +569,7 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
 mod tests {
     use super::*;
 
+    use crate::AppConfig;
     use aionui_extension::{ExtensionSource, ScanPath};
 
     #[tokio::test]
@@ -592,10 +594,13 @@ mod tests {
         .unwrap();
 
         let db = aionui_db::init_database_memory().await.unwrap();
-        let services =
-            AppServices::from_database_with_data_dir_and_app_version(db, data_dir, false, "2.1.0".to_string())
-                .await
-                .unwrap();
+        let config = AppConfig {
+            data_dir: data_dir.clone(),
+            work_dir: data_dir,
+            app_version: "2.1.0".to_string(),
+            ..Default::default()
+        };
+        let services = AppServices::from_config(db, &config).await.unwrap();
 
         let (ext_state, _hub_state, _skill_state) = build_extension_states(&services).await;
         ext_state

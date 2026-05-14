@@ -22,7 +22,7 @@ use tower::ServiceExt;
 
 use common::{body_json, get_request, json_with_token, setup_and_login};
 
-use aionui_app::{AppServices, build_module_states, create_router_with_states};
+use aionui_app::{AppConfig, AppServices, build_module_states, create_router_with_states};
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService, StarOfficeDetector,
 };
@@ -44,9 +44,12 @@ async fn build_office_app_with_roots(
     let data_dir = tmp.path().to_path_buf();
 
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_database_with_data_dir(db, data_dir, false)
-        .await
-        .unwrap();
+    let config = AppConfig {
+        data_dir: data_dir.clone(),
+        work_dir: data_dir,
+        ..Default::default()
+    };
+    let services = AppServices::from_config(db, &config).await.unwrap();
     let (mut states, _) = build_module_states(&services).await;
 
     states.office = build_test_office_state(tmp.path(), allowed_roots);

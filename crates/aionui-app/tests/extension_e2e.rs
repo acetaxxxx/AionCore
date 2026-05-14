@@ -5,7 +5,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use aionui_app::{AppServices, build_module_states, create_router_with_states, derive_encryption_key};
+use aionui_app::{AppConfig, AppServices, build_module_states, create_router_with_states, derive_encryption_key};
 use aionui_common::{decrypt_string, now_ms};
 use aionui_db::{IChannelRepository, SqliteChannelRepository};
 use aionui_extension::{ExtensionSource, ScanPath};
@@ -150,14 +150,14 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
 
 async fn build_app_with_extension_root(ext_root: &std::path::Path) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_database_with_data_dir_and_app_version(
-        db,
-        ext_root.join("..").join("data"),
-        false,
-        "1.0.0".to_string(),
-    )
-    .await
-    .unwrap();
+    let data_dir = ext_root.join("..").join("data");
+    let config = AppConfig {
+        data_dir: data_dir.clone(),
+        work_dir: data_dir,
+        app_version: "1.0.0".to_string(),
+        ..Default::default()
+    };
+    let services = AppServices::from_config(db, &config).await.unwrap();
     let (states, _) = build_module_states(&services).await;
     states
         .extension
