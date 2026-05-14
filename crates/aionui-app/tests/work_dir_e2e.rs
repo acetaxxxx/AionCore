@@ -1,7 +1,7 @@
 //! Integration tests verifying that --work-dir is used for conversation workspace creation.
 
-use aionui_app::{AppConfig, AppServices, build_conversation_state};
 use aionui_api_types::CreateConversationRequest;
+use aionui_app::{AppConfig, AppServices, build_conversation_state};
 use aionui_common::AgentType;
 
 #[tokio::test]

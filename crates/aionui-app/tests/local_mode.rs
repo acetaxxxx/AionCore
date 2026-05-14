@@ -34,7 +34,9 @@ async fn test_local_mode_skips_auth() {
 #[tokio::test]
 async fn test_non_local_mode_requires_auth() {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default()).await.unwrap();
+    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
+        .await
+        .unwrap();
 
     let router = aionui_app::create_router(&services).await;
 
