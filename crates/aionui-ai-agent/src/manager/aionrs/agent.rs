@@ -14,7 +14,7 @@ use aionui_common::{
     AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms,
 };
 use serde_json::Value;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 use tracing::{debug, error, info};
 
 use crate::agent_runtime::AgentRuntime;
@@ -35,6 +35,9 @@ pub struct AionrsAgentManager {
     mcp_managers: Vec<Arc<McpManager>>,
     approval_manager: Arc<ToolApprovalManager>,
     confirmations: Arc<std::sync::RwLock<Vec<Confirmation>>>,
+    /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
+    /// `tokio::select!` in `send_message()`.
+    cancel_notify: Arc<Notify>,
 }
 
 impl Drop for AionrsAgentManager {
@@ -142,6 +145,7 @@ impl AionrsAgentManager {
             mcp_managers: result.mcp_managers,
             approval_manager,
             confirmations,
+            cancel_notify: Arc::new(Notify::new()),
         })
     }
 }
@@ -183,25 +187,32 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
 
         let mut engine = self.engine.lock().await;
-        let result = engine.run(&data.content, &data.msg_id).await;
+
+        let result = tokio::select! {
+            res = engine.run(&data.content, &data.msg_id) => Some(res),
+            _ = self.cancel_notify.notified() => {
+                info!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    "Aionrs engine.run() cancelled by user"
+                );
+                None
+            }
+        };
 
         let elapsed_ms = now_ms() - started_at;
-
         self.runtime.bump_activity();
 
         match result {
-            Ok(_) => {
+            Some(Ok(_)) => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
                     "Aionrs engine.run() completed, emitting Finish"
                 );
-                // AgentEngine.run() does not call emit_stream_end(), so we must
-                // send the Finish event ourselves to unblock StreamRelay.
                 self.runtime.emit_finish(None);
                 Ok(())
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 let error_msg = format!("Aionrs agent error: {e}");
                 error!(
                     conversation_id = %self.runtime.conversation_id(),
@@ -212,6 +223,10 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
                 self.runtime.emit_error(error_msg.clone());
                 self.runtime.emit_finish(None);
                 Err(AppError::Internal(error_msg))
+            }
+            None => {
+                // Cancelled — Finish already emitted by cancel()
+                Ok(())
             }
         }
     }
@@ -230,6 +245,8 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
                 code: None,
             }));
         self.runtime.emit_finish(None);
+        // Signal the tokio::select! in send_message() to drop engine.run()
+        self.cancel_notify.notify_waiters();
         Ok(())
     }
 
