@@ -413,7 +413,8 @@ impl AgentInstance {
     pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AppError> {
         match self {
             Self::Acp(m) => m.load_slash_commands().await,
-            Self::Aionrs(_) | Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Ok(Vec::new()),
+            Self::Aionrs(m) => m.get_slash_commands().await,
+            Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Ok(Vec::new()),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_slash_commands().await,
         }

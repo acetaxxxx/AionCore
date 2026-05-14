@@ -334,6 +334,15 @@ impl AionrsAgentManager {
         );
         Ok(())
     }
+
+    pub async fn get_slash_commands(&self) -> Result<Vec<aionui_api_types::SlashCommandItem>, AppError> {
+        let engine = self.engine.lock().await;
+        Ok(engine
+            .slash_command_list()
+            .into_iter()
+            .map(|(command, description)| aionui_api_types::SlashCommandItem { command, description })
+            .collect())
+    }
 }
 
 fn parse_session_mode(s: &str) -> SessionMode {
