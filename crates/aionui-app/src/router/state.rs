@@ -66,11 +66,26 @@ pub struct ModuleStates {
     pub assistant: AssistantRouterState,
 }
 
-fn default_allowed_roots() -> Vec<std::path::PathBuf> {
-    vec![
+fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![
         std::env::temp_dir(),
         dirs::home_dir().unwrap_or_else(std::env::temp_dir),
-    ]
+    ];
+    // Auto-provisioned per-conversation workspaces live under
+    // `{work_dir}/conversations/{label}-temp-{id}/`. On Windows the
+    // operator may put `work_dir` on a separate drive (e.g. `X:\AionUi`)
+    // that's neither under `temp_dir` nor `home_dir`, which previously
+    // caused `/api/fs/list` to 403 every Hermes-mode session
+    // (ELECTRON-1BT). Including `work_dir` keeps temp + custom-on-drive
+    // workspaces on the allowlist without widening the sandbox to
+    // unrelated paths.
+    if let Some(wd) = work_dir
+        && !wd.as_os_str().is_empty()
+        && !roots.iter().any(|r| r == wd)
+    {
+        roots.push(wd.to_path_buf());
+    }
+    roots
 }
 /// Components needed to start the channel orchestrator.
 ///
@@ -238,7 +253,7 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 /// Build the default `FileRouterState` from application services.
 pub fn build_file_state(services: &AppServices) -> FileRouterState {
     let broadcaster = services.event_bus.clone();
-    let allowed_roots = default_allowed_roots();
+    let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
     let browse_roots = aionui_file::browse::default_browse_roots();
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
     let watch_service = Arc::new(FileWatchService::new(broadcaster).expect("file watch service initialization"));
@@ -512,7 +527,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
 /// Build the default `OfficeRouterState` from application services.
 pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let data_dir = services.data_dir.as_path();
-    let allowed_roots = default_allowed_roots();
+    let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
 
     let spawner: Arc<dyn aionui_office::ProcessSpawner> = Arc::new(aionui_office::DefaultProcessSpawner);
     let watch_manager = Arc::new(OfficecliWatchManager::new(spawner, services.event_bus.clone()));

@@ -8,6 +8,7 @@ use crate::manager::acp::{
     AcpSession, AcpSessionEvent, ModelIdentityReminderHook, PermissionRouter, SessionNewPreludeHook,
 };
 use crate::protocol::acp::AcpProtocol;
+use crate::protocol::error::AcpError;
 use crate::protocol::events::AgentStreamEvent;
 use crate::registry::CatalogSender;
 use crate::shared_kernel::{ModeId, ModelId, SessionId as DomainSessionId};
@@ -44,6 +45,29 @@ use super::mode_normalize::normalize_requested_mode;
 
 /// Grace period before force-killing an ACP process (ms).
 const ACP_KILL_GRACE_MS: u64 = 500;
+
+/// Decompose a child `ExitStatus` (or its absence) into the
+/// `(exit_code, signal)` pair that `AcpError::StartupCrash` /
+/// `AcpError::Disconnected` carry.
+///
+/// `None` ⇒ wait failed; we have no actionable info to pass on.
+/// On Unix, terminating signals surface via `ExitStatusExt::signal()`; the
+/// numeric value is rendered as `Some("signal:N")`. On Windows there are no
+/// POSIX signals, so `signal` stays `None` and the upstream exit code is the
+/// only diagnostic.
+fn exit_status_parts(exit: Option<std::process::ExitStatus>) -> (Option<i32>, Option<String>) {
+    let Some(status) = exit else {
+        return (None, None);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return (status.code(), Some(format!("signal:{sig}")));
+        }
+    }
+    (status.code(), None)
+}
 
 fn confirm_option_id(data: &Value) -> Option<String> {
     match data {
@@ -171,16 +195,36 @@ impl AcpAgentManager {
         let (permission_tx, permission_rx) = mpsc::channel(32);
         let runtime = AgentRuntime::new(params.conversation_id.clone(), params.workspace.path.clone(), 256);
 
-        let protocol = AcpProtocol::connect(stdin, stdout, runtime.event_sender(), permission_tx, notification_tx)
-            .await
-            .map_err(|e| {
+        // Race the handshake against process exit. The SDK's stdout EOF
+        // detection can lag (observed: 30s on Windows when the agent dies
+        // 70ms in — ELECTRON-1BT), so we explicitly watch the child. If
+        // it dies before init completes, surface a `StartupCrash` carrying
+        // the buffered stderr instead of waiting out the timeout.
+        let connect_fut = AcpProtocol::connect(stdin, stdout, runtime.event_sender(), permission_tx, notification_tx);
+        tokio::pin!(connect_fut);
+        let protocol = tokio::select! {
+            biased;
+            exit = process.wait_for_exit() => {
+                let stderr = process.peek_stderr_tail(64).await;
+                let (exit_code, signal) = exit_status_parts(exit);
+                error!(
+                    conversation_id = %params.conversation_id,
+                    exit_code = ?exit_code,
+                    signal = ?signal,
+                    stderr = %stderr,
+                    "Agent process exited before ACP handshake completed"
+                );
+                return Err(AppError::from(AcpError::StartupCrash { exit_code, signal, stderr }));
+            }
+            res = &mut connect_fut => res.map_err(|e| {
                 error!(
                     conversation_id = %params.conversation_id,
                     error = %ErrorChain(&e),
                     "Failed to establish ACP protocol connection"
                 );
                 AppError::from(e)
-            })?;
+            })?,
+        };
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));
 
         let snapshot = params.session_snapshot.as_ref();
@@ -686,8 +730,26 @@ impl AcpAgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::user_facing_message;
+    use super::{exit_status_parts, user_facing_message};
     use aionui_common::AppError;
+
+    #[test]
+    fn exit_status_parts_handles_missing_status() {
+        assert_eq!(exit_status_parts(None), (None, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_status_parts_extracts_unix_exit_code() {
+        // ExitStatus::from_raw is the only stable constructor. On Unix the
+        // low 8 bits are the signal; bits 8..15 are the exit code when the
+        // process exited normally.
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(1 << 8); // exit 1
+        let (code, signal) = exit_status_parts(Some(status));
+        assert_eq!(code, Some(1));
+        assert_eq!(signal, None);
+    }
 
     #[test]
     fn strips_bad_gateway_prefix() {
