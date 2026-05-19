@@ -58,6 +58,18 @@ pub(crate) enum AcpError {
     InitTimeout { timeout_secs: u64 },
 }
 
+/// Format the human-readable suffix for `StartupCrash` / `Disconnected`.
+/// stderr is deliberately omitted — see the `From<AcpError> for AppError`
+/// security note.
+fn format_exit_detail(exit_code: Option<i32>, signal: Option<&str>) -> String {
+    match (exit_code, signal) {
+        (Some(code), Some(sig)) => format!(" (exit code {code}, {sig})"),
+        (Some(code), None) => format!(" (exit code {code})"),
+        (None, Some(sig)) => format!(" ({sig})"),
+        (None, None) => String::new(),
+    }
+}
+
 /// JSON-RPC default message strings that carry no useful information.
 /// When `AgentInternal` arrives with one of these as its `message`, we fall
 /// back to a diagnostic display ("Agent internal error (code -32603)").
@@ -81,13 +93,12 @@ impl std::fmt::Display for AcpError {
             }
             AcpError::StartupCrash { exit_code, signal, .. } => {
                 // stderr intentionally NOT included — may carry secrets.
-                write!(
-                    f,
-                    "Agent process exited during startup (exit={exit_code:?}, signal={signal:?})"
-                )
+                let detail = format_exit_detail(*exit_code, signal.as_deref());
+                write!(f, "Agent process exited before initialize handshake completed{detail}")
             }
             AcpError::Disconnected { exit_code, signal, .. } => {
-                write!(f, "Agent process disconnected (exit={exit_code:?}, signal={signal:?})")
+                let detail = format_exit_detail(*exit_code, signal.as_deref());
+                write!(f, "Agent process disconnected{detail}")
             }
             AcpError::AuthRequired => f.write_str("Authentication required"),
             AcpError::SessionNotFound { session_id } => {
@@ -374,6 +385,44 @@ mod tests {
             !display.contains("SUPER SECRET"),
             "Display should not leak stderr: {display}"
         );
+    }
+
+    #[test]
+    fn startup_crash_display_includes_exit_code() {
+        let err = AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: String::new(),
+        };
+        let display = err.to_string();
+        assert!(display.contains("exit code 1"), "got {display}");
+        assert!(
+            display.contains("before initialize handshake"),
+            "must explain when in lifecycle the crash happened; got {display}"
+        );
+    }
+
+    #[test]
+    fn startup_crash_display_omits_detail_when_unknown() {
+        let err = AcpError::StartupCrash {
+            exit_code: None,
+            signal: None,
+            stderr: String::new(),
+        };
+        let display = err.to_string();
+        assert!(!display.contains("None"), "must not surface raw `None`; got {display}");
+        assert!(!display.contains("()"), "must not produce empty parens; got {display}");
+    }
+
+    #[test]
+    fn disconnected_display_includes_signal_when_present() {
+        let err = AcpError::Disconnected {
+            exit_code: None,
+            signal: Some("signal:9".into()),
+            stderr: String::new(),
+        };
+        let display = err.to_string();
+        assert!(display.contains("signal:9"), "got {display}");
     }
 
     #[test]
