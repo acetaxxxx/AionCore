@@ -39,7 +39,7 @@ use aionui_common::ErrorChain;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{self as stream_event, AgentStreamEvent};
@@ -228,7 +228,7 @@ impl AcpProtocol {
         if !self.is_connected() {
             return;
         }
-        log_notify(AGENT_METHOD_NAMES.session_cancel, &json_str(&notification));
+        log_client_notify(AGENT_METHOD_NAMES.session_cancel, &json_str(&notification));
         let _ = self.connection.send_notification(notification);
     }
 
@@ -283,7 +283,7 @@ impl AcpProtocol {
             return;
         }
         let method = format!("_{}", notification.method);
-        log_notify(&method, &json_str(&notification));
+        log_client_notify(&method, &json_str(&notification));
         let wrapped = ClientNotification::ExtNotification(notification);
         let _ = self.connection.send_notification(wrapped);
     }
@@ -302,9 +302,9 @@ impl AcpProtocol {
         Req::Response: serde::Serialize + std::fmt::Debug + Send,
     {
         self.ensure_connected()?;
-        log_request(method, &json_str(&req));
+        log_client_request(method, &json_str(&req));
         let rsp = self.connection.send_request(req).block_task().await;
-        log_response(method, &json_or_err(&rsp));
+        log_agent_response(method, &json_or_err(&rsp));
         rsp.map_err(|e| AcpError::from_sdk(e, method))
     }
 
@@ -422,9 +422,9 @@ async fn run_sdk_background(
             // to call `block_task` (see SDK `connect_with` doc example).
             let init_result = {
                 let req = InitializeRequest::new(ProtocolVersion::LATEST);
-                log_request("initialize", &json_str(&req));
+                log_client_request("initialize", &json_str(&req));
                 let raw = connection.send_request(req).block_task().await;
-                log_response("initialize", &json_or_err(&raw));
+                log_agent_response("initialize", &json_or_err(&raw));
                 raw.map_err(|e| AcpError::from_sdk(e, "initialize"))
             };
 
@@ -473,7 +473,7 @@ async fn handle_session_notification(
     notification: SessionNotification,
     event_tx: &broadcast::Sender<AgentStreamEvent>,
 ) {
-    log_incoming("session/update", &json_str(&notification));
+    log_agent_notify("session/update", &json_str(&notification));
 
     let events = stream_event::session_notification_to_events(&notification);
     for event in events {
@@ -493,7 +493,7 @@ async fn handle_permission_request(
     responder: Responder<RequestPermissionResponse>,
     event_tx: &mpsc::Sender<PermissionRequest>,
 ) {
-    log_incoming("session/request_permission", &json_str(&request));
+    log_agent_request("session/request_permission", &json_str(&request));
 
     let (response_tx, response_rx) = oneshot::channel();
 
@@ -512,7 +512,7 @@ async fn handle_permission_request(
         }
     };
 
-    log_outgoing("session/request_permission", &json_str(&response));
+    log_client_response("session/request_permission", &json_str(&response));
     let _ = responder.respond(response);
 }
 
@@ -529,29 +529,75 @@ fn json_or_err<T: serde::Serialize + std::fmt::Debug, E: std::fmt::Debug>(result
     }
 }
 
-/// Log an outgoing ACP request (`→`).
-fn log_request(method: &str, body: &str) {
-    debug!("[ACP] {method} ->\n -> {body}");
+/// Returns `true` when the `session/update` notification body carries a
+/// piece of the prompt-reply stream (high-frequency, high-volume content).
+///
+/// Unknown / new `sessionUpdate` kinds default to `false` so newly added
+/// metadata events stay visible at `info!` until explicitly classified.
+fn is_streaming_chunk(body: &str) -> bool {
+    // Streaming chunks of the prompt reply: token-level message / thought
+    // text, and the incremental tool_call / plan structures the agent emits
+    // mid-response. Their `_update` siblings are part of the same stream.
+    const STREAMING_KINDS: &[&str] = &[
+        "agent_message_chunk",
+        "agent_thought_chunk",
+        "user_message_chunk",
+        "tool_call",
+        "tool_call_update",
+        "plan",
+    ];
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let kind = value
+        .pointer("/update/sessionUpdate")
+        .and_then(serde_json::Value::as_str);
+    matches!(kind, Some(k) if STREAMING_KINDS.contains(&k))
 }
 
-/// Log an incoming ACP response (`←`).
-fn log_response(method: &str, body: &str) {
-    debug!("[ACP] {method} <-\n <- {body}");
+/// Log a JSON-RPC request from AionUi to the ACP agent.
+/// `session/prompt` carries large user input and stays at debug.
+fn log_client_request(method: &str, body: &str) {
+    if method == "session/prompt" {
+        debug!(direction = "client_request", method, body, "[ACP]");
+    } else {
+        info!(direction = "client_request", method, body, "[ACP]");
+    }
 }
 
-/// Log a fire-and-forget notification (`⚡`).
-fn log_notify(method: &str, body: &str) {
-    debug!("[ACP] {method} ⚡⚡\n ⚡⚡ {body}");
+/// Log a JSON-RPC response from the ACP agent.
+/// `session/prompt` reply is large; stays at debug.
+fn log_agent_response(method: &str, body: &str) {
+    if method == "session/prompt" {
+        debug!(direction = "agent_response", method, body, "[ACP]");
+    } else {
+        info!(direction = "agent_response", method, body, "[ACP]");
+    }
 }
 
-/// Log an incoming agent notification/request (`←`).
-fn log_incoming(method: &str, body: &str) {
-    debug!("[ACP] {method} <-\n <- {body}");
+/// Log a fire-and-forget notification from AionUi to the agent.
+fn log_client_notify(method: &str, body: &str) {
+    info!(direction = "client_notify", method, body, "[ACP]");
 }
 
-/// Log an outgoing agent notification/request (`→`).
-fn log_outgoing(method: &str, body: &str) {
-    debug!("[ACP] {method} ->\n -> {body}");
+/// Log an inbound notification from the agent.
+/// `session/update` requires per-kind filtering — streaming chunks stay at debug.
+fn log_agent_notify(method: &str, body: &str) {
+    if method == "session/update" && is_streaming_chunk(body) {
+        debug!(direction = "agent_notify", method, body, "[ACP]");
+    } else {
+        info!(direction = "agent_notify", method, body, "[ACP]");
+    }
+}
+
+/// Log an inbound request from the agent (e.g. session/request_permission).
+fn log_agent_request(method: &str, body: &str) {
+    info!(direction = "agent_request", method, body, "[ACP]");
+}
+
+/// Log a JSON-RPC response from AionUi back to the agent.
+fn log_client_response(method: &str, body: &str) {
+    info!(direction = "client_response", method, body, "[ACP]");
 }
 
 impl std::fmt::Debug for AcpProtocol {
@@ -614,5 +660,82 @@ mod tests {
         let seen_during = simulated_load(&flag, Arc::clone(&flag_probe)).await;
         assert!(seen_during, "flag should be true inside guarded scope");
         assert!(!flag.load(Ordering::Acquire), "flag should be false after guard drop");
+    }
+
+    #[test]
+    fn log_agent_notify_filters_streaming_chunks_at_info_level() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing::Level;
+        use tracing_subscriber::fmt;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(Level::INFO)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_agent_notify(
+                "session/update",
+                r#"{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk"}}"#,
+            );
+            log_agent_notify(
+                "session/update",
+                r#"{"sessionId":"s1","update":{"sessionUpdate":"current_mode_update","modeId":"yolo"}}"#,
+            );
+        });
+
+        let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            !captured.contains("agent_message_chunk"),
+            "streaming chunk should NOT appear at info level: {captured}"
+        );
+        assert!(
+            captured.contains("current_mode_update"),
+            "non-streaming update should appear at info level: {captured}"
+        );
+        assert!(
+            captured.contains("agent_notify"),
+            "structured `direction` field should be `agent_notify`: {captured}"
+        );
+        assert!(
+            captured.contains("session/update"),
+            "structured `method` field should be present: {captured}"
+        );
+    }
+
+    #[test]
+    fn is_streaming_chunk_recognises_prompt_stream_kinds() {
+        // SDK delivers `params` already unwrapped — `body` here mirrors what
+        // the log helpers receive: the JSON-RPC params object with `sessionId`
+        // and `update` at the top level.
+        let body_chunk = r#"{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}"#;
+        let mode_update = r#"{"sessionId":"s1","update":{"sessionUpdate":"current_mode_update","modeId":"yolo"}}"#;
+        let unknown = r#"{"sessionId":"s1","update":{"sessionUpdate":"future_unknown_kind"}}"#;
+        let malformed = "not json";
+
+        assert!(is_streaming_chunk(body_chunk));
+        assert!(!is_streaming_chunk(mode_update));
+        assert!(!is_streaming_chunk(unknown), "unknown kinds default to keep");
+        assert!(!is_streaming_chunk(malformed), "malformed bodies default to keep");
     }
 }
