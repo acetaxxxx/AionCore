@@ -470,15 +470,30 @@ impl JobExecutor {
         saved_skill: Option<&SavedSkillContext>,
     ) -> ExecutionResult {
         let agent_type = parse_agent_type(&self.agent_registry, &job.agent_type).await;
-        // `BuildTaskOptions.model` is non-optional; non-aionrs agent types
-        // ignore it in their factory branches, so a blank placeholder is the
-        // canonical empty value (mirrors `ConversationService::build_task_options`
-        // for rows with NULL `model`).
-        let model = resolve_model(job).unwrap_or_else(|| ProviderWithModel {
-            provider_id: String::new(),
-            model: String::new(),
-            use_model: None,
-        });
+        // The interactive `send_message` path resolves the model by parsing
+        // `conversation.model` via
+        // `aionui_conversation::task_options::provider_model_from_conversation_row`.
+        // Cron routes through the same helper so that an aionrs job whose
+        // cached `agent_config.backend` is a stale vendor label (`"aionrs"`)
+        // cannot reach the factory and raise `Provider 'aionrs' not found`
+        // (Sentry ELECTRON-1HM). `resolve_conversation` (called by
+        // `execute`/`execute_prepared` before this method runs) guarantees
+        // the row exists, so `Ok(None)` only fires on a delete racing the
+        // executor — we fall back to the canonical empty sentinel, which
+        // matches what the helper itself returns for unparseable rows.
+        let model = match self.get_conversation_row(conversation_id).await {
+            Ok(Some(row)) => aionui_conversation::task_options::provider_model_from_conversation_row(&row),
+            Ok(None) => aionui_conversation::task_options::empty_provider_model(),
+            Err(e) => {
+                error!(
+                    job_id = %job.id,
+                    conversation_id,
+                    error = %e,
+                    "Failed to load conversation row for cron model resolution"
+                );
+                return ExecutionResult::Error { message: e.to_string() };
+            }
+        };
         let workspace = match self.resolve_execution_workspace(job, conversation_id).await {
             Ok(workspace) => workspace,
             Err(e) => {
