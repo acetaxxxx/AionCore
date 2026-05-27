@@ -1,19 +1,19 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentInstance, IWorkerTaskManager};
+use aionui_ai_agent::{ConnectorError, IAgentConnector, IAgentConnectorFactory};
 
 use crate::response_middleware::ICronService;
 use aionui_api_types::{
     ApprovalCheckResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationArtifactStatus, ConversationListResponse, ConversationResponse, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage,
+    ConversationArtifactStatus, ConversationListResponse, ConversationResponse, ConversationStatus,
+    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
-    AgentType, AppError, ConversationSource, ConversationStatus, ErrorChain, OnConversationDelete, PaginatedResult,
+    AgentKillReason, AgentType, AppError, ConversationSource, ErrorChain, OnConversationDelete, PaginatedResult,
     generate_short_id, now_ms,
 };
 use aionui_db::models::MessageRow;
@@ -24,6 +24,8 @@ use aionui_db::{
 use aionui_realtime::EventBroadcaster;
 use tracing::{debug, error, info, warn};
 
+use crate::conv_actor::ConvActor;
+use crate::conv_service_trait::ConversationStatus as ConvConversationStatus;
 use crate::convert::{
     row_to_artifact_response, row_to_message_response, row_to_response, row_to_response_with_extra, search_row_to_item,
     string_to_enum,
@@ -31,18 +33,17 @@ use crate::convert::{
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::stream_relay::StreamRelay;
+use dashmap::DashMap;
 use std::sync::RwLock;
-
-const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
 
 #[derive(Clone)]
 pub struct ConversationService {
     workspace_root: std::path::PathBuf,
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
-    task_manager: Arc<dyn IWorkerTaskManager>,
+    connector_factory: Arc<dyn IAgentConnectorFactory>,
     /// Hooks invoked at the end of `delete()` so other services
-    /// (`WorkerTaskManagerImpl`, `CronService`, …) can clean up their
+    /// (`ConnectorFactory`, `CronService`, …) can clean up their
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl —
     /// mirrors the `cron_service` slot pattern below.
@@ -53,6 +54,12 @@ pub struct ConversationService {
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
+
+    /// Per-conversation runtime state owners. Lazily populated on first
+    /// access (`get_or_create_actor`). The map is the runtime source of
+    /// truth that replaces DB.status; entries are dropped from `delete()`.
+    /// See `crates/aionui-conversation/src/conv_actor.rs`.
+    actors: Arc<DashMap<String, Arc<ConvActor>>>,
 }
 
 // ── Construction & Dependency Injection ──────────────────────────────
@@ -62,7 +69,7 @@ impl ConversationService {
         workspace_root: std::path::PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
         skill_resolver: Arc<dyn SkillResolver>,
-        task_manager: Arc<dyn IWorkerTaskManager>,
+        connector_factory: Arc<dyn IAgentConnectorFactory>,
 
         conversation_repo: Arc<dyn IConversationRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
@@ -72,13 +79,14 @@ impl ConversationService {
             workspace_root,
             broadcaster,
             skill_resolver,
-            task_manager,
+            connector_factory,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             cron_service: Arc::new(RwLock::new(None)),
 
             conversation_repo,
             agent_metadata_repo,
             acp_session_repo,
+            actors: Arc::new(DashMap::new()),
         }
     }
 
@@ -91,8 +99,9 @@ impl ConversationService {
     /// Register a hook to be notified when a conversation is deleted.
     ///
     /// Hooks are dispatched sequentially in registration order from
-    /// `delete()`. Used by `aionui-app` to wire up `WorkerTaskManagerImpl`
-    /// (kill the agent process) and `CronService` (cascade-delete cron jobs).
+    /// `delete()`. Used by `aionui-app` to wire up `ConnectorFactory`
+    /// (drop the agent connector slot) and `CronService` (cascade-delete
+    /// cron jobs).
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
             guard.push(hook);
@@ -117,10 +126,43 @@ impl ConversationService {
         &self.conversation_repo
     }
 
-    pub(crate) fn task(&self, conversation_id: &str) -> Result<AgentInstance, AppError> {
-        self.task_manager
-            .get_task(conversation_id)
+    pub(crate) fn connector(&self, conversation_id: &str) -> Result<Arc<dyn IAgentConnector>, AppError> {
+        self.connector_factory
+            .get(conversation_id)
             .ok_or_else(|| AppError::NotFound(format!("No active agent for conversation '{conversation_id}'")))
+    }
+
+    /// Look up (or lazily create) the per-conversation `ConvActor`.
+    ///
+    /// The actor is the runtime source of truth for whether a turn is in
+    /// flight. Entries persist for the conversation's lifetime and are
+    /// removed by `delete()` via [`Self::drop_actor`].
+    pub fn get_or_create_actor(&self, id: &str) -> Arc<ConvActor> {
+        if let Some(existing) = self.actors.get(id) {
+            return existing.clone();
+        }
+        // `entry().or_insert_with` collapses the racing-create case into a
+        // single insertion: if two callers reach here concurrently only
+        // one `ConvActor::new` survives in the map.
+        self.actors
+            .entry(id.to_owned())
+            .or_insert_with(|| ConvActor::new(id.to_owned()))
+            .clone()
+    }
+
+    /// Lock-free read of a conversation's runtime status.
+    ///
+    /// Returns `Idle` for unknown ids — never-opened and finished
+    /// conversations look the same from outside the conv layer.
+    pub fn actor_status(&self, id: &str) -> ConvConversationStatus {
+        self.actors.get(id).map(|a| a.public_status()).unwrap_or_default()
+    }
+
+    /// Remove an actor entry. Called from `delete()` after all other
+    /// cleanup hooks have fired so observers still see the actor while
+    /// they shut down.
+    pub(crate) fn drop_actor(&self, id: &str) {
+        self.actors.remove(id);
     }
 }
 
@@ -263,6 +305,12 @@ impl ConversationService {
             );
         }
 
+        // `status` is `#[deprecated]` (ConvActor is the runtime source
+        // of truth) but the column is preserved for backwards
+        // compatibility with external observers. We still seed it to
+        // "pending" on create so legacy export/import flows behave
+        // identically. New runtime code MUST NOT consult this field.
+        #[allow(deprecated)]
         let row = aionui_db::models::ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),
@@ -294,7 +342,7 @@ impl ConversationService {
             self.create_acp_session_row(&id, &extra).await?;
         }
 
-        let response = row_to_response(row, &self.workspace_root)?;
+        let response = row_to_response(row, &self.workspace_root, &self.actors)?;
 
         self.broadcast_list_changed(&response.id, "created", response.source.as_ref());
 
@@ -388,7 +436,7 @@ impl ConversationService {
         let mut extra: serde_json::Value =
             serde_json::from_str(&row.extra).map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(&row.id, &mut extra).await;
-        row_to_response_with_extra(row, extra, &self.workspace_root)
+        row_to_response_with_extra(row, extra, &self.workspace_root, &self.actors)
     }
 
     /// List conversations with cursor-based pagination and optional filters.
@@ -427,7 +475,7 @@ impl ConversationService {
                 }
             };
             self.backfill_extra_inplace(&row_id, &mut extra).await;
-            match row_to_response_with_extra(row, extra, &self.workspace_root) {
+            match row_to_response_with_extra(row, extra, &self.workspace_root, &self.actors) {
                 Ok(resp) => items.push(resp),
                 Err(err) => warn!(
                     conversation_id = %row_id,
@@ -455,7 +503,7 @@ impl ConversationService {
         user_id: &str,
         id: &str,
         req: UpdateConversationRequest,
-        task_manager: &Arc<dyn IWorkerTaskManager>,
+        connector_factory: &Arc<dyn IAgentConnectorFactory>,
     ) -> Result<ConversationResponse, AppError> {
         let existing = self
             .conversation_repo
@@ -539,11 +587,12 @@ impl ConversationService {
         if model_changed {
             info!(
                 model_changed = true,
-                "Conversation updated, killing agent task due to model change"
+                "Conversation updated, dropping connector slot due to model change"
             );
-            if let Err(e) = task_manager.kill(id, None) {
-                warn!(error = %ErrorChain(&e), "Failed to kill agent after model change");
-            }
+            // The next send_message will rebuild the connector with the
+            // new model. Kept best-effort: if the agent is mid-turn the
+            // close() inside drop_connector will still be invoked.
+            connector_factory.drop_connector(id, None);
         }
 
         // Re-fetch to return the updated version
@@ -553,7 +602,7 @@ impl ConversationService {
             .await?
             .ok_or_else(|| AppError::Internal("Conversation vanished after update".into()))?;
 
-        let response = row_to_response(updated, &self.workspace_root)?;
+        let response = row_to_response(updated, &self.workspace_root, &self.actors)?;
 
         info!("Conversation updated");
         self.broadcast_list_changed(id, "updated", response.source.as_ref());
@@ -641,6 +690,10 @@ impl ConversationService {
             hook.on_conversation_deleted(id).await;
         }
 
+        // Tear down the per-conversation actor. Done last so hooks
+        // above can still observe the actor while they cancel.
+        self.drop_actor(id);
+
         info!("Conversation deleted");
         self.broadcast_list_changed(id, "deleted", source.as_ref());
 
@@ -694,7 +747,7 @@ impl ConversationService {
     pub async fn list_associated(&self, user_id: &str, id: &str) -> Result<Vec<ConversationResponse>, AppError> {
         let rows = self.conversation_repo.list_associated(user_id, id).await?;
         rows.into_iter()
-            .map(|row| row_to_response(row, &self.workspace_root))
+            .map(|row| row_to_response(row, &self.workspace_root, &self.actors))
             .collect()
     }
 
@@ -706,7 +759,7 @@ impl ConversationService {
     ) -> Result<Vec<ConversationResponse>, AppError> {
         let rows = self.conversation_repo.list_by_cron_job(user_id, cron_job_id).await?;
         rows.into_iter()
-            .map(|row| row_to_response(row, &self.workspace_root))
+            .map(|row| row_to_response(row, &self.workspace_root, &self.actors))
             .collect()
     }
 }
@@ -847,7 +900,7 @@ impl ConversationService {
         let items = result
             .items
             .into_iter()
-            .map(|row| search_row_to_item(row, &self.workspace_root))
+            .map(|row| search_row_to_item(row, &self.workspace_root, &self.actors))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(PaginatedResult {
@@ -866,7 +919,7 @@ impl ConversationService {
         &self,
         user_id: &str,
         conversation_id: &str,
-        task_manager: &Arc<dyn IWorkerTaskManager>,
+        connector_factory: &Arc<dyn IAgentConnectorFactory>,
     ) -> Result<ConfirmationListResponse, AppError> {
         self.conversation_repo
             .get(conversation_id)
@@ -874,7 +927,7 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
 
-        let agent = match task_manager.get_task(conversation_id) {
+        let agent = match connector_factory.get(conversation_id) {
             Some(a) => a,
             None => return Ok(Vec::new()),
         };
@@ -892,7 +945,7 @@ impl ConversationService {
         conversation_id: &str,
         call_id: &str,
         req: ConfirmRequest,
-        task_manager: &Arc<dyn IWorkerTaskManager>,
+        connector_factory: &Arc<dyn IAgentConnectorFactory>,
     ) -> Result<(), AppError> {
         self.conversation_repo
             .get(conversation_id)
@@ -900,8 +953,8 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
 
-        let agent = task_manager
-            .get_task(conversation_id)
+        let agent = connector_factory
+            .get(conversation_id)
             .ok_or_else(|| AppError::NotFound("No active agent for this conversation".into()))?;
 
         let confirmations = agent.get_confirmations();
@@ -931,7 +984,7 @@ impl ConversationService {
         conversation_id: &str,
         action: &str,
         command_type: Option<&str>,
-        task_manager: &Arc<dyn IWorkerTaskManager>,
+        connector_factory: &Arc<dyn IAgentConnectorFactory>,
     ) -> Result<ApprovalCheckResponse, AppError> {
         self.conversation_repo
             .get(conversation_id)
@@ -939,8 +992,8 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
 
-        let approved = task_manager
-            .get_task(conversation_id)
+        let approved = connector_factory
+            .get(conversation_id)
             .is_some_and(|agent| agent.check_approval(action, command_type));
 
         Ok(ApprovalCheckResponse { approved })
@@ -964,7 +1017,7 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         req: SendMessageRequest,
-        task_manager: &Arc<dyn IWorkerTaskManager>,
+        connector_factory: &Arc<dyn IAgentConnectorFactory>,
     ) -> Result<String, AppError> {
         if req.content.trim().is_empty() {
             return Err(AppError::BadRequest("Message content must not be empty".into()));
@@ -992,22 +1045,16 @@ impl ConversationService {
             ));
         }
 
-        // Check if conversation is already processing (simple guard)
-        let status: ConversationStatus = match row.status.as_deref() {
-            None | Some("") => ConversationStatus::Finished,
-            Some(s) => string_to_enum(s)?,
-        };
-        if status == ConversationStatus::Running {
-            return Err(AppError::Conflict(
-                "Conversation is already processing a message".into(),
-            ));
-        }
-
-        // Store user message. `msg_id` is server-generated so the WebSocket
-        // stream, DB row, and client-side message index all agree on the same
-        // key. We reuse the same value for `id` (primary key) and `msg_id`
-        // to preserve legacy callers that still rely on `id == msg_id`.
+        // Structural turn-in-flight guard. The ConvActor mutex is the
+        // single serializer for concurrent send/cancel — its
+        // `begin_turn` returns `AppError::Conflict` if a turn is
+        // already running and gives us a `TurnHandle` whose Drop
+        // transitions state back to Idle. We deliberately do not
+        // consult DB.status here: it cannot see in-memory turn state
+        // and contributed to the cancel→send race (ELECTRON-1KB).
         let user_msg_id = Self::mint_msg_id();
+        let actor = self.get_or_create_actor(conversation_id);
+        let turn_handle = actor.begin_turn(user_msg_id.clone()).await?;
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
@@ -1042,7 +1089,7 @@ impl ConversationService {
         // Build task options from conversation row
         let build_opts = self.build_task_options(&row)?;
         let stored_workspace = build_opts.workspace.clone();
-        let agent = task_manager.get_or_build_task(conversation_id, build_opts).await?;
+        let agent = connector_factory.build_or_get(build_opts).await?;
 
         // If the factory resolved a different workspace (e.g. auto-created temp
         // dir for a legacy conversation with empty workspace), persist it back.
@@ -1051,17 +1098,9 @@ impl ConversationService {
 
         info!(agent_type = ?agent.agent_type(), "Agent task ready");
 
-        // TODO: 好蠢的设计, status 写数据库, 最好干掉啦
-        let update = ConversationRowUpdate {
-            status: Some(enum_to_db(&ConversationStatus::Running)?),
-            updated_at: Some(now_ms()),
-            ..Default::default()
-        };
-
-        if let Err(e) = self.conversation_repo.update(conversation_id, &update).await {
-            warn!(error = %ErrorChain(&e), "Failed to set conversation status to Running");
-            return Err(e.into());
-        }
+        // DB.status is not the source of truth — ConvActor is. The
+        // column is kept (`#[deprecated]`) until external observers
+        // relying on it have migrated.
         let conv_id = conversation_id.to_owned();
         let repo = Arc::clone(&self.conversation_repo);
         let broadcaster = Arc::clone(&self.broadcaster);
@@ -1076,75 +1115,69 @@ impl ConversationService {
         // correlation id so DB row, WebSocket stream events, and
         // agent-internal tracing all share one identifier per turn.
         let user_msg_id_ret = user_msg_id.clone();
+        let event_tx = actor.event_tx.clone();
+        // `send` is single-turn. The cron-style continuation loop
+        // lives on the biz layer (`CronContinuationOrchestrator`),
+        // which observes the `TurnCompleted` event below and decides
+        // whether to issue a follow-up `send`. The conv layer no
+        // longer interprets `system_responses` — it just forwards
+        // them.
+        //
+        // `turn_handle` is moved into the relay's release hook so the
+        // `ConvActor` running slot is freed *before* the client sees
+        // the terminal event. If we instead held the handle until the
+        // spawn task scope ended, the queue's next dequeue would race
+        // the slot release and the backend would return Conflict.
         tokio::spawn(async move {
-            let first_turn_msg_id = Self::mint_msg_id();
-            let mut pending_send = Some((
-                SendMessageData {
-                    content: req.content,
-                    msg_id: first_turn_msg_id.clone(),
-                    files: req.files,
-                    inject_skills: req.inject_skills,
-                },
-                first_turn_msg_id,
-            ));
-            let mut continuation_count = 0usize;
+            let turn_msg_id = Self::mint_msg_id();
+            let send_data = SendMessageData {
+                content: req.content,
+                msg_id: turn_msg_id.clone(),
+                files: req.files,
+                inject_skills: req.inject_skills,
+            };
 
-            while let Some((current_send, msg_id)) = pending_send.take() {
-                if continuation_count >= MAX_CRON_CONTINUATIONS_PER_TURN {
-                    warn!(
-                        conversation_id = %conv_id,
-                        max = MAX_CRON_CONTINUATIONS_PER_TURN,
-                        "Reached cron continuation limit; ending turn early"
-                    );
-                    break;
+            let relay = StreamRelay::new(
+                conv_id.clone(),
+                turn_msg_id.clone(),
+                user_id_owned.clone(),
+                Arc::clone(&repo),
+                Arc::clone(&broadcaster),
+                cron_service.clone(),
+            )
+            .with_turn_handle(turn_handle);
+
+            let rx = agent.subscribe_legacy();
+            let send_agent = agent.clone();
+            let conv_id_send = conv_id.clone();
+            // 1. Send the message to the agent and concurrently run the relay to stream events.
+            tokio::spawn(async move {
+                if let Err(e) = send_agent.send_message(send_data).await {
+                    error!(conversation_id = %conv_id_send, error = %ErrorChain(&e), "Agent send_message failed");
                 }
+            });
+            // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.
+            let outcome = relay.consume(rx).await;
+            // The relay invoked the release hook before broadcasting
+            // the terminal event, so the actor slot is already free
+            // here. If the relay future were dropped without
+            // observing a terminal event, `TurnHandle` would drop
+            // with the closure and still release the slot — but the
+            // relay's `Closed` arm covers that path explicitly.
 
-                let relay = StreamRelay::new(
-                    conv_id.clone(),
-                    msg_id,
-                    user_id_owned.clone(),
-                    Arc::clone(&repo),
-                    Arc::clone(&broadcaster),
-                    cron_service.clone(),
-                )
-                .with_turn_completion(false);
-
-                let rx = agent.subscribe();
-                let send_agent = agent.clone();
-                let conv_id_send = conv_id.clone();
-                // 1. Send the message to the agent and concurrently run the relay to stream events.
-                tokio::spawn(async move {
-                    if let Err(e) = send_agent.send_message(current_send).await {
-                        error!(conversation_id = %conv_id_send, error = %ErrorChain(&e), "Agent send_message failed");
-                    }
-                });
-                // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.
-                let outcome = relay.consume(rx).await;
-
-                if let Some(session_key) = agent.get_session_key() {
-                    persist_session_key(&repo, &conv_id, &session_key).await;
-                }
-
-                if outcome.system_responses.is_empty() {
-                    break;
-                }
-                continuation_count += 1;
-                let next_turn_msg_id = Self::mint_msg_id();
-                pending_send = Some((
-                    SendMessageData {
-                        content: outcome.system_responses.join("\n"),
-                        msg_id: next_turn_msg_id.clone(),
-                        files: vec![],
-                        inject_skills: vec![],
-                    },
-                    next_turn_msg_id,
-                ));
+            if let Some(session_key) = agent.get_session_key() {
+                persist_session_key(&repo, &conv_id, &session_key).await;
             }
 
-            StreamRelay::complete_conversation(&repo, &broadcaster, &conv_id).await;
+            // Surface the turn boundary to biz-layer subscribers. Best
+            // effort: subscribers may have dropped, which is fine.
+            let _ = event_tx.send(crate::conv_service_trait::ConversationEvent::TurnCompleted {
+                msg_id: turn_msg_id,
+                system_responses: outcome.system_responses,
+            });
         });
 
-        info!(msg_id = %user_msg_id_ret, "Message dispatched, stream relay started");
+        info!(msg_id = %user_msg_id_ret, "Message dispatched, single-turn relay started");
         Ok(user_msg_id_ret)
     }
 
@@ -1182,7 +1215,7 @@ impl ConversationService {
         &self,
         user_id: &str,
         conversation_id: &str,
-        task_manager: &Arc<dyn IWorkerTaskManager>,
+        connector_factory: &Arc<dyn IAgentConnectorFactory>,
     ) -> Result<(), AppError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
@@ -1191,14 +1224,22 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
 
-        let Some(agent) = task_manager.get_task(conversation_id) else {
+        let Some(agent) = connector_factory.get(conversation_id) else {
             info!("No active agent to cancel; treating as idempotent success");
+            if let Some(actor) = self.actors.get(conversation_id) {
+                actor.wait_for_idle().await;
+            }
             return Ok(());
         };
 
-        if let Err(e) = agent.cancel().await {
-            warn!(error = %ErrorChain(&e), "Failed to cancel agent");
-            return Err(e);
+        if let Err(e) = agent.cancel_current_turn().await {
+            let err = connector_error_to_app_error(e);
+            warn!(error = %ErrorChain(&err), "Failed to cancel agent turn");
+            return Err(err);
+        }
+
+        if let Some(actor) = self.actors.get(conversation_id) {
+            actor.wait_for_idle().await;
         }
 
         info!("Stream canceled");
@@ -1214,7 +1255,7 @@ impl ConversationService {
         &self,
         user_id: &str,
         conversation_id: &str,
-        task_manager: &Arc<dyn IWorkerTaskManager>,
+        connector_factory: &Arc<dyn IAgentConnectorFactory>,
     ) -> Result<(), AppError> {
         let row = self
             .conversation_repo
@@ -1225,11 +1266,12 @@ impl ConversationService {
 
         let build_opts = self.build_task_options(&row)?;
         let stored_workspace = build_opts.workspace.clone();
-        let agent = task_manager.get_or_build_task(conversation_id, build_opts).await?;
+        let agent = connector_factory.build_or_get(build_opts).await?;
 
         // Persist auto-resolved workspace if factory picked a different path.
         self.maybe_persist_workspace(conversation_id, &stored_workspace, agent.workspace())
             .await?;
+        self.get_or_create_actor(conversation_id).mark_idle().await;
 
         debug!("Agent warmed up");
         Ok(())
@@ -1580,6 +1622,110 @@ fn log_conversation_created(response: &ConversationResponse, extra: &serde_json:
             agent_type = lineage.agent_type,
             "Conversation created (no assistant)"
         );
+    }
+}
+
+// ── IConversationService trait impl ─────────────────────────────────
+//
+// Trait surface bound to existing inherent methods so biz-layer crates
+// can depend on the trait rather than the concrete struct. Most methods
+// delegate verbatim; the interesting ones are:
+//
+// - `cancel`: orders the underlying agent stop FIRST (best-effort), then
+//   awaits `actor.wait_for_idle()`. The actor is unblocked by the
+//   `TurnHandle::Drop` that runs when the spawned turn task in
+//   `send_message` exits — closing the cancel→send race that the
+//   legacy DB.status guard could not handle.
+// - `subscribe`: returns a fresh `broadcast::Receiver` for lifecycle
+//   events (`TurnStarted`, `TurnCompleted`, etc.) rather than the
+//   lower-level `AgentStreamEvent` stream consumed by `subscribe_legacy`.
+#[async_trait::async_trait]
+impl crate::conv_service_trait::IConversationService for ConversationService {
+    async fn create(&self, user_id: &str, opts: CreateConversationRequest) -> Result<String, AppError> {
+        // Inherent `create` returns the full response; the trait surface
+        // intentionally returns just the id to keep biz-layer callers from
+        // taking on the response shape.
+        let resp = ConversationService::create(self, user_id, opts).await?;
+        Ok(resp.id)
+    }
+
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), AppError> {
+        ConversationService::delete(self, user_id, id).await
+    }
+
+    async fn get(&self, user_id: &str, id: &str) -> Result<ConversationResponse, AppError> {
+        ConversationService::get(self, user_id, id).await
+    }
+
+    async fn list(&self, user_id: &str, q: ListConversationsQuery) -> Result<ConversationListResponse, AppError> {
+        ConversationService::list(self, user_id, q).await
+    }
+
+    async fn warmup(&self, user_id: &str, id: &str) -> Result<(), AppError> {
+        ConversationService::warmup(self, user_id, id, &self.connector_factory).await
+    }
+
+    async fn send(&self, user_id: &str, id: &str, req: SendMessageRequest) -> Result<String, AppError> {
+        ConversationService::send_message(self, user_id, id, req, &self.connector_factory).await
+    }
+
+    async fn cancel(&self, user_id: &str, id: &str) -> Result<(), AppError> {
+        // Verify ownership first so a wrong-user caller cannot observe
+        // someone else's running state via this side channel.
+        let _ = self
+            .conversation_repo
+            .get(id)
+            .await?
+            .filter(|r| r.user_id == user_id)
+            .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
+
+        ConversationService::cancel(self, user_id, id, &self.connector_factory).await
+    }
+
+    async fn cancel_idle(&self, id: &str) -> Result<(), AppError> {
+        // Missing rows are treated as already cleaned up — the scanner
+        // can race with a manual delete.
+        if self.conversation_repo.get(id).await?.is_none() {
+            return Ok(());
+        }
+        self.connector_factory
+            .drop_connector(id, Some(AgentKillReason::IdleTimeout));
+        self.drop_actor(id);
+        Ok(())
+    }
+
+    fn status(&self, id: &str) -> crate::conv_service_trait::ConversationStatus {
+        self.actor_status(id)
+    }
+
+    fn subscribe(&self, id: &str) -> tokio::sync::broadcast::Receiver<crate::conv_service_trait::ConversationEvent> {
+        self.get_or_create_actor(id).subscribe()
+    }
+
+    fn collect_idle(&self, threshold_ms: i64) -> Vec<String> {
+        let cutoff = aionui_common::now_ms() - threshold_ms;
+        self.actors
+            .iter()
+            .filter_map(|entry| {
+                let actor = entry.value();
+                let is_idle = matches!(
+                    actor.public_status(),
+                    crate::conv_service_trait::ConversationStatus::Idle
+                );
+                (is_idle && actor.last_activity_ms() < cutoff).then(|| entry.key().clone())
+            })
+            .collect()
+    }
+}
+
+fn connector_error_to_app_error(error: ConnectorError) -> AppError {
+    match error {
+        ConnectorError::Other(err) => err,
+        ConnectorError::Busy => AppError::Conflict("Agent turn already in flight".into()),
+        ConnectorError::NotOpen
+        | ConnectorError::Cancelled
+        | ConnectorError::Protocol(_)
+        | ConnectorError::SubprocessDied(_) => AppError::Internal(error.to_string()),
     }
 }
 

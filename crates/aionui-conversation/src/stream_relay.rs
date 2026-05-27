@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::{
     AgentStreamEvent,
@@ -12,6 +12,7 @@ use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResu
 use aionui_api_types::WebSocketMessage;
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
+use crate::conv_actor::TurnHandle;
 use crate::service::ConversationService;
 use aionui_db::IConversationRepository;
 use aionui_db::models::MessageRow;
@@ -61,7 +62,9 @@ pub struct StreamRelay {
     repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     cron_service: Option<Arc<dyn ICronService>>,
-    complete_turn: bool,
+    /// Released exactly once before terminal events are forwarded to
+    /// WebSocket subscribers.
+    turn_handle: Mutex<Option<TurnHandle>>,
 }
 
 impl StreamRelay {
@@ -80,13 +83,24 @@ impl StreamRelay {
             repo,
             broadcaster,
             cron_service,
-            complete_turn: true,
+            turn_handle: Mutex::new(None),
         }
     }
 
-    pub fn with_turn_completion(mut self, enabled: bool) -> Self {
-        self.complete_turn = enabled;
+    /// Register the turn handle released exactly once, just before the
+    /// terminal event reaches WebSocket subscribers.
+    pub fn with_turn_handle(self, handle: TurnHandle) -> Self {
+        if let Ok(mut guard) = self.turn_handle.lock() {
+            *guard = Some(handle);
+        }
         self
+    }
+
+    async fn release_turn_slot(&self) {
+        let handle = self.turn_handle.lock().ok().and_then(|mut g| g.take());
+        if let Some(handle) = handle {
+            handle.release().await;
+        }
     }
 
     /// Run the relay loop. Consumes `self` and runs until the agent stream ends.
@@ -171,11 +185,14 @@ impl StreamRelay {
                             },
                         )
                         .await;
+                        // Release the actor's running slot before the
+                        // client sees the terminal event — otherwise the
+                        // queue's next dequeue races with the slot
+                        // release and the backend returns Conflict.
+                        self.release_turn_slot().await;
                         self.forward_to_websocket(&event);
                         let outcome = self.finalize(&full_text_buffer, &text_segments, &event).await;
-                        if self.complete_turn {
-                            Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
-                        }
+                        Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
                         break outcome;
                     }
                     AgentStreamEvent::ToolCall(data) => {
@@ -214,6 +231,9 @@ impl StreamRelay {
                     self.complete_active_thinking(&mut active_thinking).await;
                     self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                         .await;
+                    // Release the slot before broadcasting turn.completed
+                    // for the same reason as the Finish/Error branch.
+                    self.release_turn_slot().await;
                     // Channel closed without finish/error — still finalize
                     let outcome = self
                         .finalize(
@@ -222,9 +242,7 @@ impl StreamRelay {
                             &AgentStreamEvent::Finish(aionui_ai_agent::protocol::events::FinishEventData::default()),
                         )
                         .await;
-                    if self.complete_turn {
-                        Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
-                    }
+                    Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
                     break outcome;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -758,19 +776,17 @@ impl StreamRelay {
 
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
     pub async fn complete_conversation(
-        repo: &Arc<dyn IConversationRepository>,
+        _repo: &Arc<dyn IConversationRepository>,
         broadcaster: &Arc<dyn EventBroadcaster>,
         conversation_id: &str,
     ) {
-        let update = aionui_db::ConversationRowUpdate {
-            status: Some("finished".to_owned()),
-            updated_at: Some(now_ms()),
-            ..Default::default()
-        };
-        if let Err(e) = repo.update(conversation_id, &update).await {
-            error!(error = %ErrorChain(&e), "Failed to update conversation status");
-        }
-
+        // DB.status is not the runtime source of truth — `ConvActor`
+        // is. The runtime transition back to `Idle` is handled by
+        // `TurnHandle::Drop` in the `send_message` spawn. Here we
+        // only broadcast turn.completed so live subscribers re-enable
+        // the input. `_repo` is preserved to keep the signature
+        // stable for callers; it can be dropped once they all stop
+        // passing it.
         let payload = json!({
             "conversation_id": conversation_id,
             "session_id": conversation_id,
@@ -818,6 +834,7 @@ impl ICronService for SharedCronService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conv_actor::ConvActor;
     use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData, ThinkingEventData};
     use aionui_db::DbError;
     use std::sync::Mutex;
@@ -1160,6 +1177,101 @@ mod tests {
         assert_eq!(data["session_id"], "conv-1");
         assert_eq!(data["status"], "finished");
         assert_eq!(data["canSendMessage"], true);
+    }
+
+    #[tokio::test]
+    async fn turn_handle_releases_before_terminal_event_reaches_bus() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let mut ws_rx = bus.subscribe();
+        let actor = ConvActor::new("conv-1".into());
+        actor.mark_idle().await;
+        let turn_handle = actor.begin_turn("asst-1".into()).await.unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let observed_when_finish_arrived = Arc::new(AtomicBool::new(false));
+        let observed_when_turn_completed = Arc::new(AtomicBool::new(false));
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        )
+        .with_turn_handle(turn_handle);
+
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let observe_finish = Arc::clone(&observed_when_finish_arrived);
+        let observe_turn = Arc::clone(&observed_when_turn_completed);
+        let actor_observed = actor.clone();
+        let released_observed = Arc::clone(&released);
+        let drain = tokio::spawn(async move {
+            while let Ok(evt) = ws_rx.recv().await {
+                let snapshot = actor_observed.public_status() == crate::conv_service_trait::ConversationStatus::Idle;
+                if snapshot {
+                    released_observed.store(true, Ordering::SeqCst);
+                }
+                let kind = evt.data["type"].as_str().unwrap_or("");
+                if evt.name == "message.stream" && kind == "finish" {
+                    observe_finish.store(snapshot, Ordering::SeqCst);
+                }
+                if evt.name == "turn.completed" {
+                    observe_turn.store(snapshot, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+
+        relay.consume(rx).await;
+        drain.await.unwrap();
+
+        assert!(released.load(Ordering::SeqCst), "turn handle must release");
+        assert!(
+            observed_when_finish_arrived.load(Ordering::SeqCst),
+            "turn handle must release before the terminal stream event reaches the bus"
+        );
+        assert!(
+            observed_when_turn_completed.load(Ordering::SeqCst),
+            "turn handle must release before turn.completed reaches the bus"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_handle_releases_on_channel_close() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+
+        let actor = ConvActor::new("conv-1".into());
+        actor.mark_idle().await;
+        let turn_handle = actor.begin_turn("asst-1".into()).await.unwrap();
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        )
+        .with_turn_handle(turn_handle);
+
+        let rx = tx.subscribe();
+        // Drop the sender to close the channel without a terminal
+        // event. The relay's `Closed` arm must still release the turn.
+        drop(tx);
+        relay.consume(rx).await;
+
+        assert_eq!(
+            actor.public_status(),
+            crate::conv_service_trait::ConversationStatus::Idle
+        );
     }
 
     #[tokio::test]

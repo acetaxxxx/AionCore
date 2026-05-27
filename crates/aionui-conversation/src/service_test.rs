@@ -1,20 +1,23 @@
-use std::collections::VecDeque;
+// Tests construct and read `ConversationRow.status` (`#[deprecated]`)
+// to verify legacy fixtures and to ensure runtime hot paths do NOT
+// rely on it. Module-level allow keeps the deprecation lint active
+// everywhere outside this file.
+#![allow(deprecated)]
+
 use std::sync::{Arc, Mutex};
 
-use aionui_ai_agent::IWorkerTaskManager;
-use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, FinishEventData, TextEventData};
-use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+use aionui_ai_agent::test_support::{MockConnector, MockConnectorFactory};
+use aionui_ai_agent::{IAgentConnector, IAgentConnectorFactory};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::ConversationArtifactKind;
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
-    SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, ConversationStatus, CreateConversationRequest, ListConversationsQuery,
+    SearchMessagesQuery, SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
-    AgentKillReason, AgentType, AppError, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
-    TimestampMs,
+    AgentKillReason, AgentType, AppError, Confirmation, ConversationSource, PaginatedResult, TimestampMs,
 };
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams,
@@ -27,8 +30,8 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
-use tokio::sync::broadcast;
 
+use crate::conv_service_trait::{ConversationEvent, IConversationService};
 use crate::service::ConversationService;
 use crate::skill_resolver::FixedSkillResolver;
 
@@ -457,7 +460,7 @@ fn make_service() -> (
     ConversationService,
     Arc<MockBroadcaster>,
     Arc<MockRepo>,
-    Arc<dyn IWorkerTaskManager>,
+    Arc<dyn IAgentConnectorFactory>,
 ) {
     make_service_with_resolver(Arc::new(FixedSkillResolver { names: vec![] }))
 }
@@ -468,23 +471,48 @@ fn make_service_with_resolver(
     ConversationService,
     Arc<MockBroadcaster>,
     Arc<MockRepo>,
-    Arc<dyn IWorkerTaskManager>,
+    Arc<dyn IAgentConnectorFactory>,
 ) {
     let repo = Arc::new(MockRepo::new());
     let broadcaster = Arc::new(MockBroadcaster::new());
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
     let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let factory: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
     let svc = ConversationService::new(
         std::env::temp_dir(),
         broadcaster.clone(),
         skill_resolver,
-        task_mgr.clone(),
+        factory.clone(),
         repo.clone(),
         agent_metadata_repo,
         acp_session_repo,
     );
-    (svc, broadcaster, repo, task_mgr)
+    (svc, broadcaster, repo, factory)
+}
+
+fn make_service_with_mock_factory() -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<MockConnectorFactory>,
+    Arc<dyn IAgentConnectorFactory>,
+) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
+    let factory = MockConnectorFactory::builder().build();
+    let factory_dyn: Arc<dyn IAgentConnectorFactory> = factory.clone();
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        factory_dyn.clone(),
+        repo.clone(),
+        agent_metadata_repo,
+        acp_session_repo,
+    );
+    (svc, broadcaster, repo, factory, factory_dyn)
 }
 
 fn make_create_req() -> CreateConversationRequest {
@@ -505,6 +533,10 @@ async fn create_returns_conversation_with_defaults() {
 
     assert!(!resp.id.is_empty());
     assert_eq!(resp.r#type, AgentType::Acp);
+    // A freshly created conversation has no ConvActor entry; the response
+    // status falls back to the DB row's "pending" so the wire format keeps
+    // signalling never-opened to the frontend. The actor-derived status
+    // takes over on first turn.
     assert_eq!(resp.status, ConversationStatus::Pending);
     assert_eq!(resp.source, Some(ConversationSource::Aionui));
     assert!(!resp.pinned);
@@ -919,6 +951,11 @@ async fn reset_sets_status_to_pending() {
     svc.reset("user_1", &conv.id).await.unwrap();
 
     let fetched = svc.get("user_1", &conv.id).await.unwrap();
+    // reset() writes DB.status="pending" and clears any actor; with no
+    // actor entry the response status falls back to the DB column, so the
+    // wire format reports `Pending`. The DTO enum lives in
+    // `aionui_api_types::ConversationStatus`; the runtime truth is
+    // `aionui_conversation::ConversationStatus` on `ConvActor`.
     assert_eq!(fetched.status, ConversationStatus::Pending);
 }
 
@@ -1020,336 +1057,69 @@ async fn search_messages_whitespace_keyword_returns_bad_request() {
     assert!(matches!(err, AppError::BadRequest(_)));
 }
 
-// ── Mock Agent ───────────────────────────────────────────────────
+// ── Mock connector helpers ───────────────────────────────────────
+//
+// Thin wrappers over the shared `MockConnector` fixture in
+// `aionui_ai_agent::test_support`. They exist only to preserve the
+// callsite ergonomics the existing tests rely on.
 
-struct MockAgent {
-    conversation_id: String,
-    event_tx: broadcast::Sender<AgentStreamEvent>,
-    stopped: Mutex<bool>,
-    confirmations: Mutex<Vec<Confirmation>>,
-    approval_memory: Mutex<std::collections::HashMap<String, bool>>,
-    allow_direct_confirm: bool,
-    /// Optional workspace override; falls back to "/tmp/test" when `None`.
-    workspace_override: Option<String>,
+use aionui_ai_agent::test_support::MockConnectorBuilder;
+use std::sync::Arc as StdArc;
+
+fn insert_mock_connector(factory: &Arc<MockConnectorFactory>, conversation_id: &str) -> StdArc<MockConnector> {
+    let connector = MockConnector::builder(conversation_id).build_arc();
+    factory.insert(
+        conversation_id,
+        connector.clone() as Arc<dyn aionui_ai_agent::IAgentConnector>,
+    );
+    connector
 }
 
-impl MockAgent {
-    fn new(conversation_id: &str) -> Self {
-        let (event_tx, _) = broadcast::channel(64);
-        Self {
-            conversation_id: conversation_id.to_owned(),
-            event_tx,
-            stopped: Mutex::new(false),
-            confirmations: Mutex::new(vec![]),
-            approval_memory: Mutex::new(std::collections::HashMap::new()),
-            allow_direct_confirm: false,
-            workspace_override: None,
-        }
-    }
-
-    fn with_confirmations(conversation_id: &str, confirmations: Vec<Confirmation>) -> Self {
-        let (event_tx, _) = broadcast::channel(64);
-        Self {
-            conversation_id: conversation_id.to_owned(),
-            event_tx,
-            stopped: Mutex::new(false),
-            confirmations: Mutex::new(confirmations),
-            approval_memory: Mutex::new(std::collections::HashMap::new()),
-            allow_direct_confirm: false,
-            workspace_override: None,
-        }
-    }
-
-    fn with_direct_confirm(conversation_id: &str) -> Self {
-        let (event_tx, _) = broadcast::channel(64);
-        Self {
-            conversation_id: conversation_id.to_owned(),
-            event_tx,
-            stopped: Mutex::new(false),
-            confirmations: Mutex::new(vec![]),
-            approval_memory: Mutex::new(std::collections::HashMap::new()),
-            allow_direct_confirm: true,
-            workspace_override: None,
-        }
-    }
+fn insert_mock_with_confirmations(
+    factory: &Arc<MockConnectorFactory>,
+    conversation_id: &str,
+    confirmations: Vec<Confirmation>,
+) -> StdArc<MockConnector> {
+    let connector = MockConnector::builder(conversation_id)
+        .confirmations(confirmations)
+        .build_arc();
+    factory.insert(
+        conversation_id,
+        connector.clone() as Arc<dyn aionui_ai_agent::IAgentConnector>,
+    );
+    connector
 }
 
-#[async_trait::async_trait]
-impl IAgentTask for MockAgent {
-    fn agent_type(&self) -> AgentType {
-        AgentType::Acp
-    }
-    fn conversation_id(&self) -> &str {
-        &self.conversation_id
-    }
-    fn workspace(&self) -> &str {
-        self.workspace_override.as_deref().unwrap_or("/tmp/test")
-    }
-    fn status(&self) -> Option<ConversationStatus> {
-        None
-    }
-    fn last_activity_at(&self) -> TimestampMs {
-        0
-    }
-    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
-        self.event_tx.subscribe()
-    }
-    async fn send_message(&self, _data: SendMessageData) -> Result<(), AppError> {
-        // Emit finish event so the relay task completes
-        let _ = self.event_tx.send(AgentStreamEvent::Finish(
-            aionui_ai_agent::protocol::events::FinishEventData::default(),
-        ));
-        Ok(())
-    }
-    async fn cancel(&self) -> Result<(), AppError> {
-        *self.stopped.lock().unwrap() = true;
-        Ok(())
-    }
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
-        Ok(())
-    }
+fn insert_mock_with_direct_confirm(
+    factory: &Arc<MockConnectorFactory>,
+    conversation_id: &str,
+) -> StdArc<MockConnector> {
+    let connector = MockConnector::builder(conversation_id)
+        .allow_direct_confirm()
+        .build_arc();
+    factory.insert(
+        conversation_id,
+        connector.clone() as Arc<dyn aionui_ai_agent::IAgentConnector>,
+    );
+    connector
 }
 
-#[async_trait::async_trait]
-impl IMockAgent for MockAgent {
-    fn get_confirmations(&self) -> Vec<Confirmation> {
-        self.confirmations.lock().unwrap().clone()
+fn insert_scripted_connector(
+    factory: &Arc<MockConnectorFactory>,
+    conversation_id: &str,
+    scripts: Vec<Vec<AgentStreamEvent>>,
+) -> StdArc<MockConnector> {
+    let mut builder = MockConnectorBuilder::new(conversation_id);
+    for script in scripts {
+        builder = builder.script(script);
     }
-    fn check_approval(&self, action: &str, command_type: Option<&str>) -> bool {
-        let key = match command_type {
-            Some(ct) => format!("{action}:{ct}"),
-            None => action.to_owned(),
-        };
-        self.approval_memory.lock().unwrap().get(&key).copied().unwrap_or(false)
-    }
-    fn confirm(
-        &self,
-        _msg_id: &str,
-        call_id: &str,
-        _data: serde_json::Value,
-        always_allow: bool,
-    ) -> Result<(), AppError> {
-        let mut confs = self.confirmations.lock().unwrap();
-        let existed = confs.iter().any(|c| c.call_id == call_id);
-        if !existed && !self.allow_direct_confirm {
-            return Err(AppError::NotFound(format!("Confirmation {call_id} not found")));
-        }
-        if always_allow && let Some(conf) = confs.iter().find(|c| c.call_id == call_id) {
-            let key = match (conf.action.as_deref(), conf.command_type.as_deref()) {
-                (Some(a), Some(ct)) => format!("{a}:{ct}"),
-                (Some(a), None) => a.to_owned(),
-                _ => String::new(),
-            };
-            self.approval_memory.lock().unwrap().insert(key, true);
-        }
-        confs.retain(|c| c.call_id != call_id);
-        Ok(())
-    }
+    let connector = builder.build_arc();
+    factory.insert(
+        conversation_id,
+        connector.clone() as Arc<dyn aionui_ai_agent::IAgentConnector>,
+    );
+    connector
 }
-
-// ── Mock WorkerTaskManager ──────────────────────────────────────
-
-struct MockTaskManager {
-    agents: Mutex<std::collections::HashMap<String, AgentInstance>>,
-}
-
-impl MockTaskManager {
-    fn new() -> Self {
-        Self {
-            agents: Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    fn insert_agent(&self, conversation_id: &str, agent: AgentInstance) {
-        self.agents.lock().unwrap().insert(conversation_id.to_owned(), agent);
-    }
-}
-
-#[async_trait::async_trait]
-impl IWorkerTaskManager for MockTaskManager {
-    fn get_task(&self, conversation_id: &str) -> Option<AgentInstance> {
-        self.agents.lock().unwrap().get(conversation_id).cloned()
-    }
-
-    async fn get_or_build_task(
-        &self,
-        conversation_id: &str,
-        _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
-        let mut agents = self.agents.lock().unwrap();
-        if let Some(existing) = agents.get(conversation_id) {
-            return Ok(existing.clone());
-        }
-        let instance = AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id)));
-        agents.insert(conversation_id.to_owned(), instance.clone());
-        Ok(instance)
-    }
-
-    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
-        self.agents.lock().unwrap().remove(conversation_id);
-        Ok(())
-    }
-
-    fn kill_and_wait(
-        &self,
-        conversation_id: &str,
-        reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let _ = self.kill(conversation_id, reason);
-        Box::pin(std::future::ready(()))
-    }
-
-    fn clear(&self) {
-        self.agents.lock().unwrap().clear();
-    }
-
-    fn active_count(&self) -> usize {
-        self.agents.lock().unwrap().len()
-    }
-
-    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
-        vec![]
-    }
-}
-
-/// A variant of MockTaskManager that always builds agents with a specific workspace.
-struct MockTaskManagerWithWorkspace {
-    workspace: String,
-    agents: Mutex<std::collections::HashMap<String, AgentInstance>>,
-}
-
-impl MockTaskManagerWithWorkspace {
-    fn new(workspace: &str) -> Self {
-        Self {
-            workspace: workspace.to_owned(),
-            agents: Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
-    fn get_task(&self, conversation_id: &str) -> Option<AgentInstance> {
-        self.agents.lock().unwrap().get(conversation_id).cloned()
-    }
-
-    async fn get_or_build_task(
-        &self,
-        conversation_id: &str,
-        _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
-        let workspace = self.workspace.clone();
-        let mut agents = self.agents.lock().unwrap();
-        if let Some(existing) = agents.get(conversation_id) {
-            return Ok(existing.clone());
-        }
-        let mut agent = MockAgent::new(conversation_id);
-        agent.workspace_override = Some(workspace);
-        let instance = AgentInstance::Mock(Arc::new(agent));
-        agents.insert(conversation_id.to_owned(), instance.clone());
-        Ok(instance)
-    }
-
-    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
-        self.agents.lock().unwrap().remove(conversation_id);
-        Ok(())
-    }
-
-    fn kill_and_wait(
-        &self,
-        conversation_id: &str,
-        reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let _ = self.kill(conversation_id, reason);
-        Box::pin(std::future::ready(()))
-    }
-
-    fn clear(&self) {
-        self.agents.lock().unwrap().clear();
-    }
-
-    fn active_count(&self) -> usize {
-        self.agents.lock().unwrap().len()
-    }
-
-    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
-        vec![]
-    }
-}
-
-struct ScriptedAgent {
-    conversation_id: String,
-    event_tx: broadcast::Sender<AgentStreamEvent>,
-    scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
-    sent_contents: Mutex<Vec<String>>,
-}
-
-impl ScriptedAgent {
-    fn new(conversation_id: &str, scripts: Vec<Vec<AgentStreamEvent>>) -> Self {
-        let (event_tx, _) = broadcast::channel(64);
-        Self {
-            conversation_id: conversation_id.to_owned(),
-            event_tx,
-            scripts: Mutex::new(VecDeque::from(scripts)),
-            sent_contents: Mutex::new(vec![]),
-        }
-    }
-
-    fn sent_contents(&self) -> Vec<String> {
-        self.sent_contents.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl IAgentTask for ScriptedAgent {
-    fn agent_type(&self) -> AgentType {
-        AgentType::Acp
-    }
-
-    fn conversation_id(&self) -> &str {
-        &self.conversation_id
-    }
-
-    fn workspace(&self) -> &str {
-        "/tmp/test"
-    }
-
-    fn status(&self) -> Option<ConversationStatus> {
-        Some(ConversationStatus::Finished)
-    }
-
-    fn last_activity_at(&self) -> TimestampMs {
-        0
-    }
-
-    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
-        self.event_tx.subscribe()
-    }
-
-    async fn send_message(&self, data: SendMessageData) -> Result<(), AppError> {
-        self.sent_contents.lock().unwrap().push(data.content);
-        let script = self
-            .scripts
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| vec![AgentStreamEvent::Finish(FinishEventData::default())]);
-        for event in script {
-            let _ = self.event_tx.send(event);
-        }
-        Ok(())
-    }
-
-    async fn cancel(&self) -> Result<(), AppError> {
-        Ok(())
-    }
-
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
-        Ok(())
-    }
-}
-
-impl IMockAgent for ScriptedAgent {}
 
 struct MockCronContinuationService;
 
@@ -1401,7 +1171,7 @@ fn make_send_req() -> SendMessageRequest {
 #[tokio::test]
 async fn send_message_returns_accepted() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let msg_id = svc
@@ -1416,7 +1186,7 @@ async fn send_message_returns_accepted() {
 #[tokio::test]
 async fn send_message_broadcasts_user_created_event() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     // Clear events from create
@@ -1442,7 +1212,7 @@ async fn send_message_broadcasts_user_created_event() {
 #[tokio::test]
 async fn send_message_persists_hidden_user_message_when_requested() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let req: SendMessageRequest = serde_json::from_value(json!({
@@ -1467,7 +1237,7 @@ async fn send_message_persists_hidden_user_message_when_requested() {
 #[tokio::test]
 async fn send_message_empty_content_returns_bad_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let req: SendMessageRequest = serde_json::from_value(json!({
@@ -1482,7 +1252,7 @@ async fn send_message_empty_content_returns_bad_request() {
 #[tokio::test]
 async fn send_message_whitespace_content_returns_bad_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let req: SendMessageRequest = serde_json::from_value(json!({
@@ -1497,7 +1267,7 @@ async fn send_message_whitespace_content_returns_bad_request() {
 #[tokio::test]
 async fn send_message_conversation_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let err = svc
         .send_message("user_1", "no-such-id", make_send_req(), &task_mgr)
@@ -1509,7 +1279,7 @@ async fn send_message_conversation_not_found() {
 #[tokio::test]
 async fn send_message_wrong_user_returns_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let err = svc
@@ -1521,17 +1291,29 @@ async fn send_message_wrong_user_returns_not_found() {
 
 #[tokio::test]
 async fn send_message_running_conversation_returns_conflict() {
+    // The in-flight guard is ConvActor's mutex, not DB.status. We
+    // hold a TurnHandle for the conversation's actor and confirm
+    // that send_message refuses with 409. Crucially, we leave the
+    // DB row's status field untouched (and even set it to a corrupt
+    // value) to lock in that the runtime-state guard does not
+    // consult the DB column.
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    // Manually set status to running
-    let update = ConversationRowUpdate {
-        status: Some("running".into()),
+    // Corrupt the DB.status column. If the legacy guard ever sneaks back
+    // in, this would either deserialize-fail or return a stale value.
+    let corrupt_update = ConversationRowUpdate {
+        status: Some("garbage-not-a-status".into()),
         ..Default::default()
     };
-    repo.update(&conv.id, &update).await.unwrap();
+    repo.update(&conv.id, &corrupt_update).await.unwrap();
+
+    // Hold the actor's turn slot so send_message must collide with us.
+    let actor = svc.get_or_create_actor(&conv.id);
+    actor.mark_idle().await;
+    let _held = actor.begin_turn("msg-already-running".into()).await.unwrap();
 
     let err = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
@@ -1548,7 +1330,8 @@ async fn send_message_persists_factory_resolved_workspace() {
     // agent reports.
     let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
     let auto_workspace = "/tmp/factory-resolved";
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManagerWithWorkspace::new(auto_workspace));
+    let task_mgr: Arc<dyn IAgentConnectorFactory> =
+        MockConnectorFactory::builder().fixed_workspace(auto_workspace).build();
 
     // Create a conversation with an empty workspace to simulate legacy case.
     let req: CreateConversationRequest = serde_json::from_value(json!({
@@ -1575,38 +1358,34 @@ async fn send_message_persists_factory_resolved_workspace() {
 }
 
 #[tokio::test]
-async fn send_message_continues_cron_system_responses() {
+async fn send_message_is_single_turn_with_system_responses() {
+    // Conv layer does not chain continuations. A single
+    // `send_message` dispatches exactly ONE turn. `system_responses`
+    // captured by the relay are forwarded via the `TurnCompleted`
+    // event for biz-layer subscribers (e.g.
+    // `CronContinuationOrchestrator`) to act on — the conv layer
+    // must NOT re-enter `send_message` itself.
     let (svc, broadcaster, _repo, _default_task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let scripted_agent = Arc::new(ScriptedAgent::new(
+    let scripted_agent = insert_scripted_connector(
+        &task_mgr,
         &conv.id,
-        vec![
-            vec![
-                AgentStreamEvent::Text(TextEventData {
-                    content: "I'll check. [CRON_LIST]".into(),
-                }),
-                AgentStreamEvent::Finish(FinishEventData::default()),
-            ],
-            vec![
-                AgentStreamEvent::Text(TextEventData {
-                    content: "[CRON_CREATE]\nname: Daily Greeting\nschedule: 0 9 * * *\nschedule_description: Daily at 9:00 AM\nmessage: Say good morning\n[/CRON_CREATE]".into(),
-                }),
-                AgentStreamEvent::Finish(FinishEventData::default()),
-            ],
-            vec![
-                AgentStreamEvent::Text(TextEventData {
-                    content: "Done. The task is scheduled.".into(),
-                }),
-                AgentStreamEvent::Finish(FinishEventData::default()),
-            ],
-        ],
-    ));
-    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent.clone()));
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData {
+                content: "I'll check. [CRON_LIST]".into(),
+            }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    );
     svc.with_cron_service(Some(Arc::new(MockCronContinuationService)));
 
-    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    // Subscribe BEFORE send so we don't miss TurnStarted/TurnCompleted.
+    // Use the trait surface to mirror how biz-layer subscribers do it.
+    let mut rx = IConversationService::subscribe(&svc, &conv.id);
+
+    let task_mgr_dyn: Arc<dyn IAgentConnectorFactory> = task_mgr.clone();
     let req: SendMessageRequest = serde_json::from_value(json!({
         "content": "Create the task now"
     }))
@@ -1614,9 +1393,10 @@ async fn send_message_continues_cron_system_responses() {
 
     svc.send_message("user_1", &conv.id, req, &task_mgr_dyn).await.unwrap();
 
+    // Wait for exactly ONE send through to the agent.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if scripted_agent.sent_contents().len() >= 3 {
+            if !scripted_agent.sent_contents().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1625,13 +1405,41 @@ async fn send_message_continues_cron_system_responses() {
     .await
     .unwrap();
 
-    let sends = scripted_agent.sent_contents();
-    assert_eq!(sends.len(), 3);
-    assert_eq!(sends[0], "Create the task now");
-    assert_eq!(sends[1], "[System: No scheduled tasks]");
-    assert_eq!(sends[2], "[System: Created cron job 'Daily Greeting']");
+    // Drain the lifecycle event stream: TurnStarted → TurnCompleted.
+    let evt1 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(evt1, ConversationEvent::TurnStarted { .. }));
+
+    let evt2 = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let captured_responses = match evt2 {
+        ConversationEvent::TurnCompleted { system_responses, .. } => system_responses,
+        other => panic!("expected TurnCompleted, got {other:?}"),
+    };
+    assert_eq!(
+        captured_responses,
+        vec!["[System: No scheduled tasks]".to_string()],
+        "TurnCompleted must surface the relay-captured system_responses"
+    );
+
+    // CRUCIAL: conv layer must not chain a second turn. Give the
+    // would-be loop time to fire and verify nothing else arrives.
+    let next = tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv()).await;
+    assert!(next.is_err(), "conv layer must not chain a second turn (got {next:?})");
+    assert_eq!(
+        scripted_agent.sent_contents().len(),
+        1,
+        "send_message must invoke the agent exactly once per call"
+    );
 
     let finished = svc.get("user_1", &conv.id).await.unwrap();
+    // response.status is derived from the runtime ConvActor. After
+    // the turn task exits, the actor is `Idle`, which the legacy
+    // three-state mapping flattens to `Finished` for client compat.
     assert_eq!(finished.status, ConversationStatus::Finished);
 
     let events = broadcaster.take_events();
@@ -1644,7 +1452,7 @@ async fn send_message_continues_cron_system_responses() {
 #[tokio::test]
 async fn stop_stream_with_active_agent() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -1653,14 +1461,14 @@ async fn stop_stream_with_active_agent() {
         "user_1",
         &conv.id,
         make_send_req(),
-        &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        &(task_mgr.clone() as Arc<dyn IAgentConnectorFactory>),
     )
     .await
     .unwrap();
 
     // Stop should succeed since agent exists
     let result = svc
-        .cancel("user_1", &conv.id, &(task_mgr as Arc<dyn IWorkerTaskManager>))
+        .cancel("user_1", &conv.id, &(task_mgr as Arc<dyn IAgentConnectorFactory>))
         .await;
     assert!(result.is_ok());
 }
@@ -1668,7 +1476,7 @@ async fn stop_stream_with_active_agent() {
 #[tokio::test]
 async fn stop_stream_conversation_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let err = svc.cancel("user_1", "no-such-id", &task_mgr).await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
@@ -1677,7 +1485,7 @@ async fn stop_stream_conversation_not_found() {
 #[tokio::test]
 async fn stop_stream_no_active_agent_is_idempotent() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -1688,7 +1496,7 @@ async fn stop_stream_no_active_agent_is_idempotent() {
 #[tokio::test]
 async fn stop_stream_wrong_user_returns_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let err = svc.cancel("user_2", &conv.id, &task_mgr).await.unwrap_err();
@@ -1700,23 +1508,27 @@ async fn stop_stream_wrong_user_returns_not_found() {
 #[tokio::test]
 async fn warmup_creates_agent_task() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let result = svc
-        .warmup("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .warmup(
+            "user_1",
+            &conv.id,
+            &(task_mgr.clone() as Arc<dyn IAgentConnectorFactory>),
+        )
         .await;
     assert!(result.is_ok());
 
     // Agent should now exist
-    assert!(task_mgr.get_task(&conv.id).is_some());
+    assert!(task_mgr.get(&conv.id).is_some());
 }
 
 #[tokio::test]
 async fn warmup_conversation_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let err = svc.warmup("user_1", "no-such-id", &task_mgr).await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
@@ -1725,7 +1537,7 @@ async fn warmup_conversation_not_found() {
 #[tokio::test]
 async fn warmup_wrong_user_returns_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let err = svc.warmup("user_2", &conv.id, &task_mgr).await.unwrap_err();
@@ -1760,7 +1572,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
 #[tokio::test]
 async fn list_confirmations_empty_when_no_agent() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let result = svc.list_confirmations("user_1", &conv.id, &task_mgr).await.unwrap();
@@ -1770,18 +1582,14 @@ async fn list_confirmations_empty_when_no_agent() {
 #[tokio::test]
 async fn list_confirmations_returns_items() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let agent = AgentInstance::Mock(Arc::new(MockAgent::with_confirmations(
-        &conv.id,
-        make_test_confirmations(),
-    )));
-    task_mgr.insert_agent(&conv.id, agent);
+    let _agent = insert_mock_with_confirmations(&task_mgr, &conv.id, make_test_confirmations());
 
     let result = svc
-        .list_confirmations("user_1", &conv.id, &(task_mgr as Arc<dyn IWorkerTaskManager>))
+        .list_confirmations("user_1", &conv.id, &(task_mgr as Arc<dyn IAgentConnectorFactory>))
         .await
         .unwrap();
     assert_eq!(result.len(), 2);
@@ -1792,7 +1600,7 @@ async fn list_confirmations_returns_items() {
 #[tokio::test]
 async fn list_confirmations_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let err = svc
         .list_confirmations("user_1", "no-such-id", &task_mgr)
@@ -1804,7 +1612,7 @@ async fn list_confirmations_not_found() {
 #[tokio::test]
 async fn list_confirmations_wrong_user() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let err = svc.list_confirmations("user_2", &conv.id, &task_mgr).await.unwrap_err();
@@ -1814,16 +1622,12 @@ async fn list_confirmations_wrong_user() {
 #[tokio::test]
 async fn confirm_removes_confirmation_and_broadcasts() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     broadcaster.take_events(); // clear create event
 
-    let agent = AgentInstance::Mock(Arc::new(MockAgent::with_confirmations(
-        &conv.id,
-        make_test_confirmations(),
-    )));
-    task_mgr.insert_agent(&conv.id, agent);
+    let agent = insert_mock_with_confirmations(&task_mgr, &conv.id, make_test_confirmations());
 
     let req = aionui_api_types::ConfirmRequest {
         msg_id: "msg-1".into(),
@@ -1835,13 +1639,13 @@ async fn confirm_removes_confirmation_and_broadcasts() {
         &conv.id,
         "call-1",
         req,
-        &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        &(task_mgr.clone() as Arc<dyn IAgentConnectorFactory>),
     )
     .await
     .unwrap();
 
     // Confirmation should be removed from the agent
-    let remaining = task_mgr.get_task(&conv.id).unwrap().get_confirmations();
+    let remaining = agent.get_confirmations();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].call_id, "call-2");
 
@@ -1856,28 +1660,23 @@ async fn confirm_removes_confirmation_and_broadcasts() {
 #[tokio::test]
 async fn confirm_with_always_allow_stores_approval() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let agent = AgentInstance::Mock(Arc::new(MockAgent::with_confirmations(
-        &conv.id,
-        make_test_confirmations(),
-    )));
-    task_mgr.insert_agent(&conv.id, agent);
+    let agent = insert_mock_with_confirmations(&task_mgr, &conv.id, make_test_confirmations());
 
     let req = aionui_api_types::ConfirmRequest {
         msg_id: "msg-1".into(),
         data: json!({ "value": "allow" }),
         always_allow: true,
     };
-    let task_mgr_arc: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let task_mgr_arc: Arc<dyn IAgentConnectorFactory> = task_mgr.clone();
     svc.confirm("user_1", &conv.id, "call-1", req, &task_mgr_arc)
         .await
         .unwrap();
 
     // check_approval should now return true for edit_file:bash
-    let agent = task_mgr.get_task(&conv.id).unwrap();
     assert!(agent.check_approval("edit_file", Some("bash")));
     assert!(!agent.check_approval("delete_file", None));
 }
@@ -1885,15 +1684,11 @@ async fn confirm_with_always_allow_stores_approval() {
 #[tokio::test]
 async fn confirm_nonexistent_call_id_returns_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let agent = AgentInstance::Mock(Arc::new(MockAgent::with_confirmations(
-        &conv.id,
-        make_test_confirmations(),
-    )));
-    task_mgr.insert_agent(&conv.id, agent);
+    let _agent = insert_mock_with_confirmations(&task_mgr, &conv.id, make_test_confirmations());
 
     let req = aionui_api_types::ConfirmRequest {
         msg_id: "msg-1".into(),
@@ -1906,7 +1701,7 @@ async fn confirm_nonexistent_call_id_returns_not_found() {
             &conv.id,
             "nonexistent-call",
             req,
-            &(task_mgr as Arc<dyn IWorkerTaskManager>),
+            &(task_mgr as Arc<dyn IAgentConnectorFactory>),
         )
         .await
         .unwrap_err();
@@ -1916,13 +1711,12 @@ async fn confirm_nonexistent_call_id_returns_not_found() {
 #[tokio::test]
 async fn confirm_without_confirmation_state_still_calls_agent() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    let agent = AgentInstance::Mock(Arc::new(MockAgent::with_direct_confirm(&conv.id)));
-    task_mgr.insert_agent(&conv.id, agent);
+    let _agent = insert_mock_with_direct_confirm(&task_mgr, &conv.id);
 
     let req = aionui_api_types::ConfirmRequest {
         msg_id: "msg-1".into(),
@@ -1934,7 +1728,7 @@ async fn confirm_without_confirmation_state_still_calls_agent() {
         &conv.id,
         "call-1",
         req,
-        &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        &(task_mgr.clone() as Arc<dyn IAgentConnectorFactory>),
     )
     .await
     .unwrap();
@@ -1945,7 +1739,7 @@ async fn confirm_without_confirmation_state_still_calls_agent() {
 #[tokio::test]
 async fn confirm_no_agent_returns_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -1964,12 +1758,11 @@ async fn confirm_no_agent_returns_not_found() {
 #[tokio::test]
 async fn check_approval_returns_false_when_not_set() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let agent = AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id)));
-    task_mgr.insert_agent(&conv.id, agent);
+    let _agent = insert_mock_connector(&task_mgr, &conv.id);
 
     let result = svc
         .check_approval(
@@ -1977,7 +1770,7 @@ async fn check_approval_returns_false_when_not_set() {
             &conv.id,
             "edit_file",
             None,
-            &(task_mgr as Arc<dyn IWorkerTaskManager>),
+            &(task_mgr as Arc<dyn IAgentConnectorFactory>),
         )
         .await
         .unwrap();
@@ -1987,15 +1780,11 @@ async fn check_approval_returns_false_when_not_set() {
 #[tokio::test]
 async fn check_approval_returns_true_after_always_allow() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let agent = AgentInstance::Mock(Arc::new(MockAgent::with_confirmations(
-        &conv.id,
-        make_test_confirmations(),
-    )));
-    task_mgr.insert_agent(&conv.id, agent);
+    let _agent = insert_mock_with_confirmations(&task_mgr, &conv.id, make_test_confirmations());
 
     // Confirm with always_allow
     let req = aionui_api_types::ConfirmRequest {
@@ -2003,7 +1792,7 @@ async fn check_approval_returns_true_after_always_allow() {
         data: json!({ "value": "allow" }),
         always_allow: true,
     };
-    let task_mgr_arc: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let task_mgr_arc: Arc<dyn IAgentConnectorFactory> = task_mgr.clone();
     svc.confirm("user_1", &conv.id, "call-1", req, &task_mgr_arc)
         .await
         .unwrap();
@@ -2019,7 +1808,7 @@ async fn check_approval_returns_true_after_always_allow() {
 #[tokio::test]
 async fn check_approval_returns_false_when_no_agent() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -2033,7 +1822,7 @@ async fn check_approval_returns_false_when_no_agent() {
 #[tokio::test]
 async fn check_approval_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
 
     let err = svc
         .check_approval("user_1", "no-such-id", "edit_file", None, &task_mgr)
@@ -2309,4 +2098,297 @@ async fn insert_raw_message_persists_row_and_broadcasts_stream() {
     assert_eq!(data["position"], "left");
     assert_eq!(data["data"]["content"], "from teammate");
     assert_eq!(data["data"]["teammate_message"], true);
+}
+
+// ── IConversationService trait impl ─────────────────────────────────
+
+#[test]
+fn conversation_service_implements_iconversation_service() {
+    fn _assert<T: crate::conv_service_trait::IConversationService>() {}
+    _assert::<ConversationService>();
+}
+
+#[tokio::test]
+async fn cancel_idempotent_when_no_turn_in_flight() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    // No turn running: cancel must return Ok without hanging.
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        crate::conv_service_trait::IConversationService::cancel(&svc, "user_1", &conv.id),
+    )
+    .await
+    .expect("cancel must not hang when no turn is in flight")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cancel_rejects_unknown_conversation() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let err = crate::conv_service_trait::IConversationService::cancel(&svc, "user_1", "no-such-id")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn cancel_rejects_wrong_user() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let err = crate::conv_service_trait::IConversationService::cancel(&svc, "user_2", &conv.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn status_reports_running_when_actor_running() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let actor = svc.get_or_create_actor(&conv.id);
+    actor.mark_idle().await;
+    let _h = actor.begin_turn("msg-rt".into()).await.unwrap();
+
+    let status = crate::conv_service_trait::IConversationService::status(&svc, &conv.id);
+    match status {
+        crate::conv_service_trait::ConversationStatus::Running { msg_id } => assert_eq!(msg_id, "msg-rt"),
+        other => panic!("expected Running, got {other:?}"),
+    }
+}
+
+// ── Response.status derived from runtime ConvActor ──────────────────
+
+#[tokio::test]
+async fn response_status_reflects_runtime_not_db() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    // Spin up an actor in Idle so the response is no longer reading from
+    // row.status; then corrupt DB.status to "running" and verify the
+    // actor's view (Idle → Finished) wins over the corrupted column.
+    let actor = svc.get_or_create_actor(&conv.id);
+    actor.mark_idle().await;
+
+    let corrupt = ConversationRowUpdate {
+        status: Some("running".into()),
+        ..Default::default()
+    };
+    repo.update(&conv.id, &corrupt).await.unwrap();
+
+    let resp = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(
+        resp.status,
+        ConversationStatus::Finished,
+        "when an actor exists, its state wins over DB.status"
+    );
+
+    // Now begin a turn on the actor and assert the response flips to Running.
+    let _held = actor.begin_turn("msg-running".into()).await.unwrap();
+
+    let resp = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(resp.status, ConversationStatus::Running);
+}
+
+// ── DB.status no longer written from runtime ────────────────────────
+
+#[tokio::test]
+async fn send_message_does_not_write_db_status_running() {
+    // send_message must not write DB.status = "running". The
+    // ConvActor mutex is the runtime source of truth; the column
+    // stays at whatever create() set it to (currently "pending").
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IAgentConnectorFactory> = MockConnectorFactory::builder().build();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    assert_ne!(
+        row.status.as_deref(),
+        Some("running"),
+        "send_message must not write DB.status='running'"
+    );
+}
+
+#[tokio::test]
+async fn turn_completion_does_not_write_db_status_finished() {
+    // complete_conversation must not write DB.status="finished". We
+    // invoke it directly with a known-pending row and assert the
+    // column is unchanged. We exercise the function via its public
+    // path so a future refactor that re-introduces the write is
+    // caught here.
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let before = repo.get(&conv.id).await.unwrap().unwrap();
+    let initial_status = before.status.clone();
+
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = _broadcaster.clone();
+    crate::stream_relay::StreamRelay::complete_conversation(svc.conversation_repo(), &broadcaster_dyn, &conv.id).await;
+
+    let after = repo.get(&conv.id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status, initial_status,
+        "complete_conversation must not write DB.status='finished'"
+    );
+}
+
+// ── ConvActor map ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn service_actor_is_idle_for_unknown_conversation() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    assert_eq!(
+        svc.actor_status("nonexistent"),
+        crate::conv_service_trait::ConversationStatus::Idle
+    );
+}
+
+#[tokio::test]
+async fn service_actor_is_created_on_first_access() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let actor = svc.get_or_create_actor("conv-1");
+    assert_eq!(
+        actor.public_status(),
+        crate::conv_service_trait::ConversationStatus::Idle
+    );
+    let again = svc.get_or_create_actor("conv-1");
+    assert!(Arc::ptr_eq(&actor, &again));
+}
+
+#[tokio::test]
+async fn service_actor_is_dropped_on_delete() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    // Create a conversation through the public API so delete() finds the row.
+    let resp = svc.create("user_1", make_create_req()).await.unwrap();
+    let actor1 = svc.get_or_create_actor(&resp.id);
+
+    svc.delete("user_1", &resp.id).await.unwrap();
+
+    // After delete, asking for the actor again must produce a fresh one.
+    let actor2 = svc.get_or_create_actor(&resp.id);
+    assert!(
+        !Arc::ptr_eq(&actor1, &actor2),
+        "delete() must drop the actor entry so a subsequent lookup returns a fresh actor"
+    );
+}
+
+// ── collect_idle ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn collect_idle_returns_only_actors_idle_past_threshold() {
+    use aionui_common::now_ms;
+
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    // stale: idle and last activity backdated past the threshold.
+    let stale = svc.get_or_create_actor("stale");
+    stale.mark_idle().await;
+    stale.set_last_activity_ms_for_test(now_ms() - 10 * 60 * 1000);
+
+    // fresh: idle but with a recent timestamp.
+    let fresh = svc.get_or_create_actor("fresh");
+    fresh.mark_idle().await;
+
+    // busy: a turn is in flight, must never be returned regardless of age.
+    let busy = svc.get_or_create_actor("busy");
+    busy.mark_idle().await;
+    let _h = busy.begin_turn("m".into()).await.unwrap();
+    busy.set_last_activity_ms_for_test(now_ms() - 10 * 60 * 1000);
+
+    let mut idle =
+        <ConversationService as crate::conv_service_trait::IConversationService>::collect_idle(&svc, 5 * 60 * 1000);
+    idle.sort();
+    assert_eq!(idle, vec!["stale".to_owned()]);
+}
+
+#[tokio::test]
+async fn collect_idle_empty_when_no_actors() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let idle =
+        <ConversationService as crate::conv_service_trait::IConversationService>::collect_idle(&svc, 5 * 60 * 1000);
+    assert!(idle.is_empty());
+}
+
+#[tokio::test]
+async fn cancel_idle_resolves_owner_and_is_noop_for_missing_row() {
+    // Missing row -> Ok (idempotent).
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    <ConversationService as crate::conv_service_trait::IConversationService>::cancel_idle(&svc, "missing")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn warmup_marks_conversation_idle_for_runtime_status_and_scanner() {
+    let (svc, _broadcaster, _repo, _factory, factory_dyn) = make_service_with_mock_factory();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    assert_eq!(
+        svc.get("user_1", &conv.id).await.unwrap().status,
+        ConversationStatus::Pending
+    );
+
+    svc.warmup("user_1", &conv.id, &factory_dyn).await.unwrap();
+
+    assert_eq!(
+        svc.get("user_1", &conv.id).await.unwrap().status,
+        ConversationStatus::Finished
+    );
+    let idle = <ConversationService as crate::conv_service_trait::IConversationService>::collect_idle(&svc, -1);
+    assert_eq!(idle, vec![conv.id]);
+}
+
+#[tokio::test]
+async fn cancel_inherent_path_waits_for_actor_idle() {
+    let (svc, _broadcaster, _repo, factory, factory_dyn) = make_service_with_mock_factory();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let connector = MockConnector::builder(&conv.id).build_arc();
+    let connector_dyn: Arc<dyn IAgentConnector> = connector.clone();
+    factory.insert(&conv.id, connector_dyn);
+
+    let actor = svc.get_or_create_actor(&conv.id);
+    let turn_handle = actor.begin_turn("msg-running".into()).await.unwrap();
+    let drop_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(turn_handle);
+    });
+
+    let started = std::time::Instant::now();
+    svc.cancel("user_1", &conv.id, &factory_dyn).await.unwrap();
+    let elapsed = started.elapsed();
+
+    drop_task.await.unwrap();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(15),
+        "inherent cancel returned before the actor released its running slot ({elapsed:?})"
+    );
+    assert_eq!(
+        <ConversationService as crate::conv_service_trait::IConversationService>::status(&svc, &conv.id),
+        crate::conv_service_trait::ConversationStatus::Idle
+    );
+    assert!(connector.was_cancelled());
+}
+
+#[tokio::test]
+async fn cancel_idle_drops_connector_with_idle_timeout_reason() {
+    let (svc, _broadcaster, _repo, factory, factory_dyn) = make_service_with_mock_factory();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    svc.warmup("user_1", &conv.id, &factory_dyn).await.unwrap();
+    assert_eq!(factory.active_count(), 1);
+
+    <ConversationService as crate::conv_service_trait::IConversationService>::cancel_idle(&svc, &conv.id)
+        .await
+        .unwrap();
+
+    assert_eq!(factory.active_count(), 0);
+    assert_eq!(
+        factory.drop_calls(),
+        vec![(conv.id, Some(AgentKillReason::IdleTimeout))]
+    );
 }
