@@ -4,9 +4,8 @@ use tracing::{debug, error};
 
 /// Force-kill a process by PID, plus any descendants.
 ///
-/// Uses platform-native shell commands so we don't pull in a `libc`/`winapi`
-/// dependency just for this one call site:
-/// * Unix: `kill -9 <pid>`
+/// Uses platform-native shell commands:
+/// * Unix: `kill -9 -<pid>` to target the spawned process group
 /// * Windows: `taskkill /F /T /PID <pid>` (`/T` walks the process tree —
 ///   the ACP CLI typically spawns a node/bun child that must die with it)
 ///
@@ -14,23 +13,53 @@ use tracing::{debug, error};
 pub(super) fn force_kill(pid: u32) -> Result<(), AppError> {
     #[cfg(unix)]
     {
-        let result = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .output();
+        use std::io;
 
-        match result {
-            Ok(output) if output.status.success() => {
-                debug!(pid, "SIGKILL sent successfully");
-                Ok(())
+        fn kill_pid(target_pid: u32) -> Result<(), AppError> {
+            let rc = unsafe { libc::kill(target_pid as i32, libc::SIGKILL) };
+            if rc == 0 {
+                debug!(pid = target_pid, "Direct SIGKILL sent successfully");
+                return Ok(());
             }
-            Ok(_output) => {
-                // Non-zero exit likely means process already exited — acceptable
-                debug!(pid, "Process already exited before SIGKILL");
+
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                debug!(pid = target_pid, "Process already exited before SIGKILL");
                 Ok(())
+            } else {
+                error!(pid = target_pid, error = %err, "Direct SIGKILL failed");
+                Err(AppError::Internal(format!(
+                    "Failed to kill process {target_pid}: {err}"
+                )))
             }
-            Err(e) => {
-                error!(pid, error = %e, "Failed to execute kill command");
-                Err(AppError::Internal(format!("Failed to kill process {pid}: {e}")))
+        }
+
+        let pgid = unsafe { libc::getpgid(pid as i32) };
+        if pgid == -1 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                debug!(pid, "Process already exited before resolving process group");
+                return Ok(());
+            }
+
+            error!(pid, error = %err, "Failed to resolve process group");
+            return kill_pid(pid);
+        }
+
+        let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        if rc == 0 {
+            debug!(pid, process_group = pgid, "SIGKILL sent successfully");
+            Ok(())
+        } else {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                debug!(pid, process_group = pgid, "Process group already exited before SIGKILL");
+                kill_pid(pid)
+            } else {
+                error!(pid, process_group = pgid, error = %err, "Failed to send SIGKILL to process group");
+                Err(AppError::Internal(format!(
+                    "Failed to kill process group {pgid}: {err}"
+                )))
             }
         }
     }
@@ -79,6 +108,8 @@ pub(super) fn force_kill(pid: u32) -> Result<(), AppError> {
 #[cfg(test)]
 mod force_kill_tests {
     use super::force_kill;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -93,10 +124,11 @@ mod force_kill_tests {
                 .spawn()
                 .expect("spawn powershell sleep")
         } else {
-            Command::new("sh")
-                .args(["-c", "sleep 60"])
-                .spawn()
-                .expect("spawn sleep")
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 60"]);
+            #[cfg(unix)]
+            command.process_group(0);
+            command.spawn().expect("spawn sleep")
         }
     }
 
