@@ -21,6 +21,7 @@ use crate::agent_runtime::AgentRuntime;
 use crate::capability::backend_output_sink::BackendOutputSink;
 use crate::capability::backend_protocol_sink::BackendProtocolSink;
 use crate::protocol::events::AgentStreamEvent;
+use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 pub struct AionrsAgentManager {
@@ -185,7 +186,7 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         self.runtime.subscribe()
     }
 
-    async fn send_message(&self, data: SendMessageData) -> Result<(), AppError> {
+    async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         let started_at = now_ms();
         info!(
             conversation_id = %self.runtime.conversation_id(),
@@ -230,9 +231,10 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
                     error = %ErrorChain(&e),
                     "Aionrs engine.run() failed, emitting Error+Finish"
                 );
-                self.runtime.emit_error(error_msg.clone());
+                let send_error = aionrs_engine_error_to_send_error(error_msg);
+                self.runtime.emit_error_data(send_error.stream_error().clone());
                 self.runtime.emit_finish(None);
-                Err(AppError::Internal(error_msg))
+                Err(send_error)
             }
             None => {
                 self.runtime.emit_error("Stopped by user");
@@ -351,6 +353,14 @@ fn parse_session_mode(s: &str) -> SessionMode {
         "yolo" => SessionMode::Yolo,
         _ => SessionMode::Default,
     }
+}
+
+fn aionrs_engine_error_to_send_error(error_msg: String) -> AgentSendError {
+    let lower = error_msg.to_ascii_lowercase();
+    if lower.contains("provider error") || lower.contains("provider:") {
+        return AgentSendError::from_app_error(AppError::BadGateway(error_msg));
+    }
+    AgentSendError::from_app_error(AppError::Internal(error_msg))
 }
 
 #[cfg(test)]
@@ -487,5 +497,23 @@ mod tests {
             AgentStreamEvent::Finish(_) => {}
             other => panic!("Expected Finish, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn aionrs_provider_connection_error_is_user_llm_provider_error() {
+        let send_error = aionrs_engine_error_to_send_error(
+            "Aionrs agent error: Provider error: Connection error: Signable request error: failed to create canonical request"
+                .to_owned(),
+        );
+
+        assert_eq!(
+            send_error.code(),
+            Some(aionui_api_types::AgentErrorCode::UserLlmProviderConfigError)
+        );
+        assert_eq!(
+            send_error.ownership(),
+            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
+        );
+        assert_eq!(send_error.stream_error().retryable, Some(false));
     }
 }

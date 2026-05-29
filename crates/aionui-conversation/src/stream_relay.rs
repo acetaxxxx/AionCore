@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::{
-    AgentStreamEvent,
+    AgentSendError, AgentStreamEvent,
     protocol::events::{
         ThinkingEventData,
         tool_call::{AcpToolCallSessionUpdateKind, AcpToolCallStatus, ToolCallStatus},
@@ -17,7 +17,7 @@ use aionui_db::IConversationRepository;
 use aionui_db::models::MessageRow;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, error, info, warn};
 
 /// Number of text chunks to accumulate before flushing to the database.
@@ -97,7 +97,32 @@ impl StreamRelay {
             msg_id = %self.msg_id,
         )
     )]
-    pub async fn consume(self, mut rx: broadcast::Receiver<AgentStreamEvent>) -> RelayOutcome {
+    pub async fn consume(self, rx: broadcast::Receiver<AgentStreamEvent>) -> RelayOutcome {
+        self.consume_inner(rx, None).await
+    }
+
+    /// Run the relay loop while also accepting a typed send failure from the
+    /// task that called `IAgentTask::send_message`.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            conversation_id = %self.conversation_id,
+            msg_id = %self.msg_id,
+        )
+    )]
+    pub async fn consume_with_send_error(
+        self,
+        rx: broadcast::Receiver<AgentStreamEvent>,
+        send_error_rx: oneshot::Receiver<AgentSendError>,
+    ) -> RelayOutcome {
+        self.consume_inner(rx, Some(send_error_rx)).await
+    }
+
+    async fn consume_inner(
+        self,
+        mut rx: broadcast::Receiver<AgentStreamEvent>,
+        mut send_error_rx: Option<oneshot::Receiver<AgentSendError>>,
+    ) -> RelayOutcome {
         let started_at = now_ms();
         info!("StreamRelay started");
 
@@ -108,9 +133,32 @@ impl StreamRelay {
         let mut used_primary_segment_msg_id = false;
         let mut first_agent_event_logged = false;
         let mut first_visible_output_logged = false;
+        let mut send_error_done = send_error_rx.is_none();
 
         loop {
-            match rx.recv().await {
+            let recv_result = if send_error_done {
+                rx.recv().await
+            } else {
+                tokio::select! {
+                    recv = rx.recv() => recv,
+                    send_error = send_error_rx.as_mut().expect("send_error_rx exists while pending") => {
+                        send_error_done = true;
+                        match send_error {
+                            Ok(send_error) => {
+                                warn!(
+                                    code = ?send_error.code(),
+                                    ownership = ?send_error.ownership(),
+                                    "Injecting stream error for failed agent send"
+                                );
+                                Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                }
+            };
+
+            match recv_result {
                 Ok(event) => {
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
@@ -483,7 +531,7 @@ impl StreamRelay {
             outcome.system_responses = processed.system_responses;
         } else if let AgentStreamEvent::Error(data) = event {
             // No text accumulated but got an error — store error as tips message
-            let content = json!({ "content": data.message, "type": "error" }).to_string();
+            let content = json!({ "content": &data.message, "type": "error", "error": &data }).to_string();
             let row = MessageRow {
                 id: ConversationService::mint_msg_id(),
                 conversation_id: self.conversation_id.clone(),
@@ -1002,10 +1050,10 @@ mod tests {
 
         let rx = tx.subscribe();
 
-        tx.send(AgentStreamEvent::Error(ErrorEventData {
-            message: "Something went wrong".into(),
-            code: None,
-        }))
+        tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
+            "Something went wrong",
+            None,
+        )))
         .unwrap();
 
         let outcome = relay.consume(rx).await;
@@ -1020,6 +1068,148 @@ mod tests {
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Something went wrong");
         assert_eq!(content["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn run_send_error_injects_error_and_completes_turn() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+        let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
+        send_error_tx
+            .send(AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
+                "provider returned 401 invalid api key".into(),
+            )))
+            .unwrap();
+
+        let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
+        assert!(outcome.system_responses.is_empty());
+
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].r#type, "tips");
+        assert_eq!(inserts[0].status.as_deref(), Some("error"));
+        let content: serde_json::Value = serde_json::from_str(&inserts[0].content).unwrap();
+        assert_eq!(content["content"], "The model provider rejected the request");
+        assert_eq!(content["type"], "error");
+        assert_eq!(content["error"]["code"], "USER_LLM_PROVIDER_AUTH_FAILED");
+        assert_eq!(content["error"]["ownership"], "user_llm_provider");
+        assert_eq!(content["error"]["retryable"], false);
+        assert_eq!(content["error"]["feedback_recommended"], false);
+        assert_eq!(content["error"]["detail"], "provider returned 401 invalid api key");
+        assert_eq!(content["error"]["resolution"]["kind"], "check_provider_credentials");
+        assert_eq!(content["error"]["resolution"]["target"], "provider_settings");
+
+        let mut ws_events = vec![];
+        while let Ok(evt) = ws_rx.try_recv() {
+            ws_events.push(evt);
+        }
+
+        let error_event = ws_events
+            .iter()
+            .find(|evt| evt.name == "message.stream" && evt.data["type"] == "error")
+            .expect("send error should be forwarded as message.stream error");
+        assert_eq!(error_event.data["data"]["code"], "USER_LLM_PROVIDER_AUTH_FAILED");
+        assert_eq!(error_event.data["data"]["ownership"], "user_llm_provider");
+        assert!(ws_events.iter().any(|evt| evt.name == "turn.completed"));
+    }
+
+    #[tokio::test]
+    async fn run_send_error_keeps_existing_stream_error_when_it_arrives_first() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+        let send_error = AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
+            "provider returned 401 invalid api key".into(),
+        ));
+        tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
+            "stream already emitted",
+            None,
+        )))
+        .unwrap();
+        let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
+        let delayed_send_error = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = send_error_tx.send(send_error);
+        });
+
+        let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
+        delayed_send_error.await.unwrap();
+        assert!(outcome.system_responses.is_empty());
+
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].r#type, "tips");
+        let content: serde_json::Value = serde_json::from_str(&inserts[0].content).unwrap();
+        assert_eq!(content["content"], "stream already emitted");
+        assert_eq!(content["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn run_send_error_uses_send_error_when_it_arrives_first() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+        let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
+        send_error_tx
+            .send(AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
+                "provider returned 401 invalid api key".into(),
+            )))
+            .unwrap();
+        let delayed_stream_error = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
+                "stream already emitted",
+                None,
+            )));
+        });
+
+        let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
+        delayed_stream_error.await.unwrap();
+        assert!(outcome.system_responses.is_empty());
+
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].r#type, "tips");
+        let content: serde_json::Value = serde_json::from_str(&inserts[0].content).unwrap();
+        assert_eq!(content["content"], "The model provider rejected the request");
+        assert_eq!(content["type"], "error");
+        assert_eq!(content["error"]["resolution"]["kind"], "check_provider_credentials");
+        assert_eq!(content["error"]["resolution"]["target"], "provider_settings");
     }
 
     #[tokio::test]

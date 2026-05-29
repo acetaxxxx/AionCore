@@ -25,6 +25,7 @@ use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::resolve_command_path;
 use std::collections::{HashMap, HashSet};
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::convert::{
@@ -1275,6 +1276,11 @@ impl ConversationService {
         let build_opts = match self.build_task_options(&row) {
             Ok(opts) => opts,
             Err(err) => {
+                error!(
+                    error_code = err.error_code(),
+                    error = %ErrorChain(&err),
+                    "Failed to build task options for message send"
+                );
                 let _ = self.persist_send_failure_tip(conversation_id, &err).await;
                 return Err(err);
             }
@@ -1314,7 +1320,12 @@ impl ConversationService {
             let agent = match task_manager.get_or_build_task(&conv_id, build_opts).await {
                 Ok(agent) => agent,
                 Err(err) => {
-                    warn!(conversation_id = %conv_id, error = %ErrorChain(&err), "Agent task build failed");
+                    error!(
+                        conversation_id = %conv_id,
+                        error_code = err.error_code(),
+                        error = %ErrorChain(&err),
+                        "Agent task build failed"
+                    );
                     service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
                     StreamRelay::complete_conversation(&repo, &broadcaster, &conv_id).await;
                     return;
@@ -1327,7 +1338,12 @@ impl ConversationService {
                 .maybe_persist_workspace(&conv_id, &stored_workspace, agent.workspace())
                 .await
             {
-                warn!(conversation_id = %conv_id, error = %ErrorChain(&err), "Failed to persist resolved workspace");
+                error!(
+                    conversation_id = %conv_id,
+                    error_code = err.error_code(),
+                    error = %ErrorChain(&err),
+                    "Failed to persist resolved workspace"
+                );
                 service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
                 StreamRelay::complete_conversation(&repo, &broadcaster, &conv_id).await;
                 return;
@@ -1375,14 +1391,16 @@ impl ConversationService {
                 let rx = agent.subscribe();
                 let send_agent = agent.clone();
                 let conv_id_send = conv_id.clone();
+                let (send_error_tx, send_error_rx) = oneshot::channel();
                 // 1. Send the message to the agent and concurrently run the relay to stream events.
                 tokio::spawn(async move {
                     if let Err(e) = send_agent.send_message(current_send).await {
                         error!(conversation_id = %conv_id_send, error = %ErrorChain(&e), "Agent send_message failed");
+                        let _ = send_error_tx.send(e);
                     }
                 });
                 // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.
-                let outcome = relay.consume(rx).await;
+                let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
 
                 if let Some(session_key) = agent.get_session_key() {
                     persist_session_key(&repo, &conv_id, &session_key).await;
