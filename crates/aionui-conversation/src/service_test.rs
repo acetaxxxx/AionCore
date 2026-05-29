@@ -5,10 +5,10 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use aionui_ai_agent::IWorkerTaskManager;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+use aionui_ai_agent::{AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::ConversationArtifactKind;
@@ -1098,7 +1098,7 @@ impl IAgentTask for MockAgent {
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.event_tx.subscribe()
     }
-    async fn send_message(&self, _data: SendMessageData) -> Result<(), AppError> {
+    async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
         // Emit finish event so the relay task completes
         let _ = self.event_tx.send(AgentStreamEvent::Finish(
             aionui_ai_agent::protocol::events::FinishEventData::default(),
@@ -1434,7 +1434,7 @@ impl IAgentTask for ScriptedAgent {
         self.event_tx.subscribe()
     }
 
-    async fn send_message(&self, data: SendMessageData) -> Result<(), AppError> {
+    async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.sent_contents.lock().unwrap().push(data.content);
         let script = self
             .scripts
@@ -1637,9 +1637,14 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
     assert_eq!(content["type"], "error");
     assert_eq!(content["source"], "send_failed");
     assert_eq!(content["code"], "BAD_GATEWAY");
+    assert_eq!(content["error"]["code"], "UNKNOWN_UPSTREAM_ERROR");
+    assert_eq!(content["error"]["ownership"], "unknown_upstream");
+    assert_eq!(content["error"]["retryable"], true);
+    assert_eq!(content["error"]["feedback_recommended"], true);
+    assert_eq!(content["error"]["detail"], "ACP init failed: config file is invalid");
     assert_eq!(
         content["content"],
-        "Bad gateway: ACP init failed: config file is invalid"
+        "The upstream Agent failed while handling the request"
     );
 
     let updated = repo.get(&conv.id).await.unwrap().unwrap();
