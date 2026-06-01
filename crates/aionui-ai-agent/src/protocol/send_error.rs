@@ -337,6 +337,14 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
             AgentErrorResolutionKind::CheckAgentInstallation,
         ));
     }
+    if lower.contains("process exited with code") {
+        return Some(agent_error(
+            "The selected Agent process exited unexpectedly",
+            AgentErrorCode::UserAgentDisconnected,
+            true,
+            AgentErrorResolutionKind::ReconnectAgent,
+        ));
+    }
     if lower.contains("initialize handshake timed out") {
         return Some(agent_error(
             "The selected Agent did not finish starting in time",
@@ -395,7 +403,17 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
 }
 
 fn classify_provider_api(lower: &str) -> Option<ClassifiedError> {
-    if contains_any(lower, &["402", "insufficient balance"]) {
+    if contains_any(
+        lower,
+        &[
+            "402",
+            "insufficient balance",
+            "credit balance is too low",
+            "purchase credits",
+            "plans & billing",
+            "plans and billing",
+        ],
+    ) {
         return Some(provider_error(
             "The model provider account requires billing attention",
             AgentErrorCode::UserLlmProviderBillingRequired,
@@ -521,9 +539,7 @@ fn classify_provider_api(lower: &str) -> Option<ClassifiedError> {
             Some(AgentErrorResolutionTarget::ProviderSettings),
         ));
     }
-    if (lower.contains("404") || lower.contains("not found"))
-        && contains_any(lower, &["/chat/completions", "\"path\"", "endpoint", "base url"])
-    {
+    if lower.contains("404") || lower.contains("not found") {
         return Some(provider_error(
             "The model provider endpoint was not found",
             AgentErrorCode::UserLlmProviderEndpointNotFound,
@@ -888,6 +904,25 @@ mod tests {
     }
 
     #[test]
+    fn classifies_mid_session_cli_exit_as_agent_disconnected() {
+        // Mid-session ACP CLI exit (e.g. Claude Code) surfaces as -32603 with
+        // `details: "Claude Code process exited with code 1"`. Previously this
+        // fell through to UNKNOWN_UPSTREAM_ERROR; it now maps to a retryable
+        // agent disconnect.
+        assert_classification(
+            "Agent internal error (code -32603) ({\"details\":\"Claude Code process exited with code 1\"})",
+            AgentErrorCode::UserAgentDisconnected,
+            AgentErrorOwnership::UserAgent,
+            AgentErrorResolutionKind::ReconnectAgent,
+        );
+        let err = AgentSendError::from_app_error(AppError::BadGateway(
+            "Agent internal error (code -32603) ({\"details\":\"Claude Code process exited with code 1\"})".into(),
+        ));
+        assert_eq!(err.stream_error().retryable, Some(true));
+        assert_eq!(err.stream_error().feedback_recommended, Some(false));
+    }
+
+    #[test]
     fn classifies_agent_protocol_and_session_failures() {
         assert_classification(
             "Connection error: protocol mismatch Connection error: Max reconnect attempts (10) reached",
@@ -941,6 +976,12 @@ mod tests {
     fn classifies_provider_billing_auth_and_rate_limit() {
         assert_classification(
             "Aionrs agent error: Provider error: API error 402: {\"error\":{\"message\":\"Insufficient Balance\"}}",
+            AgentErrorCode::UserLlmProviderBillingRequired,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::CheckProviderBilling,
+        );
+        assert_classification(
+            "Aionrs agent error: Provider error: API error 400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.\"}}",
             AgentErrorCode::UserLlmProviderBillingRequired,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::CheckProviderBilling,
@@ -1090,6 +1131,20 @@ mod tests {
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::Retry,
         );
+    }
+
+    #[test]
+    fn classifies_bare_provider_404_as_endpoint_not_found() {
+        let detail = "Aionrs agent error: Provider error: API error 404: {\"detail\":\"Not Found\"}";
+        assert_classification(
+            detail,
+            AgentErrorCode::UserLlmProviderEndpointNotFound,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::CheckProviderBaseUrl,
+        );
+        assert_resolution_target(detail, AgentErrorResolutionTarget::ProviderSettings);
+        let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
+        assert_eq!(err.stream_error().retryable, Some(false));
     }
 
     #[test]
