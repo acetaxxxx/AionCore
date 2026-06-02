@@ -17,7 +17,7 @@ use aionui_api_types::{
 };
 use aionui_common::{
     AgentType, AppError, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    PaginatedResult, generate_short_id, now_ms,
+    PaginatedResult, generate_short_id, now_ms, workspace_path_has_whitespace_segment,
 };
 use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
@@ -265,12 +265,18 @@ impl ConversationService {
         // `is_custom_workspace` is the authoritative signal consumed later to
         // decide whether we should wire skill symlinks (temp workspaces only
         // — user-chosen paths must not be mutated).
-        let user_supplied_workspace = extra
+        let user_supplied_workspace = match extra
             .get("workspace")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned());
+        {
+            Some(workspace) => Some(normalize_workspace_path(workspace)?),
+            None => None,
+        };
         let is_custom_workspace = user_supplied_workspace.is_some();
+        if let Some(workspace) = user_supplied_workspace.as_ref() {
+            extra["workspace"] = serde_json::Value::String(workspace.clone());
+        }
 
         let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
             // Per-conversation temp workspaces live under
@@ -700,6 +706,9 @@ impl ConversationService {
             {
                 warn!("aionrs update: stripped legacy `extra.model` from merged extra");
             }
+            if new_extra.get("workspace").is_some() {
+                normalize_workspace_extra(&mut existing_extra)?;
+            }
             Some(
                 serde_json::to_string(&existing_extra)
                     .map_err(|e| AppError::Internal(format!("Failed to serialize merged extra: {e}")))?,
@@ -779,6 +788,9 @@ impl ConversationService {
         let mut merged: serde_json::Value =
             serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
         merge_json(&mut merged, &patch);
+        if patch.get("workspace").is_some() {
+            normalize_workspace_extra(&mut merged)?;
+        }
 
         let updates = ConversationRowUpdate {
             extra: Some(
@@ -1604,7 +1616,16 @@ impl ConversationService {
         }
 
         // Extract workspace from extra (common across agent types)
-        let workspace = extra.get("workspace").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+        let workspace = match extra.get("workspace").and_then(|v| v.as_str()) {
+            Some(workspace) if !workspace.is_empty() => {
+                let normalized = validate_runtime_workspace_path(workspace)?;
+                if normalized != workspace {
+                    extra["workspace"] = serde_json::Value::String(normalized.clone());
+                }
+                normalized
+            }
+            _ => String::new(),
+        };
 
         Ok(BuildTaskOptions {
             agent_type,
@@ -1803,6 +1824,58 @@ fn backfill_cron_job_id_alias(extra: &mut serde_json::Value) -> bool {
     }
 
     mutated
+}
+
+fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), AppError> {
+    let Some(obj) = extra.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(workspace) = obj
+        .get("workspace")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+    else {
+        return Ok(());
+    };
+    if workspace.is_empty() {
+        return Ok(());
+    }
+
+    let normalized = normalize_workspace_path(&workspace)?;
+    if normalized != workspace.as_str() {
+        obj.insert("workspace".to_owned(), serde_json::Value::String(normalized));
+    }
+    Ok(())
+}
+
+fn normalize_workspace_path(workspace: &str) -> Result<String, AppError> {
+    if workspace.trim().is_empty() {
+        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+    }
+
+    let workspace_path = PathBuf::from(workspace);
+    if workspace_path_has_whitespace_segment(&workspace_path) {
+        return Err(AppError::WorkspacePathContainsWhitespace(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    Ok(workspace.to_owned())
+}
+
+fn validate_runtime_workspace_path(workspace: &str) -> Result<String, AppError> {
+    if workspace.trim().is_empty() {
+        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+    }
+
+    let workspace_path = PathBuf::from(workspace);
+    if workspace_path_has_whitespace_segment(&workspace_path) {
+        return Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    Ok(workspace.to_owned())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
