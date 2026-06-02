@@ -57,7 +57,7 @@ impl ApiResponse<()> {
 /// Standard API error response.
 ///
 /// Matches the JSON format produced by `AppError::IntoResponse`:
-/// `{ "success": false, "error": "...", "code": "..." }`.
+/// `{ "success": false, "error": "...", "code": "...", "details": ... }`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub success: bool,
@@ -69,24 +69,19 @@ pub struct ErrorResponse {
 
 impl ErrorResponse {
     pub fn new(error: impl Into<String>, code: impl Into<String>) -> Self {
-        Self {
-            success: false,
-            error: error.into(),
-            code: code.into(),
-            details: None,
-        }
+        Self::new_with_details(error, code, None)
     }
 
     pub fn new_with_details(
         error: impl Into<String>,
         code: impl Into<String>,
-        details: impl Into<serde_json::Value>,
+        details: impl Into<Option<serde_json::Value>>,
     ) -> Self {
         Self {
             success: false,
             error: error.into(),
             code: code.into(),
-            details: Some(details.into()),
+            details: details.into(),
         }
     }
 }
@@ -191,6 +186,7 @@ mod tests {
         assert!(!resp.success);
         assert_eq!(resp.error, "Unauthorized: invalid token");
         assert_eq!(resp.code, "UNAUTHORIZED");
+        assert!(resp.details.is_none());
     }
 
     #[test]
@@ -262,5 +258,16 @@ mod tests {
         assert_eq!(resp.error, "Not found");
         assert_eq!(resp.code, "NOT_FOUND");
         assert!(resp.details.is_none());
+    }
+
+    #[test]
+    fn test_error_response_with_details() {
+        let resp = ErrorResponse::new_with_details(
+            "Command not found: npx",
+            "MCP_COMMAND_NOT_FOUND",
+            Some(serde_json::json!({ "command": "npx" })),
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["details"]["command"], "npx");
     }
 }
