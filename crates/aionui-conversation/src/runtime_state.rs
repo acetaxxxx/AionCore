@@ -138,37 +138,46 @@ impl ConversationRuntimeStateService {
         }
     }
 
-    fn release(&self, conversation_id: &str) {
+    fn release(&self, conversation_id: &str) -> bool {
         match self.state.lock() {
             Ok(mut state) => {
                 state.active_turns.remove(conversation_id);
-                state.deleting_conversations.remove(conversation_id);
-                info!(conversation_id, "conversation runtime turn claim released");
+                let was_deleting = state.deleting_conversations.remove(conversation_id);
+                info!(
+                    conversation_id,
+                    deleting = was_deleting,
+                    "conversation runtime turn claim released"
+                );
+                was_deleting
             }
             Err(_) => {
                 warn!(
                     conversation_id,
                     "conversation runtime state lock poisoned while releasing turn"
                 );
+                false
             }
         }
     }
 }
 
 impl TurnClaim {
-    pub fn release(&mut self) {
-        self.release_inner();
+    pub fn release(&mut self) -> bool {
+        self.release_inner()
     }
 
-    fn release_inner(&mut self) {
+    fn release_inner(&mut self) -> bool {
         if self.released {
-            return;
+            return false;
         }
 
-        if let Some(state) = self.state.upgrade() {
-            state.release(&self.conversation_id);
-        }
+        let was_deleting = self
+            .state
+            .upgrade()
+            .map(|state| state.release(&self.conversation_id))
+            .unwrap_or(false);
         self.released = true;
+        was_deleting
     }
 }
 
@@ -220,12 +229,12 @@ mod tests {
     #[test]
     fn release_clears_deleting_flag_for_active_turn() {
         let state = Arc::new(ConversationRuntimeStateService::default());
-        let claim = state.try_claim_turn("conv-1").expect("claim should be created");
+        let mut claim = state.try_claim_turn("conv-1").expect("claim should be created");
 
         state.mark_deleting("conv-1");
         assert!(state.is_deleting("conv-1"));
 
-        drop(claim);
+        assert!(claim.release());
 
         assert!(!state.is_deleting("conv-1"));
     }

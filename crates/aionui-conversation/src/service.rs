@@ -209,6 +209,14 @@ impl ConversationService {
     }
 
     pub async fn complete_turn(&self, conversation_id: &str) {
+        if self.runtime_state.is_deleting(conversation_id) {
+            debug!(
+                conversation_id,
+                "Skipping turn completion because conversation is deleting"
+            );
+            return;
+        }
+
         let runtime = self.runtime_summary_for(conversation_id).await;
         StreamRelay::complete_conversation_with_runtime(
             &self.conversation_repo,
@@ -217,6 +225,18 @@ impl ConversationService {
             Some(runtime),
         )
         .await;
+    }
+
+    async fn complete_released_turn(&self, conversation_id: &str, was_deleting: bool) {
+        if was_deleting {
+            debug!(
+                conversation_id,
+                "Skipping turn completion because conversation was deleting at claim release"
+            );
+            return;
+        }
+
+        self.complete_turn(conversation_id).await;
     }
 }
 
@@ -1370,9 +1390,16 @@ impl ConversationService {
                         error = %ErrorChain(&err),
                         "Agent task build failed"
                     );
-                    service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
-                    turn_claim.release();
-                    service.complete_turn(&conv_id).await;
+                    if service.runtime_state.is_deleting(&conv_id) {
+                        debug!(
+                            conversation_id = %conv_id,
+                            "Skipping send failure persistence because conversation is deleting"
+                        );
+                    } else {
+                        service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
+                    }
+                    let was_deleting = turn_claim.release();
+                    service.complete_released_turn(&conv_id, was_deleting).await;
                     return;
                 }
             };
@@ -1389,9 +1416,16 @@ impl ConversationService {
                     error = %ErrorChain(&err),
                     "Failed to persist resolved workspace"
                 );
-                service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
-                turn_claim.release();
-                service.complete_turn(&conv_id).await;
+                if service.runtime_state.is_deleting(&conv_id) {
+                    debug!(
+                        conversation_id = %conv_id,
+                        "Skipping workspace failure persistence because conversation is deleting"
+                    );
+                } else {
+                    service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
+                }
+                let was_deleting = turn_claim.release();
+                service.complete_released_turn(&conv_id, was_deleting).await;
                 return;
             }
 
@@ -1472,6 +1506,14 @@ impl ConversationService {
                 // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.
                 let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
 
+                if runtime_state.is_deleting(&conv_id) {
+                    debug!(
+                        conversation_id = %conv_id,
+                        "Skipping post-terminal persistence because conversation is deleting"
+                    );
+                    break;
+                }
+
                 if let Some(session_key) = agent.get_session_key() {
                     persist_session_key(&repo, &conv_id, &session_key).await;
                 }
@@ -1499,8 +1541,8 @@ impl ConversationService {
                 ));
             }
 
-            turn_claim.release();
-            service.complete_turn(&conv_id).await;
+            let was_deleting = turn_claim.release();
+            service.complete_released_turn(&conv_id, was_deleting).await;
         });
 
         info!(

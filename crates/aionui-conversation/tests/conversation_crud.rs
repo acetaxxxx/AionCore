@@ -746,6 +746,18 @@ async fn update_accepts_top_level_model_for_aionrs() {
 }
 
 #[tokio::test]
+async fn complete_turn_skips_status_update_when_conversation_is_deleting() {
+    let (svc, _, _task_mgr) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    svc.runtime_state().mark_deleting(&conv.id);
+    svc.complete_turn(&conv.id).await;
+
+    let row = svc.conversation_repo().get(&conv.id).await.unwrap().unwrap();
+    assert_eq!(row.status.as_deref(), Some("pending"));
+}
+
+#[tokio::test]
 async fn update_non_aionrs_extra_model_does_not_kill_task() {
     // Verifies the explicit rule that `extra.model` changes for non-aionrs
     // do NOT trigger task_manager.kill. Since our `NoopTaskManager::kill` is
