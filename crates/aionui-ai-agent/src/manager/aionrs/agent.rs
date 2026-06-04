@@ -249,15 +249,13 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
                     error = %ErrorChain(&e),
-                    "Aionrs engine.run() failed, emitting Error+Finish"
+                    "Aionrs engine.run() failed, emitting Error"
                 );
                 let send_error = aionrs_engine_error_to_send_error(error_msg);
                 self.runtime.emit_error_data(send_error.stream_error().clone());
-                self.runtime.emit_finish(None);
                 Err(send_error)
             }
             None => {
-                self.runtime.emit_error("Stopped by user");
                 self.runtime.emit_finish(None);
                 Ok(())
             }

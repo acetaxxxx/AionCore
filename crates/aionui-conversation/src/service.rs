@@ -1432,8 +1432,31 @@ impl ConversationService {
                 // 1. Send the message to the agent and concurrently run the relay to stream events.
                 tokio::spawn(async move {
                     if let Err(e) = send_agent.send_message(current_send).await {
-                        error!(conversation_id = %conv_id_send, error = %ErrorChain(&e), "Agent send_message failed");
-                        let _ = send_error_tx.send(e);
+                        let task_status = send_agent.status();
+                        let agent_type = send_agent.agent_type();
+                        error!(
+                            conversation_id = %conv_id_send,
+                            ?agent_type,
+                            ?task_status,
+                            error = %ErrorChain(&e),
+                            "Agent send_message failed"
+                        );
+                        if task_status == Some(ConversationStatus::Finished) {
+                            debug!(
+                                conversation_id = %conv_id_send,
+                                ?agent_type,
+                                "Agent send_message failure already published runtime terminal; skipping fallback stream error"
+                            );
+                        } else {
+                            warn!(
+                                conversation_id = %conv_id_send,
+                                ?agent_type,
+                                code = ?e.code(),
+                                ownership = ?e.ownership(),
+                                "Agent send_message returned error without runtime terminal; injecting fallback stream error"
+                            );
+                            let _ = send_error_tx.send(e);
+                        }
                     }
                 });
                 // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.

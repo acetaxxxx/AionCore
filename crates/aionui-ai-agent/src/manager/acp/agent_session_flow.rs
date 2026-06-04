@@ -2,8 +2,7 @@ use crate::manager::acp::AcpAgentManager;
 use crate::manager::acp::mode_normalize::agent_metadata_uses_meta_resume;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{
-    AgentStreamEvent, AvailableCommandsEventData, ErrorEventData, FinishEventData, SessionAssignedEventData,
-    StartEventData,
+    AgentStreamEvent, AvailableCommandsEventData, ErrorEventData, SessionAssignedEventData, StartEventData,
 };
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
@@ -20,6 +19,13 @@ use super::error_mapping::{
     AcpSendFailure, acp_error_to_app_error, is_acp_session_not_found, is_mapped_acp_session_not_found,
 };
 use tracing::warn;
+
+#[derive(Debug)]
+pub(super) enum PromptOutcome {
+    Completed { session_id: String },
+    Cancelled { session_id: String },
+    EmptyResponse { session_id: String, error: ErrorEventData },
+}
 
 impl AcpAgentManager {
     /// Establish a fresh ACP session (session/new) and apply desired
@@ -228,7 +234,7 @@ impl AcpAgentManager {
         &self,
         data: &SendMessageData,
         session_id: Option<&str>,
-    ) -> Result<(), AcpSendFailure> {
+    ) -> Result<PromptOutcome, AcpSendFailure> {
         let sid = session_id
             .ok_or_else(|| AppError::Internal("Cannot prompt: no session ID available".into()))
             .map_err(AcpSendFailure::from)?;
@@ -255,24 +261,11 @@ impl AcpAgentManager {
             .await
             .map_err(AcpSendFailure::from)?;
 
-        // Diagnose the "blank reply" case: the agent finished a turn without
-        // producing any user-visible output. We surface a structured error to
-        // the renderer so the user gets actionable feedback instead of a
-        // silent success. Cancelled turns are deliberately excluded — the
-        // user already initiated the cancel and doesn't need a second
-        // notification.
-        if !matches!(prompt_response.stop_reason, StopReason::Cancelled) && is_empty_turn(&mut probe_rx) {
-            self.runtime.emit(AgentStreamEvent::Error(empty_finish_diagnostic_error(
-                prompt_response.stop_reason,
-            )));
-        }
-
-        // Emit Finish event
-        self.runtime.emit(AgentStreamEvent::Finish(FinishEventData {
-            session_id: Some(sid.to_owned()),
-        }));
-
-        Ok(())
+        Ok(prompt_outcome_from_stop_reason(
+            sid,
+            prompt_response.stop_reason,
+            is_empty_turn(&mut probe_rx),
+        ))
     }
 
     /// Emit model/mode/config events from the session aggregate so the frontend
@@ -376,6 +369,25 @@ fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
     )
 }
 
+fn prompt_outcome_from_stop_reason(session_id: &str, stop_reason: StopReason, empty_turn: bool) -> PromptOutcome {
+    if matches!(stop_reason, StopReason::Cancelled) {
+        return PromptOutcome::Cancelled {
+            session_id: session_id.to_owned(),
+        };
+    }
+
+    if empty_turn {
+        return PromptOutcome::EmptyResponse {
+            session_id: session_id.to_owned(),
+            error: empty_finish_diagnostic_error(stop_reason),
+        };
+    }
+
+    PromptOutcome::Completed {
+        session_id: session_id.to_owned(),
+    }
+}
+
 fn empty_finish_diagnostic_error(stop_reason: StopReason) -> ErrorEventData {
     ErrorEventData::classified(
         // TODO(i18n): wire to a frontend translation key once a
@@ -432,6 +444,7 @@ mod tests {
     use crate::protocol::error::AcpError;
     use crate::shared_kernel::SessionId as DomainSessionId;
     use agent_client_protocol::schema::AgentCapabilities;
+    use aionui_api_types::AgentErrorCode;
 
     fn make_session() -> AcpSession {
         AcpSession::new(None, None, Default::default())
@@ -702,5 +715,43 @@ mod tests {
             .expect("empty-finish classified errors must include a resolution");
         assert_eq!(resolution.kind, AgentErrorResolutionKind::SendFeedback);
         assert_eq!(resolution.target, Some(AgentErrorResolutionTarget::Feedback));
+    }
+
+    #[test]
+    fn prompt_outcome_empty_response_maps_to_error_without_finish() {
+        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, true);
+
+        match outcome {
+            super::PromptOutcome::EmptyResponse { session_id, error } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(error.code, Some(AgentErrorCode::UnknownUpstreamError));
+                assert_eq!(error.feedback_recommended, Some(true));
+            }
+            other => panic!("expected EmptyResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_outcome_cancelled_takes_priority_over_empty_response() {
+        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::Cancelled, true);
+
+        match outcome {
+            super::PromptOutcome::Cancelled { session_id } => {
+                assert_eq!(session_id, "sess-1");
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_outcome_completed_when_visible_output_exists() {
+        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, false);
+
+        match outcome {
+            super::PromptOutcome::Completed { session_id } => {
+                assert_eq!(session_id, "sess-1");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 }
