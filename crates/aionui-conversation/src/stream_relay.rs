@@ -27,8 +27,16 @@ fn is_not_found(err: &DbError) -> bool {
     matches!(err, DbError::NotFound(_))
 }
 
+fn is_foreign_key_constraint(err: &DbError) -> bool {
+    err.to_string().contains("FOREIGN KEY constraint failed")
+}
+
+fn is_deleted_during_stream_persistence(err: &DbError) -> bool {
+    is_not_found(err) || is_foreign_key_constraint(err)
+}
+
 fn log_persist_error(err: &DbError, message: &'static str) {
-    if is_not_found(err) {
+    if is_deleted_during_stream_persistence(err) {
         debug!(error = %ErrorChain(err), "{message}; conversation was likely deleted during stream finalization");
     } else {
         error!(error = %ErrorChain(err), "{message}");
@@ -469,7 +477,7 @@ impl StreamRelay {
                 hidden: None,
             };
             if let Err(e) = self.repo.update_message(&segment.id, &update).await {
-                error!(error = %ErrorChain(&e), "Failed to update streaming text segment");
+                log_persist_error(&e, "Failed to update streaming text segment");
             }
         } else {
             let row = MessageRow {
@@ -484,7 +492,7 @@ impl StreamRelay {
                 created_at: segment.created_at,
             };
             if let Err(e) = self.repo.insert_message(&row).await {
-                error!(error = %ErrorChain(&e), "Failed to create streaming text segment");
+                log_persist_error(&e, "Failed to create streaming text segment");
             }
             segment.record_created = true;
         }
@@ -656,7 +664,7 @@ impl StreamRelay {
             created_at: segment.started_at,
         };
         if let Err(e) = self.repo.insert_message(&row).await {
-            error!(error = %ErrorChain(&e), "Failed to persist thinking message");
+            log_persist_error(&e, "Failed to persist thinking message");
         }
     }
 
@@ -1835,6 +1843,64 @@ mod tests {
         StreamRelay::complete_conversation_with_runtime(&repo, &bus, "deleted-conv", None).await;
     }
 
+    #[tokio::test]
+    async fn finalize_treats_foreign_key_failure_as_deleted_conversation() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_foreign_key_failure(true);
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let relay = StreamRelay::new(
+            "deleted-conv".into(),
+            "assistant-msg".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+
+        let outcome = relay
+            .finalize(
+                "partial answer",
+                &[],
+                &AgentStreamEvent::Finish(FinishEventData::default()),
+                RelayTerminal::Finish,
+            )
+            .await;
+
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert!(
+            repo.take_inserts().is_empty(),
+            "failed fallback writes must not be recorded as persisted messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_active_thinking_treats_foreign_key_failure_as_deleted_conversation() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_foreign_key_failure(true);
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let relay = StreamRelay::new(
+            "deleted-conv".into(),
+            "assistant-msg".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let mut active_thinking = Some(ThinkingSegmentState {
+            id: "thinking-1".into(),
+            buffer: "working".into(),
+            started_at: now_ms(),
+        });
+
+        relay.complete_active_thinking(&mut active_thinking).await;
+
+        assert!(active_thinking.is_none());
+        assert!(
+            repo.take_inserts().is_empty(),
+            "failed thinking writes must not be recorded as persisted messages"
+        );
+    }
+
     // ── Helpers ──────────────────────────────────────────────────
 
     struct MockCronService;
@@ -1889,6 +1955,7 @@ mod tests {
         inserts: Mutex<Vec<MessageRow>>,
         updates: Mutex<Vec<(String, aionui_db::MessageRowUpdate)>>,
         not_found: AtomicBool,
+        foreign_key_failure: AtomicBool,
     }
 
     impl RecordingRepo {
@@ -1897,11 +1964,16 @@ mod tests {
                 inserts: Mutex::new(vec![]),
                 updates: Mutex::new(vec![]),
                 not_found: AtomicBool::new(false),
+                foreign_key_failure: AtomicBool::new(false),
             }
         }
 
         fn set_not_found(&self, value: bool) {
             self.not_found.store(value, Ordering::Release);
+        }
+
+        fn set_foreign_key_failure(&self, value: bool) {
+            self.foreign_key_failure.store(value, Ordering::Release);
         }
 
         fn take_inserts(&self) -> Vec<MessageRow> {
@@ -1981,6 +2053,9 @@ mod tests {
         async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound(format!("Message '{}'", row.id)));
+            }
+            if self.foreign_key_failure.load(Ordering::Acquire) {
+                return Err(DbError::Init("FOREIGN KEY constraint failed".into()));
             }
             self.inserts.lock().unwrap().push(row.clone());
             Ok(())

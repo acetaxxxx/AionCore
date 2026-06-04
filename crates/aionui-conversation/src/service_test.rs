@@ -978,6 +978,38 @@ async fn delete_invokes_registered_hook() {
     assert_eq!(calls.as_slice(), &[conv.id]);
 }
 
+#[tokio::test]
+async fn delete_invokes_registered_hook_before_row_delete() {
+    use aionui_common::OnConversationDelete;
+
+    struct RowVisibleHook {
+        repo: Arc<MockRepo>,
+        observations: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OnConversationDelete for RowVisibleHook {
+        async fn on_conversation_deleted(&self, conversation_id: &str) {
+            let exists = self.repo.get(conversation_id).await.unwrap().is_some();
+            self.observations.lock().unwrap().push(exists);
+        }
+    }
+
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let hook = Arc::new(RowVisibleHook {
+        repo: repo.clone(),
+        observations: Mutex::new(vec![]),
+    });
+    svc.with_delete_hook(hook.clone());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    svc.delete("user_1", &conv.id).await.unwrap();
+
+    let observations = hook.observations.lock().unwrap();
+    assert_eq!(observations.as_slice(), &[true]);
+    assert!(repo.get(&conv.id).await.unwrap().is_none());
+}
+
 // ── Broadcast payload tests ────────────────────────────────────────
 
 #[tokio::test]
