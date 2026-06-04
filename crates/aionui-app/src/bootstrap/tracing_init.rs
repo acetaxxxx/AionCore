@@ -8,7 +8,16 @@ use std::path::Path;
 
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-const NOISE_SUPPRESSIONS: &[&str] = &["sqlx::query=warn", "hyper_util=warn", "reqwest=warn"];
+const NOISE_SUPPRESSIONS: &[&str] = &[
+    "sqlx::query=warn",
+    "hyper_util=warn",
+    "reqwest=warn",
+    // The ACP SDK logs raw UntypedMessage values at debug/trace, including
+    // session/update chunks with user/agent text. Keep its protocol internals
+    // out of default dev logs; aionui_ai_agent::protocol::acp emits sanitized
+    // summaries for the ACP flow we need to debug.
+    "agent_client_protocol::jsonrpc=info",
+];
 
 const AIONRS_TARGETS: &[&str] = &[
     "aion_agent",
@@ -91,5 +100,41 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> LogGuards {
     LogGuards {
         _backend: backend_guard,
         _aionrs: aionrs_guard,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::Level;
+
+    #[test]
+    fn env_filter_suppresses_raw_acp_sdk_jsonrpc_debug_even_when_debug_enabled() {
+        let subscriber = tracing_subscriber::registry().with(build_env_filter(Some("debug")));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                !tracing::enabled!(target: "agent_client_protocol::jsonrpc::handlers", Level::DEBUG),
+                "ACP SDK JSON-RPC debug logs include raw UntypedMessage payloads"
+            );
+            assert!(
+                tracing::enabled!(target: "aionui_ai_agent::protocol::acp", Level::DEBUG),
+                "AionUi ACP sanitized debug summaries should still be available"
+            );
+        });
+    }
+
+    #[test]
+    fn backend_filter_suppresses_raw_acp_sdk_jsonrpc_debug_even_when_debug_enabled() {
+        let subscriber = tracing_subscriber::registry().with(build_backend_filter(Some("debug")));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                !tracing::enabled!(target: "agent_client_protocol::jsonrpc::handlers", Level::DEBUG),
+                "ACP SDK JSON-RPC debug logs include raw UntypedMessage payloads"
+            );
+            assert!(
+                tracing::enabled!(target: "aionui_ai_agent::protocol::acp", Level::DEBUG),
+                "AionUi ACP sanitized debug summaries should still be available"
+            );
+        });
     }
 }
