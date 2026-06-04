@@ -160,4 +160,38 @@ mod tests {
         assert!(summary.is_processing);
         assert!(!summary.can_send_message);
     }
+
+    #[test]
+    fn summary_waiting_confirmation_takes_priority() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state.try_claim_turn("conv-1").expect("claim should be created");
+
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 1);
+
+        assert_eq!(summary.state, ConversationRuntimeStateKind::WaitingConfirmation);
+        assert!(summary.is_processing);
+        assert!(!summary.can_send_message);
+    }
+
+    #[test]
+    fn summary_uses_running_task_without_claim() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0);
+
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Running);
+        assert!(summary.is_processing);
+        assert!(!summary.can_send_message);
+    }
+
+    #[test]
+    fn summary_idle_when_no_claim_running_task_or_confirmation() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Finished), true, 0);
+
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Idle);
+        assert!(!summary.is_processing);
+        assert!(summary.can_send_message);
+    }
 }
