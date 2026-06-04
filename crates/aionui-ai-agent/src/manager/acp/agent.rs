@@ -705,6 +705,13 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
             session.record_close_reason(Some(CloseReason::UserCancel));
         }
 
+        info!(
+            agent_type = "acp",
+            terminal_kind = "finish",
+            source = "cancel_request",
+            session_id = session_id.as_deref().unwrap_or("none"),
+            "ACP cancel emitting terminal finish"
+        );
         self.runtime.emit_finish(None);
 
         Ok(())
