@@ -34,6 +34,7 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::broadcast;
 
+use crate::ConversationError;
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 
@@ -641,7 +642,7 @@ async fn create_rejects_workspace_with_trailing_whitespace_in_request() {
 
     assert!(matches!(
         err,
-        AppError::WorkspacePathContainsWhitespace(message)
+        ConversationError::App(AppError::WorkspacePathContainsWhitespace(message))
             if message == workspace_with_trailing_space
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -665,7 +666,7 @@ async fn create_rejects_workspace_with_whitespace_in_any_path_segment() {
 
     assert!(matches!(
         err,
-        AppError::WorkspacePathContainsWhitespace(message)
+        ConversationError::App(AppError::WorkspacePathContainsWhitespace(message))
             if message == workspace.to_string_lossy()
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -749,7 +750,7 @@ async fn get_reports_idle_runtime_when_only_persisted_status_is_running() {
 async fn get_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let err = svc.get("user_1", "non-existent").await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── List tests ─────────────────────────────────────────────────────
@@ -924,7 +925,7 @@ async fn update_not_found() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
     let err = svc.update("user_1", "non-existent", req, &task_mgr).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── Delete tests ───────────────────────────────────────────────────
@@ -939,7 +940,7 @@ async fn delete_conversation() {
 
     // Should be gone
     let err = svc.get("user_1", &conv.id).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 
     // Should broadcast deleted
     let events = broadcaster.take_events();
@@ -952,7 +953,7 @@ async fn delete_conversation() {
 async fn delete_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let err = svc.delete("user_1", "non-existent").await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -1027,7 +1028,7 @@ async fn get_wrong_user_returns_not_found() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let err = svc.get("user_2", &conv.id).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -1037,7 +1038,7 @@ async fn update_wrong_user_returns_not_found() {
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "hacked" })).unwrap();
     let err = svc.update("user_2", &conv.id, req, &task_mgr).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 
     // Original should be unchanged
     let original = svc.get("user_1", &conv.id).await.unwrap();
@@ -1050,7 +1051,7 @@ async fn delete_wrong_user_returns_not_found() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let err = svc.delete("user_2", &conv.id).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 
     // Should still exist
     let still_exists = svc.get("user_1", &conv.id).await.unwrap();
@@ -1152,7 +1153,7 @@ async fn list_artifacts_includes_legacy_cron_trigger_messages() {
 async fn reset_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let err = svc.reset("user_1", "no-such-id").await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -1161,7 +1162,7 @@ async fn reset_wrong_user() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     let err = svc.reset("user_2", &conv.id).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── Search validation tests ───────────────────────────────────────
@@ -1176,7 +1177,7 @@ async fn search_messages_empty_keyword_returns_bad_request() {
         page_size: None,
     };
     let err = svc.search_messages("user_1", query).await.unwrap_err();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    assert!(matches!(err, ConversationError::BadRequest { .. }));
 }
 
 #[tokio::test]
@@ -1189,7 +1190,7 @@ async fn search_messages_whitespace_keyword_returns_bad_request() {
         page_size: None,
     };
     let err = svc.search_messages("user_1", query).await.unwrap_err();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    assert!(matches!(err, ConversationError::BadRequest { .. }));
 }
 
 // ── Mock Agent ───────────────────────────────────────────────────
@@ -1749,7 +1750,8 @@ async fn send_message_rejects_legacy_workspace_with_runtime_error_code() {
         .unwrap_err();
     assert!(matches!(
         err,
-        AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"
+        ConversationError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+            if message == "/tmp/my project"
     ));
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1939,7 +1941,7 @@ async fn send_message_empty_content_returns_bad_request() {
     .unwrap();
 
     let err = svc.send_message("user_1", &conv.id, req, &task_mgr).await.unwrap_err();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    assert!(matches!(err, ConversationError::BadRequest { .. }));
 }
 
 #[tokio::test]
@@ -1954,7 +1956,7 @@ async fn send_message_whitespace_content_returns_bad_request() {
     .unwrap();
 
     let err = svc.send_message("user_1", &conv.id, req, &task_mgr).await.unwrap_err();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    assert!(matches!(err, ConversationError::BadRequest { .. }));
 }
 
 #[tokio::test]
@@ -1966,7 +1968,7 @@ async fn send_message_conversation_not_found() {
         .send_message("user_1", "no-such-id", make_send_req(), &task_mgr)
         .await
         .unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -1979,7 +1981,7 @@ async fn send_message_wrong_user_returns_not_found() {
         .send_message("user_2", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -2015,7 +2017,7 @@ async fn send_message_rejects_active_runtime_claim() {
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap_err();
-    assert!(matches!(err, AppError::Conflict(_)));
+    assert!(matches!(err, ConversationError::Busy { .. }));
 }
 
 #[tokio::test]
@@ -2211,7 +2213,7 @@ async fn stop_stream_conversation_not_found() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let err = svc.cancel("user_1", "no-such-id", &task_mgr).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -2232,7 +2234,7 @@ async fn stop_stream_wrong_user_returns_not_found() {
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let err = svc.cancel("user_2", &conv.id, &task_mgr).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── warmup tests ────────────────────────────────────────────────
@@ -2259,7 +2261,7 @@ async fn warmup_conversation_not_found() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let err = svc.warmup("user_1", "no-such-id", &task_mgr).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -2269,7 +2271,7 @@ async fn warmup_wrong_user_returns_not_found() {
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let err = svc.warmup("user_2", &conv.id, &task_mgr).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -2292,7 +2294,8 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
     let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
     assert!(matches!(
         err,
-        AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"
+        ConversationError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+            if message == "/tmp/my project"
     ));
 }
 
@@ -2362,7 +2365,7 @@ async fn list_confirmations_not_found() {
         .list_confirmations("user_1", "no-such-id", &task_mgr)
         .await
         .unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -2372,7 +2375,7 @@ async fn list_confirmations_wrong_user() {
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let err = svc.list_confirmations("user_2", &conv.id, &task_mgr).await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -2474,7 +2477,7 @@ async fn confirm_nonexistent_call_id_returns_not_found() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::App(AppError::NotFound(_))));
 }
 
 #[tokio::test]
@@ -2522,7 +2525,7 @@ async fn confirm_no_agent_returns_not_found() {
         .confirm("user_1", &conv.id, "call-1", req, &task_mgr)
         .await
         .unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::ActiveAgentNotFound { .. }));
 }
 
 #[tokio::test]
@@ -2603,7 +2606,7 @@ async fn check_approval_not_found() {
         .check_approval("user_1", "no-such-id", "edit_file", None, &task_mgr)
         .await
         .unwrap_err();
-    assert!(matches!(err, AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── Skill snapshot tests ───────────────────────────────────────────
@@ -2697,7 +2700,7 @@ async fn update_rejects_extra_skills() {
     let err = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap_err();
 
     match err {
-        AppError::BadRequest(msg) => assert!(msg.contains("skills"), "msg = {msg:?}"),
+        ConversationError::BadRequest { reason: msg } => assert!(msg.contains("skills"), "msg = {msg:?}"),
         other => panic!("expected BadRequest, got {other:?}"),
     }
 }
