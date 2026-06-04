@@ -835,6 +835,8 @@ impl ConversationService {
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
 
+        let had_active_turn = self.runtime_state.mark_deleting(id);
+
         // Snapshot the hook list under the read lock, then drop the guard
         // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
         // across `.await` would make this future non-`Send`.
@@ -844,7 +846,13 @@ impl ConversationService {
             hook.on_conversation_deleted(id).await;
         }
 
-        self.conversation_repo.delete(id).await?;
+        if let Err(err) = self.conversation_repo.delete(id).await {
+            self.runtime_state.clear_deleting(id);
+            return Err(err.into());
+        }
+        if !had_active_turn {
+            self.runtime_state.clear_deleting(id);
+        }
         // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
         // conversations that used to be ACP (shouldn't happen but is
         // cheap to cover) still drop their orphaned session row.
@@ -1336,6 +1344,7 @@ impl ConversationService {
         let repo = Arc::clone(&self.conversation_repo);
         let broadcaster = Arc::clone(&self.broadcaster);
         let cron_service = self.current_cron_service();
+        let runtime_state = self.runtime_state();
         let user_id_owned = user_id.to_owned();
         let service = self.clone();
         let task_manager = Arc::clone(task_manager);
@@ -1423,6 +1432,7 @@ impl ConversationService {
                     Arc::clone(&broadcaster),
                     cron_service.clone(),
                 )
+                .with_runtime_state(Arc::clone(&runtime_state))
                 .with_turn_completion(false);
 
                 let rx = agent.subscribe();
