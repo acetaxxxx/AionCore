@@ -93,7 +93,7 @@ pub struct ConversationService {
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
     task_manager: Arc<dyn IWorkerTaskManager>,
-    /// Hooks invoked at the end of `delete()` so other services
+    /// Hooks invoked during `delete()` before the DB row is removed so other services
     /// (`WorkerTaskManagerImpl`, `CronService`, …) can clean up their
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl —
@@ -157,8 +157,8 @@ impl ConversationService {
 
     /// Register a hook to be notified when a conversation is deleted.
     ///
-    /// Hooks are dispatched sequentially in registration order from
-    /// `delete()`. Used by `aionui-app` to wire up `WorkerTaskManagerImpl`
+    /// Hooks are dispatched sequentially in registration order before
+    /// `delete()` removes the conversation row. Used by `aionui-app` to wire up `WorkerTaskManagerImpl`
     /// (kill the agent process) and `CronService` (cascade-delete cron jobs).
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
@@ -835,6 +835,15 @@ impl ConversationService {
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
 
+        // Snapshot the hook list under the read lock, then drop the guard
+        // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
+        // across `.await` would make this future non-`Send`.
+        let hooks: Vec<Arc<dyn OnConversationDelete>> =
+            self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
+        for hook in hooks {
+            hook.on_conversation_deleted(id).await;
+        }
+
         self.conversation_repo.delete(id).await?;
         // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
         // conversations that used to be ACP (shouldn't happen but is
@@ -844,15 +853,6 @@ impl ConversationService {
                 error = %ErrorChain(&err),
                 "Failed to delete acp_session row on conversation delete"
             );
-        }
-
-        // Snapshot the hook list under the read lock, then drop the guard
-        // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
-        // across `.await` would make this future non-`Send`.
-        let hooks: Vec<Arc<dyn OnConversationDelete>> =
-            self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
-        for hook in hooks {
-            hook.on_conversation_deleted(id).await;
         }
 
         info!("Conversation deleted");
