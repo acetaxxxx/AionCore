@@ -9,7 +9,13 @@ use tracing::{info, warn};
 
 #[derive(Debug, Default)]
 pub struct ConversationRuntimeStateService {
-    active_turns: Mutex<HashSet<String>>,
+    state: Mutex<ConversationRuntimeState>,
+}
+
+#[derive(Debug, Default)]
+struct ConversationRuntimeState {
+    active_turns: HashSet<String>,
+    deleting_conversations: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -21,7 +27,7 @@ pub struct TurnClaim {
 
 impl ConversationRuntimeStateService {
     pub fn try_claim_turn(self: &Arc<Self>, conversation_id: &str) -> Result<TurnClaim, AppError> {
-        let mut active_turns = self.active_turns.lock().map_err(|_| {
+        let mut state = self.state.lock().map_err(|_| {
             warn!(
                 conversation_id,
                 "conversation runtime state lock poisoned while claiming turn"
@@ -29,7 +35,17 @@ impl ConversationRuntimeStateService {
             AppError::Internal("conversation runtime state lock poisoned".into())
         })?;
 
-        if !active_turns.insert(conversation_id.to_owned()) {
+        if state.deleting_conversations.contains(conversation_id) {
+            info!(
+                conversation_id,
+                "conversation runtime turn claim rejected because conversation is deleting"
+            );
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} is being deleted"
+            )));
+        }
+
+        if !state.active_turns.insert(conversation_id.to_owned()) {
             info!(conversation_id, "conversation runtime turn claim rejected");
             return Err(AppError::Conflict(format!(
                 "conversation {conversation_id} is already running"
@@ -46,9 +62,48 @@ impl ConversationRuntimeStateService {
     }
 
     pub fn is_claimed(&self, conversation_id: &str) -> bool {
-        self.active_turns
+        self.state
             .lock()
-            .map(|active_turns| active_turns.contains(conversation_id))
+            .map(|state| state.active_turns.contains(conversation_id))
+            .unwrap_or(false)
+    }
+
+    pub fn mark_deleting(&self, conversation_id: &str) -> bool {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.deleting_conversations.insert(conversation_id.to_owned());
+                let active = state.active_turns.contains(conversation_id);
+                info!(conversation_id, active, "conversation marked deleting");
+                active
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    "conversation runtime state lock poisoned while marking delete"
+                );
+                false
+            }
+        }
+    }
+
+    pub fn clear_deleting(&self, conversation_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.deleting_conversations.remove(conversation_id);
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    "conversation runtime state lock poisoned while clearing delete"
+                );
+            }
+        }
+    }
+
+    pub fn is_deleting(&self, conversation_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.deleting_conversations.contains(conversation_id))
             .unwrap_or(false)
     }
 
@@ -84,9 +139,10 @@ impl ConversationRuntimeStateService {
     }
 
     fn release(&self, conversation_id: &str) {
-        match self.active_turns.lock() {
-            Ok(mut active_turns) => {
-                active_turns.remove(conversation_id);
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.active_turns.remove(conversation_id);
+                state.deleting_conversations.remove(conversation_id);
                 info!(conversation_id, "conversation runtime turn claim released");
             }
             Err(_) => {
@@ -147,6 +203,31 @@ mod tests {
 
         assert!(!state.is_claimed("conv-1"));
         assert!(state.try_claim_turn("conv-1").is_ok());
+    }
+
+    #[test]
+    fn deleting_rejects_new_turn_claims() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        state.mark_deleting("conv-1");
+
+        let err = state
+            .try_claim_turn("conv-1")
+            .expect_err("deleting conversation should reject new turns");
+        assert!(err.to_string().contains("being deleted"));
+    }
+
+    #[test]
+    fn release_clears_deleting_flag_for_active_turn() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let claim = state.try_claim_turn("conv-1").expect("claim should be created");
+
+        state.mark_deleting("conv-1");
+        assert!(state.is_deleting("conv-1"));
+
+        drop(claim);
+
+        assert!(!state.is_deleting("conv-1"));
     }
 
     #[test]

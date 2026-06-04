@@ -12,6 +12,7 @@ use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResu
 use aionui_api_types::{AgentErrorCode, ConversationRuntimeSummary, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
+use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
 use aionui_db::models::MessageRow;
 use aionui_db::{DbError, IConversationRepository};
@@ -113,6 +114,7 @@ pub struct StreamRelay {
     repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     cron_service: Option<Arc<dyn ICronService>>,
+    runtime_state: Option<Arc<ConversationRuntimeStateService>>,
     complete_turn: bool,
 }
 
@@ -132,8 +134,14 @@ impl StreamRelay {
             repo,
             broadcaster,
             cron_service,
+            runtime_state: None,
             complete_turn: true,
         }
+    }
+
+    pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
+        self.runtime_state = Some(runtime_state);
+        self
     }
 
     pub fn with_turn_completion(mut self, enabled: bool) -> Self {
@@ -212,6 +220,15 @@ impl StreamRelay {
 
             match recv_result {
                 Ok(event) => {
+                    let deleting = self.is_deleting();
+                    if deleting && !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
+                        debug!(
+                            event_type = Self::event_kind(&event),
+                            "Skipping non-terminal stream event because conversation is deleting"
+                        );
+                        continue;
+                    }
+
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
                         info!(
@@ -303,20 +320,31 @@ impl StreamRelay {
                                 }
                             }
 
-                            self.complete_active_thinking(&mut active_thinking).await;
-                            self.close_active_text_segment(
-                                &mut active_text,
-                                &mut text_segments,
-                                if matches!(event, AgentStreamEvent::Error(_)) {
-                                    "error"
-                                } else {
-                                    "finish"
-                                },
-                            )
-                            .await;
+                            if deleting {
+                                debug!("Skipping terminal DB finalization because conversation is deleting");
+                            } else {
+                                self.complete_active_thinking(&mut active_thinking).await;
+                                self.close_active_text_segment(
+                                    &mut active_text,
+                                    &mut text_segments,
+                                    if matches!(event, AgentStreamEvent::Error(_)) {
+                                        "error"
+                                    } else {
+                                        "finish"
+                                    },
+                                )
+                                .await;
+                            }
                             self.forward_to_websocket(&event);
-                            let outcome = self.finalize(&full_text_buffer, &text_segments, &event, terminal).await;
-                            if self.complete_turn {
+                            let outcome = if deleting {
+                                RelayOutcome {
+                                    system_responses: Vec::new(),
+                                    terminal,
+                                }
+                            } else {
+                                self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
+                            };
+                            if self.complete_turn && !deleting {
                                 Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
                             }
                             break outcome;
@@ -355,19 +383,30 @@ impl StreamRelay {
                         "StreamRelay channel closed without terminal event"
                     );
 
-                    self.complete_active_thinking(&mut active_thinking).await;
-                    self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
-                        .await;
+                    let deleting = self.is_deleting();
+                    if deleting {
+                        debug!("Skipping channel-closed DB finalization because conversation is deleting");
+                    } else {
+                        self.complete_active_thinking(&mut active_thinking).await;
+                        self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                            .await;
+                    }
                     // Channel closed without finish/error — still finalize
-                    let outcome = self
-                        .finalize(
+                    let outcome = if deleting {
+                        RelayOutcome {
+                            system_responses: Vec::new(),
+                            terminal: RelayTerminal::ChannelClosed,
+                        }
+                    } else {
+                        self.finalize(
                             &full_text_buffer,
                             &text_segments,
                             &AgentStreamEvent::Finish(aionui_ai_agent::protocol::events::FinishEventData::default()),
                             RelayTerminal::ChannelClosed,
                         )
-                        .await;
-                    if self.complete_turn {
+                        .await
+                    };
+                    if self.complete_turn && !deleting {
                         Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
                     }
                     break outcome;
@@ -377,6 +416,12 @@ impl StreamRelay {
                 }
             }
         }
+    }
+
+    fn is_deleting(&self) -> bool {
+        self.runtime_state
+            .as_ref()
+            .is_some_and(|state| state.is_deleting(&self.conversation_id))
     }
 
     fn event_kind(event: &AgentStreamEvent) -> &'static str {
@@ -1841,6 +1886,38 @@ mod tests {
         let bus: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
 
         StreamRelay::complete_conversation_with_runtime(&repo, &bus, "deleted-conv", None).await;
+    }
+
+    #[tokio::test]
+    async fn run_skips_db_finalization_when_conversation_is_deleting() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let runtime_state = Arc::new(ConversationRuntimeStateService::default());
+        runtime_state.mark_deleting("deleted-conv");
+        let (tx, _) = broadcast::channel(16);
+
+        let relay = StreamRelay::new(
+            "deleted-conv".into(),
+            "assistant-msg".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        )
+        .with_runtime_state(runtime_state);
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "partial answer".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert!(repo.take_inserts().is_empty());
+        assert!(repo.take_updates().is_empty());
     }
 
     #[tokio::test]
