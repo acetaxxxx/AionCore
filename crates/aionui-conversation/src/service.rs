@@ -94,7 +94,7 @@ pub struct ConversationService {
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
     task_manager: Arc<dyn IWorkerTaskManager>,
-    /// Hooks invoked at the end of `delete()` so other services
+    /// Hooks invoked during `delete()` before the DB row is removed so other services
     /// (`WorkerTaskManagerImpl`, `CronService`, …) can clean up their
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl —
@@ -158,8 +158,8 @@ impl ConversationService {
 
     /// Register a hook to be notified when a conversation is deleted.
     ///
-    /// Hooks are dispatched sequentially in registration order from
-    /// `delete()`. Used by `aionui-app` to wire up `WorkerTaskManagerImpl`
+    /// Hooks are dispatched sequentially in registration order before
+    /// `delete()` removes the conversation row. Used by `aionui-app` to wire up `WorkerTaskManagerImpl`
     /// (kill the agent process) and `CronService` (cascade-delete cron jobs).
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
@@ -212,6 +212,14 @@ impl ConversationService {
     }
 
     pub async fn complete_turn(&self, conversation_id: &str) {
+        if self.runtime_state.is_deleting(conversation_id) {
+            debug!(
+                conversation_id,
+                "Skipping turn completion because conversation is deleting"
+            );
+            return;
+        }
+
         let runtime = self.runtime_summary_for(conversation_id).await;
         StreamRelay::complete_conversation_with_runtime(
             &self.conversation_repo,
@@ -220,6 +228,18 @@ impl ConversationService {
             Some(runtime),
         )
         .await;
+    }
+
+    async fn complete_released_turn(&self, conversation_id: &str, was_deleting: bool) {
+        if was_deleting {
+            debug!(
+                conversation_id,
+                "Skipping turn completion because conversation was deleting at claim release"
+            );
+            return;
+        }
+
+        self.complete_turn(conversation_id).await;
     }
 }
 
@@ -845,16 +865,7 @@ impl ConversationService {
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
 
-        self.conversation_repo.delete(id).await?;
-        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
-        // conversations that used to be ACP (shouldn't happen but is
-        // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete(id).await {
-            warn!(
-                error = %ErrorChain(&err),
-                "Failed to delete acp_session row on conversation delete"
-            );
-        }
+        let had_active_turn = self.runtime_state.mark_deleting(id);
 
         // Snapshot the hook list under the read lock, then drop the guard
         // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
@@ -863,6 +874,23 @@ impl ConversationService {
             self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
         for hook in hooks {
             hook.on_conversation_deleted(id).await;
+        }
+
+        if let Err(err) = self.conversation_repo.delete(id).await {
+            self.runtime_state.clear_deleting(id);
+            return Err(err.into());
+        }
+        if !had_active_turn {
+            self.runtime_state.clear_deleting(id);
+        }
+        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
+        // conversations that used to be ACP (shouldn't happen but is
+        // cheap to cover) still drop their orphaned session row.
+        if let Err(err) = self.acp_session_repo.delete(id).await {
+            warn!(
+                error = %ErrorChain(&err),
+                "Failed to delete acp_session row on conversation delete"
+            );
         }
 
         info!("Conversation deleted");
@@ -1385,6 +1413,7 @@ impl ConversationService {
         let repo = Arc::clone(&self.conversation_repo);
         let broadcaster = Arc::clone(&self.broadcaster);
         let cron_service = self.current_cron_service();
+        let runtime_state = self.runtime_state();
         let user_id_owned = user_id.to_owned();
         let service = self.clone();
         let task_manager = Arc::clone(task_manager);
@@ -1410,9 +1439,16 @@ impl ConversationService {
                         error = %ErrorChain(&err),
                         "Agent task build failed"
                     );
-                    service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
-                    turn_claim.release();
-                    service.complete_turn(&conv_id).await;
+                    if service.runtime_state.is_deleting(&conv_id) {
+                        debug!(
+                            conversation_id = %conv_id,
+                            "Skipping send failure persistence because conversation is deleting"
+                        );
+                    } else {
+                        service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
+                    }
+                    let was_deleting = turn_claim.release();
+                    service.complete_released_turn(&conv_id, was_deleting).await;
                     return;
                 }
             };
@@ -1429,9 +1465,16 @@ impl ConversationService {
                     error = %ErrorChain(&err),
                     "Failed to persist resolved workspace"
                 );
-                service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
-                turn_claim.release();
-                service.complete_turn(&conv_id).await;
+                if service.runtime_state.is_deleting(&conv_id) {
+                    debug!(
+                        conversation_id = %conv_id,
+                        "Skipping workspace failure persistence because conversation is deleting"
+                    );
+                } else {
+                    service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
+                }
+                let was_deleting = turn_claim.release();
+                service.complete_released_turn(&conv_id, was_deleting).await;
                 return;
             }
 
@@ -1472,6 +1515,7 @@ impl ConversationService {
                     Arc::clone(&broadcaster),
                     cron_service.clone(),
                 )
+                .with_runtime_state(Arc::clone(&runtime_state))
                 .with_turn_completion(false);
 
                 let rx = agent.subscribe();
@@ -1481,12 +1525,43 @@ impl ConversationService {
                 // 1. Send the message to the agent and concurrently run the relay to stream events.
                 tokio::spawn(async move {
                     if let Err(e) = send_agent.send_message(current_send).await {
-                        error!(conversation_id = %conv_id_send, error = %ErrorChain(&e), "Agent send_message failed");
-                        let _ = send_error_tx.send(e);
+                        let task_status = send_agent.status();
+                        let agent_type = send_agent.agent_type();
+                        error!(
+                            conversation_id = %conv_id_send,
+                            ?agent_type,
+                            ?task_status,
+                            error = %ErrorChain(&e),
+                            "Agent send_message failed"
+                        );
+                        if task_status == Some(ConversationStatus::Finished) {
+                            debug!(
+                                conversation_id = %conv_id_send,
+                                ?agent_type,
+                                "Agent send_message failure already published runtime terminal; skipping fallback stream error"
+                            );
+                        } else {
+                            warn!(
+                                conversation_id = %conv_id_send,
+                                ?agent_type,
+                                code = ?e.code(),
+                                ownership = ?e.ownership(),
+                                "Agent send_message returned error without runtime terminal; injecting fallback stream error"
+                            );
+                            let _ = send_error_tx.send(e);
+                        }
                     }
                 });
                 // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.
                 let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
+
+                if runtime_state.is_deleting(&conv_id) {
+                    debug!(
+                        conversation_id = %conv_id,
+                        "Skipping post-terminal persistence because conversation is deleting"
+                    );
+                    break;
+                }
 
                 if let Some(session_key) = agent.get_session_key() {
                     persist_session_key(&repo, &conv_id, &session_key).await;
@@ -1515,8 +1590,8 @@ impl ConversationService {
                 ));
             }
 
-            turn_claim.release();
-            service.complete_turn(&conv_id).await;
+            let was_deleting = turn_claim.release();
+            service.complete_released_turn(&conv_id, was_deleting).await;
         });
 
         info!(

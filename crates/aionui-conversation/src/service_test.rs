@@ -979,6 +979,38 @@ async fn delete_invokes_registered_hook() {
     assert_eq!(calls.as_slice(), &[conv.id]);
 }
 
+#[tokio::test]
+async fn delete_invokes_registered_hook_before_row_delete() {
+    use aionui_common::OnConversationDelete;
+
+    struct RowVisibleHook {
+        repo: Arc<MockRepo>,
+        observations: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OnConversationDelete for RowVisibleHook {
+        async fn on_conversation_deleted(&self, conversation_id: &str) {
+            let exists = self.repo.get(conversation_id).await.unwrap().is_some();
+            self.observations.lock().unwrap().push(exists);
+        }
+    }
+
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let hook = Arc::new(RowVisibleHook {
+        repo: repo.clone(),
+        observations: Mutex::new(vec![]),
+    });
+    svc.with_delete_hook(hook.clone());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    svc.delete("user_1", &conv.id).await.unwrap();
+
+    let observations = hook.observations.lock().unwrap();
+    assert_eq!(observations.as_slice(), &[true]);
+    assert!(repo.get(&conv.id).await.unwrap().is_none());
+}
+
 // ── Broadcast payload tests ────────────────────────────────────────
 
 #[tokio::test]
@@ -1574,9 +1606,11 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
 struct ScriptedAgent {
     conversation_id: String,
     agent_type: AgentType,
+    status: Option<ConversationStatus>,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
+    send_error: Option<AgentSendError>,
 }
 
 impl ScriptedAgent {
@@ -1585,14 +1619,26 @@ impl ScriptedAgent {
         Self {
             conversation_id: conversation_id.to_owned(),
             agent_type: AgentType::Acp,
+            status: Some(ConversationStatus::Finished),
             event_tx,
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
+            send_error: None,
         }
     }
 
     fn with_agent_type(mut self, agent_type: AgentType) -> Self {
         self.agent_type = agent_type;
+        self
+    }
+
+    fn with_status(mut self, status: Option<ConversationStatus>) -> Self {
+        self.status = status;
+        self
+    }
+
+    fn with_send_error(mut self, error: AgentSendError) -> Self {
+        self.send_error = Some(error);
         self
     }
 
@@ -1616,7 +1662,7 @@ impl IAgentTask for ScriptedAgent {
     }
 
     fn status(&self) -> Option<ConversationStatus> {
-        Some(ConversationStatus::Finished)
+        self.status
     }
 
     fn last_activity_at(&self) -> TimestampMs {
@@ -1637,6 +1683,9 @@ impl IAgentTask for ScriptedAgent {
             .unwrap_or_else(|| vec![AgentStreamEvent::Finish(FinishEventData::default())]);
         for event in script {
             let _ = self.event_tx.send(event);
+        }
+        if let Some(error) = &self.send_error {
+            return Err(error.clone());
         }
         Ok(())
     }
@@ -2179,6 +2228,68 @@ async fn send_message_does_not_evict_non_acp_task_after_terminal_error() {
 
     assert_eq!(task_mgr.kill_count(), 0);
     assert_eq!(task_mgr.active_count(), 1);
+}
+
+#[tokio::test]
+async fn send_message_does_not_inject_send_error_when_runtime_terminal_exists() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
+                "runtime already emitted",
+                Some(AgentErrorCode::UnknownUpstreamError),
+            ))]],
+        )
+        .with_send_error(AgentSendError::from_app_error(AppError::BadGateway(
+            "fallback should not render".into(),
+        ))),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(tips.len(), 1);
+    let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
+    assert_eq!(content["content"], "runtime already emitted");
+}
+
+#[tokio::test]
+async fn send_message_injects_send_error_when_runtime_terminal_missing() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(&conv.id, vec![vec![]])
+            .with_status(None)
+            .with_send_error(AgentSendError::from_app_error(AppError::BadGateway(
+                "provider returned 401 invalid api key".into(),
+            ))),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(tips.len(), 1);
+    let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
+    assert_eq!(content["type"], "error");
+    assert_eq!(content["error"]["code"], "USER_LLM_PROVIDER_AUTH_FAILED");
 }
 
 // ── stop_stream tests ───────────────────────────────────────────
