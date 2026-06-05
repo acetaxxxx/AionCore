@@ -611,11 +611,18 @@ fn make_service_with_mock_task_manager(
 }
 
 fn make_create_req() -> CreateConversationRequest {
+    let workspace = ensure_test_workspace_path();
     serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap()
+}
+
+fn ensure_test_workspace_path() -> String {
+    let workspace = std::env::temp_dir().join("aionui-conversation-service-test-project");
+    std::fs::create_dir_all(&workspace).unwrap();
+    workspace.to_string_lossy().to_string()
 }
 
 // ── Create tests ───────────────────────────────────────────────────
@@ -623,6 +630,7 @@ fn make_create_req() -> CreateConversationRequest {
 #[tokio::test]
 async fn create_returns_conversation_with_defaults() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let resp = svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -632,7 +640,7 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(resp.source, Some(ConversationSource::Aionui));
     assert!(!resp.pinned);
     assert!(resp.pinned_at.is_none());
-    assert_eq!(resp.extra["workspace"], "/project");
+    assert_eq!(resp.extra["workspace"], workspace);
     assert!(resp.created_at > 0);
     assert_eq!(resp.created_at, resp.modified_at);
 
@@ -646,7 +654,7 @@ async fn create_returns_conversation_with_defaults() {
 }
 
 #[tokio::test]
-async fn create_rejects_workspace_with_trailing_whitespace_in_request() {
+async fn create_rejects_unavailable_workspace_with_trailing_whitespace_in_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
     std::fs::create_dir(&dir).unwrap();
@@ -660,17 +668,34 @@ async fn create_rejects_workspace_with_trailing_whitespace_in_request() {
     }))
     .unwrap();
     let err = svc.create("user_1", req).await.unwrap_err();
-
     assert!(matches!(
         err,
-        ConversationError::WorkspacePathContainsWhitespace { path: message }
-            if message == workspace_with_trailing_space
+        ConversationError::WorkspacePathUnavailable { path }
+            if path == workspace_with_trailing_space
     ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
-async fn create_rejects_workspace_with_whitespace_in_any_path_segment() {
+async fn create_accepts_existing_workspace_with_trailing_whitespace_in_name() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let workspace = dir.join("workspace ");
+    std::fs::create_dir(&workspace).unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace.to_string_lossy() }
+    }))
+    .unwrap();
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.extra["workspace"], workspace.to_string_lossy().to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn create_accepts_workspace_with_whitespace_in_any_path_segment() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
     std::fs::create_dir(&dir).unwrap();
@@ -683,13 +708,8 @@ async fn create_rejects_workspace_with_whitespace_in_any_path_segment() {
         "extra": { "workspace": workspace.to_string_lossy() }
     }))
     .unwrap();
-    let err = svc.create("user_1", req).await.unwrap_err();
-
-    assert!(matches!(
-        err,
-        ConversationError::WorkspacePathContainsWhitespace { path: message }
-            if message == workspace.to_string_lossy()
-    ));
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.extra["workspace"], workspace.to_string_lossy().to_string());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -717,12 +737,13 @@ async fn create_with_custom_name_and_source() {
 #[tokio::test]
 async fn create_stores_model_as_json() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     // Top-level model is only valid for aionrs conversations.
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "aionrs",
         "model": { "provider_id": "p1", "model": "m1" },
-        "extra": { "workspace": "/project" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap();
     let resp = svc.create("user_1", req).await.unwrap();
@@ -899,33 +920,42 @@ async fn update_unpin_clears_pinned_at() {
 #[tokio::test]
 async fn update_extra_merge() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!(
+        "aionui-conversation-update-extra-merge-{}",
+        aionui_common::generate_short_id()
+    ));
+    let old_workspace = dir.join("old-workspace");
+    let new_workspace = dir.join("new-workspace");
+    std::fs::create_dir_all(&old_workspace).unwrap();
+    std::fs::create_dir_all(&new_workspace).unwrap();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/old", "contextFileName": "ctx.md" }
+        "extra": { "workspace": old_workspace.to_string_lossy(), "contextFileName": "ctx.md" }
     }))
     .unwrap();
     let conv = svc.create("user_1", req).await.unwrap();
 
     // Update only workspace — contextFileName should be preserved
     let update_req: UpdateConversationRequest =
-        serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
+        serde_json::from_value(json!({ "extra": { "workspace": new_workspace.to_string_lossy() } })).unwrap();
     let updated = svc.update("user_1", &conv.id, update_req, &task_mgr).await.unwrap();
 
-    assert_eq!(updated.extra["workspace"], "/new");
+    assert_eq!(updated.extra["workspace"], new_workspace.to_string_lossy().to_string());
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
 }
 
 #[tokio::test]
 async fn update_model() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     // Top-level model updates are only valid on aionrs conversations
     // (Task 8 enforces the aionrs-only rule in update).
     let create_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "aionrs",
         "model": { "provider_id": "p1", "model": "m1" },
-        "extra": { "workspace": "/project" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap();
     let conv = svc.create("user_1", create_req).await.unwrap();
@@ -1116,19 +1146,20 @@ async fn delete_wrong_user_returns_not_found() {
 #[tokio::test]
 async fn clone_without_source_creates_new() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let req: CloneConversationRequest = serde_json::from_value(json!({
         "conversation": {
             "type": "acp",
             "name": "Cloned",
-            "extra": { "workspace": "/new" }
+            "extra": { "workspace": workspace }
         }
     }))
     .unwrap();
 
     let resp = svc.clone_create("user_1", req).await.unwrap();
     assert_eq!(resp.name, "Cloned");
-    assert_eq!(resp.extra["workspace"], "/new");
+    assert_eq!(resp.extra["workspace"], workspace);
 
     let events = broadcaster.take_events();
     assert_eq!(events.len(), 1);
@@ -1886,12 +1917,13 @@ async fn set_model_returns_confirmed_model_from_active_agent() {
 }
 
 #[tokio::test]
-async fn send_message_rejects_legacy_workspace_with_runtime_error_code() {
-    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+async fn send_message_missing_workspace_persists_message_and_failure_tip() {
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let legacy_workspace = "/tmp/my project".to_owned();
+    broadcaster.take_events();
+    let legacy_workspace = format!("/tmp/does-not-exist-{}", aionui_common::generate_short_id());
     repo.update(
         &conv.id,
         &ConversationRowUpdate {
@@ -1902,43 +1934,62 @@ async fn send_message_rejects_legacy_workspace_with_runtime_error_code() {
     .await
     .unwrap();
 
-    let err = svc
+    let msg_id = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported { path: message }
-            if message == "/tmp/my project"
-    ));
+        .unwrap();
+    assert!(
+        !msg_id.is_empty(),
+        "msg_id must still be returned when runtime workspace validation fails"
+    );
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
-            if messages.iter().any(|message| message.r#type == "tips") {
+            if messages.iter().any(|message| message.r#type == "tips")
+                && messages.iter().any(|message| message.r#type == "text")
+            {
                 return messages;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("legacy workspace failure should persist an error tip");
+    .expect("missing workspace failure should persist a user message and error tip");
+
+    let user_message = messages
+        .iter()
+        .find(|message| message.r#type == "text")
+        .expect("missing workspace failure should persist the user message");
+    assert_eq!(user_message.msg_id.as_deref(), Some(msg_id.as_str()));
 
     let error_tip = messages
         .iter()
         .find(|message| message.r#type == "tips")
-        .expect("legacy workspace failure should persist an error tips message");
+        .expect("missing workspace failure should persist an error tips message");
     let content: serde_json::Value = serde_json::from_str(&error_tip.content).unwrap();
+    assert_eq!(content["code"], "WORKSPACE_PATH_RUNTIME_UNAVAILABLE");
+    assert_eq!(content["details"]["workspace_path"], legacy_workspace);
+    assert_eq!(content["error"]["code"], "WORKSPACE_PATH_RUNTIME_UNAVAILABLE");
+    assert_eq!(content["error"]["workspacePath"], legacy_workspace);
+
+    let events = broadcaster.take_events();
+    let error_tip_event = events
+        .iter()
+        .find(|event| event.name == "message.stream" && event.data["type"] == "tips")
+        .expect("missing workspace failure should broadcast the error tips message");
+    assert_eq!(error_tip_event.data["status"], "error");
     assert_eq!(
-        content["code"],
-        "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
+        error_tip_event.data["data"]["code"],
+        "WORKSPACE_PATH_RUNTIME_UNAVAILABLE"
     );
-    assert_eq!(content["details"]["workspace_path"], "/tmp/my project");
-    assert_eq!(
-        content["error"]["code"],
-        "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
-    );
-    assert_eq!(content["error"]["workspacePath"], "/tmp/my project");
+
+    let turn_event = events
+        .iter()
+        .find(|event| event.name == "turn.completed")
+        .expect("missing workspace failure should complete the turn");
+    assert_eq!(turn_event.data["runtime"]["is_processing"], false);
+    assert_eq!(turn_event.data["runtime"]["can_send_message"], true);
 }
 
 #[tokio::test]
@@ -2500,7 +2551,7 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let legacy_workspace = "/tmp/my project".to_owned();
+    let legacy_workspace = format!("/tmp/does-not-exist-{}", aionui_common::generate_short_id());
     repo.update(
         &conv.id,
         &ConversationRowUpdate {
@@ -2514,8 +2565,8 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
     let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
     assert!(matches!(
         err,
-        ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported { path: message }
-            if message == "/tmp/my project"
+        ConversationError::WorkspacePathRuntimeUnavailable { path: message }
+            if message == legacy_workspace
     ));
 }
 
@@ -2837,12 +2888,13 @@ async fn create_writes_extra_skills_from_auto_inject_and_preset() {
         names: vec!["cron".into(), "todo-tracker".into()],
     });
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "t",
         "extra": {
-            "workspace": "/project",
+            "workspace": workspace,
             "backend": "claude",
             "preset_enabled_skills": ["pdf", "cron"],
             "exclude_auto_inject_skills": ["todo-tracker"],
@@ -2860,10 +2912,11 @@ async fn create_writes_extra_skills_from_auto_inject_and_preset() {
 async fn create_writes_empty_skills_when_no_auto_inject_and_no_preset() {
     let resolver = Arc::new(FixedSkillResolver { names: vec![] });
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project", "backend": "claude" },
+        "extra": { "workspace": workspace, "backend": "claude" },
     }))
     .unwrap();
     let resp = svc.create("user-1", req).await.unwrap();
@@ -2905,10 +2958,11 @@ async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
 #[tokio::test]
 async fn update_rejects_extra_skills() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project", "backend": "claude" },
+        "extra": { "workspace": workspace, "backend": "claude" },
     }))
     .unwrap();
     let resp = svc.create("u", req).await.unwrap();
@@ -2928,10 +2982,11 @@ async fn update_rejects_extra_skills() {
 #[tokio::test]
 async fn update_rejects_acp_runtime_current_extra_fields() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project", "backend": "claude" },
+        "extra": { "workspace": workspace, "backend": "claude" },
     }))
     .unwrap();
     let resp = svc.create("u", req).await.unwrap();
@@ -2953,10 +3008,11 @@ async fn update_rejects_acp_runtime_current_extra_fields() {
 #[tokio::test]
 async fn update_allows_other_extra_fields() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project", "backend": "claude" },
+        "extra": { "workspace": workspace, "backend": "claude" },
     }))
     .unwrap();
     let resp = svc.create("u", req).await.unwrap();
@@ -3085,10 +3141,11 @@ async fn create_honors_legacy_alias_fields_from_clone_merge() {
 
     // Legacy-shaped extra — what clone_create might merge in from an
     // unmigrated source conversation.
+    let workspace = ensure_test_workspace_path();
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "extra": {
-            "workspace": "/project",
+            "workspace": workspace,
             "backend": "claude",
             "enabled_skills": ["pdf"],
             "exclude_builtin_skills": ["cron"],
