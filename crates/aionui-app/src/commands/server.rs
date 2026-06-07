@@ -262,6 +262,8 @@ pub(crate) async fn run_server(
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel::<BootstrapError>();
     let idle_scanner_handle =
         aionui_ai_agent::start_idle_scanner(services.worker_task_manager.clone(), shutdown_rx, None, None);
+    let conversation_runtime_state = services.conversation_runtime_state.clone();
+    let worker_task_manager = services.worker_task_manager.clone();
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -269,6 +271,13 @@ pub(crate) async fn run_server(
                 error.log_source();
                 tracing::error!(error = %error.stderr_line(), "shutdown signal handler failed");
                 let _ = shutdown_error_tx.send(error);
+            } else {
+                let active_turn_count = conversation_runtime_state.mark_shutting_down();
+                info!(
+                    reason = "graceful_shutdown",
+                    active_turn_count, "conversation runtime shutdown prepared"
+                );
+                worker_task_manager.clear();
             }
             let _ = shutdown_tx.send(true);
         })
