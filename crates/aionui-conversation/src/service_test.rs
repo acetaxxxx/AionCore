@@ -638,6 +638,34 @@ fn ensure_test_workspace_path() -> String {
     workspace.to_string_lossy().to_string()
 }
 
+async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agent_type: AgentType) -> ConversationRow {
+    let id = format!(
+        "legacy-{}-{}",
+        agent_type.serde_name(),
+        aionui_common::generate_short_id()
+    );
+    let row = ConversationRow {
+        id,
+        user_id: user_id.to_owned(),
+        name: format!("legacy {}", agent_type.serde_name()),
+        r#type: agent_type.serde_name().to_owned(),
+        extra: json!({
+            "workspace": ensure_test_workspace_path()
+        })
+        .to_string(),
+        model: None,
+        status: Some("finished".into()),
+        source: Some("aionui".into()),
+        channel_chat_id: None,
+        pinned: false,
+        pinned_at: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    repo.create(&row).await.unwrap();
+    row
+}
+
 // ── Create tests ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -664,6 +692,35 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
+}
+
+#[tokio::test]
+async fn create_rejects_deprecated_agent_types_for_new_conversations() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    for agent_type in [
+        AgentType::Gemini,
+        AgentType::Codex,
+        AgentType::OpenclawGateway,
+        AgentType::Nanobot,
+        AgentType::Remote,
+    ] {
+        let mut req = make_create_req();
+        req.r#type = agent_type;
+        req.model = None;
+        req.extra = json!({
+            "workspace": ensure_test_workspace_path()
+        });
+
+        let err = svc.create("user_1", req).await.unwrap_err();
+        assert_eq!(err.error_code(), "BAD_REQUEST");
+        assert!(
+            err.to_string()
+                .contains("This agent type is no longer supported for new conversations."),
+            "unexpected error for {}: {err}",
+            agent_type.serde_name()
+        );
+    }
 }
 
 #[tokio::test]
@@ -1931,13 +1988,74 @@ async fn send_message_returns_accepted() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
 
-    assert!(!msg_id.is_empty(), "msg_id must be non-empty");
-    assert_eq!(msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
+    assert!(!response.msg_id.is_empty(), "msg_id must be non-empty");
+    assert_eq!(response.msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
+    assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
+    assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+}
+
+#[tokio::test]
+async fn send_message_returns_msg_id_and_turn_id_and_summary_tracks_turn() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let slow_task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(500)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = slow_task_mgr.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    assert!(!response.msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
+    assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+    assert_eq!(
+        response.runtime.turn_id.as_deref(),
+        Some(response.turn_id.as_str()),
+        "send response runtime must identify the accepted turn"
+    );
+    assert!(response.runtime.is_processing);
+    assert!(!response.runtime.can_send_message);
+
+    let runtime = svc.runtime_summary_for(&conv.id).await;
+    assert_eq!(response.runtime, runtime);
+    assert_eq!(runtime.turn_id.as_deref(), Some(response.turn_id.as_str()));
+    assert!(runtime.is_processing);
+    assert!(!runtime.can_send_message);
+}
+
+#[tokio::test]
+async fn send_message_rejects_legacy_runtime_conversations_as_archived() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    for agent_type in [
+        AgentType::Gemini,
+        AgentType::Codex,
+        AgentType::OpenclawGateway,
+        AgentType::Nanobot,
+        AgentType::Remote,
+    ] {
+        let conv = insert_conversation_with_type(&repo, "user_1", agent_type).await;
+
+        let err = svc
+            .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "CONVERSATION_ARCHIVED");
+        assert!(
+            err.to_string()
+                .contains("This historical conversation can no longer be continued. Please start a new conversation."),
+            "unexpected archived message for {}: {err}",
+            agent_type.serde_name()
+        );
+    }
 }
 
 #[tokio::test]
@@ -2001,12 +2119,12 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
     .await
     .unwrap();
 
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
     assert!(
-        !msg_id.is_empty(),
+        !response.msg_id.is_empty(),
         "msg_id must still be returned when runtime workspace validation fails"
     );
 
@@ -2028,7 +2146,7 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
         .iter()
         .find(|message| message.r#type == "text")
         .expect("missing workspace failure should persist the user message");
-    assert_eq!(user_message.msg_id.as_deref(), Some(msg_id.as_str()));
+    assert_eq!(user_message.msg_id.as_deref(), Some(response.msg_id.as_str()));
 
     let error_tip = messages
         .iter()
@@ -2050,11 +2168,13 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
         error_tip_event.data["data"]["code"],
         "WORKSPACE_PATH_RUNTIME_UNAVAILABLE"
     );
+    assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
 
     let turn_event = events
         .iter()
         .find(|event| event.name == "turn.completed")
         .expect("missing workspace failure should complete the turn");
+    assert_eq!(turn_event.data["turn_id"], response.turn_id);
     assert_eq!(turn_event.data["runtime"]["is_processing"], false);
     assert_eq!(turn_event.data["runtime"]["can_send_message"], true);
 }
@@ -2068,7 +2188,7 @@ async fn send_message_broadcasts_user_created_event() {
     // Clear events from create
     broadcaster.take_events();
 
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
@@ -2080,7 +2200,7 @@ async fn send_message_broadcasts_user_created_event() {
         .expect("should broadcast message.userCreated event");
 
     assert_eq!(user_created.data["conversation_id"], conv.id);
-    assert_eq!(user_created.data["msg_id"], msg_id);
+    assert_eq!(user_created.data["msg_id"], response.msg_id);
     assert_eq!(user_created.data["content"], "Hello");
     assert_eq!(user_created.data["position"], "right");
 }
@@ -2092,7 +2212,7 @@ async fn send_message_returns_before_cold_agent_build_completes() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = slow_task_mgr.clone();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let msg_id = tokio::time::timeout(
+    let response = tokio::time::timeout(
         Duration::from_millis(50),
         svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr),
     )
@@ -2100,7 +2220,8 @@ async fn send_message_returns_before_cold_agent_build_completes() {
     .expect("send_message should return before cold agent build finishes")
     .unwrap();
 
-    assert!(!msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(!response.msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(response.turn_id.starts_with("turn_"));
     assert!(
         !slow_task_mgr.was_built(),
         "cold agent build should continue in the background after send_message returns"
@@ -2148,12 +2269,13 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
 
-    assert!(!msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(!response.msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(response.turn_id.starts_with("turn_"));
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -2203,6 +2325,7 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
         .expect("agent build failure should broadcast the error tips message");
     assert_eq!(error_tip_event.data["status"], "error");
     assert_eq!(error_tip_event.data["data"]["code"], "BAD_GATEWAY");
+    assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
 }
 
 #[tokio::test]
@@ -2286,7 +2409,7 @@ async fn send_message_rejects_active_runtime_claim() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let _claim = svc
         .runtime_state()
-        .try_claim_turn(&conv.id)
+        .try_claim_turn(&conv.id, "turn-test")
         .expect("test claim should be created");
 
     let err = svc
@@ -2328,11 +2451,11 @@ async fn send_message_build_failure_while_deleting_skips_failure_tip_and_complet
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
-    assert!(!msg_id.is_empty());
+    assert!(!response.msg_id.is_empty());
 
     svc.runtime_state().mark_deleting(&conv.id);
     wait_for_turn_released(&svc, &conv.id).await;
@@ -2632,20 +2755,45 @@ async fn stop_stream_with_active_agent() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     // Build agent via send_message
-    svc.send_message(
-        "user_1",
-        &conv.id,
-        make_send_req(),
-        &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
-    )
-    .await
-    .unwrap();
+    let send = svc
+        .send_message(
+            "user_1",
+            &conv.id,
+            make_send_req(),
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
 
     // Stop should succeed since agent exists
     let result = svc
-        .cancel("user_1", &conv.id, &(task_mgr as Arc<dyn IWorkerTaskManager>))
+        .cancel(
+            "user_1",
+            &conv.id,
+            &send.turn_id,
+            &(task_mgr as Arc<dyn IWorkerTaskManager>),
+        )
         .await;
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn cancel_with_mismatched_turn_id_does_not_cancel_and_returns_current_runtime() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let slow_task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(500)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = slow_task_mgr.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    let response = svc.cancel("user_1", &conv.id, "turn_stale", &task_mgr).await.unwrap();
+
+    assert_eq!(response.runtime.turn_id.as_deref(), Some(send.turn_id.as_str()));
+    assert!(response.runtime.is_processing);
+    assert!(svc.runtime_state().is_claimed(&conv.id));
 }
 
 #[tokio::test]
@@ -2653,7 +2801,10 @@ async fn stop_stream_conversation_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
-    let err = svc.cancel("user_1", "no-such-id", &task_mgr).await.unwrap_err();
+    let err = svc
+        .cancel("user_1", "no-such-id", "turn-test", &task_mgr)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
@@ -2664,7 +2815,7 @@ async fn stop_stream_no_active_agent_is_idempotent() {
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let result = svc.cancel("user_1", &conv.id, &task_mgr).await;
+    let result = svc.cancel("user_1", &conv.id, "turn-test", &task_mgr).await;
     assert!(result.is_ok());
 }
 
@@ -2674,7 +2825,10 @@ async fn stop_stream_wrong_user_returns_not_found() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let err = svc.cancel("user_2", &conv.id, &task_mgr).await.unwrap_err();
+    let err = svc
+        .cancel("user_2", &conv.id, "turn-test", &task_mgr)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
@@ -2694,6 +2848,32 @@ async fn warmup_creates_agent_task() {
 
     // Agent should now exist
     assert!(task_mgr.get_task(&conv.id).is_some());
+}
+
+#[tokio::test]
+async fn warmup_rejects_legacy_runtime_conversations_as_archived() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    for agent_type in [
+        AgentType::Gemini,
+        AgentType::Codex,
+        AgentType::OpenclawGateway,
+        AgentType::Nanobot,
+        AgentType::Remote,
+    ] {
+        let conv = insert_conversation_with_type(&repo, "user_1", agent_type).await;
+
+        let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+
+        assert_eq!(err.error_code(), "CONVERSATION_ARCHIVED");
+        assert!(
+            err.to_string()
+                .contains("This historical conversation can no longer be continued. Please start a new conversation."),
+            "unexpected archived message for {}: {err}",
+            agent_type.serde_name()
+        );
+    }
 }
 
 #[tokio::test]
