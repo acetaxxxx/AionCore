@@ -115,7 +115,17 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
     {
         let name = field.name().unwrap_or("").to_owned();
         match name.as_str() {
-            "file" => {
+            "file" | "audio" => {
+                if file_name.is_none()
+                    && let Some(name) = field.file_name().filter(|name| !name.is_empty())
+                {
+                    file_name = Some(name.to_owned());
+                }
+                if mime_type.is_none()
+                    && let Some(content_type) = field.content_type().filter(|value| !value.is_empty())
+                {
+                    mime_type = Some(content_type.to_owned());
+                }
                 file_data = Some(
                     field
                         .bytes()
@@ -179,9 +189,12 @@ async fn speech_to_text(
         (status, Json(body))
     })?;
 
+    // Key mismatch fix: frontend stores as "tools.speechToText" but backend
+    // previously queried only "speechToText". Request both keys to ensure
+    // we find the config regardless of which key name was used.
     let prefs = state
         .client_pref_service
-        .get_preferences(Some(&["speechToText"]))
+        .get_preferences(Some(&["speechToText", "tools.speechToText"]))
         .await
         .map_err(|e| {
             let e = ApiError::from(e);
@@ -194,8 +207,11 @@ async fn speech_to_text(
             (status, Json(body))
         })?;
 
+    // Key mismatch fix: AionUI frontend sends "tools.speechToText" but backend
+    // expects "speechToText". Try both keys for backward compatibility.
     let config: SpeechToTextConfig = prefs
-        .get("speechToText")
+        .get("tools.speechToText")
+        .or_else(|| prefs.get("speechToText"))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or(SpeechToTextConfig {
             enabled: false,
