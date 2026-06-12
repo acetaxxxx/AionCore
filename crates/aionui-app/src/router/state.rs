@@ -14,11 +14,11 @@ use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState};
 use aionui_db::{
     IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IProviderRepository,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
-    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
-    SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
+    IProviderRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -40,9 +40,13 @@ use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, ModelFetchService, ProtocolDetectionService,
     ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService,
 };
-use aionui_team::{TeamRouterState, TeamSessionService};
+use aionui_team::{
+    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationLookupPort, TeamConversationProvisioningPort,
+    TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
+};
 
 use crate::config::derive_encryption_key;
+use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
 
 #[derive(Debug)]
@@ -346,37 +350,9 @@ pub fn build_conversation_state(
     cron_service: Option<Arc<aionui_cron::service::CronService>>,
     assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
 ) -> ConversationRouterState {
-    let pool = services.database.pool().clone();
-    let conversaion_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
-        Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
-    let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
-        services.skill_paths.clone(),
-    ));
-    let conversation_service = ConversationService::new(
-        services.work_dir.clone(),
-        services.event_bus.clone(),
-        skill_resolver,
-        services.worker_task_manager.clone(),
-        conversaion_repo,
-        agent_metadata_repo,
-        acp_session_repo,
-    )
-    .with_runtime_state(services.conversation_runtime_state.clone());
-    conversation_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
-        services.database.pool().clone(),
-    )));
-    conversation_service
-        .with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone())));
-    conversation_service.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(pool.clone())));
-    conversation_service
-        .with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone())));
+    let conversation_service = services.conversation_service.clone();
     if let Some(dispatcher) = assistant_dispatcher {
         conversation_service.with_assistant_dispatcher(dispatcher);
-    }
-    if let Some(hook) = services.task_manager_delete_hook.clone() {
-        conversation_service.with_delete_hook(hook);
     }
     if let Some(cron_service) = cron_service {
         conversation_service.with_delete_hook(cron_service.clone());
@@ -581,47 +557,36 @@ pub async fn build_channel_state(
 /// per `docs/teams/phase1/interface-contracts.md` §10.
 pub fn build_team_state(
     services: &AppServices,
-    cron_service: Option<Arc<aionui_cron::service::CronService>>,
+    _cron_service: Option<Arc<aionui_cron::service::CronService>>,
     backend_binary_path: Arc<std::path::PathBuf>,
     guide_mcp_config: Option<aionui_api_types::GuideMcpConfig>,
 ) -> TeamRouterState {
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
-    let conv_repo: Arc<dyn aionui_db::IConversationRepository> =
-        Arc::new(SqliteConversationRepository::new(pool.clone()));
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
-        Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
-    let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
-        services.skill_paths.clone(),
-    ));
-    let conv_service = ConversationService::new(
-        services.work_dir.clone(),
-        services.event_bus.clone(),
-        skill_resolver,
-        services.worker_task_manager.clone(),
+    let conv_service = services.conversation_service.clone();
+    let conv_repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(pool));
+    let adapters = Arc::new(TeamConversationAdapters::new(
+        conv_service,
         conv_repo,
-        agent_metadata_repo,
-        acp_session_repo,
-    )
-    .with_runtime_state(services.conversation_runtime_state.clone());
-    conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
-        services.database.pool().clone(),
-    )));
-    if let Some(hook) = services.task_manager_delete_hook.clone() {
-        conv_service.with_delete_hook(hook);
-    }
-    if let Some(cron_service) = cron_service {
-        conv_service.with_delete_hook(cron_service.clone());
-        conv_service.with_cron_service(Some(cron_service));
-    }
+        services.event_bus.clone(),
+        services.worker_task_manager.clone(),
+    ));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = adapters.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = adapters.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = adapters.clone();
+    let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
+    let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
     let service = TeamSessionService::new(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
         Arc::new(SqliteProviderRepository::new(services.database.pool().clone())),
-        conv_service,
+        conversation_port,
+        projection_store,
+        lookup_port,
         services.event_bus.clone(),
         services.worker_task_manager.clone(),
+        turn_port,
+        cancellation_port,
         backend_binary_path,
         guide_mcp_config,
     );
