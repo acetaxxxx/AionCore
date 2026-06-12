@@ -655,12 +655,10 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         services.database.pool().clone(),
     )));
 
-    let busy_guard = Arc::new(aionui_cron::busy_guard::CronBusyGuard::new());
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
         services.worker_task_manager.clone(),
         conv_repo,
         Arc::new(conv_service.clone()),
-        busy_guard,
         services.work_dir.clone(),
         services.data_dir.clone(),
         services.event_bus.clone(),
