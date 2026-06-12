@@ -1,6 +1,8 @@
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
+use crate::TeamMcpStdioConfig;
+
 // ---------------------------------------------------------------------------
 // A. Team management — Request DTOs
 // ---------------------------------------------------------------------------
@@ -70,7 +72,92 @@ pub struct RenameAgentRequest {
 }
 
 // ---------------------------------------------------------------------------
-// C. Message & session — Request DTOs
+// C. Team runtime context — persisted conversation.extra contract
+// ---------------------------------------------------------------------------
+
+/// Typed Team binding decoded from a team-owned conversation's `extra`.
+///
+/// This is the runtime-build contract consumed after `SessionContextBuilder`
+/// has parsed persisted JSON. `team_id` is the ownership marker; `slot_id`
+/// and `role` identify the agent slot when the conversation is attached to an
+/// active Team session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSessionBinding {
+    pub team_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub runtime_seed: TeamRuntimeSeed,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<TeamMcpRuntimeConfig>,
+}
+
+impl TeamSessionBinding {
+    pub fn from_extra_str(extra: &str) -> Result<Option<Self>, serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(extra)?;
+        Self::from_extra_value(&value)
+    }
+
+    pub fn from_extra_value(extra: &serde_json::Value) -> Result<Option<Self>, serde_json::Error> {
+        let Some(team_id) = extra_string_field(extra, "teamId") else {
+            return Ok(None);
+        };
+
+        let mcp = match extra.get("team_mcp_stdio_config").cloned() {
+            Some(value) if !value.is_null() => Some(TeamMcpRuntimeConfig {
+                stdio: serde_json::from_value(value)?,
+            }),
+            _ => None,
+        };
+
+        Ok(Some(Self {
+            team_id,
+            slot_id: extra_string_field(extra, "slot_id"),
+            role: extra_string_field(extra, "role"),
+            runtime_seed: TeamRuntimeSeed {
+                backend: extra_string_field(extra, "backend"),
+                session_mode: extra_string_field(extra, "session_mode"),
+                current_model_id: extra_string_field(extra, "current_model_id"),
+            },
+            mcp,
+        }))
+    }
+
+    pub fn team_id_marker_from_extra_str(extra: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(extra).ok()?;
+        extra_string_field(&value, "teamId")
+    }
+}
+
+fn extra_string_field(extra: &serde_json::Value, key: &str) -> Option<String> {
+    extra
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// Startup seed values Team provisioning persists for runtime build.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamRuntimeSeed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_model_id: Option<String>,
+}
+
+/// Typed Team MCP runtime configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamMcpRuntimeConfig {
+    pub stdio: TeamMcpStdioConfig,
+}
+
+// ---------------------------------------------------------------------------
+// D. Message & session — Request DTOs
 // ---------------------------------------------------------------------------
 
 /// Request body for `POST /api/teams/:id/messages`.
@@ -96,8 +183,74 @@ pub struct SendAgentMessageRequest {
     pub files: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRunTargetRole {
+    Lead,
+    Teammate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRunStatus {
+    Accepted,
+    Running,
+    Cancelling,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelTeamRunRequest {
+    #[serde(default)]
+    pub target_slot_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelTeamChildTurnRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamRunAckResponse {
+    pub team_run_id: String,
+    pub team_id: String,
+    pub target_slot_id: String,
+    pub target_role: TeamRunTargetRole,
+    pub status: TeamRunStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamRunPayload {
+    pub team_id: String,
+    pub team_run_id: String,
+    pub target_slot_id: String,
+    pub target_role: TeamRunTargetRole,
+    pub status: TeamRunStatus,
+    pub active_child_count: usize,
+    pub pending_wake_count: usize,
+    pub starting_child_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamChildTurnPayload {
+    pub team_id: String,
+    pub team_run_id: String,
+    pub slot_id: String,
+    pub role: TeamRunTargetRole,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub status: TeamRunStatus,
+}
+
 // ---------------------------------------------------------------------------
-// D. Team management — Response DTOs
+// E. Team management — Response DTOs
 // ---------------------------------------------------------------------------
 
 /// Single agent within a team response.
@@ -139,10 +292,10 @@ pub struct TeamResponse {
 pub type TeamListResponse = Vec<TeamResponse>;
 
 // ---------------------------------------------------------------------------
-// E. WebSocket event payloads
+// F. WebSocket event payloads
 // ---------------------------------------------------------------------------
 
-/// Payload for `team.agent.status` WebSocket event.
+/// Payload for `team.agentStatusChanged` WebSocket event.
 ///
 /// Pushed when an agent's runtime status changes (e.g., idle → working).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -152,7 +305,7 @@ pub struct TeamAgentStatusPayload {
     pub status: String,
 }
 
-/// Payload for `team.agent.spawned` WebSocket event.
+/// Payload for `team.agentSpawned` WebSocket event.
 ///
 /// Pushed when the lead dynamically creates a new agent via
 /// `team_spawn_agent`.
@@ -162,7 +315,7 @@ pub struct TeamAgentSpawnedPayload {
     pub agent: TeamAgentResponse,
 }
 
-/// Payload for `team.agent.removed` WebSocket event.
+/// Payload for `team.agentRemoved` WebSocket event.
 ///
 /// Pushed when an agent is removed from the team.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -171,7 +324,7 @@ pub struct TeamAgentRemovedPayload {
     pub slot_id: String,
 }
 
-/// Payload for `team.agent.renamed` WebSocket event.
+/// Payload for `team.agentRenamed` WebSocket event.
 ///
 /// Pushed when an agent's display name is changed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -179,19 +332,6 @@ pub struct TeamAgentRenamedPayload {
     pub team_id: String,
     pub slot_id: String,
     pub name: String,
-}
-
-/// Payload for `team.agent.shutdown` WebSocket event.
-///
-/// Pushed when a teammate acknowledges a Lead-initiated shutdown by
-/// replying `shutdown_approved`. The acknowledging teammate is identified
-/// by `slot_id`; `remove_agent` (and the accompanying
-/// `team.agent.removed` event) follows asynchronously once the agent
-/// process is actually killed and state is cleared.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TeamAgentShutdownPayload {
-    pub team_id: String,
-    pub slot_id: String,
 }
 
 /// Lifecycle phases of the per-team MCP stdio bridge + ACP session.
@@ -214,7 +354,7 @@ pub enum TeamMcpPhase {
     McpToolsReady,
 }
 
-/// Payload for `team.mcp.status` WebSocket event.
+/// Payload for `team.mcpStatus` WebSocket event.
 ///
 /// Pushed whenever a teammate's MCP bridge or ACP session transitions to
 /// a new [`TeamMcpPhase`]. Optional fields carry phase-specific detail:
@@ -233,7 +373,7 @@ pub struct TeamMcpStatusPayload {
     pub error: Option<String>,
 }
 
-/// Payload for `team.teammate.message` WebSocket event.
+/// Payload for `team.teammateMessage` WebSocket event.
 ///
 /// Pushed when a teammate sends a message to another agent within the
 /// team; identifies both the sender (`from_slot_id` / `from_name`) and
@@ -715,19 +855,6 @@ mod tests {
         assert_eq!(parsed, payload);
     }
 
-    #[test]
-    fn team_agent_shutdown_payload_roundtrip() {
-        let payload = TeamAgentShutdownPayload {
-            team_id: "t1".into(),
-            slot_id: "s2".into(),
-        };
-        let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["team_id"], "t1");
-        assert_eq!(json["slot_id"], "s2");
-        let parsed: TeamAgentShutdownPayload = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed, payload);
-    }
-
     // -- Deserialize from snake_case JSON (matching Rust field names) -----------
 
     #[test]
@@ -878,5 +1005,96 @@ mod tests {
         assert_eq!(json["content"], "ping");
         assert_eq!(json["from_slot_id"], "slot-1");
         assert_eq!(json["from_name"], "Lead");
+    }
+
+    #[test]
+    fn team_run_ack_serializes_snake_case_enums() {
+        let ack = TeamRunAckResponse {
+            team_run_id: "trun-1".into(),
+            team_id: "team-1".into(),
+            target_slot_id: "lead-1".into(),
+            target_role: TeamRunTargetRole::Lead,
+            status: TeamRunStatus::Accepted,
+            message_id: Some("msg-1".into()),
+        };
+
+        let value = serde_json::to_value(&ack).unwrap();
+        assert_eq!(value["target_role"], "lead");
+        assert_eq!(value["status"], "accepted");
+        assert_eq!(value["message_id"], "msg-1");
+    }
+
+    #[test]
+    fn team_run_payload_omits_sensitive_content() {
+        let payload = TeamRunPayload {
+            team_id: "team-1".into(),
+            team_run_id: "trun-1".into(),
+            target_slot_id: "worker-1".into(),
+            target_role: TeamRunTargetRole::Teammate,
+            status: TeamRunStatus::Running,
+            active_child_count: 1,
+            pending_wake_count: 0,
+            starting_child_count: 2,
+        };
+
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["starting_child_count"], 2);
+        assert!(value.get("content").is_none());
+        assert!(value.get("prompt").is_none());
+        assert!(value.get("tool_input").is_none());
+    }
+
+    #[test]
+    fn team_session_binding_decodes_persisted_extra_contract() {
+        let extra = serde_json::json!({
+            "teamId": "team-1",
+            "slot_id": "lead-1",
+            "role": "lead",
+            "backend": "claude",
+            "session_mode": "full_auto",
+            "current_model_id": "opus",
+            "team_mcp_stdio_config": {
+                "team_id": "team-1",
+                "port": 4242,
+                "token": "token",
+                "slot_id": "lead-1",
+                "binary_path": "/tmp/aioncore"
+            }
+        });
+
+        let binding = TeamSessionBinding::from_extra_value(&extra).unwrap().unwrap();
+
+        assert_eq!(binding.team_id, "team-1");
+        assert_eq!(binding.slot_id.as_deref(), Some("lead-1"));
+        assert_eq!(binding.role.as_deref(), Some("lead"));
+        assert_eq!(binding.runtime_seed.backend.as_deref(), Some("claude"));
+        assert_eq!(binding.runtime_seed.session_mode.as_deref(), Some("full_auto"));
+        assert_eq!(binding.runtime_seed.current_model_id.as_deref(), Some("opus"));
+        let mcp = binding.mcp.unwrap();
+        assert_eq!(mcp.stdio.team_id, "team-1");
+        assert_eq!(mcp.stdio.slot_id, "lead-1");
+    }
+
+    #[test]
+    fn team_session_binding_ignores_missing_or_blank_team_marker() {
+        assert!(
+            TeamSessionBinding::from_extra_value(&serde_json::json!({}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            TeamSessionBinding::from_extra_value(&serde_json::json!({"teamId": "  "}))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn team_session_binding_marker_reader_extracts_team_id_only() {
+        let extra = r#"{"teamId":"team-9","team_mcp_stdio_config":{"invalid":true}}"#;
+        assert_eq!(
+            TeamSessionBinding::team_id_marker_from_extra_str(extra).as_deref(),
+            Some("team-9")
+        );
     }
 }

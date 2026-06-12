@@ -1,5 +1,3 @@
-use aionui_conversation::ConversationError;
-
 #[derive(Debug, thiserror::Error)]
 pub enum TeamError {
     #[error("Team not found: {0}")]
@@ -16,6 +14,9 @@ pub enum TeamError {
 
     #[error("Leader-only action: {0}")]
     LeaderOnly(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
 
     #[error("Session not found: {0}")]
     SessionNotFound(String),
@@ -35,9 +36,6 @@ pub enum TeamError {
     #[error("Workspace path is unavailable during execution: {0}")]
     WorkspacePathRuntimeUnavailable(String),
 
-    #[error(transparent)]
-    Conversation(#[from] ConversationError),
-
     #[error("{0}")]
     Database(#[from] aionui_db::DbError),
 
@@ -45,27 +43,9 @@ pub enum TeamError {
     Json(#[from] serde_json::Error),
 }
 
-impl TeamError {
-    pub(crate) fn from_conversation_create(error: ConversationError) -> Self {
-        match error {
-            ConversationError::WorkspacePathUnavailable { path } => Self::WorkspacePathUnavailable(path),
-            ConversationError::WorkspacePathRuntimeUnavailable { path } => Self::WorkspacePathRuntimeUnavailable(path),
-            other => Self::InvalidRequest(format!("failed to create conversation: {other}")),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn conversation_create_preserves_workspace_error_code() {
-        let err = TeamError::from_conversation_create(ConversationError::WorkspacePathUnavailable {
-            path: "/tmp/a b".into(),
-        });
-        assert!(matches!(err, TeamError::WorkspacePathUnavailable(msg) if msg == "/tmp/a b"));
-    }
 
     #[test]
     fn display_messages() {

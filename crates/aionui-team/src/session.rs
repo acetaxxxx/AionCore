@@ -2,29 +2,35 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_ai_agent::types::SendMessageData;
+use aionui_api_types::{TeamRunAckResponse, TeamRunTargetRole};
 use aionui_common::AgentKillReason;
-use aionui_conversation::ConversationService;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
 use tracing::{info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
+use crate::events::TeamEventEmitter;
 use crate::mailbox::Mailbox;
 use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
+use crate::message_projection::{
+    TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
+};
+use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
-use crate::service::spawn_support::resolve_full_auto_mode;
 use crate::task_board::TaskBoard;
+use crate::team_run::{ChildCancelTarget, TeamRunManager, target_role_for};
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
+use crate::wake::TeamWakeSource;
 
 /// Input for the wake path. Produced by [`TeamSession::compute_wake_input`],
 /// consumed by D7b's `send_message` / `send_message_to_agent` (not implemented
 /// in D7a). `first_message` includes the role prompt on cold starts.
 #[derive(Debug, Clone)]
 pub struct WakeInput {
+    pub team_run_id: Option<String>,
     pub conversation_id: String,
     pub first_message: String,
     /// `false` when the mailbox is empty — caller should skip wake and
@@ -36,10 +42,7 @@ pub struct WakeInput {
     /// **not** yet marked as read — the caller must call
     /// `mailbox.mark_read_batch` after successful delivery.
     pub unread: Vec<crate::types::MailboxMessage>,
-    /// Role of the wake target. Leader wakes do **not** mirror mailbox rows
-    /// into the conversation — the content is already embedded in the role
-    /// prompt sent to the leader directly. Only teammate wakes get the left
-    /// bubble treatment.
+    /// Role of the wake target.
     pub agent_role: TeammateRole,
 }
 
@@ -61,6 +64,10 @@ pub struct TeamSession {
     mcp_server: TeamMcpServer,
     backend_binary_path: Arc<PathBuf>,
     task_manager: Arc<dyn IWorkerTaskManager>,
+    turn_port: Arc<dyn AgentTurnExecutionPort>,
+    cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+    projection_store: Arc<dyn TeamProjectionMessageStore>,
+    team_run_manager: Arc<TeamRunManager>,
     /// Owner user_id for this team — needed when spawn_agent creates a
     /// new conversation (conversations are scoped per user).
     user_id: String,
@@ -79,17 +86,25 @@ pub struct TeamSession {
 }
 
 impl TeamSession {
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         team: Team,
         repo: Arc<dyn ITeamRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
         backend_binary_path: Arc<PathBuf>,
         task_manager: Arc<dyn IWorkerTaskManager>,
+        turn_port: Arc<dyn AgentTurnExecutionPort>,
+        cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+        projection_store: Arc<dyn TeamProjectionMessageStore>,
         user_id: String,
         service: Weak<TeamSessionService>,
     ) -> Result<Self, TeamError> {
         let mailbox = Arc::new(Mailbox::new(repo.clone()));
         let task_board = Arc::new(TaskBoard::new(repo));
+        let team_run_manager = Arc::new(TeamRunManager::new(
+            team.id.clone(),
+            Arc::new(TeamEventEmitter::new(team.id.clone(), broadcaster.clone())),
+        ));
 
         let scheduler = Arc::new(TeammateManager::new(
             team.id.clone(),
@@ -125,6 +140,10 @@ impl TeamSession {
             mcp_server,
             backend_binary_path,
             task_manager,
+            turn_port,
+            cancellation_port,
+            projection_store,
+            team_run_manager,
             user_id,
             service,
             broadcaster,
@@ -148,8 +167,19 @@ impl TeamSession {
         &self.event_loops
     }
 
-    /// Signal an agent's event loop to drain its mailbox.
-    pub fn notify_agent(&self, slot_id: &str) {
+    pub fn turn_port(&self) -> &Arc<dyn AgentTurnExecutionPort> {
+        &self.turn_port
+    }
+
+    pub fn cancellation_port(&self) -> &Arc<dyn AgentTurnCancellationPort> {
+        &self.cancellation_port
+    }
+
+    pub fn team_run_manager(&self) -> &Arc<TeamRunManager> {
+        &self.team_run_manager
+    }
+
+    pub(crate) fn notify_agent_for_session_restore_drain(&self, slot_id: &str) {
         self.event_loops.notify(slot_id);
     }
 
@@ -226,6 +256,7 @@ impl TeamSession {
         let should_send = !unread.is_empty();
 
         Ok(Some(WakeInput {
+            team_run_id: self.team_run_manager.active_run_id().await,
             conversation_id: agent.conversation_id,
             first_message,
             should_send,
@@ -288,7 +319,11 @@ impl TeamSession {
     /// semantics — see backend-audit §3.5 #46): the mailbox row is already
     /// persisted, so surfacing an error to the HTTP caller would invite a
     /// retry that double-writes the message.
-    pub async fn send_message(&self, content: &str, files: Option<Vec<String>>) -> Result<(), TeamError> {
+    pub async fn send_message(
+        &self,
+        content: &str,
+        files: Option<Vec<String>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let lead_slot_id = self
             .scheduler
             .find_lead_slot_id()
@@ -296,8 +331,13 @@ impl TeamSession {
             .ok_or_else(|| TeamError::AgentNotFound("no lead agent in team".into()))?;
 
         let lead_conv_id = self.scheduler.get_agent(&lead_slot_id).await?.conversation_id;
+        let mut ack = self
+            .team_run_manager
+            .accept_user_message(&lead_slot_id, TeamRunTargetRole::Lead, false, None)
+            .await?;
 
-        self.mailbox
+        let mailbox_message = match self
+            .mailbox
             .write_with_files(
                 &self.team.id,
                 &lead_slot_id,
@@ -307,36 +347,38 @@ impl TeamSession {
                 None,
                 files.as_deref(),
             )
-            .await?;
-
-        // Persist the user message as a right bubble in the leader's conversation.
-        // Strip [SYSTEM NOTE: ...] blocks so internal instructions are not visible
-        // to the user in the chat UI.
-        if let Some(svc) = self.service.upgrade() {
-            let visible_content = strip_system_notes(content);
-            let msg_id = ConversationService::mint_msg_id();
-            let row = aionui_db::models::MessageRow {
-                id: msg_id.clone(),
-                conversation_id: lead_conv_id,
-                msg_id: Some(msg_id),
-                r#type: "text".into(),
-                content: serde_json::json!({ "content": visible_content }).to_string(),
-                position: Some("right".into()),
-                status: Some("finish".into()),
-                hidden: false,
-                created_at: aionui_common::now_ms(),
-            };
-            if let Err(e) = svc.conversation_service_ref().insert_raw_message(&row).await {
-                warn!(
-                    team_id = %self.team.id,
-                    error = %e,
-                    "failed to persist user right bubble for leader (non-fatal)"
-                );
+            .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                self.team_run_manager.complete_failed().await;
+                return Err(err);
             }
+        };
+        ack.message_id = Some(mailbox_message.id.clone());
+
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let request = TeamProjectionRequest::user_visible(
+            &self.team.id,
+            &lead_slot_id,
+            &lead_conv_id,
+            content,
+            files.clone().unwrap_or_default(),
+        );
+        if let Err(e) = projection.project(request).await {
+            warn!(
+                team_id = %self.team.id,
+                slot_id = %lead_slot_id,
+                conversation_id = %lead_conv_id,
+                error = %e,
+                "failed to project user right bubble for leader (non-fatal)"
+            );
         }
 
-        self.try_wake(&lead_slot_id, files).await;
-        Ok(())
+        let _ = files;
+        self.wake_agent_for_team_work(&lead_slot_id, TeamWakeSource::UserMessage)
+            .await?;
+        Ok(ack)
     }
 
     /// Write a user message to the specified agent's mailbox and trigger a wake.
@@ -348,10 +390,25 @@ impl TeamSession {
         slot_id: &str,
         content: &str,
         files: Option<Vec<String>>,
-    ) -> Result<(), TeamError> {
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
+        let source = if self.team_run_manager.active_run_id().await.is_some() {
+            TeamWakeSource::UserIntervention
+        } else {
+            TeamWakeSource::UserMessage
+        };
+        let mut ack = self
+            .team_run_manager
+            .accept_user_message(
+                slot_id,
+                target_role_for(agent.role),
+                agent.role == TeammateRole::Teammate,
+                None,
+            )
+            .await?;
 
-        self.mailbox
+        let mailbox_message = match self
+            .mailbox
             .write_with_files(
                 &self.team.id,
                 slot_id,
@@ -361,148 +418,109 @@ impl TeamSession {
                 None,
                 files.as_deref(),
             )
-            .await?;
-
-        // Persist the user message as a right bubble in the agent's conversation
-        // so the teammate panel shows what the user said.
-        if let Some(svc) = self.service.upgrade() {
-            let msg_id = ConversationService::mint_msg_id();
-            let row = aionui_db::models::MessageRow {
-                id: msg_id.clone(),
-                conversation_id: agent.conversation_id.clone(),
-                msg_id: Some(msg_id),
-                r#type: "text".into(),
-                content: serde_json::json!({ "content": content }).to_string(),
-                position: Some("right".into()),
-                status: Some("finish".into()),
-                hidden: false,
-                created_at: aionui_common::now_ms(),
-            };
-            if let Err(e) = svc.conversation_service_ref().insert_raw_message(&row).await {
-                warn!(
-                    team_id = %self.team.id,
-                    slot_id,
-                    error = %e,
-                    "failed to persist user right bubble (non-fatal)"
-                );
-            }
-        }
-
-        self.try_wake(slot_id, files).await;
-        Ok(())
-    }
-
-    /// Signal an agent's event loop to process its mailbox.
-    ///
-    /// In the event-loop model, all wake logic lives inside the per-agent
-    /// event loop. This method is the single trigger point used by:
-    /// - `send_message` / `send_message_to_agent` (user messages)
-    /// - MCP `team_send_message` / `team_shutdown_agent` (agent-to-agent)
-    /// - `spawn_agent` (welcome message)
-    /// - `on_agent_finish` cascade (all-settled → leader)
-    ///
-    /// When an event loop is registered for the slot, it just notifies it.
-    /// When no loop exists (unit tests, race during spawn), falls back to
-    /// a direct inline send so messages are not silently dropped.
-    pub(crate) async fn try_wake(&self, slot_id: &str, files: Option<Vec<String>>) {
-        // Prefer the event loop path
-        if self.event_loops.has(slot_id) {
-            self.event_loops.notify(slot_id);
-            return;
-        }
-
-        // Fallback: inline send (used in unit tests and during spawn race)
-        self.try_wake_inline(slot_id, files).await;
-    }
-
-    /// Legacy inline wake implementation. Used as fallback when no event loop
-    /// is registered for the slot.
-    async fn try_wake_inline(&self, slot_id: &str, files: Option<Vec<String>>) {
-        if !self.scheduler.acquire_wake_lock(slot_id) {
-            return;
-        }
-
-        let input = match self.compute_wake_input(slot_id).await {
-            Ok(Some(input)) => input,
-            Ok(None) => {
-                self.scheduler.release_wake_lock(slot_id);
-                return;
-            }
+            .await
+        {
+            Ok(message) => message,
             Err(err) => {
-                warn!(
-                    team_id = %self.team.id,
-                    slot_id,
-                    error = %err,
-                    "try_wake_inline: compute_wake_input failed"
-                );
-                self.scheduler.release_wake_lock(slot_id);
-                return;
+                self.team_run_manager.complete_failed().await;
+                return Err(err);
             }
         };
+        ack.message_id = Some(mailbox_message.id.clone());
 
-        if !input.should_send {
-            self.scheduler.release_wake_lock(slot_id);
-            return;
-        }
-
-        self.mirror_unread_to_conversation(&input).await;
-
-        let handle = if let Some(h) = self.task_manager.get_task(&input.conversation_id) {
-            h
-        } else {
-            self.scheduler.release_wake_lock(slot_id);
-            return;
-        };
-
-        if handle.status() == Some(aionui_common::ConversationStatus::Running) {
-            self.scheduler.release_wake_lock(slot_id);
-            return;
-        }
-
-        let _ = self.scheduler.set_status(slot_id, TeammateStatus::Working).await;
-
-        let msg_id = ConversationService::mint_msg_id();
-        let data = SendMessageData {
-            content: input.first_message,
-            msg_id,
-            turn_id: None,
-            files: files.unwrap_or_default(),
-            inject_skills: Vec::new(),
-        };
-
-        if let Err(err) = handle.send_message(data).await {
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let request = TeamProjectionRequest::user_visible(
+            &self.team.id,
+            slot_id,
+            &agent.conversation_id,
+            content,
+            files.clone().unwrap_or_default(),
+        );
+        if let Err(e) = projection.project(request).await {
             warn!(
                 team_id = %self.team.id,
                 slot_id,
-                error = %err,
-                "try_wake_inline: send_message failed"
+                conversation_id = %agent.conversation_id,
+                error = %e,
+                "failed to project user right bubble (non-fatal)"
             );
-            let _ = self.scheduler.set_status(slot_id, TeammateStatus::Idle).await;
-            self.scheduler.release_wake_lock(slot_id);
+        }
+
+        let _ = files;
+        self.wake_agent_for_team_work(slot_id, source).await?;
+        Ok(ack)
+    }
+
+    pub(crate) async fn wake_agent_for_team_work(
+        &self,
+        slot_id: &str,
+        source: TeamWakeSource,
+    ) -> Result<(), TeamError> {
+        let target_role = self.reserve_wake_for_team_work(slot_id, source).await?;
+
+        if self.event_loops.has(slot_id) {
+            self.notify_reserved_wake_for_team_work(slot_id, target_role, source);
+            return Ok(());
+        }
+
+        warn!(
+            team_id = %self.team.id,
+            slot_id,
+            target_role = ?target_role,
+            wake_source = %source,
+            "team wake recorded but event loop is not registered; pending wake retained"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn reserve_wake_for_team_work(
+        &self,
+        slot_id: &str,
+        source: TeamWakeSource,
+    ) -> Result<TeamRunTargetRole, TeamError> {
+        let agent = self.scheduler.get_agent(slot_id).await?;
+        let target_role = target_role_for(agent.role);
+        self.team_run_manager
+            .record_pending_wake(slot_id, target_role.clone(), source)
+            .await?;
+        Ok(target_role)
+    }
+
+    pub(crate) fn notify_reserved_wake_for_team_work(
+        &self,
+        slot_id: &str,
+        target_role: TeamRunTargetRole,
+        source: TeamWakeSource,
+    ) {
+        if self.event_loops.has(slot_id) {
+            self.event_loops.notify(slot_id);
+            info!(
+                team_id = %self.team.id,
+                slot_id,
+                target_role = ?target_role,
+                wake_source = %source,
+                "team reserved wake notified"
+            );
             return;
         }
 
-        let msg_ids: Vec<String> = input.unread.iter().map(|m| m.id.clone()).collect();
-        if !msg_ids.is_empty() {
-            let _ = self.mailbox.mark_read_batch(&msg_ids).await;
-        }
-
-        self.scheduler.release_wake_lock(slot_id);
+        warn!(
+            team_id = %self.team.id,
+            slot_id,
+            target_role = ?target_role,
+            wake_source = %source,
+            "team reserved wake notification skipped because event loop is not registered"
+        );
     }
 
     /// Mirror each non-user mailbox row into the target agent's conversation
     /// as a left bubble so the UI shows "who said what" when the user opens
-    /// a teammate's chat panel.
+    /// an agent's chat panel.
     ///
     /// Skipped for:
-    /// - Leader wakes: the mailbox content is embedded inside the role prompt
-    ///   sent to the leader directly; duplicating it as a bubble would clutter
-    ///   the leader's own thread (AionUi parity: `agent.role !== 'leader'`).
     /// - `from_agent_id == "user"`: user-originated messages are already
     ///   written to the conversation by the standard user-send path, and we
     ///   must not double-write them.
-    /// - Test/unit contexts where `TeamSession::service` is a dangling
-    ///   `Weak` (no conversation service reachable).
     ///
     /// Failures per-message are logged and swallowed — the mailbox rows are
     /// already marked read, and we never let a conversation-write failure
@@ -511,13 +529,7 @@ impl TeamSession {
         if input.unread.is_empty() {
             return;
         }
-        if matches!(input.agent_role, TeammateRole::Lead) {
-            return;
-        }
-        let Some(service) = self.service.upgrade() else {
-            return;
-        };
-        let conversation_service = service.conversation_service_ref();
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let agents = self.scheduler.list_agents().await;
         let total = input.unread.len();
 
@@ -536,52 +548,219 @@ impl TeamSession {
             } else {
                 msg.content.clone()
             };
-            let msg_id = ConversationService::mint_msg_id();
-            let content_json = serde_json::json!({
-                "content": display_content,
-                "teammate_message": true,
-                "sender_name": sender_name,
-                "sender_backend": sender_backend,
-                "sender_conversation_id": sender_conv_id,
-            })
-            .to_string();
-            let row = aionui_db::models::MessageRow {
-                id: msg_id.clone(),
+            let request = TeamProjectionRequest {
+                team_id: self.team.id.clone(),
+                slot_id: msg.to_agent_id.clone(),
                 conversation_id: input.conversation_id.clone(),
-                msg_id: Some(msg_id.clone()),
-                r#type: "text".into(),
-                content: content_json,
-                position: Some("left".into()),
-                status: Some("finish".into()),
-                hidden: false,
-                created_at: aionui_common::now_ms(),
+                source: TeamProjectionSource::Teammate {
+                    from_slot_id: msg.from_agent_id.clone(),
+                    from_name: sender_name,
+                    sender_backend,
+                    sender_conversation_id: sender_conv_id,
+                },
+                content: display_content,
+                files: msg.files.clone().unwrap_or_default(),
+                visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
+                dedupe_key: Some(teammate_dedupe_key(&self.team.id, &msg.id, &input.conversation_id)),
             };
-            if let Err(err) = conversation_service.insert_raw_message(&row).await {
+            if let Err(err) = projection.project(request).await {
                 warn!(
                     team_id = %self.team.id,
                     conversation_id = %input.conversation_id,
                     from = %msg.from_agent_id,
                     error = %err,
-                    "mirror_unread_to_conversation: insert_raw_message failed (non-fatal)"
+                    "mirror_unread_to_conversation: projection failed (non-fatal)"
                 );
-                continue;
             }
-
-            // Broadcast so the frontend can render the bubble in real-time
-            // without a full message reload. The msg_id is included for
-            // deduplication against the DB-persisted row.
-            let ws_payload = serde_json::json!({
-                "conversation_id": input.conversation_id,
-                "msg_id": msg_id,
-                "content": display_content,
-                "from_slot_id": msg.from_agent_id,
-                "from_name": sender_name,
-                "teammate_message": true,
-                "sender_backend": sender_backend,
-            });
-            let event = aionui_api_types::WebSocketMessage::new("team.teammate.message", ws_payload);
-            self.broadcaster.broadcast(event);
         }
+    }
+
+    pub async fn cancel_run(
+        &self,
+        team_run_id: &str,
+        target_slot_id: Option<String>,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        let current_run_id = self
+            .team_run_manager
+            .current_run_id()
+            .await
+            .ok_or_else(|| TeamError::InvalidRequest("no active team run to cancel".into()))?;
+        if current_run_id != team_run_id {
+            return Err(TeamError::InvalidRequest(format!(
+                "team run {team_run_id} is not active"
+            )));
+        }
+
+        self.team_run_manager.begin_cancel(target_slot_id, reason).await?;
+
+        let agent_ids = self
+            .scheduler
+            .list_agents()
+            .await
+            .into_iter()
+            .map(|agent| agent.slot_id)
+            .collect::<Vec<_>>();
+        let marked = self
+            .mailbox
+            .mark_all_unread_for_agents_read(&self.team.id, &agent_ids)
+            .await?;
+        info!(
+            team_id = %self.team.id,
+            team_run_id,
+            agent_count = agent_ids.len(),
+            marked_unread = marked,
+            "team_run cancel drained unread mailbox rows"
+        );
+
+        let active_child_turns = self.team_run_manager.active_child_turns().await;
+        let active_child_count = active_child_turns.len();
+        for child in active_child_turns {
+            if let Err(err) = self
+                .cancellation_port
+                .cancel_agent_turn(&self.user_id, &child.conversation_id, &child.turn_id)
+                .await
+            {
+                warn!(
+                    team_id = %self.team.id,
+                    team_run_id,
+                    slot_id = %child.slot_id,
+                    turn_id = %child.turn_id,
+                    error = %err,
+                    "team_run cancel child turn failed (continuing)"
+                );
+            }
+            self.team_run_manager.record_child_cancelled(&child).await;
+        }
+
+        match self.team_run_manager.try_complete_cancelled().await {
+            Some(payload) => {
+                info!(
+                    team_id = %self.team.id,
+                    team_run_id,
+                    active_child_count,
+                    starting_child_count = payload.starting_child_count,
+                    pending_wake_count = payload.pending_wake_count,
+                    marked_unread = marked,
+                    "team_run cancel completed"
+                );
+            }
+            None => {
+                info!(
+                    team_id = %self.team.id,
+                    team_run_id,
+                    active_child_count,
+                    marked_unread = marked,
+                    "team_run cancel completion pending"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn cancel_child_turn(
+        &self,
+        team_run_id: &str,
+        slot_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        let target = self.team_run_manager.begin_cancel_child(slot_id).await?;
+        match target {
+            ChildCancelTarget::Active(child) => {
+                if child.team_run_id != team_run_id {
+                    return Err(TeamError::InvalidRequest(format!(
+                        "agent {slot_id} is not active in team run {team_run_id}"
+                    )));
+                }
+                self.cancellation_port
+                    .cancel_agent_turn(&self.user_id, &child.conversation_id, &child.turn_id)
+                    .await
+                    .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
+                self.team_run_manager.record_child_cancelled(&child).await;
+
+                if child.role == TeamRunTargetRole::Teammate {
+                    self.notify_leader_child_interrupted(slot_id, reason).await?;
+                } else {
+                    self.team_run_manager.maybe_complete().await;
+                }
+            }
+            ChildCancelTarget::Starting(reservation) => {
+                if reservation.team_run_id != team_run_id {
+                    return Err(TeamError::InvalidRequest(format!(
+                        "agent {slot_id} is not starting in team run {team_run_id}"
+                    )));
+                }
+                if reservation.role == TeamRunTargetRole::Teammate {
+                    self.notify_leader_child_interrupted(slot_id, reason).await?;
+                }
+                self.team_run_manager.try_complete_cancelled().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn notify_leader_child_interrupted(&self, slot_id: &str, reason: Option<String>) -> Result<(), TeamError> {
+        if let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await {
+            let content = reason.unwrap_or_else(|| format!("Agent {slot_id} was interrupted by the user."));
+            self.mailbox
+                .write(
+                    &self.team.id,
+                    &lead_slot_id,
+                    slot_id,
+                    MailboxMessageType::IdleNotification,
+                    &content,
+                    Some("Interrupted by user"),
+                )
+                .await?;
+            self.wake_agent_for_team_work(&lead_slot_id, TeamWakeSource::InterruptedNotification)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn notify_leader_spawn_attach_failed(
+        &self,
+        failed_slot_id: &str,
+        error: &str,
+    ) -> Result<(), TeamError> {
+        let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
+            return Err(TeamError::AgentNotFound("lead".into()));
+        };
+        let content = format!("Spawned teammate {failed_slot_id} failed to attach its runtime. Error: {error}");
+        self.mailbox
+            .write(
+                &self.team.id,
+                &lead_slot_id,
+                failed_slot_id,
+                MailboxMessageType::Message,
+                &content,
+                None,
+            )
+            .await?;
+        self.wake_agent_for_team_work(&lead_slot_id, TeamWakeSource::SpawnAttachFailure)
+            .await
+    }
+
+    pub(crate) async fn wake_leader_after_recovery_message(
+        &self,
+        source_slot_id: &str,
+        source: TeamWakeSource,
+    ) -> Result<(), TeamError> {
+        let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
+            return Err(TeamError::AgentNotFound("lead".into()));
+        };
+        if self.team_run_manager.active_run_id().await.is_some() {
+            return self.wake_agent_for_team_work(&lead_slot_id, source).await;
+        }
+        info!(
+            team_id = %self.team.id,
+            slot_id = %lead_slot_id,
+            source_slot_id,
+            wake_source = %source,
+            wake_policy = "deferred_mailbox_only",
+            "leader recovery message deferred because no active team run exists"
+        );
+        Ok(())
     }
 
     pub async fn add_agent(&self, agent: &TeamAgent) {
@@ -707,6 +886,17 @@ impl TeamSession {
             )
             .await?;
 
+        let spawn_welcome_role = self
+            .reserve_wake_for_team_work(&new_agent.slot_id, TeamWakeSource::SpawnWelcome)
+            .await?;
+        info!(
+            team_id = %self.team.id,
+            slot_id = %new_agent.slot_id,
+            target_role = ?spawn_welcome_role,
+            wake_source = %TeamWakeSource::SpawnWelcome,
+            "spawn welcome wake reserved before runtime attach"
+        );
+
         // Step 7: attach the CLI process and register the finish subscriber
         // in a background task. This involves spawning the CLI process and
         // completing the ACP protocol handshake, which can take significant
@@ -739,20 +929,30 @@ impl TeamSession {
                         error = %err,
                         "failed to attach spawned agent process; agent is persisted but not yet running"
                     );
+                    if let Err(notify_err) = service
+                        .notify_leader_spawn_attach_failed(&team_id, &agent_clone.slot_id, &err.to_string())
+                        .await
+                    {
+                        warn!(
+                            team_id = %team_id,
+                            slot_id = %agent_clone.slot_id,
+                            error = %notify_err,
+                            "failed to notify leader about spawned agent attach failure"
+                        );
+                    }
+                    return;
                 }
 
                 // Register the event loop for the newly spawned agent.
                 service.register_event_loop(&team_id, &agent_clone.slot_id);
 
                 // Notify the event loop to drain the welcome message.
-                if let Err(e) = service.wake_agent_in_session(&team_id, &agent_clone.slot_id).await {
-                    warn!(
-                        team_id = %team_id,
-                        slot_id = %agent_clone.slot_id,
-                        error = %e,
-                        "wake after spawn process ready failed (non-fatal; mailbox retained)"
-                    );
-                }
+                service.notify_reserved_wake_for_team_work(
+                    &team_id,
+                    &agent_clone.slot_id,
+                    spawn_welcome_role,
+                    TeamWakeSource::SpawnWelcome,
+                );
             });
         }
 
@@ -771,36 +971,10 @@ impl TeamSession {
         user_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError> {
-        let patch = serde_json::json!({
-            "team_mcp_stdio_config": mcp_stdio_cfg,
-            "session_mode": resolve_full_auto_mode(&agent.backend),
-        });
-
         service
-            .conversation_service_ref()
-            .update_extra(&agent.conversation_id, patch)
+            .provisioner()
+            .attach_agent_process(user_id, agent, mcp_stdio_cfg, task_manager)
             .await
-            .map_err(|e| {
-                TeamError::InvalidRequest(format!(
-                    "failed to persist team_mcp_stdio_config for {}: {e}",
-                    agent.slot_id
-                ))
-            })?;
-
-        let _ = task_manager.kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild));
-
-        service
-            .conversation_service_ref()
-            .warmup(user_id, &agent.conversation_id, task_manager)
-            .await
-            .map_err(|e| {
-                TeamError::InvalidRequest(format!(
-                    "failed to warm up spawned agent {}: {e}",
-                    agent.conversation_id
-                ))
-            })?;
-
-        Ok(())
     }
 
     pub fn stop(&self) {
@@ -817,48 +991,101 @@ impl TeamSession {
     }
 }
 
-/// Remove `[SYSTEM NOTE: ...]` blocks from a message so they don't appear in
-/// user-visible chat bubbles. The full content (with notes) is still delivered
-/// to the agent via the mailbox/wake payload.
-fn strip_system_notes(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("[SYSTEM NOTE:") {
-        result.push_str(&rest[..start]);
-        if let Some(end) = rest[start..].find(']') {
-            rest = &rest[start + end + 1..];
-        } else {
-            rest = &rest[start..];
-            break;
-        }
-    }
-    result.push_str(rest);
-    result.trim().to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::MockTeamRepo;
     use crate::types::{Team, TeamAgent, TeammateRole};
     use aionui_ai_agent::AgentError;
-    use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
-    use aionui_ai_agent::protocol::events::AgentStreamEvent;
-    use aionui_ai_agent::shared_kernel::approval_key;
+    use aionui_ai_agent::agent_task::AgentInstance;
     use aionui_ai_agent::types::BuildTaskOptions;
-    use aionui_ai_agent::types::SendMessageData;
-    use aionui_api_types::{AgentModeResponse, WebSocketMessage};
-    use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
+    use aionui_api_types::WebSocketMessage;
+    use aionui_common::{AgentKillReason, TimestampMs};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::broadcast;
 
     struct NullBroadcaster;
     impl EventBroadcaster for NullBroadcaster {
         fn broadcast(&self, _msg: WebSocketMessage<serde_json::Value>) {}
     }
 
+    struct NoopTurnPort;
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnExecutionPort for NoopTurnPort {
+        async fn run_agent_turn(
+            &self,
+            request: crate::ports::AgentTurnRequest,
+        ) -> Result<crate::ports::AgentTurnOutcome, crate::ports::AgentTurnExecutionError> {
+            if let Some(on_started) = request.on_started.as_ref() {
+                on_started(crate::ports::AgentTurnStarted {
+                    team_run_id: request.team_run_id.clone().expect("team run id"),
+                    slot_id: request.slot_id.clone(),
+                    role: request.role.clone(),
+                    conversation_id: request.conversation_id.clone(),
+                    turn_id: "turn-test".into(),
+                })
+                .await;
+            }
+            Ok(crate::ports::AgentTurnOutcome {
+                conversation_id: request.conversation_id,
+                turn_id: "turn-test".into(),
+                status: crate::ports::AgentTurnStatus::Completed,
+                runtime: None,
+            })
+        }
+    }
+
+    fn noop_turn_port() -> Arc<dyn crate::ports::AgentTurnExecutionPort> {
+        Arc::new(NoopTurnPort)
+    }
+
+    struct NoopCancellationPort;
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnCancellationPort for NoopCancellationPort {
+        async fn cancel_agent_turn(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _turn_id: &str,
+        ) -> Result<(), crate::ports::AgentTurnExecutionError> {
+            Ok(())
+        }
+    }
+
+    fn noop_cancellation_port() -> Arc<dyn crate::ports::AgentTurnCancellationPort> {
+        Arc::new(NoopCancellationPort)
+    }
+
+    #[derive(Default)]
+    struct NoopProjectionStore;
+
+    #[async_trait::async_trait]
+    impl TeamProjectionMessageStore for NoopProjectionStore {
+        fn mint_message_id(&self) -> String {
+            "msg-test".into()
+        }
+
+        async fn find_projected_message(
+            &self,
+            _conversation_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<aionui_db::models::MessageRow>, TeamError> {
+            Ok(None)
+        }
+
+        async fn insert_projected_message(&self, _row: &aionui_db::models::MessageRow) -> Result<(), TeamError> {
+            Ok(())
+        }
+    }
+
+    fn noop_projection_store() -> Arc<dyn TeamProjectionMessageStore> {
+        Arc::new(NoopProjectionStore)
+    }
+
     /// RecordingBroadcaster used by the D29d-1 ratification test below to
-    /// assert that `team.agent.spawned` is *not* emitted on failed spawns.
+    /// assert that `team.agentSpawned` is *not* emitted on failed spawns.
     #[derive(Default)]
     struct RecordingBroadcaster {
         events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
@@ -882,81 +1109,6 @@ mod tests {
 
     fn backend_path() -> Arc<PathBuf> {
         Arc::new(PathBuf::from("/tmp/aioncore-test"))
-    }
-
-    /// Mock agent whose `send_message` pushes the received payload into a
-    /// shared log, optionally failing with a configurable error.
-    struct RecordingAgent {
-        conversation_id: String,
-        sent: Arc<Mutex<Vec<SendMessageData>>>,
-        fail_with: Option<String>,
-        event_tx: broadcast::Sender<AgentStreamEvent>,
-    }
-
-    impl RecordingAgent {
-        fn new(conversation_id: &str, sent: Arc<Mutex<Vec<SendMessageData>>>, fail_with: Option<String>) -> Self {
-            let (event_tx, _) = broadcast::channel(4);
-            Self {
-                conversation_id: conversation_id.into(),
-                sent,
-                fail_with,
-                event_tx,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl IAgentTask for RecordingAgent {
-        fn agent_type(&self) -> AgentType {
-            AgentType::Acp
-        }
-        fn conversation_id(&self) -> &str {
-            &self.conversation_id
-        }
-        fn workspace(&self) -> &str {
-            "/tmp/ws"
-        }
-        fn status(&self) -> Option<ConversationStatus> {
-            None
-        }
-        fn last_activity_at(&self) -> TimestampMs {
-            now_ms()
-        }
-        fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
-            self.event_tx.subscribe()
-        }
-        async fn send_message(&self, data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
-            self.sent.lock().unwrap().push(data);
-            match &self.fail_with {
-                Some(msg) => Err(aionui_ai_agent::AgentSendError::from_agent_error(AgentError::internal(
-                    msg.clone(),
-                ))),
-                None => Ok(()),
-            }
-        }
-        async fn cancel(&self) -> Result<(), AgentError> {
-            Ok(())
-        }
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
-            Ok(())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl IMockAgent for RecordingAgent {
-        fn get_confirmations(&self) -> Vec<Confirmation> {
-            Vec::new()
-        }
-        fn check_approval(&self, action: &str, command_type: Option<&str>) -> bool {
-            let _ = approval_key(Some(action), command_type);
-            false
-        }
-        async fn mode(&self) -> Result<AgentModeResponse, AgentError> {
-            Ok(AgentModeResponse {
-                mode: "default".into(),
-                initialized: false,
-            })
-        }
     }
 
     /// In-memory stub for [`IWorkerTaskManager`]. Only `get_task` is
@@ -985,10 +1137,6 @@ mod tests {
                 kill_calls: Mutex::new(Vec::new()),
                 kill_error: Some(msg.to_owned()),
             }
-        }
-
-        fn insert(&self, conv_id: &str, handle: AgentInstance) {
-            self.tasks.lock().unwrap().insert(conv_id.into(), handle);
         }
 
         fn kill_calls(&self) -> Vec<(String, Option<AgentKillReason>)> {
@@ -1033,23 +1181,6 @@ mod tests {
         fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
             Vec::new()
         }
-    }
-
-    /// Build a task_manager pre-populated with a [`RecordingAgent`] per
-    /// conversation in `conv_ids`. `fail_with` — when set — makes
-    /// `send_message` fail for every agent so tests can exercise the
-    /// log-not-throw path.
-    fn task_manager_with_agents(
-        conv_ids: &[&str],
-        fail_with: Option<String>,
-    ) -> (Arc<dyn IWorkerTaskManager>, Arc<Mutex<Vec<SendMessageData>>>) {
-        let sent: Arc<Mutex<Vec<SendMessageData>>> = Arc::new(Mutex::new(Vec::new()));
-        let stub = StubTaskManager::new();
-        for conv_id in conv_ids {
-            let agent = AgentInstance::Mock(Arc::new(RecordingAgent::new(conv_id, sent.clone(), fail_with.clone())));
-            stub.insert(conv_id, agent);
-        }
-        (Arc::new(stub), sent)
     }
 
     /// Empty task_manager — `get_task` returns `None` for every conversation.
@@ -1102,11 +1233,197 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
+            noop_cancellation_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn wake_agent_for_team_work_records_pending_wake_without_registered_loop() {
+        let session = start_session().await;
+        session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        session
+            .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage)
+            .await
+            .expect("pending wake is recorded even before loop registration");
+
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .expect("wake should be claimable");
+
+        assert_eq!(reservation.slot_id, "worker-1");
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn reserved_spawn_welcome_survives_leader_empty_wake_until_teammate_registers() {
+        let session = start_session().await;
+        let ack = session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        let role = session
+            .reserve_wake_for_team_work("worker-1", TeamWakeSource::SpawnWelcome)
+            .await
+            .expect("reserve spawn welcome");
+        assert_eq!(role, TeamRunTargetRole::Teammate);
+
+        assert!(
+            session
+                .team_run_manager()
+                .record_empty_wake_observed("lead-1")
+                .await
+                .is_none(),
+            "lead empty wake must not complete while worker spawn welcome is pending"
+        );
+        assert_eq!(
+            session.team_run_manager().active_run_id().await.as_deref(),
+            Some(ack.team_run_id.as_str())
+        );
+
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .expect("worker should claim reserved spawn welcome");
+
+        assert_eq!(reservation.slot_id, "worker-1");
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn reserve_wake_for_team_work_rejects_without_active_run() {
+        let session = start_session().await;
+
+        let err = session
+            .reserve_wake_for_team_work("worker-1", TeamWakeSource::SpawnWelcome)
+            .await
+            .expect_err("run-scoped reserve without active run must fail");
+
+        assert!(matches!(
+            err,
+            TeamError::InvalidRequest(message)
+                if message == "no active team run for run-scoped wake"
+        ));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn wake_agent_for_team_work_rejects_orphan_mcp_work() {
+        let session = start_session().await;
+
+        let err = session
+            .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage)
+            .await
+            .expect_err("MCP work without active run must fail");
+
+        assert!(matches!(
+            err,
+            TeamError::InvalidRequest(message)
+                if message == "no active team run for run-scoped wake"
+        ));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn session_restore_drain_does_not_record_pending_wake_without_active_run() {
+        let session = start_session().await;
+
+        session.notify_agent_for_session_restore_drain("worker-1");
+
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await;
+
+        assert!(
+            reservation.is_none(),
+            "restore drain must not create Team Run reservation"
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn crash_notification_in_active_run_wakes_leader() {
+        let session = start_session().await;
+        session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        session
+            .wake_leader_after_recovery_message("worker-1", TeamWakeSource::CrashNotification)
+            .await
+            .expect("active run recovery should wake leader");
+
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("lead-1", TeamRunTargetRole::Lead, "c1")
+            .await
+            .expect("leader recovery wake should be claimable");
+
+        assert_eq!(reservation.slot_id, "lead-1");
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn crash_notification_without_active_run_is_deferred_mailbox_only() {
+        let session = start_session().await;
+
+        session
+            .wake_leader_after_recovery_message("worker-1", TeamWakeSource::CrashNotification)
+            .await
+            .expect("deferred recovery notification should not fail");
+
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("lead-1", TeamRunTargetRole::Lead, "c1")
+            .await;
+
+        assert!(
+            reservation.is_none(),
+            "deferred recovery must not create Team Run reservation"
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn inactivity_notification_in_active_run_wakes_leader() {
+        let session = start_session().await;
+        session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        session
+            .wake_leader_after_recovery_message("worker-1", TeamWakeSource::InactivityTimeout)
+            .await
+            .expect("active run inactivity recovery should wake leader");
+
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("lead-1", TeamRunTargetRole::Lead, "c1")
+            .await
+            .expect("leader inactivity wake should be claimable");
+
+        assert_eq!(reservation.slot_id, "lead-1");
+        session.stop();
     }
 
     #[tokio::test]
@@ -1149,6 +1466,9 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
+            noop_cancellation_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1175,6 +1495,9 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
+            noop_cancellation_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1242,6 +1565,9 @@ mod tests {
             broadcaster,
             backend_path(),
             stub_dyn,
+            noop_turn_port(),
+            noop_cancellation_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1272,6 +1598,9 @@ mod tests {
             broadcaster,
             backend_path(),
             stub_dyn,
+            noop_turn_port(),
+            noop_cancellation_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1482,7 +1811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirror_unread_to_conversation_is_noop_for_leader() {
+    async fn mirror_unread_to_conversation_skips_when_service_weak_is_dangling_for_leader() {
         let session = start_session().await;
         session
             .mailbox
@@ -1499,8 +1828,8 @@ mod tests {
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
-        // The service `Weak` is dangling in unit tests, but the leader short-circuit
-        // must hit before any upgrade — this call must not panic.
+        // In unit tests, `service` is a dangling Weak — the mirror helper must
+        // skip gracefully even for leader targets.
         session.mirror_unread_to_conversation(&input).await;
         session.stop();
     }
@@ -1582,6 +1911,9 @@ mod tests {
             broadcaster,
             backend_path(),
             task_manager,
+            noop_turn_port(),
+            noop_cancellation_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1591,20 +1923,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_forwards_files_to_task_manager() {
-        let (task_manager, sent) = task_manager_with_agents(&["c1"], None);
-        let (session, _repo) = start_session_with(task_manager).await;
+    async fn send_message_persists_files_in_mailbox_without_inline_wake() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
 
         session
             .send_message("Hello", Some(vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()]))
             .await
             .unwrap();
 
-        let log = sent.lock().unwrap();
-        assert_eq!(log.len(), 1, "expected exactly one send_message call");
-        assert_eq!(log[0].files, vec!["/tmp/a.txt", "/tmp/b.txt"]);
-        assert!(log[0].content.contains("Hello"));
-        assert!(!log[0].msg_id.is_empty());
+        let unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(
+            unread[0].files.as_deref(),
+            Some(&["/tmp/a.txt".into(), "/tmp/b.txt".into()][..])
+        );
+        assert_eq!(unread[0].content, "Hello");
         session.stop();
     }
 
@@ -1626,51 +1959,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_swallows_task_manager_send_failure() {
-        // Agent present but send_message fails — D7b must log and return Ok
-        // (P0#46). A propagated error would invite retries that double-write
-        // the mailbox.
-        let (task_manager, sent) = task_manager_with_agents(&["c1"], Some("boom".into()));
-        let (session, _repo) = start_session_with(task_manager).await;
+    async fn send_message_without_event_loop_retains_mailbox_message() {
+        let (session, repo) = start_session_with(empty_task_manager()).await;
 
         session
             .send_message("payload", None)
             .await
-            .expect("wake failure must be swallowed");
+            .expect("send_message must persist mailbox row without inline wake");
 
-        // The attempt still reached the agent, so the sent log has one entry.
-        assert_eq!(sent.lock().unwrap().len(), 1);
+        let state = repo.state.lock().unwrap();
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].content, "payload");
         session.stop();
     }
 
     #[tokio::test]
-    async fn send_message_to_agent_targets_specific_conversation() {
-        let (task_manager, sent) = task_manager_with_agents(&["c1", "c2"], None);
-        let (session, _repo) = start_session_with(task_manager).await;
+    async fn send_message_to_agent_persists_files_for_target_mailbox() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
 
         session
             .send_message_to_agent("worker-1", "do X", Some(vec!["/tmp/x.md".into()]))
             .await
             .unwrap();
 
-        let log = sent.lock().unwrap();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].files, vec!["/tmp/x.md"]);
-        assert!(log[0].content.contains("do X"));
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].files.as_deref(), Some(&["/tmp/x.md".into()][..]));
+        assert_eq!(unread[0].content, "do X");
         session.stop();
     }
 
     #[tokio::test]
-    async fn send_message_with_empty_content_still_wakes() {
-        // compute_wake_input returns should_send=true whenever the mailbox has
-        // unread entries, regardless of content. Ensure the wake still fires
-        // when a caller passes an empty string.
-        let (task_manager, sent) = task_manager_with_agents(&["c1"], None);
-        let (session, _repo) = start_session_with(task_manager).await;
+    async fn send_message_with_empty_content_still_persists_mailbox_row() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
 
         session.send_message("", None).await.unwrap();
 
-        assert_eq!(sent.lock().unwrap().len(), 1);
+        let unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].content, "");
         session.stop();
     }
 
@@ -1685,6 +2012,9 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
+            noop_cancellation_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1704,6 +2034,9 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
+            noop_cancellation_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1847,7 +2180,7 @@ mod tests {
 
     // -- W5-D29d-1 ratification: spawn emit-order contract ------------------
     //
-    // The success-path emission of `team.agent.spawned` is exercised by
+    // The success-path emission of `team.agentSpawned` is exercised by
     // `scheduler::tests::add_agent_broadcasts_spawned_event` — `spawn_agent`
     // reaches that emission via `scheduler.add_agent(&new_agent)` after
     // `persist_spawned_agent` returns. This ratification test locks the
@@ -1865,8 +2198,8 @@ mod tests {
             .expect_err("unit test has no service wire; spawn stops at DB step");
         assert_reached_db_step(err);
         assert!(
-            !recorder.names().iter().any(|n| n == "team.agent.spawned"),
-            "team.agent.spawned must not be emitted when spawn fails before add_agent; saw {:?}",
+            !recorder.names().iter().any(|n| n == "team.agentSpawned"),
+            "team.agentSpawned must not be emitted when spawn fails before add_agent; saw {:?}",
             recorder.names()
         );
         session.stop();
@@ -1881,8 +2214,8 @@ mod tests {
             .expect_err("non-lead caller must be rejected");
         assert!(matches!(&err, TeamError::LeaderOnly(what) if what == "spawn_agent"));
         assert!(
-            !recorder.names().iter().any(|n| n == "team.agent.spawned"),
-            "team.agent.spawned must not be emitted when guard rejects the caller; saw {:?}",
+            !recorder.names().iter().any(|n| n == "team.agentSpawned"),
+            "team.agentSpawned must not be emitted when guard rejects the caller; saw {:?}",
             recorder.names()
         );
         session.stop();
