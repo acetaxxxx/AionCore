@@ -8,7 +8,7 @@ const DEFAULT_BASE_URL: &str = "https://api.deepgram.com";
 /// Resolve the effective base URL. Unset or blank values fall back to the
 /// default — the settings UI saves unfilled fields as empty strings, which
 /// would otherwise produce a relative URL that fails the request builder.
-fn resolve_base_url(configured: Option<&str>) -> &str {
+pub(crate) fn resolve_base_url(configured: Option<&str>) -> &str {
     configured
         .map(str::trim)
         .filter(|s| !s.is_empty())
