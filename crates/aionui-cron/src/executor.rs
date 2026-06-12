@@ -439,6 +439,7 @@ impl JobExecutor {
             r#type: agent_type,
             name: Some(job.name.clone()),
             model,
+            assistant: None,
             source: None,
             channel_chat_id: None,
             extra,
