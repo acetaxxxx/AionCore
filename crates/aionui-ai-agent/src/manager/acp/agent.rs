@@ -5,28 +5,30 @@ use crate::capability::prompt_pipeline::PromptPipeline;
 use crate::capability::skill_manager::AcpSkillManager;
 use crate::error::AgentError;
 use crate::factory::acp_assembler::AcpSessionParams;
-use crate::manager::acp::{
-    AcpSession, AcpSessionEvent, ModelIdentityReminderHook, PermissionRouter, SessionNewPreludeHook,
-};
+use crate::manager::acp::{AcpSession, AcpSessionEvent, PermissionRouter, SessionNewPreludeHook};
 use crate::manager::process_registry::{register_session_process, unregister_agent_process};
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::{AcpError, CloseReason};
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::registry::CatalogSender;
-use crate::shared_kernel::{ModeId, ModelId, SessionId as DomainSessionId};
+use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::{
-    AvailableCommand, CancelNotification, SessionId, SessionModelState, SessionNotification, SetSessionModeRequest,
-    SetSessionModelRequest, UsageUpdate,
+    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionModelState,
+    SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
 };
-use aionui_api_types::{AgentHandshake, SlashCommandCompletionBehavior, SlashCommandItem};
+use aionui_api_types::{
+    AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
+    SlashCommandCompletionBehavior, SlashCommandItem,
+};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -52,10 +54,12 @@ pub(super) fn user_facing_message(err: &AgentError) -> String {
 }
 
 use super::codex_sandbox;
+use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
 
 /// Grace period before force-killing an ACP process (ms).
 const ACP_KILL_GRACE_MS: u64 = 500;
+const OBSERVED_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Decompose a child `ExitStatus` (or its absence) into the
 /// `(exit_code, signal)` pair that `AcpError::StartupCrash` /
@@ -101,6 +105,65 @@ fn initial_mode_from_params(params: &AcpSessionParams) -> Option<ModeId> {
         })
         .filter(|m| !m.is_empty())
         .map(ModeId::new)
+}
+
+fn has_persisted_config_for_category(
+    initial_config: &HashMap<ConfigKey, ConfigValue>,
+    category: &SessionConfigOptionCategory,
+) -> bool {
+    match category {
+        SessionConfigOptionCategory::Mode => initial_config.keys().any(|key| key.as_str() == "mode"),
+        SessionConfigOptionCategory::Model => initial_config.keys().any(|key| key.as_str() == "model"),
+        SessionConfigOptionCategory::ThoughtLevel => initial_config.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "thought_level" | "reasoning_effort" | "effort" | "thinking_budget" | "thinking"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn seed_startup_config_preferences(
+    session: &mut AcpSession,
+    params: &AcpSessionParams,
+    initial_config: &HashMap<ConfigKey, ConfigValue>,
+) {
+    if let Some(mode) = params
+        .config
+        .session_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| !has_persisted_config_for_category(initial_config, &SessionConfigOptionCategory::Mode))
+    {
+        session.seed_pending_startup_config(SessionConfigOptionCategory::Mode, ConfigValue::new(mode.to_owned()));
+    }
+
+    if let Some(model) = params
+        .config
+        .current_model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| !has_persisted_config_for_category(initial_config, &SessionConfigOptionCategory::Model))
+    {
+        session.seed_pending_startup_config(SessionConfigOptionCategory::Model, ConfigValue::new(model.to_owned()));
+    }
+
+    if let Some(thought_level) = params
+        .config
+        .thought_level
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| !has_persisted_config_for_category(initial_config, &SessionConfigOptionCategory::ThoughtLevel))
+    {
+        session.seed_pending_startup_config(
+            SessionConfigOptionCategory::ThoughtLevel,
+            ConfigValue::new(thought_level.to_owned()),
+        );
+    }
 }
 
 fn confirm_option_id(data: &Value) -> Option<String> {
@@ -344,12 +407,11 @@ impl AcpAgentManager {
             snapshot.map(|s| s.config_selections.clone()).unwrap_or_default(),
         );
 
-        let session = AcpSession::new(initial_mode, initial_model, initial_config);
+        let startup_config_seed_base = initial_config.clone();
+        let mut session = AcpSession::new(initial_mode, initial_model, initial_config);
+        seed_startup_config_preferences(&mut session, &params, &startup_config_seed_base);
 
-        let pipeline = PromptPipeline::new(vec![
-            Arc::new(SessionNewPreludeHook),
-            Arc::new(ModelIdentityReminderHook),
-        ]);
+        let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
 
         let manager = Self {
             params,
@@ -436,6 +498,267 @@ impl AcpAgentManager {
     /// Cached context usage info from the ACP backend.
     pub(crate) async fn usage(&self) -> Option<UsageUpdate> {
         self.session.read().await.context_usage().cloned()
+    }
+
+    pub(crate) async fn config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        let session = self.session.read().await;
+        Ok(GetConfigOptionsResponse {
+            config_options: session.config_snapshot().options,
+        })
+    }
+
+    pub(crate) async fn set_config_option_confirmed(
+        &self,
+        option_id: &str,
+        value: &str,
+    ) -> Result<SetConfigOptionResponse, AgentError> {
+        let option_id = option_id.trim();
+        let value = value.trim();
+        if option_id.is_empty() {
+            return Err(AgentError::bad_request("option_id must not be empty"));
+        }
+        if value.is_empty() {
+            return Err(AgentError::bad_request("value must not be empty"));
+        }
+
+        let guard = {
+            let mut session = self.session.write().await;
+            session.try_begin_config_set()
+        };
+        let Some(guard) = guard else {
+            tracing::info!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_option_id = %option_id,
+                requested_value = %value,
+                "acp_config_option_update_rejected_in_progress"
+            );
+            return Err(AgentError::conflict("ACP config update is already in progress"));
+        };
+
+        let result = self.set_config_option_confirmed_inner(option_id, value).await;
+
+        {
+            let mut session = self.session.write().await;
+            session.end_config_set(guard);
+        }
+
+        result
+    }
+
+    async fn set_config_option_confirmed_inner(
+        &self,
+        option_id: &str,
+        value: &str,
+    ) -> Result<SetConfigOptionResponse, AgentError> {
+        let (session_id, set_path, is_mode_option) = {
+            let session = self.session.read().await;
+            let snapshot = session.config_snapshot();
+            let mut set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
+                ConfigSetPathError::OptionNotFound => {
+                    AgentError::bad_request(format!("Config option '{option_id}' is not available"))
+                }
+                ConfigSetPathError::ValueNotSelectable => AgentError::bad_request(format!(
+                    "Value '{value}' is not selectable for config option '{option_id}'"
+                )),
+            })?;
+            if session.config_options().is_none() {
+                set_path = match option_id {
+                    "mode" => ConfigSetPath::LegacyMode,
+                    "model" => ConfigSetPath::LegacyModel,
+                    _ => set_path,
+                };
+            }
+            let session_id = session.session_id().map(ToOwned::to_owned).ok_or_else(|| {
+                warn!(
+                    conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
+                    config_id = %option_id,
+                    "acp_config_option_set_missing_session"
+                );
+                AgentError::bad_request("No active session")
+            })?;
+            (session_id, set_path, snapshot.is_mode_option(option_id))
+        };
+
+        tracing::info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            config_id = %option_id,
+            requested = %value,
+            "acp_config_option_set_requested"
+        );
+
+        if self.params.metadata.backend.as_deref() == Some("codex") && is_mode_option {
+            codex_sandbox::sync_for_agent(&self.params.metadata, Some(value)).await;
+        }
+
+        match set_path {
+            ConfigSetPath::ConfigOption { option_id: config_id } => {
+                let response = self
+                    .protocol
+                    .set_config_option(SetSessionConfigOptionRequest::new(
+                        SessionId::new(session_id.clone()),
+                        config_id.clone(),
+                        value.to_owned(),
+                    ))
+                    .await
+                    .map_err(|err| {
+                        warn!(
+                            conversation_id = %self.params.conversation_id,
+                            agent_backend = ?self.params.metadata.backend,
+                            config_id = %config_id,
+                            requested = %value,
+                            error = %err,
+                            "acp_config_option_command_failed"
+                        );
+                        AgentError::from(err)
+                    })?;
+
+                tracing::info!(
+                    conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
+                    config_id = %config_id,
+                    requested = %value,
+                    method = "session/set_config_option",
+                    "acp_config_option_command_ack"
+                );
+
+                {
+                    let mut session = self.session.write().await;
+                    if session.session_id() != Some(session_id.as_str()) {
+                        return Err(AgentError::conflict(
+                            "Active ACP session changed while applying config option",
+                        ));
+                    }
+                    session.apply_advertised_config_options(response.config_options);
+                    self.commit_session_changes(&mut session).await;
+                }
+                self.wait_for_observed_config_option(&config_id, value, OBSERVED_CONFIRMATION_TIMEOUT)
+                    .await
+            }
+            ConfigSetPath::LegacyMode => {
+                self.protocol
+                    .set_mode(SetSessionModeRequest::new(
+                        SessionId::new(session_id.clone()),
+                        value.to_owned(),
+                    ))
+                    .await
+                    .map_err(|err| {
+                        warn!(
+                            conversation_id = %self.params.conversation_id,
+                            agent_backend = ?self.params.metadata.backend,
+                            config_id = %option_id,
+                            requested = %value,
+                            error = %err,
+                            "acp_config_option_command_failed"
+                        );
+                        AgentError::from(err)
+                    })?;
+                tracing::info!(
+                    conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
+                    config_id = %option_id,
+                    requested = %value,
+                    method = "session/set_mode",
+                    "acp_config_option_command_ack"
+                );
+                self.ensure_session_unchanged(&session_id, "mode").await?;
+                self.wait_for_observed_config_option("mode", value, OBSERVED_CONFIRMATION_TIMEOUT)
+                    .await
+            }
+            ConfigSetPath::LegacyModel => {
+                self.protocol
+                    .set_model(SetSessionModelRequest::new(
+                        SessionId::new(session_id.clone()),
+                        value.to_owned(),
+                    ))
+                    .await
+                    .map_err(|err| {
+                        warn!(
+                            conversation_id = %self.params.conversation_id,
+                            agent_backend = ?self.params.metadata.backend,
+                            config_id = %option_id,
+                            requested = %value,
+                            error = %err,
+                            "acp_config_option_command_failed"
+                        );
+                        AgentError::from(err)
+                    })?;
+                tracing::info!(
+                    conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
+                    config_id = %option_id,
+                    requested = %value,
+                    method = "session/set_model",
+                    "acp_config_option_command_ack"
+                );
+                self.ensure_session_unchanged(&session_id, "model").await?;
+                self.wait_for_observed_config_option("model", value, OBSERVED_CONFIRMATION_TIMEOUT)
+                    .await
+            }
+        }
+        .map(|snapshot| SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::Observed,
+            config_options: Some(snapshot.options),
+        })
+    }
+
+    async fn ensure_session_unchanged(&self, session_id: &str, field: &str) -> Result<(), AgentError> {
+        let session = self.session.read().await;
+        if session.session_id() == Some(session_id) {
+            return Ok(());
+        }
+        warn!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            config_id = %field,
+            confirmed_session_id = %session_id,
+            active_session_id = ?session.session_id(),
+            "acp_config_option_session_changed"
+        );
+        Err(AgentError::conflict(
+            "Active ACP session changed while applying config option",
+        ))
+    }
+
+    async fn wait_for_observed_config_option(
+        &self,
+        option_id: &str,
+        requested: &str,
+        timeout: Duration,
+    ) -> Result<ConfigSnapshot, AgentError> {
+        let started = Instant::now();
+        loop {
+            let snapshot = {
+                let session = self.session.read().await;
+                session.config_snapshot()
+            };
+            if snapshot.observed_matches(option_id, requested) {
+                tracing::info!(
+                    conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
+                    config_id = %option_id,
+                    requested = %requested,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "acp_config_option_observed_confirmed"
+                );
+                return Ok(snapshot);
+            }
+            if started.elapsed() >= timeout {
+                tracing::warn!(
+                    conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
+                    config_id = %option_id,
+                    requested = %requested,
+                    timeout_ms = timeout.as_millis(),
+                    last_observed = ?snapshot.option_current(option_id),
+                    "acp_config_option_confirmation_timeout"
+                );
+                return Err(AgentError::timeout("ACP config option confirmation timed out"));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Set the mode for the current session.
@@ -581,11 +904,7 @@ impl AcpAgentManager {
             );
             return Err(AgentError::conflict("Active ACP session changed while applying model"));
         }
-        let model = ModelId::new(model_id);
-        session.confirm_model(model.clone());
-        if self.params.metadata.behavior_policy.self_identity_sticky {
-            session.set_pending_model_notice(model);
-        }
+        session.confirm_model(ModelId::new(model_id));
         let confirmed_model = session
             .model_info()
             .cloned()
@@ -696,7 +1015,7 @@ impl AcpAgentManager {
     /// The prompt is passed through `self.pipeline.pre_send` before being
     /// forwarded to the CLI. Each hook in the pipeline reads one-shot flags
     /// on `AcpSession` (e.g. `pending_session_new_prelude`,
-    /// `pending_model_notice`) and prepends the appropriate block when set.
+    /// flags) and prepends the appropriate block when set.
     async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<PromptOutcome, AcpSendFailure> {
         let sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
@@ -994,8 +1313,10 @@ mod tests {
     use crate::error::AgentError;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::CloseReason;
-    use agent_client_protocol::schema::AvailableCommand;
+    use crate::shared_kernel::{ConfigKey, ConfigValue};
+    use agent_client_protocol::schema::{AvailableCommand, SessionConfigOptionCategory};
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn exit_status_parts_handles_missing_status() {
@@ -1192,6 +1513,26 @@ mod tests {
             Some(aionui_api_types::SlashCommandCompletionBehavior::NeutralTipOnEmpty)
         );
         assert_eq!(matched.empty_turn_tip_code.as_deref(), None);
+    }
+
+    #[test]
+    fn persisted_thought_config_does_not_block_model_startup_seed_category() {
+        let persisted_config = HashMap::from([(ConfigKey::new("effort"), ConfigValue::new("medium"))]);
+
+        assert!(!super::has_persisted_config_for_category(
+            &persisted_config,
+            &SessionConfigOptionCategory::Model
+        ));
+    }
+
+    #[test]
+    fn persisted_thought_config_is_detected_by_known_raw_keys() {
+        let persisted_config = HashMap::from([(ConfigKey::new("reasoning_effort"), ConfigValue::new("low"))]);
+
+        assert!(super::has_persisted_config_for_category(
+            &persisted_config,
+            &SessionConfigOptionCategory::ThoughtLevel
+        ));
     }
 
     // Close-reason compositional tests live in `agent_close.rs` so that
