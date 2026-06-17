@@ -169,6 +169,36 @@ async fn handle_tool_request(
 // Tool implementations
 // ---------------------------------------------------------------------------
 
+fn build_create_team_handoff_next_step(summary: &str) -> String {
+    format!(
+        "Team was created and the UI has switched to the team conversation. End this solo turn now. \
+         Do not call any `team_*` tools from this solo turn. Reply to the user only with one short \
+         handoff in their language. It should mean: the Team is ready, send the next message, and I will continue from there. \
+         Do not mention the Team page, solo turn, `team_*` tools, `TeamRun`, or internal tool state. \
+         Task summary: {summary}"
+    )
+}
+
+const NO_ACTIVE_TEAM_RUN_FOR_RUN_SCOPED_WAKE: &str = "no active team run for run-scoped wake";
+const GUIDE_NO_ACTIVE_TEAM_RUN_HANDOFF_ERROR: &str =
+    "Team was created, but no TeamRun is active yet. Open the team chat and continue from there.";
+
+fn is_run_scoped_guide_team_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "team_send_message"
+            | "team_spawn_agent"
+            | "team_task_create"
+            | "team_task_update"
+            | "team_rename_agent"
+            | "team_shutdown_agent"
+    )
+}
+
+fn guide_no_active_team_run_handoff_response() -> serde_json::Value {
+    serde_json::json!({ "error": GUIDE_NO_ACTIVE_TEAM_RUN_HANDOFF_ERROR })
+}
+
 async fn exec_create_team(
     request_body: &serde_json::Value,
     args: &serde_json::Value,
@@ -268,11 +298,7 @@ async fn exec_create_team(
         "name": team.name,
         "route": route,
         "status": "team_created",
-        "next_step": format!(
-            "You are now the team Leader. Your team tools (team_spawn_agent, team_send_message, etc.) are now active. \
-             Immediately proceed to spawn teammates as planned. Task summary: {}",
-            params.summary
-        )
+        "next_step": build_create_team_handoff_next_step(&params.summary)
     })
 }
 
@@ -317,6 +343,29 @@ async fn exec_team_tool(
             return serde_json::json!({"error": "No active team session. The team may still be starting up."});
         }
     };
+
+    if is_run_scoped_guide_team_tool(tool_name) {
+        match svc.require_active_team_run_for_team_work(&team_id).await {
+            Ok(()) => {}
+            Err(crate::TeamError::InvalidRequest(message)) if message == NO_ACTIVE_TEAM_RUN_FOR_RUN_SCOPED_WAKE => {
+                warn!(
+                    tool = tool_name,
+                    team_id = %team_id,
+                    "Guide HTTP: run-scoped team tool refused because no active TeamRun exists"
+                );
+                return guide_no_active_team_run_handoff_response();
+            }
+            Err(error) => {
+                warn!(
+                    tool = tool_name,
+                    team_id = %team_id,
+                    error = %error,
+                    "Guide HTTP: active TeamRun check failed before forwarding team tool"
+                );
+                return serde_json::json!({"error": error.to_string()});
+            }
+        }
+    }
 
     let svc_weak = Arc::downgrade(&svc);
     let result = crate::mcp::server::dispatch_tool(
@@ -383,6 +432,92 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn create_team_next_step_tells_solo_agent_to_end_turn() {
+        let next_step = build_create_team_handoff_next_step("Build a research and implementation team");
+
+        assert!(next_step.contains("Team was created and the UI has switched to the team conversation."));
+        assert!(next_step.contains("End this solo turn now."));
+        assert!(next_step.contains("Do not call any `team_*` tools from this solo turn."));
+        assert!(next_step.contains(
+            "Reply to the user only with one short handoff in their language. It should mean: the Team is ready, send the next message, and I will continue from there."
+        ));
+        assert!(
+            next_step.contains(
+                "Do not mention the Team page, solo turn, `team_*` tools, `TeamRun`, or internal tool state."
+            )
+        );
+        assert!(next_step.contains("Task summary: Build a research and implementation team"));
+        assert!(
+            !next_step.contains("team_spawn_agent"),
+            "next_step must not name spawn as an immediately available action"
+        );
+        assert!(
+            !next_step.contains("team_send_message"),
+            "next_step must not name send_message as an immediately available action"
+        );
+        assert!(
+            !next_step.contains("tools are now active"),
+            "next_step must not claim Team tools are active immediately after creation"
+        );
+    }
+
+    #[test]
+    fn run_scoped_guide_team_tools_are_classified_for_handoff_guard() {
+        for tool_name in [
+            "team_send_message",
+            "team_spawn_agent",
+            "team_task_create",
+            "team_task_update",
+            "team_rename_agent",
+            "team_shutdown_agent",
+        ] {
+            assert!(
+                is_run_scoped_guide_team_tool(tool_name),
+                "{tool_name} should require an active TeamRun in the Guide forwarding path"
+            );
+        }
+
+        for tool_name in [
+            "team_members",
+            "team_task_list",
+            "team_list_models",
+            "team_describe_assistant",
+        ] {
+            assert!(
+                !is_run_scoped_guide_team_tool(tool_name),
+                "{tool_name} is read-only/catalog-style and should not use the run-scoped handoff guard"
+            );
+        }
+    }
+
+    #[test]
+    fn guide_no_active_team_run_handoff_error_is_clear() {
+        let response = guide_no_active_team_run_handoff_response();
+        let error = response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("error string");
+
+        assert_eq!(
+            error,
+            "Team was created, but no TeamRun is active yet. Open the team chat and continue from there."
+        );
+        assert!(!error.contains("no active team run for run-scoped wake"));
+    }
+
+    #[test]
+    fn guide_handoff_guard_is_not_a_correctness_api() {
+        assert!(is_run_scoped_guide_team_tool("team_send_message"));
+        let response = guide_no_active_team_run_handoff_response();
+        let text = serde_json::to_string(&response).unwrap();
+        assert!(text.contains("Open the team chat"));
+        assert!(
+            !text.contains("correctness"),
+            "guide handoff text must stay user-facing and not document concurrency guarantees"
+        );
+    }
 
     #[tokio::test]
     async fn start_returns_positive_port_and_token() {
