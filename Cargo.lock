@@ -332,6 +332,7 @@ dependencies = [
  "aionui-realtime",
  "aionui-runtime",
  "aionui-system",
+ "aionui-team-prompts",
  "async-trait",
  "axum",
  "base64",
@@ -391,6 +392,7 @@ dependencies = [
  "aionui-shell",
  "aionui-system",
  "aionui-team",
+ "aionui-team-prompts",
  "anyhow",
  "async-trait",
  "axum",
@@ -818,6 +820,7 @@ dependencies = [
  "aionui-common",
  "aionui-db",
  "aionui-realtime",
+ "aionui-team-prompts",
  "async-trait",
  "axum",
  "dashmap",
@@ -830,6 +833,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aionui-team-prompts"
+version = "0.1.31"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
