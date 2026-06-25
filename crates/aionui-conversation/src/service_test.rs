@@ -34,10 +34,11 @@ use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SortOrder, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantPreferenceRepository, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
 };
+use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -183,6 +184,27 @@ impl MockRepo {
             assistant_snapshots: Mutex::new(vec![]),
         }
     }
+}
+
+fn message_is_before_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> bool {
+    message.created_at < cursor.created_at || (message.created_at == cursor.created_at && message.id < cursor.id)
+}
+
+fn message_is_after_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> bool {
+    message.created_at > cursor.created_at || (message.created_at == cursor.created_at && message.id > cursor.id)
+}
+
+async fn repo_messages_asc(repo: &Arc<MockRepo>, conv_id: &str, limit: u32) -> Vec<MessageRow> {
+    repo.list_messages_page(
+        conv_id,
+        &MessagePageParams {
+            limit,
+            direction: MessagePageDirection::InitialLatest,
+        },
+    )
+    .await
+    .unwrap()
+    .items
 }
 
 #[async_trait::async_trait]
@@ -336,40 +358,90 @@ impl IConversationRepository for MockRepo {
         Ok(rows.len() != before)
     }
 
-    async fn get_messages(
+    async fn list_messages_page(
         &self,
         conv_id: &str,
-        page: u32,
-        page_size: u32,
-        order: SortOrder,
-    ) -> Result<PaginatedResult<MessageRow>, aionui_db::DbError> {
+        params: &MessagePageParams,
+    ) -> Result<MessagePageResult, aionui_db::DbError> {
         let messages = self.messages.lock().unwrap();
         let mut matched: Vec<_> = messages
             .iter()
             .filter(|message| message.conversation_id == conv_id)
+            .filter(|message| !matches!(message.r#type.as_str(), "cron_trigger" | "skill_suggest"))
             .cloned()
             .collect();
-        matched.sort_by_key(|message| message.created_at);
-        if matches!(order, SortOrder::Desc) {
-            matched.reverse();
-        }
+        matched.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
 
-        let start = page.saturating_sub(1) as usize * page_size as usize;
-        let end = (start + page_size as usize).min(matched.len());
-        let items = if start < matched.len() {
-            matched[start..end].to_vec()
-        } else {
-            Vec::new()
+        let limit = params.limit.max(1) as usize;
+        let items = match &params.direction {
+            MessagePageDirection::InitialLatest => {
+                let start = matched.len().saturating_sub(limit);
+                matched[start..].to_vec()
+            }
+            MessagePageDirection::Before { cursor } => matched
+                .iter()
+                .filter(|message| message_is_before_cursor(message, cursor))
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            MessagePageDirection::After { cursor } => matched
+                .iter()
+                .filter(|message| message_is_after_cursor(message, cursor))
+                .take(limit)
+                .cloned()
+                .collect(),
+            MessagePageDirection::Anchor { message_id } => {
+                let anchor = matched
+                    .iter()
+                    .find(|message| message.id == *message_id)
+                    .cloned()
+                    .ok_or_else(|| aionui_db::DbError::NotFound(format!("Message {message_id}")))?;
+                let before_take = (limit.saturating_sub(1)) / 2;
+                let anchor_cursor = MessagePageCursor::from(&anchor);
+                let before = matched
+                    .iter()
+                    .filter(|message| message_is_before_cursor(message, &anchor_cursor))
+                    .rev()
+                    .take(before_take)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let after = matched
+                    .iter()
+                    .filter(|message| message_is_after_cursor(message, &anchor_cursor))
+                    .take(limit.saturating_sub(1 + before.len()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                before
+                    .into_iter()
+                    .rev()
+                    .chain(std::iter::once(anchor))
+                    .chain(after)
+                    .collect()
+            }
         };
-        Ok(PaginatedResult {
+        let has_more_before = items.first().is_some_and(|first| {
+            let cursor = MessagePageCursor::from(first);
+            matched.iter().any(|message| message_is_before_cursor(message, &cursor))
+        });
+        let has_more_after = items.last().is_some_and(|last| {
+            let cursor = MessagePageCursor::from(last);
+            matched.iter().any(|message| message_is_after_cursor(message, &cursor))
+        });
+
+        Ok(MessagePageResult {
             items,
-            total: matched.len() as u64,
-            has_more: end < matched.len(),
+            has_more_before,
+            has_more_after,
         })
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), aionui_db::DbError> {
-        self.messages.lock().unwrap().push(message.clone());
+        let mut messages = self.messages.lock().unwrap();
+        messages.push(message.clone());
         Ok(())
     }
 
@@ -3181,7 +3253,17 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+            let messages = repo
+                .list_messages_page(
+                    &conv.id,
+                    &MessagePageParams {
+                        limit: 20,
+                        direction: MessagePageDirection::InitialLatest,
+                    },
+                )
+                .await
+                .unwrap()
+                .items;
             if messages.iter().any(|message| message.r#type == "tips")
                 && messages.iter().any(|message| message.r#type == "text")
             {
@@ -3300,7 +3382,17 @@ async fn send_message_persists_hidden_user_message_when_requested() {
 
     svc.send_message("user_1", &conv.id, req, &task_mgr).await.unwrap();
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     // The user message is the only hidden text row written by the service.
     let user_message = messages
         .iter()
@@ -3330,7 +3422,17 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+            let messages = repo
+                .list_messages_page(
+                    &conv.id,
+                    &MessagePageParams {
+                        limit: 20,
+                        direction: MessagePageDirection::InitialLatest,
+                    },
+                )
+                .await
+                .unwrap()
+                .items;
             if messages.iter().any(|message| message.r#type == "tips") {
                 return messages;
             }
@@ -3413,7 +3515,17 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
 
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let tip = messages
         .iter()
         .find(|row| row.r#type == "tips" && row.status.as_deref() == Some("error"))
@@ -3552,7 +3664,17 @@ async fn send_message_rejects_when_runtime_is_shutting_down() {
         .unwrap_err();
     assert!(matches!(err, ConversationError::Busy { .. }));
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     assert!(
         messages.is_empty(),
         "shutdown rejection must not persist a user message"
@@ -3579,7 +3701,17 @@ async fn send_message_build_failure_while_deleting_skips_failure_tip_and_complet
     svc.runtime_state().mark_deleting(&conv.id);
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     assert!(
         messages.iter().all(|message| message.r#type != "tips"),
         "deleting conversation must skip build-failure tips"
@@ -3670,7 +3802,17 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
 
     svc.recover_stale_runtime_state_on_startup().await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let visible = messages.iter().find(|message| message.id == "visible-stale").unwrap();
     assert_eq!(visible.status.as_deref(), Some("finish"));
     assert!(!visible.hidden);
@@ -3828,7 +3970,17 @@ async fn send_message_does_not_inject_send_error_when_runtime_terminal_exists() 
         .unwrap();
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(tips.len(), 1);
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
@@ -3856,7 +4008,17 @@ async fn send_message_injects_send_error_when_runtime_terminal_missing() {
         .unwrap();
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(tips.len(), 1);
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
@@ -3888,7 +4050,7 @@ async fn send_message_recovers_when_finished_task_has_no_runtime_terminal() {
     assert_eq!(task_mgr.kill_count(), 1);
     assert_eq!(task_mgr.active_count(), 1);
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert!(tips.is_empty());
 }
@@ -3934,7 +4096,7 @@ async fn send_message_auto_replays_clean_retryable_acp_error_once() {
     assert_eq!(first.sent_contents(), vec!["Hello"]);
     assert_eq!(second.sent_contents(), vec!["Hello"]);
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let users: Vec<_> = messages
         .iter()
         .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("right"))
@@ -4042,7 +4204,7 @@ async fn send_message_does_not_auto_replay_after_visible_output() {
 
     assert_eq!(task_mgr.build_count(), 1);
     assert_eq!(task_mgr.kill_count(), 1);
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let assistants: Vec<_> = messages
         .iter()
         .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("left"))
@@ -4134,7 +4296,7 @@ async fn send_message_does_not_auto_replay_model_not_found() {
 
     assert_eq!(task_mgr.build_count(), 1);
     assert_eq!(task_mgr.kill_count(), 1);
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(
         tips.len(),
@@ -4192,7 +4354,7 @@ async fn send_message_auto_replay_stops_after_second_retryable_failure() {
 
     assert_eq!(task_mgr.build_count(), 2);
     assert_eq!(task_mgr.kill_count(), 2);
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(tips.len(), 1, "second failure is final and visible");
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
