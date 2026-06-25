@@ -139,9 +139,97 @@ struct CreateTeamParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListModelsParams {
-    /// Agent type/backend to query (e.g. "gemini", "claude", "codex"). Shows all when omitted.
+    /// Assistant ID to query. Shows all backends when omitted.
     #[serde(default)]
-    agent_type: Option<String>,
+    assistant_id: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SendMessageParams {
+    /// Target teammate name, or "*" to broadcast to all.
+    to: String,
+    /// Message content to send.
+    message: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SpawnAgentParams {
+    /// Name for the new teammate agent.
+    name: String,
+    /// Assistant identifier from the available assistants catalog.
+    #[serde(default)]
+    assistant_id: Option<String>,
+    /// Model override for the new agent.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct TaskCreateParams {
+    /// Short task title.
+    subject: String,
+    /// Detailed task description.
+    #[serde(default)]
+    description: Option<String>,
+    /// Teammate name assigned as owner.
+    #[serde(default)]
+    owner: Option<String>,
+    /// Task IDs that must complete before this task can start.
+    #[serde(default)]
+    blocked_by: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct TaskUpdateParams {
+    /// ID of the task to update.
+    task_id: String,
+    /// New status: pending, in_progress, completed, or deleted.
+    #[serde(default)]
+    status: Option<String>,
+    /// Updated task description.
+    #[serde(default)]
+    description: Option<String>,
+    /// New owner teammate name.
+    #[serde(default)]
+    owner: Option<String>,
+    /// Updated list of blocking task IDs.
+    #[serde(default)]
+    blocked_by: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RenameAgentParams {
+    /// Slot ID of the team member to rename.
+    slot_id: String,
+    /// New display name.
+    new_name: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ShutdownAgentParams {
+    /// Slot ID of the teammate to shut down.
+    slot_id: String,
+    /// Optional reason for shutdown.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct TeamListModelsParams {
+    /// Assistant ID to query. Shows all backends when omitted.
+    #[serde(default)]
+    assistant_id: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DescribeAssistantParams {
+    /// Assistant identifier to look up.
+    assistant_id: String,
+    /// Locale for the description (e.g. "en", "zh"). Default when omitted.
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 #[tool_router(server_handler)]
@@ -164,13 +252,153 @@ impl GuideServer {
 
     #[tool(
         name = "aion_list_models",
-        description = "Query available models for team agent types. Pass agent_type to filter, or omit to see all."
+        description = "Query available models for team assistants. Pass assistant_id to query a specific assistant, or omit it to see all backends."
     )]
     async fn list_models(&self, Parameters(params): Parameters<ListModelsParams>) -> CallToolResult {
         self.forward_tool(
             "aion_list_models",
             &serde_json::json!({
-                "agent_type": params.agent_type,
+                "assistant_id": params.assistant_id,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_send_message",
+        description = "Send a message to a teammate or broadcast to all (to=\"*\")."
+    )]
+    async fn team_send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> CallToolResult {
+        self.forward_tool(
+            "team_send_message",
+            &serde_json::json!({
+                "to": params.to,
+                "message": params.message,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_spawn_agent",
+        description = "Create a new teammate agent from an assistant in the available assistants catalog. Leader only."
+    )]
+    async fn team_spawn_agent(&self, Parameters(params): Parameters<SpawnAgentParams>) -> CallToolResult {
+        self.forward_tool(
+            "team_spawn_agent",
+            &serde_json::json!({
+                "name": params.name,
+                "assistant_id": params.assistant_id,
+                "model": params.model,
+            }),
+        )
+        .await
+    }
+
+    #[tool(name = "team_task_create", description = "Create a new task on the team task board.")]
+    async fn team_task_create(&self, Parameters(params): Parameters<TaskCreateParams>) -> CallToolResult {
+        self.forward_tool(
+            "team_task_create",
+            &serde_json::json!({
+                "subject": params.subject,
+                "description": params.description,
+                "owner": params.owner,
+                "blocked_by": params.blocked_by,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_task_update",
+        description = "Update an existing task on the team task board."
+    )]
+    async fn team_task_update(&self, Parameters(params): Parameters<TaskUpdateParams>) -> CallToolResult {
+        self.forward_tool(
+            "team_task_update",
+            &serde_json::json!({
+                "task_id": params.task_id,
+                "status": params.status,
+                "description": params.description,
+                "owner": params.owner,
+                "blocked_by": params.blocked_by,
+            }),
+        )
+        .await
+    }
+
+    #[tool(name = "team_task_list", description = "List all tasks on the team task board.")]
+    async fn team_task_list(&self) -> CallToolResult {
+        self.forward_tool("team_task_list", &serde_json::json!({})).await
+    }
+
+    #[tool(
+        name = "team_members",
+        description = "List all team members with their roles and current status."
+    )]
+    async fn team_members(&self) -> CallToolResult {
+        self.forward_tool("team_members", &serde_json::json!({})).await
+    }
+
+    #[tool(name = "team_rename_agent", description = "Rename a team member.")]
+    async fn team_rename_agent(&self, Parameters(params): Parameters<RenameAgentParams>) -> CallToolResult {
+        self.forward_tool(
+            "team_rename_agent",
+            &serde_json::json!({
+                "slot_id": params.slot_id,
+                "new_name": params.new_name,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_shutdown_agent",
+        description = "Initiate graceful shutdown of a teammate. Leader only."
+    )]
+    async fn team_shutdown_agent(&self, Parameters(params): Parameters<ShutdownAgentParams>) -> CallToolResult {
+        self.forward_tool(
+            "team_shutdown_agent",
+            &serde_json::json!({
+                "slot_id": params.slot_id,
+                "reason": params.reason,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_list_assistants",
+        description = "List the assistants available for team spawning. Returns the real assistant catalog with real assistant_id values, names, backends, descriptions, and skills.\n\nUse this before team_spawn_agent when you need the exact assistant_id for a teammate. Do NOT guess from backend names like claude/codex/gemini - only use assistant_id values returned here."
+    )]
+    async fn team_list_assistants(&self) -> CallToolResult {
+        self.forward_tool("team_list_assistants", &serde_json::json!({})).await
+    }
+
+    #[tool(
+        name = "team_list_models",
+        description = "Query available models for team assistants."
+    )]
+    async fn team_list_models(&self, Parameters(params): Parameters<TeamListModelsParams>) -> CallToolResult {
+        self.forward_tool(
+            "team_list_models",
+            &serde_json::json!({
+                "assistant_id": params.assistant_id,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_describe_assistant",
+        description = "Get detailed information about an assistant before spawning it as a teammate."
+    )]
+    async fn team_describe_assistant(&self, Parameters(params): Parameters<DescribeAssistantParams>) -> CallToolResult {
+        self.forward_tool(
+            "team_describe_assistant",
+            &serde_json::json!({
+                "assistant_id": params.assistant_id,
+                "locale": params.locale,
             }),
         )
         .await
@@ -205,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn guide_stdio_exposes_only_create_team_and_list_models() {
+    fn guide_stdio_exposes_guide_and_team_tools() {
         let router = GuideServer::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -215,7 +443,21 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["aion_create_team".to_owned(), "aion_list_models".to_owned()]
+            vec![
+                "aion_create_team".to_owned(),
+                "aion_list_models".to_owned(),
+                "team_describe_assistant".to_owned(),
+                "team_list_assistants".to_owned(),
+                "team_list_models".to_owned(),
+                "team_members".to_owned(),
+                "team_rename_agent".to_owned(),
+                "team_send_message".to_owned(),
+                "team_shutdown_agent".to_owned(),
+                "team_spawn_agent".to_owned(),
+                "team_task_create".to_owned(),
+                "team_task_list".to_owned(),
+                "team_task_update".to_owned(),
+            ]
         );
     }
 
@@ -242,6 +484,46 @@ mod tests {
         assert_eq!(env.backend, "codex");
         assert_eq!(env.conversation_id, "conv-1");
         assert_eq!(env.user_id, "user-1");
+    }
+
+    #[test]
+    fn spawn_agent_params_reject_legacy_custom_agent_id_alias() {
+        let parsed = serde_json::from_value::<SpawnAgentParams>(json!({
+            "name": "helper",
+            "custom_agent_id": "assistant-123",
+        }));
+        assert!(parsed.is_err(), "legacy custom_agent_id alias should be rejected");
+        let err = parsed.err().unwrap();
+
+        assert!(err.to_string().contains("unknown field"));
+        assert!(err.to_string().contains("custom_agent_id"));
+    }
+
+    #[test]
+    fn describe_assistant_params_reject_legacy_custom_agent_id_alias() {
+        let parsed = serde_json::from_value::<DescribeAssistantParams>(json!({
+            "custom_agent_id": "assistant-123",
+        }));
+        assert!(parsed.is_err(), "legacy custom_agent_id alias should be rejected");
+        let err = parsed.err().unwrap();
+
+        assert!(err.to_string().contains("unknown field"));
+        assert!(err.to_string().contains("custom_agent_id"));
+    }
+
+    #[test]
+    fn guide_router_exposes_team_list_assistants() {
+        let router = GuideServer::tool_router();
+        let tools = router.list_all();
+        let team_list_assistants = tools
+            .iter()
+            .find(|tool| tool.name == "team_list_assistants")
+            .expect("team_list_assistants tool missing");
+        let properties = team_list_assistants.input_schema["properties"].as_object().unwrap();
+        assert!(
+            properties.is_empty(),
+            "team_list_assistants should not accept arguments"
+        );
     }
 
     fn guide_server_for_port(port: u16) -> GuideServer {
@@ -408,6 +690,51 @@ mod tests {
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("team-secret-789"));
         assert!(!serialized.contains("team_created"));
+    }
+
+    #[tokio::test]
+    async fn forward_tool_json_object_success_body_is_returned_as_text() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "teamId": "team-123",
+                "status": "team_created",
+                "next_step": "Use team_spawn_agent with assistant_id from the catalog.",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server.forward_tool("aion_create_team", &json!({})).await;
+
+        assert_eq!(result.is_error, Some(false));
+        let text = first_text(&result);
+        assert!(text.contains("\"teamId\":\"team-123\""));
+        assert!(text.contains("\"status\":\"team_created\""));
+        assert!(text.contains("assistant_id"));
+    }
+
+    #[tokio::test]
+    async fn forward_tool_json_array_body_returns_unexpected_without_echoing_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(["team-secret-456"])))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server.forward_tool("team_members", &json!({})).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(first_text(&result), "unexpected local guide tool response");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "MCP_TOOL_RESPONSE_UNEXPECTED"
+        );
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("team-secret-456"));
     }
 
     #[tokio::test]
@@ -597,7 +924,6 @@ fn parse_tool_success_text(tool_name: &str, value: &serde_json::Value) -> Option
 fn is_create_team_success_body(value: &serde_json::Value) -> bool {
     value.get("status").and_then(|status| status.as_str()) == Some("team_created")
         && value.get("teamId").and_then(|team_id| team_id.as_str()).is_some()
-        && value.get("route").and_then(|route| route.as_str()).is_some()
         && value
             .get("next_step")
             .and_then(|next_step| next_step.as_str())
