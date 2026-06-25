@@ -1,3 +1,4 @@
+mod describe_support;
 mod response_builder;
 pub(crate) mod spawn_support;
 
@@ -11,7 +12,10 @@ use aionui_api_types::{
 };
 use aionui_common::{AgentKillReason, ConversationStatus, generate_id, now_ms};
 use aionui_db::models::TeamRow;
-use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
+use aionui_db::{
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
+    ITeamRepository, UpdateTeamParams,
+};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tracing::{info, warn};
@@ -43,6 +47,8 @@ struct SessionEntry {
 pub struct TeamSessionService {
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
     projection_store: Arc<dyn TeamProjectionMessageStore>,
@@ -78,6 +84,8 @@ impl TeamSessionService {
     pub fn new(
         repo: Arc<dyn ITeamRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
         projection_store: Arc<dyn TeamProjectionMessageStore>,
@@ -92,6 +100,8 @@ impl TeamSessionService {
         Arc::new_cyclic(|weak| Self {
             repo,
             agent_metadata_repo,
+            assistant_definition_repo,
+            assistant_overlay_repo,
             provider_repo,
             conversation_port,
             projection_store,
@@ -112,6 +122,9 @@ impl TeamSessionService {
     pub(crate) fn provisioner(&self) -> TeamAgentProvisioner {
         TeamAgentProvisioner::new(
             self.repo.clone(),
+            self.agent_metadata_repo.clone(),
+            self.assistant_definition_repo.clone(),
+            self.assistant_overlay_repo.clone(),
             self.provider_repo.clone(),
             self.conversation_port.clone(),
         )
@@ -124,6 +137,13 @@ impl TeamSessionService {
         self.lookup_port
             .lookup_team_binding_by_conversation(conversation_id)
             .await
+    }
+
+    pub(crate) async fn lookup_assistant_identity_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>, TeamError> {
+        self.conversation_port.conversation_assistant_id(conversation_id).await
     }
 
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
@@ -973,7 +993,7 @@ impl TeamSessionService {
         Ok(())
     }
 
-    pub(crate) async fn send_agent_message_from_agent(
+    pub async fn send_agent_message_from_agent(
         &self,
         team_id: &str,
         from_slot_id: &str,
@@ -1032,6 +1052,19 @@ impl TeamSessionService {
             .notify_reserved_wake_for_team_work(slot_id, target_role, source);
     }
 
+    pub(crate) fn notify_mailbox_only_wake(&self, team_id: &str, slot_id: &str, source: TeamWakeSource) {
+        let Some(entry) = self.sessions.get(team_id) else {
+            warn!(
+                team_id,
+                slot_id,
+                wake_source = %source,
+                "mailbox-only wake notify skipped because session is missing"
+            );
+            return;
+        };
+        entry.session.notify_mailbox_only_wake(slot_id, source);
+    }
+
     /// Friendly pre-check used by Guide MCP to return handoff copy before invoking
     /// run-scoped team tools. This is not a concurrency guarantee; any operation
     /// that writes mailbox, projection, scheduler, spawn, shutdown, or wake state
@@ -1047,6 +1080,23 @@ impl TeamSessionService {
         Err(TeamError::InvalidRequest(
             "no active team run for run-scoped wake".into(),
         ))
+    }
+
+    pub(crate) async fn accept_assistant_first_team_run(
+        &self,
+        team_id: &str,
+        lead_slot_id: &str,
+    ) -> Result<TeamRunAckResponse, TeamError> {
+        let entry = self
+            .sessions
+            .get(team_id)
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        let manager = entry.session.team_run_manager().clone();
+        drop(entry);
+
+        manager
+            .accept_user_message(lead_slot_id, TeamRunTargetRole::Lead, true, None)
+            .await
     }
 
     pub(crate) async fn notify_leader_spawn_attach_failed(
