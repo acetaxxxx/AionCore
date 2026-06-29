@@ -95,10 +95,10 @@ impl AionrsAgentManager {
         config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
 
         if let Some(field) = config_extra.compat_overrides.max_tokens_field {
-            config.compat.max_tokens_field = Some(field);
+            config.compat.transport.max_tokens_field = Some(field);
         }
         if let Some(path) = config_extra.compat_overrides.api_path {
-            config.compat.api_path = Some(path);
+            config.compat.transport.api_path = Some(path);
         }
 
         if !config_extra.extra_mcp_servers.is_empty() {

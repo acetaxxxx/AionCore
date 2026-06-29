@@ -12,12 +12,14 @@ _cargo *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    cargo_config=()
     restore_cargo_lock=false
     cargo_lock_snapshot=""
+    cargo_config_file=".cargo/config.toml"
+    cargo_config_snapshot=""
+    cargo_config_created=false
     aionrs_root=""
 
-    restore_local_lockfile() {
+    restore_local_state() {
         local status=$?
 
         if [[ -n "$cargo_lock_snapshot" && -f "$cargo_lock_snapshot" ]]; then
@@ -29,15 +31,23 @@ _cargo *ARGS:
             rm -f "$cargo_lock_snapshot"
         fi
 
+        if [[ -n "$cargo_config_snapshot" && -f "$cargo_config_snapshot" ]]; then
+            cp "$cargo_config_snapshot" "$cargo_config_file" || status=$?
+            rm -f "$cargo_config_snapshot"
+        elif [[ "$cargo_config_created" == "true" ]]; then
+            rm -f "$cargo_config_file"
+            rmdir .cargo 2>/dev/null || true
+        fi
+
         return "$status"
     }
-    trap restore_local_lockfile EXIT
+    trap restore_local_state EXIT
 
     verify_local_aionrs_patch() {
         local crate expected_path pkgid
         for crate in "${crates[@]}"; do
             expected_path="$aionrs_root/crates/$crate"
-            pkgid=$(cargo "${cargo_config[@]}" pkgid -p "$crate")
+            pkgid=$(cargo pkgid -p "$crate")
 
             if ! python3 -c 'import sys; from pathlib import Path; from urllib.parse import unquote, urlparse; pkgid=sys.argv[1]; expected=str(Path(sys.argv[2]).resolve()); ok=pkgid.startswith("path+file://") and str(Path(unquote(urlparse(pkgid[len("path+"):]).path)).resolve()) == expected; sys.exit(0 if ok else 1)' "$pkgid" "$expected_path"
             then
@@ -58,12 +68,23 @@ _cargo *ARGS:
         aionrs_root=$(cd "$AIONRS" && pwd -P)
         crates=(
             aion-agent
-            aion-providers
-            aion-types
-            aion-protocol
+            aion-compact
             aion-config
             aion-mcp
+            aion-memory
+            aion-process
+            aion-protocol
+            aion-providers
+            aion-skills
+            aion-tools
+            aion-types
         )
+
+        patch_config=$(mktemp)
+        {
+            echo
+            echo "[patch.'https://github.com/iOfficeAI/aionrs.git']"
+        } > "$patch_config"
 
         for crate in "${crates[@]}"; do
             crate_dir="$aionrs_root/crates/$crate"
@@ -74,8 +95,18 @@ _cargo *ARGS:
 
             toml_path=${crate_dir//\\/\\\\}
             toml_path=${toml_path//\"/\\\"}
-            cargo_config+=(--config "patch.'https://github.com/iOfficeAI/aionrs.git'.$crate.path = \"$toml_path\"")
+            echo "$crate = { path = \"$toml_path\" }" >> "$patch_config"
         done
+
+        mkdir -p .cargo
+        if [[ -f "$cargo_config_file" ]]; then
+            cargo_config_snapshot=$(mktemp)
+            cp "$cargo_config_file" "$cargo_config_snapshot"
+        else
+            cargo_config_created=true
+        fi
+        cat "$patch_config" >> "$cargo_config_file"
+        rm -f "$patch_config"
 
         echo "Using local aionrs SDK: $aionrs_root" >&2
 
@@ -91,22 +122,18 @@ _cargo *ARGS:
         fi
 
         echo "Resolving Cargo.lock against local aionrs SDK" >&2
-        cargo "${cargo_config[@]}" update \
-            -p aion-agent \
-            -p aion-providers \
-            -p aion-types \
-            -p aion-protocol \
-            -p aion-config \
-            -p aion-mcp
+        update_args=()
+        for crate in "${crates[@]}"; do
+            update_args+=(-p "$crate")
+        done
+        cargo update "${update_args[@]}"
         verify_local_aionrs_patch
     fi
 
+    args=({{ARGS}})
+
     set +e
-    if ((${#cargo_config[@]})); then
-        cargo "${cargo_config[@]}" {{ARGS}}
-    else
-        cargo {{ARGS}}
-    fi
+    cargo "${args[@]}"
     status=$?
     set -e
     exit "$status"

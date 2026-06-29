@@ -278,7 +278,7 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         name_i18n: None,
         description: None,
         description_i18n: None,
-        backend: Some("claude".into()),
+        backend: Some("claude"),
         agent_type: "acp",
         agent_source: "builtin",
         agent_source_info: None,
