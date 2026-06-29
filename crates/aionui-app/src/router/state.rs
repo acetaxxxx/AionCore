@@ -126,11 +126,9 @@ fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::P
     // Auto-provisioned per-conversation workspaces live under
     // `{work_dir}/conversations/{label}-temp-{id}/`. On Windows the
     // operator may put `work_dir` on a separate drive (e.g. `X:\AionUi`)
-    // that's neither under `temp_dir` nor `home_dir`, which previously
-    // caused `/api/fs/list` to 403 every Hermes-mode session
-    // (ELECTRON-1BT). Including `work_dir` keeps temp + custom-on-drive
-    // workspaces on the allowlist without widening the sandbox to
-    // unrelated paths.
+    // that's neither under `temp_dir` nor `home_dir`. Including `work_dir`
+    // keeps temp workspaces on the default allowlist without widening it
+    // to unrelated paths.
     if let Some(wd) = work_dir
         && !wd.as_os_str().is_empty()
         && !roots.iter().any(|r| r == wd)
