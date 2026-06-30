@@ -43,6 +43,20 @@ struct Advertised {
     available_commands: Option<Vec<AvailableCommand>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CatalogPreloadSummary {
+    pub(crate) mode_preloaded: bool,
+    pub(crate) model_preloaded: bool,
+    pub(crate) mode_catalog_count: usize,
+    pub(crate) model_catalog_count: usize,
+}
+
+impl CatalogPreloadSummary {
+    pub(crate) fn any_preloaded(self) -> bool {
+        self.mode_preloaded || self.model_preloaded
+    }
+}
+
 /// Aggregate root for a single ACP session's lifecycle and state.
 ///
 /// Encapsulates the three-layer state model (desired / observed / advertised)
@@ -473,7 +487,11 @@ impl AcpSession {
 
     pub(crate) fn config_snapshot(&self) -> ConfigSnapshot {
         if let Some(options) = self.advertised.config_options.clone() {
-            return ConfigSnapshot::from_real_options(options);
+            return ConfigSnapshot::from_real_options_with_runtime_supplements(
+                options,
+                self.advertised.modes.as_ref(),
+                self.advertised.models.as_ref(),
+            );
         }
         ConfigSnapshot::from_legacy_catalogs(self.advertised.modes.as_ref(), self.advertised.models.as_ref())
     }
@@ -618,6 +636,28 @@ impl AcpSession {
 
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
         let options = merge_config_options(self.advertised.config_options.as_deref(), options);
+        let supplement_summary = ConfigSnapshot::supplement_summary_for_real_options(
+            &options,
+            self.advertised.modes.as_ref(),
+            self.advertised.models.as_ref(),
+        );
+        if let Some(supplemented_categories) = supplement_summary.categories_csv() {
+            tracing::info!(
+                supplemented_categories,
+                real_option_count = options.len(),
+                mode_catalog_count = self
+                    .advertised
+                    .modes
+                    .as_ref()
+                    .map_or(0, |modes| modes.available_modes.len()),
+                model_catalog_count = self
+                    .advertised
+                    .models
+                    .as_ref()
+                    .map_or(0, |models| models.available_models.len()),
+                "ACP config options supplemented from advertised catalog"
+            );
+        }
 
         if let Some(modes) = derive_modes_from_config_options(&options) {
             self.apply_advertised_modes(modes);
@@ -690,6 +730,76 @@ impl AcpSession {
         if let Some(usage) = &state.context_usage {
             self.advertised.context_usage = Some(usage.clone());
         }
+    }
+
+    pub(crate) fn preload_advertised_catalogs(
+        &mut self,
+        modes: Option<SessionModeState>,
+        models: Option<SessionModelState>,
+    ) -> CatalogPreloadSummary {
+        let mut summary = CatalogPreloadSummary::default();
+
+        if let Some(modes) = modes.filter(|modes| !modes.available_modes.is_empty())
+            && self
+                .advertised
+                .modes
+                .as_ref()
+                .is_none_or(|existing| existing.available_modes.is_empty())
+        {
+            summary.mode_preloaded = true;
+            summary.mode_catalog_count = modes.available_modes.len();
+            self.advertised.modes = Some(self.mode_catalog_with_session_current(modes));
+        }
+
+        if let Some(models) = models.filter(|models| !models.available_models.is_empty())
+            && self
+                .advertised
+                .models
+                .as_ref()
+                .is_none_or(|existing| existing.available_models.is_empty())
+        {
+            summary.model_preloaded = true;
+            summary.model_catalog_count = models.available_models.len();
+            self.advertised.models = Some(self.model_catalog_with_session_current(models));
+        }
+
+        summary
+    }
+
+    fn mode_catalog_with_session_current(&self, mut modes: SessionModeState) -> SessionModeState {
+        let current = self
+            .observed
+            .mode_id
+            .as_ref()
+            .or(self.desired.mode_id.as_ref())
+            .filter(|mode| {
+                modes
+                    .available_modes
+                    .iter()
+                    .any(|available| available.id.0.as_ref() == mode.as_str())
+            });
+        if let Some(current) = current {
+            modes.current_mode_id = current.as_str().to_owned().into();
+        }
+        modes
+    }
+
+    fn model_catalog_with_session_current(&self, mut models: SessionModelState) -> SessionModelState {
+        let current = self
+            .observed
+            .model_id
+            .as_ref()
+            .or(self.desired.model_id.as_ref())
+            .filter(|model| {
+                models
+                    .available_models
+                    .iter()
+                    .any(|available| available.model_id.0.as_ref() == model.as_str())
+            });
+        if let Some(current) = current {
+            models.current_model_id = current.as_str().to_owned().into();
+        }
+        models
     }
 }
 
@@ -811,9 +921,13 @@ fn select_option_contains_value(kind: &SessionConfigKind, value: &str) -> bool {
     }
 }
 
-// Tests live in `session_tests.rs` (linked via `#[path]`) so this file
-// stays under the 1000-line per-file budget. Inside that file `super::*`
-// resolves to this module's private items.
+// Tests live in sibling files linked via `#[path]` so this file stays under
+// the 1000-line per-file budget. Inside those files `super::*` resolves to
+// this module's private items.
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_config_snapshot_tests.rs"]
+mod config_snapshot_tests;
