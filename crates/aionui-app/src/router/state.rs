@@ -378,6 +378,7 @@ pub fn build_conversation_state(
     ConversationRouterState {
         service: conversation_service,
         task_manager: services.worker_task_manager.clone(),
+        active_leases: services.active_lease_registry.clone(),
     }
 }
 
@@ -598,7 +599,10 @@ pub fn build_team_state(
         cancellation_port,
         backend_binary_path,
     );
-    TeamRouterState { service }
+    TeamRouterState {
+        service,
+        active_leases: services.active_lease_registry.clone(),
+    }
 }
 
 /// Build the default `CronRouterState` from application services.

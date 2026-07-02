@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures_util::future::{BoxFuture, join_all};
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::active_lease::ActiveLeaseRegistry;
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::types::{BuildTaskOptions, RuntimeCapabilities};
@@ -36,7 +37,7 @@ pub trait IWorkerTaskManager: Send + Sync {
     /// Concurrent callers with the same `conversation_id` block on a shared
     /// [`OnceCell`] so the factory runs at most once per conversation —
     /// avoiding the race where two concurrent HTTP requests (e.g.
-    /// `/messages` + `/warmup`) would each spawn their own CLI process and
+    /// `/messages` + `/runtime/ensure`) would each spawn their own CLI process and
     /// ACP connection, with one of them leaking.
     async fn get_or_build_task(
         &self,
@@ -63,8 +64,10 @@ pub trait IWorkerTaskManager: Send + Sync {
     /// Collect tasks eligible for idle cleanup.
     ///
     /// Returns conversation IDs of tasks that:
-    /// - have `status == Some(Finished)`
+    /// - are ACP agents
+    /// - have `status == None` or `status == Some(Finished)`
     /// - have been idle longer than `idle_threshold_ms`
+    /// - are not protected by an active foreground lease
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String>;
 }
 
@@ -84,13 +87,19 @@ type TaskSlot = Arc<OnceCell<ManagedAgentTask>>;
 pub struct WorkerTaskManagerImpl {
     tasks: DashMap<String, TaskSlot>,
     factory: AgentFactory,
+    active_leases: Arc<ActiveLeaseRegistry>,
 }
 
 impl WorkerTaskManagerImpl {
     pub fn new(factory: AgentFactory) -> Self {
+        Self::new_with_active_leases(factory, Arc::new(ActiveLeaseRegistry::new()))
+    }
+
+    pub fn new_with_active_leases(factory: AgentFactory, active_leases: Arc<ActiveLeaseRegistry>) -> Self {
         Self {
             tasks: DashMap::new(),
             factory,
+            active_leases,
         }
     }
 
@@ -195,6 +204,22 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             if let Some(managed) = slot.get() {
                 return managed.agent.kill_and_wait(reason);
             }
+            return Box::pin(async move {
+                match slot
+                    .get_or_try_init(|| async { Err(AgentError::internal("task slot removed before initialization")) })
+                    .await
+                {
+                    Ok(managed) => managed.agent.clone().kill_and_wait(reason).await,
+                    Err(error) => {
+                        debug!(
+                            conversation_id = %id,
+                            ?reason,
+                            error = %ErrorChain(&error),
+                            "Kill requested for task slot that did not finish initialization"
+                        );
+                    }
+                }
+            });
         }
         Box::pin(std::future::ready(()))
     }
@@ -228,23 +253,37 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 let last_activity_at = agent.last_activity_at();
                 let idle_ms = now.saturating_sub(last_activity_at);
 
-                let selected = agent_type == AgentType::Acp
-                    && status == Some(ConversationStatus::Finished)
-                    && idle_ms > idle_threshold_ms;
-                if selected {
-                    info!(
+                if agent_type != AgentType::Acp
+                    || !matches!(status, None | Some(ConversationStatus::Finished))
+                    || idle_ms <= idle_threshold_ms
+                {
+                    return None;
+                }
+
+                if let Some(expires_at) = self.active_leases.active_until(entry.key()) {
+                    debug!(
                         conversation_id = %entry.key(),
-                        ?agent_type,
                         ?status,
                         idle_ms,
-                        threshold_ms = idle_threshold_ms,
-                        last_activity_at,
-                        "Idle scan: selected idle agent"
+                        lease_expires_in_ms = expires_at.saturating_sub(now),
+                        reason = %"ActiveLease",
+                        "Idle scan: active lease protects idle agent"
                     );
-                    Some(entry.key().clone())
-                } else {
-                    None
+                    return None;
                 }
+
+                let idle_class = if status.is_none() { "WarmupOnly" } else { "Finished" };
+                info!(
+                    conversation_id = %entry.key(),
+                    ?agent_type,
+                    ?status,
+                    idle_ms,
+                    threshold_ms = idle_threshold_ms,
+                    idle_class = %idle_class,
+                    reason = %"IdleTimeout",
+                    "Idle scan: selected idle agent"
+                );
+                Some(entry.key().clone())
             })
             .collect()
     }
@@ -291,6 +330,7 @@ mod tests {
         workspace: String,
         status: Option<ConversationStatus>,
         last_activity: AtomicI64,
+        killed: Arc<std::sync::atomic::AtomicUsize>,
         event_tx: broadcast::Sender<AgentStreamEvent>,
     }
 
@@ -303,8 +343,14 @@ mod tests {
                 workspace: "/tmp/test".to_owned(),
                 status,
                 last_activity: AtomicI64::new(now_ms()),
+                killed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 event_tx,
             }
+        }
+
+        fn with_kill_counter(mut self, killed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            self.killed = killed;
+            self
         }
 
         fn with_agent_type(mut self, t: AgentType) -> Self {
@@ -348,6 +394,7 @@ mod tests {
             Ok(())
         }
         fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            self.killed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -551,6 +598,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kill_and_wait_waits_for_in_flight_build_and_kills_result() {
+        let build_started = Arc::new(tokio::sync::Notify::new());
+        let release_build = Arc::new(tokio::sync::Notify::new());
+        let killed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let factory: AgentFactory = Arc::new({
+            let build_started = Arc::clone(&build_started);
+            let release_build = Arc::clone(&release_build);
+            let killed = Arc::clone(&killed);
+            move |opts: BuildTaskOptions| {
+                let build_started = Arc::clone(&build_started);
+                let release_build = Arc::clone(&release_build);
+                let killed = Arc::clone(&killed);
+                async move {
+                    build_started.notify_one();
+                    release_build.notified().await;
+                    Ok(mock_instance(
+                        MockAgent::new(opts.conversation_id(), None).with_kill_counter(killed),
+                    ))
+                }
+                .boxed()
+            }
+        });
+        let mgr = Arc::new(WorkerTaskManagerImpl::new(factory));
+
+        let build = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_build_task("conv-1", make_options("conv-1")).await })
+        };
+        build_started.notified().await;
+
+        let wait = mgr.kill_and_wait("conv-1", Some(AgentKillReason::TeamMcpRebuild));
+        let wait_task = tokio::spawn(async move {
+            wait.await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !wait_task.is_finished(),
+            "kill_and_wait must wait for the in-flight build before returning"
+        );
+
+        release_build.notify_one();
+        build.await.unwrap().unwrap();
+        wait_task.await.unwrap();
+
+        assert_eq!(killed.load(Ordering::SeqCst), 1);
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    #[tokio::test]
     async fn get_task_finds_existing() {
         let mgr = make_manager();
         mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
@@ -589,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_idle_finds_finished_and_stale_acp_tasks() {
+    fn collect_idle_finds_finished_and_warmup_only_stale_acp_tasks() {
         let factory: AgentFactory = Arc::new(|_| async { unreachable!() }.boxed());
         let mgr = WorkerTaskManagerImpl::new(factory);
 
@@ -606,6 +704,12 @@ mod tests {
             mock_instance(
                 MockAgent::new("conv-stale", Some(ConversationStatus::Finished)).with_last_activity(now_ms() - 600_000),
             ),
+        );
+
+        // ACP + warmup-only + old activity → should be collected
+        insert(
+            "conv-warmup-only",
+            mock_instance(MockAgent::new("conv-warmup-only", None).with_last_activity(now_ms() - 600_000)),
         );
 
         // ACP + Finished + recent activity → should NOT be collected
@@ -636,8 +740,32 @@ mod tests {
         );
 
         let idle = mgr.collect_idle(300_000); // 5-min threshold
-        assert_eq!(idle.len(), 1);
-        assert_eq!(idle[0], "conv-stale");
+        assert_eq!(idle.len(), 2);
+        assert!(idle.contains(&"conv-stale".to_owned()));
+        assert!(idle.contains(&"conv-warmup-only".to_owned()));
+    }
+
+    #[test]
+    fn collect_idle_skips_tasks_with_active_lease() {
+        let active_leases = Arc::new(crate::ActiveLeaseRegistry::new());
+        active_leases.renew("conv-active");
+        let factory: AgentFactory = Arc::new(|_| async { unreachable!() }.boxed());
+        let mgr = WorkerTaskManagerImpl::new_with_active_leases(factory, active_leases);
+
+        let cell: OnceCell<ManagedAgentTask> = OnceCell::new();
+        cell.set(managed_instance(mock_instance(
+            MockAgent::new("conv-active", Some(ConversationStatus::Finished)).with_last_activity(now_ms() - 600_000),
+        )))
+        .ok();
+        mgr.tasks.insert("conv-active".into(), Arc::new(cell));
+
+        let captured = capture_logs(tracing::Level::DEBUG, || {
+            let idle = mgr.collect_idle(300_000);
+            assert!(idle.is_empty());
+        });
+
+        assert!(captured.contains("reason=ActiveLease"));
+        assert!(captured.contains("lease_expires_in_ms="));
     }
 
     #[test]
@@ -663,7 +791,8 @@ mod tests {
         assert!(captured.contains("status=Some(Finished)"));
         assert!(captured.contains("idle_ms="));
         assert!(captured.contains("threshold_ms=5000"));
-        assert!(captured.contains("last_activity_at="));
+        assert!(captured.contains("idle_class=Finished"));
+        assert!(captured.contains("reason=IdleTimeout"));
     }
 
     #[test]
