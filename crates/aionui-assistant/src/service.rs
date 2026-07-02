@@ -1431,10 +1431,20 @@ impl AssistantService {
                     .and_then(|b| String::from_utf8(b).ok())
                     .unwrap_or_default())
             }
-            AssistantSource::Generated | AssistantSource::User => {
-                let path = self.user_rule_path(id, locale);
-                Ok(read_file_or_empty(&path))
-            }
+            AssistantSource::Generated | AssistantSource::User => Ok(self.read_user_rule_with_fallback(id, locale)),
+        }
+    }
+
+    /// Read a user assistant's rule, falling back to any saved `<id>.*.md` file
+    /// when the locale-specific `<id>.<locale>.md` is absent. Scheduled/cron runs
+    /// create the conversation with `assistant: None`, so no UI locale reaches
+    /// rule resolution and the localized file would otherwise be missed.
+    fn read_user_rule_with_fallback(&self, id: &str, locale: Option<&str>) -> String {
+        let content = read_file_or_empty(&self.user_rule_path(id, locale));
+        if content.is_empty() {
+            read_first_assistant_md(&self.user_rules_dir(), id)
+        } else {
+            content
         }
     }
 
@@ -2557,6 +2567,31 @@ fn assistant_md_path(dir: &Path, id: &str, locale: Option<&str>) -> PathBuf {
 
 fn read_file_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Read the first available `{id}.*.md` rule file in `dir`, preferring the
+/// locale-less `{id}.md`. Used as a fallback when a rule is resolved without a
+/// locale (e.g. scheduled/cron runs, which create the conversation with
+/// `assistant: None`) and the exact `{id}.{locale}.md` file is therefore not
+/// found. Returns an empty string when no rule file exists.
+fn read_first_assistant_md(dir: &Path, id: &str) -> String {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let prefix = format!("{id}.");
+    let exact = format!("{id}.md");
+    let mut fallback: Option<PathBuf> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == exact {
+            return read_file_or_empty(&entry.path());
+        }
+        if fallback.is_none() && name.starts_with(&prefix) && name.ends_with(".md") {
+            fallback = Some(entry.path());
+        }
+    }
+    fallback.map(|path| read_file_or_empty(&path)).unwrap_or_default()
 }
 
 /// Remove every `{id}*.md` file in `dir`. Returns `true` if any file was
@@ -4931,6 +4966,29 @@ mod tests {
         fx.service.write_rule("u1", Some("en-US"), "rule body").await.unwrap();
         let content = fx.service.read_rule("u1", Some("en-US")).await.unwrap();
         assert_eq!(content, "rule body");
+    }
+
+    #[tokio::test]
+    async fn read_rule_user_falls_back_to_saved_locale_when_locale_missing() {
+        // Scheduled/cron runs resolve rules without a locale (conversation is
+        // created with `assistant: None`). The rule is stored locale-suffixed
+        // (`u1.ko-KR.md`), so a locale-less or mismatched-locale read must still
+        // find it instead of silently returning empty.
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "A".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        fx.service.write_rule("u1", Some("ko-KR"), "rule body").await.unwrap();
+
+        // No locale (the cron path) falls back to the saved file.
+        assert_eq!(fx.service.read_rule("u1", None).await.unwrap(), "rule body");
+        // A different locale also falls back rather than returning empty.
+        assert_eq!(fx.service.read_rule("u1", Some("en-US")).await.unwrap(), "rule body");
     }
 
     #[tokio::test]
