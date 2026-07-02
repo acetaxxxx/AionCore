@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_ai_agent::{AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{
+    ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
+};
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
@@ -16,10 +18,10 @@ use aionui_api_types::{
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
-    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
-    assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
+    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -2900,6 +2902,46 @@ impl ConversationService {
         })
     }
 
+    pub async fn renew_active_lease(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        active_leases: &ActiveLeaseRegistry,
+    ) -> Result<(), ConversationError> {
+        let row = match self.conversation_repo.get(conversation_id).await {
+            Ok(row) => row,
+            Err(error) => {
+                warn!(
+                    kind = "conversation",
+                    conversation_id,
+                    user_id,
+                    error = %ErrorChain(&error),
+                    "Conversation active lease renew failed"
+                );
+                return Err(error.into());
+            }
+        };
+
+        let Some(row) = row.filter(|row| row.user_id == user_id) else {
+            debug!(
+                kind = "conversation",
+                conversation_id, user_id, "Conversation active lease renew rejected"
+            );
+            return Err(ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            });
+        };
+
+        let expires_at = active_leases.renew(&row.id);
+        debug!(
+            kind = "conversation",
+            conversation_id = %row.id,
+            expires_at,
+            "Conversation active lease renewed"
+        );
+        Ok(())
+    }
+
     /// Pre-initialize an agent task for a conversation (warmup).
     ///
     /// This builds the agent task without sending a message, so the
@@ -2911,6 +2953,43 @@ impl ConversationService {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
+        let _ = self
+            .ensure_runtime_agent(user_id, conversation_id, task_manager, "warmup")
+            .await?;
+        debug!("Agent warmed up");
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn ensure_runtime(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        let (agent, recovered) = self
+            .ensure_runtime_agent(user_id, conversation_id, task_manager, "runtime_ensure")
+            .await?;
+        let config_options = agent
+            .get_config_options()
+            .await
+            .map_err(ConversationError::from)?
+            .config_options;
+
+        Ok(EnsureConversationRuntimeResponse {
+            recovered,
+            config_options,
+            runtime: self.runtime_summary_for(conversation_id).await,
+        })
+    }
+
+    async fn ensure_runtime_agent(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        phase: &'static str,
+    ) -> Result<(AgentInstance, bool), ConversationError> {
         let row = self
             .conversation_repo
             .get(conversation_id)
@@ -2921,6 +3000,11 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+
+        if let Some(agent) = task_manager.get_task(conversation_id) {
+            debug!(conversation_id, phase, "Conversation runtime already active");
+            return Ok((agent, false));
+        }
 
         let mut build_opts = self.build_task_options(&row).await?;
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
@@ -2937,7 +3021,7 @@ impl ConversationService {
                         backend = "openclaw",
                         error_kind = "openclaw_gateway_unreachable",
                         port = 18789_u16,
-                        phase = "warmup",
+                        phase,
                         "OpenClaw Gateway unreachable during ACP startup"
                     );
                     let detail = send_error
@@ -2955,8 +3039,8 @@ impl ConversationService {
         self.maybe_persist_workspace(conversation_id, &stored_workspace, agent.workspace())
             .await?;
 
-        debug!("Agent warmed up");
-        Ok(())
+        info!(conversation_id, phase, "Conversation runtime recovered");
+        Ok((agent, true))
     }
 }
 
