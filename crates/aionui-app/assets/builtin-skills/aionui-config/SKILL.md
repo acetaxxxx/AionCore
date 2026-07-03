@@ -567,17 +567,14 @@ python3 scripts/aionui_api.py get /api/settings/client   # confirm — PUT retur
 the `/management` sub-path. Each row is rich: alongside `id`, `name`, `enabled`
 (toggled on), `installed` (spawn command resolvable on `$PATH`), `team_capable`
 (can run in a team), `backend`, `agent_type`, and a `status` of `online` /
-`offline` / `missing`, it also carries `config_options`, `available_modes`,
-`available_models` (when the engine advertises them), plus `last_check_*`
-diagnostics. Check `installed` (and `status`) before binding an assistant to that
-engine (via its `agent_id` — see *Picking the engine* above).
+`offline` / `missing` / `unchecked`, it also carries `config_options`,
+`available_modes`, `available_models` (when the engine advertises them), plus
+`last_check_*` diagnostics. `unchecked` means no persisted connectivity check has
+run for that row yet. Check `installed` (and `status`) before binding an
+assistant to that engine (via its `agent_id` — see *Picking the engine* above).
 
-> What the management row does **not** carry is the rest of the engine
-> `handshake` — `agent_capabilities`, `auth_methods`, `available_commands`. For
-> those, `POST /api/agents/refresh` re-scans agents and returns each one's full
-> metadata (`available` + `handshake`). The at-a-glance modes/models are already
-> on the management row; reach for `refresh` when you need capabilities, auth
-> methods, or the command list.
+The management row is the supported engine catalog surface. Do not call legacy
+agent refresh endpoints; connectivity checks are explicit per-agent operations.
 
 ---
 
