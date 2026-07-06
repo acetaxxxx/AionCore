@@ -800,60 +800,173 @@ mod tests {
         );
     }
 
-    #[test]
-    fn map_aionrs_provider_known_platforms() {
-        assert_eq!(map_aionrs_provider("anthropic", "m", None).unwrap(), "anthropic");
-        assert_eq!(map_aionrs_provider("bedrock", "m", None).unwrap(), "bedrock");
-        assert_eq!(map_aionrs_provider("gemini", "m", None).unwrap(), "openai");
-        assert_eq!(map_aionrs_provider("openai", "m", None).unwrap(), "openai");
-        assert_eq!(map_aionrs_provider("gemini-vertex-ai", "m", None).unwrap(), "vertex");
+    struct ProviderMappingCase<'a> {
+        name: &'a str,
+        platform: &'a str,
+        model_id: &'a str,
+        model_protocols: Option<&'a str>,
+        expected_provider: Option<&'a str>,
     }
 
     #[test]
-    fn map_aionrs_provider_defaults_openai_for_custom_platforms_without_protocol() {
-        assert_eq!(map_aionrs_provider("custom", "gpt-4o", None).unwrap(), "openai");
-        assert_eq!(map_aionrs_provider("new-api", "m", None).unwrap(), "openai");
-        assert_eq!(map_aionrs_provider("unknown", "m", None).unwrap(), "openai");
-    }
+    fn map_aionrs_provider_table_driven_cases() {
+        let cases = [
+            ProviderMappingCase {
+                name: "anthropic platform defaults anthropic",
+                platform: "anthropic",
+                model_id: "m",
+                model_protocols: None,
+                expected_provider: Some("anthropic"),
+            },
+            ProviderMappingCase {
+                name: "bedrock platform defaults bedrock",
+                platform: "bedrock",
+                model_id: "m",
+                model_protocols: None,
+                expected_provider: Some("bedrock"),
+            },
+            ProviderMappingCase {
+                name: "gemini platform uses openai-compatible transport",
+                platform: "gemini",
+                model_id: "m",
+                model_protocols: None,
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "openai platform defaults openai",
+                platform: "openai",
+                model_id: "m",
+                model_protocols: None,
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "gemini vertex platform maps to vertex",
+                platform: "gemini-vertex-ai",
+                model_id: "m",
+                model_protocols: None,
+                expected_provider: Some("vertex"),
+            },
+            ProviderMappingCase {
+                name: "custom without protocols defaults openai",
+                platform: "custom",
+                model_id: "gpt-4o",
+                model_protocols: None,
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "new-api without protocols defaults openai",
+                platform: "new-api",
+                model_id: "m",
+                model_protocols: None,
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "unknown without protocols defaults openai",
+                platform: "unknown",
+                model_id: "m",
+                model_protocols: None,
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "new-api can select anthropic by model protocol",
+                platform: "new-api",
+                model_id: "claude",
+                model_protocols: Some(r#"{"claude":"anthropic"}"#),
+                expected_provider: Some("anthropic"),
+            },
+            ProviderMappingCase {
+                name: "new-api can select openai by model protocol",
+                platform: "new-api",
+                model_id: "gpt",
+                model_protocols: Some(r#"{"gpt":"openai"}"#),
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "new-api gemini protocol uses openai provider",
+                platform: "new-api",
+                model_id: "gemini",
+                model_protocols: Some(r#"{"gemini":"gemini"}"#),
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "custom can select anthropic by model protocol",
+                platform: "custom",
+                model_id: "claude",
+                model_protocols: Some(r#"{"claude":"anthropic"}"#),
+                expected_provider: Some("anthropic"),
+            },
+            ProviderMappingCase {
+                name: "custom can select openai by model protocol",
+                platform: "custom",
+                model_id: "gpt",
+                model_protocols: Some(r#"{"gpt":"openai"}"#),
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "custom missing model protocol defaults openai",
+                platform: "custom",
+                model_id: "unknown-model",
+                model_protocols: Some(r#"{"claude":"anthropic"}"#),
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "custom empty protocol map defaults openai",
+                platform: "custom",
+                model_id: "m",
+                model_protocols: Some("{}"),
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "custom empty protocol value defaults openai",
+                platform: "custom",
+                model_id: "m",
+                model_protocols: Some(r#"{"m":""}"#),
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "custom non-string protocol value defaults openai",
+                platform: "custom",
+                model_id: "m",
+                model_protocols: Some(r#"{"m":123}"#),
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "invalid protocol json returns error",
+                platform: "custom",
+                model_id: "m",
+                model_protocols: Some("not json"),
+                expected_provider: None,
+            },
+            ProviderMappingCase {
+                name: "unsupported protocol returns error",
+                platform: "custom",
+                model_id: "m",
+                model_protocols: Some(r#"{"m":"unsupported"}"#),
+                expected_provider: None,
+            },
+            ProviderMappingCase {
+                name: "known openai platform ignores anthropic protocol",
+                platform: "openai",
+                model_id: "claude",
+                model_protocols: Some(r#"{"claude":"anthropic"}"#),
+                expected_provider: Some("openai"),
+            },
+            ProviderMappingCase {
+                name: "known anthropic platform ignores openai protocol",
+                platform: "anthropic",
+                model_id: "gpt",
+                model_protocols: Some(r#"{"gpt":"openai"}"#),
+                expected_provider: Some("anthropic"),
+            },
+        ];
 
-    #[test]
-    fn map_aionrs_provider_uses_model_protocol_even_for_openai_host() {
-        let protocols = r#"{"claude-sonnet":"anthropic"}"#;
-        assert_eq!(
-            map_aionrs_provider("custom", "claude-sonnet", Some(protocols)).unwrap(),
-            "anthropic"
-        );
-    }
-
-    #[test]
-    fn map_aionrs_provider_uses_model_protocols() {
-        let protocols = r#"{"claude-sonnet":"anthropic","gpt-4o":"openai"}"#;
-        assert_eq!(
-            map_aionrs_provider("new-api", "claude-sonnet", Some(protocols)).unwrap(),
-            "anthropic"
-        );
-        assert_eq!(
-            map_aionrs_provider("custom", "gpt-4o", Some(protocols)).unwrap(),
-            "openai"
-        );
-        assert_eq!(
-            map_aionrs_provider("new-api", "unknown-model", Some(protocols)).unwrap(),
-            "openai"
-        );
-    }
-
-    #[test]
-    fn map_aionrs_provider_with_invalid_json_returns_error() {
-        assert!(map_aionrs_provider("new-api", "m", Some("not json")).is_err());
-    }
-
-    #[test]
-    fn map_aionrs_provider_custom_reads_anthropic_protocol() {
-        let protocols = r#"{"m":"anthropic"}"#;
-        assert_eq!(
-            map_aionrs_provider("custom", "m", Some(protocols)).unwrap(),
-            "anthropic"
-        );
+        for case in cases {
+            let result = map_aionrs_provider(case.platform, case.model_id, case.model_protocols);
+            match case.expected_provider {
+                Some(expected) => assert_eq!(result.unwrap(), expected, "{}", case.name),
+                None => assert!(result.is_err(), "{}", case.name),
+            }
+        }
     }
 
     #[test]
@@ -867,97 +980,257 @@ mod tests {
         assert!(!is_openai_host("not-a-url"));
     }
 
-    #[test]
-    fn resolve_openai_official_sets_max_completion_tokens() {
-        let (base_url, compat) = resolve_aionrs_url_and_compat("custom", "https://api.openai.com/v1", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.openai.com/v1"));
-        assert_eq!(compat.max_tokens_field.as_deref(), Some("max_completion_tokens"));
-        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
+    struct UrlCompatCase<'a> {
+        name: &'a str,
+        platform: &'a str,
+        raw_base_url: &'a str,
+        mapped_provider: &'a str,
+        is_full_url: bool,
+        expected_base_url: Option<&'a str>,
+        expected_api_path: Option<&'a str>,
+        expected_max_tokens_field: Option<&'a str>,
     }
 
     #[test]
-    fn resolve_non_openai_keeps_default_max_tokens() {
-        let (base_url, compat) =
-            resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com/v1"));
-        assert!(compat.max_tokens_field.is_none());
-        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
+    fn resolve_aionrs_url_and_compat_table_driven_cases() {
+        let cases = [
+            UrlCompatCase {
+                name: "official openai root appends chat completions",
+                platform: "custom",
+                raw_base_url: "https://api.openai.com",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: Some("https://api.openai.com"),
+                expected_api_path: Some("/chat/completions"),
+                expected_max_tokens_field: Some("max_completion_tokens"),
+            },
+            UrlCompatCase {
+                name: "official openai v1 prefix is preserved",
+                platform: "custom",
+                raw_base_url: "https://api.openai.com/v1",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: Some("https://api.openai.com/v1"),
+                expected_api_path: Some("/chat/completions"),
+                expected_max_tokens_field: Some("max_completion_tokens"),
+            },
+            UrlCompatCase {
+                name: "official openai v1 trailing slash is trimmed",
+                platform: "custom",
+                raw_base_url: "https://api.openai.com/v1/",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: Some("https://api.openai.com/v1"),
+                expected_api_path: Some("/chat/completions"),
+                expected_max_tokens_field: Some("max_completion_tokens"),
+            },
+            UrlCompatCase {
+                name: "deepseek openai-compatible prefix is preserved",
+                platform: "custom",
+                raw_base_url: "https://api.deepseek.com/v1",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: Some("https://api.deepseek.com/v1"),
+                expected_api_path: Some("/chat/completions"),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "glm openai-compatible prefix is preserved",
+                platform: "custom",
+                raw_base_url: "https://open.bigmodel.cn/api/paas/v4",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: Some("https://open.bigmodel.cn/api/paas/v4"),
+                expected_api_path: Some("/chat/completions"),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "new-api openai-compatible prefix is preserved",
+                platform: "new-api",
+                raw_base_url: "https://host/v1",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: Some("https://host/v1"),
+                expected_api_path: Some("/chat/completions"),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "local openai-compatible prefix is preserved",
+                platform: "custom",
+                raw_base_url: "http://localhost:11434/v1",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: Some("http://localhost:11434/v1"),
+                expected_api_path: Some("/chat/completions"),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "gemini uses openai-compatible endpoint prefix",
+                platform: "gemini",
+                raw_base_url: "https://generativelanguage.googleapis.com",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+                expected_api_path: Some("/chat/completions"),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "official anthropic keeps aionrs defaults",
+                platform: "anthropic",
+                raw_base_url: "https://api.anthropic.com",
+                mapped_provider: "anthropic",
+                is_full_url: false,
+                expected_base_url: Some("https://api.anthropic.com"),
+                expected_api_path: None,
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "official anthropic trims trailing slash",
+                platform: "anthropic",
+                raw_base_url: "https://api.anthropic.com/",
+                mapped_provider: "anthropic",
+                is_full_url: false,
+                expected_base_url: Some("https://api.anthropic.com"),
+                expected_api_path: None,
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "custom anthropic-compatible unversioned prefix appends versioned messages path",
+                platform: "custom",
+                raw_base_url: "https://proxy.example.com/anthropic",
+                mapped_provider: "anthropic",
+                is_full_url: false,
+                expected_base_url: Some("https://proxy.example.com/anthropic"),
+                expected_api_path: Some("/v1/messages"),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "openai full url mode uses url as-is",
+                platform: "custom",
+                raw_base_url: "https://proxy.example.com/v1/chat/completions",
+                mapped_provider: "openai",
+                is_full_url: true,
+                expected_base_url: Some("https://proxy.example.com/v1/chat/completions"),
+                expected_api_path: Some(""),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "anthropic full url mode uses url as-is",
+                platform: "custom",
+                raw_base_url: "https://proxy.example.com/v1/messages",
+                mapped_provider: "anthropic",
+                is_full_url: true,
+                expected_base_url: Some("https://proxy.example.com/v1/messages"),
+                expected_api_path: Some(""),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "full url mode trims trailing slash",
+                platform: "custom",
+                raw_base_url: "https://proxy.example.com/v1/chat/completions/",
+                mapped_provider: "openai",
+                is_full_url: true,
+                expected_base_url: Some("https://proxy.example.com/v1/chat/completions"),
+                expected_api_path: Some(""),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "empty base url leaves compat unset",
+                platform: "custom",
+                raw_base_url: "",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: None,
+                expected_api_path: None,
+                expected_max_tokens_field: None,
+            },
+        ];
+
+        for case in cases {
+            let (base_url, compat) =
+                resolve_aionrs_url_and_compat(case.platform, case.raw_base_url, case.mapped_provider, case.is_full_url);
+            assert_eq!(base_url.as_deref(), case.expected_base_url, "{}", case.name);
+            assert_eq!(compat.api_path.as_deref(), case.expected_api_path, "{}", case.name);
+            assert_eq!(
+                compat.max_tokens_field.as_deref(),
+                case.expected_max_tokens_field,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    struct FinalUrlCase<'a> {
+        name: &'a str,
+        provider: &'a str,
+        base_url: &'a str,
+        api_path: Option<&'a str>,
+        expected_final_url: &'a str,
+    }
+
+    fn intended_aionrs_final_url(provider: &str, base_url: &str, api_path: Option<&str>) -> String {
+        let default_path = match provider {
+            "anthropic" => "/v1/messages",
+            _ => "/v1/chat/completions",
+        };
+        format!("{}{}", base_url, api_path.unwrap_or(default_path))
     }
 
     #[test]
-    fn resolve_gemini_prepends_path_and_sets_api_path() {
-        let (base_url, compat) =
-            resolve_aionrs_url_and_compat("gemini", "https://generativelanguage.googleapis.com", "openai", false);
-        assert_eq!(
-            base_url.as_deref(),
-            Some("https://generativelanguage.googleapis.com/v1beta/openai")
-        );
-        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
-        assert!(compat.max_tokens_field.is_none());
-    }
+    fn resolved_aionrs_final_url_semantics_table_driven_cases() {
+        let cases = [
+            FinalUrlCase {
+                name: "deepseek openai-compatible chat completions",
+                provider: "openai",
+                base_url: "https://api.deepseek.com/v1",
+                api_path: Some("/chat/completions"),
+                expected_final_url: "https://api.deepseek.com/v1/chat/completions",
+            },
+            FinalUrlCase {
+                name: "glm openai-compatible chat completions",
+                provider: "openai",
+                base_url: "https://open.bigmodel.cn/api/paas/v4",
+                api_path: Some("/chat/completions"),
+                expected_final_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            },
+            FinalUrlCase {
+                name: "openai full url mode appends nothing",
+                provider: "openai",
+                base_url: "https://x/v1/chat/completions",
+                api_path: Some(""),
+                expected_final_url: "https://x/v1/chat/completions",
+            },
+            FinalUrlCase {
+                name: "official anthropic uses default versioned messages path",
+                provider: "anthropic",
+                base_url: "https://api.anthropic.com",
+                api_path: None,
+                expected_final_url: "https://api.anthropic.com/v1/messages",
+            },
+            FinalUrlCase {
+                name: "custom anthropic root uses default versioned messages path",
+                provider: "anthropic",
+                base_url: "https://proxy.example.com",
+                api_path: None,
+                expected_final_url: "https://proxy.example.com/v1/messages",
+            },
+            FinalUrlCase {
+                name: "anthropic full url mode appends nothing",
+                provider: "anthropic",
+                base_url: "https://x/v1/messages",
+                api_path: Some(""),
+                expected_final_url: "https://x/v1/messages",
+            },
+        ];
 
-    #[test]
-    fn resolve_anthropic_no_compat_overrides() {
-        let (base_url, compat) =
-            resolve_aionrs_url_and_compat("anthropic", "https://api.anthropic.com", "anthropic", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com"));
-        assert!(compat.max_tokens_field.is_none());
-        assert!(compat.api_path.is_none());
-    }
-
-    #[test]
-    fn resolve_custom_anthropic_sets_versioned_messages_path() {
-        let (base_url, compat) =
-            resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/anthropic", "anthropic", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com/anthropic"));
-        assert_eq!(compat.api_path.as_deref(), Some("/v1/messages"));
-    }
-
-    #[test]
-    fn resolve_full_url_mode_uses_url_as_is() {
-        let (base_url, compat) = resolve_aionrs_url_and_compat(
-            "custom",
-            "https://proxy.example.com/v1/chat/completions",
-            "openai",
-            true,
-        );
-        assert_eq!(
-            base_url.as_deref(),
-            Some("https://proxy.example.com/v1/chat/completions")
-        );
-        assert_eq!(compat.api_path.as_deref(), Some(""));
-        assert!(compat.max_tokens_field.is_none());
-    }
-
-    #[test]
-    fn resolve_full_url_mode_strips_trailing_slash() {
-        let (base_url, compat) = resolve_aionrs_url_and_compat(
-            "custom",
-            "https://proxy.example.com/v1/chat/completions/",
-            "openai",
-            true,
-        );
-        assert_eq!(
-            base_url.as_deref(),
-            Some("https://proxy.example.com/v1/chat/completions")
-        );
-        assert_eq!(compat.api_path.as_deref(), Some(""));
-    }
-
-    #[test]
-    fn resolve_openai_base_url_keeps_user_prefix() {
-        let (base_url, compat) =
-            resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com/v1"));
-        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
-    }
-
-    #[test]
-    fn resolve_glm_base_url_keeps_user_prefix() {
-        let (base_url, compat) =
-            resolve_aionrs_url_and_compat("custom", "https://open.bigmodel.cn/api/paas/v4", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://open.bigmodel.cn/api/paas/v4"));
-        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
+        for case in cases {
+            assert_eq!(
+                intended_aionrs_final_url(case.provider, case.base_url, case.api_path),
+                case.expected_final_url,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]
