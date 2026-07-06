@@ -235,7 +235,8 @@ pub(crate) fn map_aionrs_provider(
 ///
 /// The stored base_url is treated as the user-controlled endpoint prefix.
 /// OpenAI-compatible providers append `/chat/completions`; Anthropic-compatible
-/// custom providers append `/messages`.
+/// providers append `/v1/messages`, or `/messages` when the prefix already
+/// includes `/v1`.
 pub(crate) fn resolve_aionrs_url_and_compat(
     platform: &str,
     raw_base_url: &str,
@@ -264,8 +265,11 @@ pub(crate) fn resolve_aionrs_url_and_compat(
         "openai" if base_url.is_some() => {
             compat.api_path = Some("/chat/completions".to_owned());
         }
-        "anthropic" if base_url.is_some() && (platform != "anthropic" || trimmed.ends_with("/v1")) => {
+        "anthropic" if base_url.is_some() && trimmed.ends_with("/v1") => {
             compat.api_path = Some("/messages".to_owned());
+        }
+        "anthropic" if base_url.is_some() && platform != "anthropic" => {
+            compat.api_path = Some("/v1/messages".to_owned());
         }
         _ => {}
     }
@@ -906,10 +910,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_custom_anthropic_sets_messages_path() {
+    fn resolve_custom_anthropic_sets_versioned_messages_path() {
         let (base_url, compat) =
             resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/anthropic", "anthropic", false);
         assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com/anthropic"));
+        assert_eq!(compat.api_path.as_deref(), Some("/v1/messages"));
+    }
+
+    #[test]
+    fn resolve_custom_anthropic_v1_base_sets_messages_path() {
+        let (base_url, compat) =
+            resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/anthropic/v1", "anthropic", false);
+        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com/anthropic/v1"));
         assert_eq!(compat.api_path.as_deref(), Some("/messages"));
     }
 
