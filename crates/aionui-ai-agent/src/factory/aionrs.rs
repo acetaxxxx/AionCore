@@ -92,7 +92,7 @@ pub(super) async fn build(
         .unwrap_or(&model.model)
         .to_owned();
 
-    let provider = map_aionrs_provider(&row.platform, &row.base_url, &model_id, row.model_protocols.as_deref())?;
+    let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
 
     let (base_url, compat_overrides) =
         resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
@@ -210,7 +210,6 @@ pub(super) async fn build(
 /// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
 pub(crate) fn map_aionrs_provider(
     platform: &str,
-    raw_base_url: &str,
     model_id: &str,
     model_protocols: Option<&str>,
 ) -> Result<String, AgentError> {
@@ -220,10 +219,6 @@ pub(crate) fn map_aionrs_provider(
         "gemini" | "openai" => return Ok("openai".to_owned()),
         "gemini-vertex-ai" => return Ok("vertex".to_owned()),
         _ => {}
-    }
-
-    if is_openai_host(raw_base_url) {
-        return Ok("openai".to_owned());
     }
 
     let protocol = resolve_model_protocol(model_id, model_protocols)?;
@@ -807,31 +802,26 @@ mod tests {
 
     #[test]
     fn map_aionrs_provider_known_platforms() {
-        assert_eq!(map_aionrs_provider("anthropic", "", "m", None).unwrap(), "anthropic");
-        assert_eq!(map_aionrs_provider("bedrock", "", "m", None).unwrap(), "bedrock");
-        assert_eq!(map_aionrs_provider("gemini", "", "m", None).unwrap(), "openai");
-        assert_eq!(map_aionrs_provider("openai", "", "m", None).unwrap(), "openai");
-        assert_eq!(
-            map_aionrs_provider("gemini-vertex-ai", "", "m", None).unwrap(),
-            "vertex"
-        );
+        assert_eq!(map_aionrs_provider("anthropic", "m", None).unwrap(), "anthropic");
+        assert_eq!(map_aionrs_provider("bedrock", "m", None).unwrap(), "bedrock");
+        assert_eq!(map_aionrs_provider("gemini", "m", None).unwrap(), "openai");
+        assert_eq!(map_aionrs_provider("openai", "m", None).unwrap(), "openai");
+        assert_eq!(map_aionrs_provider("gemini-vertex-ai", "m", None).unwrap(), "vertex");
     }
 
     #[test]
     fn map_aionrs_provider_defaults_openai_for_custom_platforms_without_protocol() {
-        assert_eq!(
-            map_aionrs_provider("custom", "https://api.deepseek.com/v1", "gpt-4o", None).unwrap(),
-            "openai"
-        );
-        assert_eq!(map_aionrs_provider("new-api", "", "m", None).unwrap(), "openai");
-        assert_eq!(map_aionrs_provider("unknown", "", "m", None).unwrap(), "openai");
+        assert_eq!(map_aionrs_provider("custom", "gpt-4o", None).unwrap(), "openai");
+        assert_eq!(map_aionrs_provider("new-api", "m", None).unwrap(), "openai");
+        assert_eq!(map_aionrs_provider("unknown", "m", None).unwrap(), "openai");
     }
 
     #[test]
-    fn map_aionrs_provider_treats_official_openai_host_as_openai() {
+    fn map_aionrs_provider_uses_model_protocol_even_for_openai_host() {
+        let protocols = r#"{"claude-sonnet":"anthropic"}"#;
         assert_eq!(
-            map_aionrs_provider("custom", "https://api.openai.com/v1", "gpt-4o", None).unwrap(),
-            "openai"
+            map_aionrs_provider("custom", "claude-sonnet", Some(protocols)).unwrap(),
+            "anthropic"
         );
     }
 
@@ -839,29 +829,29 @@ mod tests {
     fn map_aionrs_provider_uses_model_protocols() {
         let protocols = r#"{"claude-sonnet":"anthropic","gpt-4o":"openai"}"#;
         assert_eq!(
-            map_aionrs_provider("new-api", "", "claude-sonnet", Some(protocols)).unwrap(),
+            map_aionrs_provider("new-api", "claude-sonnet", Some(protocols)).unwrap(),
             "anthropic"
         );
         assert_eq!(
-            map_aionrs_provider("custom", "", "gpt-4o", Some(protocols)).unwrap(),
+            map_aionrs_provider("custom", "gpt-4o", Some(protocols)).unwrap(),
             "openai"
         );
         assert_eq!(
-            map_aionrs_provider("new-api", "", "unknown-model", Some(protocols)).unwrap(),
+            map_aionrs_provider("new-api", "unknown-model", Some(protocols)).unwrap(),
             "openai"
         );
     }
 
     #[test]
     fn map_aionrs_provider_with_invalid_json_returns_error() {
-        assert!(map_aionrs_provider("new-api", "", "m", Some("not json")).is_err());
+        assert!(map_aionrs_provider("new-api", "m", Some("not json")).is_err());
     }
 
     #[test]
     fn map_aionrs_provider_custom_reads_anthropic_protocol() {
         let protocols = r#"{"m":"anthropic"}"#;
         assert_eq!(
-            map_aionrs_provider("custom", "", "m", Some(protocols)).unwrap(),
+            map_aionrs_provider("custom", "m", Some(protocols)).unwrap(),
             "anthropic"
         );
     }
