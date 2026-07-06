@@ -128,7 +128,16 @@ try {
         Test-AionrsPatch
     }
 
-    & cargo @cargoConfig @CargoArgs
+    if ($cargoConfig.Count -gt 0 -and $CargoArgs.Count -ge 2 -and $CargoArgs[0] -eq "nextest" -and $CargoArgs[1] -eq "run") {
+        $finalArgs = @("nextest", "run") + $cargoConfig
+        if ($CargoArgs.Count -gt 2) {
+            $finalArgs += $CargoArgs[2..($CargoArgs.Count - 1)]
+        }
+    } else {
+        $finalArgs = $cargoConfig + $CargoArgs
+    }
+
+    & cargo @finalArgs
     $status = $LASTEXITCODE
 } finally {
     if ($null -ne $cargoLockSnapshot -and (Test-Path -LiteralPath $cargoLockSnapshot -PathType Leaf)) {

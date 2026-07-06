@@ -11,6 +11,7 @@ use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::ensure_runtime_command_with_reporter;
+use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
 
 use crate::agent_task::AgentInstance;
@@ -91,7 +92,7 @@ pub(super) async fn build(
         .unwrap_or(&model.model)
         .to_owned();
 
-    let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref());
+    let provider = map_aionrs_provider(&row.platform, &row.base_url, &model_id, row.model_protocols.as_deref())?;
 
     let (base_url, compat_overrides) =
         resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
@@ -206,36 +207,40 @@ pub(super) async fn build(
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
 }
 
-/// Map AionUi DB platform name to the aionrs provider identifier.
-///
-/// Mirrors the frontend `src/process/agent/aionrs/envBuilder.ts` mapping.
-/// For `new-api` platform, per-model protocol overrides from `model_protocols`
-/// JSON take precedence.
-pub(crate) fn map_aionrs_provider(platform: &str, model_id: &str, model_protocols: Option<&str>) -> String {
-    if platform == "new-api"
-        && let Some(protocols_json) = model_protocols
-        && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(protocols_json)
-        && let Some(serde_json::Value::String(protocol)) = map.get(model_id)
-        && protocol == "anthropic"
-    {
-        return "anthropic".to_owned();
+/// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
+pub(crate) fn map_aionrs_provider(
+    platform: &str,
+    raw_base_url: &str,
+    model_id: &str,
+    model_protocols: Option<&str>,
+) -> Result<String, AgentError> {
+    match platform {
+        "anthropic" => return Ok("anthropic".to_owned()),
+        "bedrock" => return Ok("bedrock".to_owned()),
+        "gemini" | "openai" => return Ok("openai".to_owned()),
+        "gemini-vertex-ai" => return Ok("vertex".to_owned()),
+        _ => {}
     }
 
-    match platform {
-        "anthropic" => "anthropic",
-        "bedrock" => "bedrock",
-        "gemini-vertex-ai" => "vertex",
-        _ => "openai",
+    if is_openai_host(raw_base_url) {
+        return Ok("openai".to_owned());
     }
-    .to_owned()
+
+    let protocol = resolve_model_protocol(model_id, model_protocols)?;
+    match protocol.as_str() {
+        "anthropic" => Ok("anthropic".to_owned()),
+        "openai" | "gemini" => Ok("openai".to_owned()),
+        other => Err(AgentError::bad_request(format!(
+            "Unsupported model protocol '{other}' for model '{model_id}'"
+        ))),
+    }
 }
 
 /// Resolve base_url and compat overrides for the aionrs provider.
 ///
-/// Mirrors the frontend `envBuilder.ts` logic:
-/// - Strips trailing `/v1` from base_url (aionrs appends its own path)
-/// - Gemini: prepends `/v1beta/openai` and overrides `api_path`
-/// - OpenAI official (`api.openai.com`): sets `max_completion_tokens`
+/// The stored base_url is treated as the user-controlled endpoint prefix.
+/// OpenAI-compatible providers append `/chat/completions`; Anthropic-compatible
+/// custom providers append `/messages`.
 pub(crate) fn resolve_aionrs_url_and_compat(
     platform: &str,
     raw_base_url: &str,
@@ -257,14 +262,39 @@ pub(crate) fn resolve_aionrs_url_and_compat(
         return (Some(base), compat);
     }
 
-    let normalized = normalize_aionrs_base_url(raw_base_url);
-    let base_url = Some(normalized).filter(|u| !u.is_empty());
+    let trimmed = raw_base_url.trim_end_matches('/');
+    let base_url = Some(trimmed.to_owned()).filter(|u| !u.is_empty());
+
+    match mapped_provider {
+        "openai" if base_url.is_some() => {
+            compat.api_path = Some("/chat/completions".to_owned());
+        }
+        "anthropic" if base_url.is_some() && (platform != "anthropic" || trimmed.ends_with("/v1")) => {
+            compat.api_path = Some("/messages".to_owned());
+        }
+        _ => {}
+    }
 
     if mapped_provider == "openai" && is_openai_host(raw_base_url) {
         compat.max_tokens_field = Some("max_completion_tokens".to_owned());
     }
 
     (base_url, compat)
+}
+
+fn resolve_model_protocol(model_id: &str, model_protocols: Option<&str>) -> Result<String, AgentError> {
+    let Some(protocols_json) = model_protocols.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok("openai".to_owned());
+    };
+    let map = serde_json::from_str::<Map<String, Value>>(protocols_json).map_err(|error| {
+        AgentError::bad_request(format!(
+            "Invalid model protocols config for model '{model_id}': {error}"
+        ))
+    })?;
+    match map.get(model_id) {
+        Some(Value::String(protocol)) if !protocol.is_empty() => Ok(protocol.clone()),
+        _ => Ok("openai".to_owned()),
+    }
 }
 
 fn is_openai_host(url: &str) -> bool {
@@ -274,13 +304,6 @@ fn is_openai_host(url: &str) -> bool {
         .or_else(|| lower.strip_prefix("http://"))
         .map(|rest| rest == "api.openai.com" || rest.starts_with("api.openai.com/"))
         .unwrap_or(false)
-}
-
-/// Strip trailing `/v1`, `/v1/`, or lone `/` from a base URL so that
-/// aionrs can append its own path suffix (`/v1/messages`, `/v1/chat/completions`).
-fn normalize_aionrs_base_url(url: &str) -> String {
-    let trimmed = url.trim_end_matches('/');
-    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned()
 }
 
 pub(crate) fn resolve_bedrock_config(json: Option<&str>) -> Option<aion_config::config::BedrockConfig> {
@@ -783,68 +806,64 @@ mod tests {
     }
 
     #[test]
-    fn normalize_aionrs_base_url_strips_v1() {
-        assert_eq!(
-            normalize_aionrs_base_url("https://api.openai.com/v1"),
-            "https://api.openai.com"
-        );
-        assert_eq!(
-            normalize_aionrs_base_url("https://api.openai.com/v1/"),
-            "https://api.openai.com"
-        );
-        assert_eq!(
-            normalize_aionrs_base_url("https://api.anthropic.com"),
-            "https://api.anthropic.com"
-        );
-        assert_eq!(
-            normalize_aionrs_base_url("https://api.deepseek.com/"),
-            "https://api.deepseek.com"
-        );
-        assert_eq!(
-            normalize_aionrs_base_url("http://localhost:11434"),
-            "http://localhost:11434"
-        );
-        assert_eq!(normalize_aionrs_base_url(""), "");
-    }
-
-    #[test]
     fn map_aionrs_provider_known_platforms() {
-        assert_eq!(map_aionrs_provider("anthropic", "m", None), "anthropic");
-        assert_eq!(map_aionrs_provider("bedrock", "m", None), "bedrock");
-        assert_eq!(map_aionrs_provider("gemini-vertex-ai", "m", None), "vertex");
-    }
-
-    #[test]
-    fn map_aionrs_provider_custom_and_others_default_to_openai() {
-        assert_eq!(map_aionrs_provider("custom", "gpt-4o", None), "openai");
-        assert_eq!(map_aionrs_provider("gemini", "gemini-2.5-pro", None), "openai");
-        assert_eq!(map_aionrs_provider("new-api", "m", None), "openai");
-        assert_eq!(map_aionrs_provider("unknown", "m", None), "openai");
-    }
-
-    #[test]
-    fn map_aionrs_provider_new_api_with_anthropic_protocol() {
-        let protocols = r#"{"claude-sonnet":"anthropic","gpt-4o":"openai"}"#;
+        assert_eq!(map_aionrs_provider("anthropic", "", "m", None).unwrap(), "anthropic");
+        assert_eq!(map_aionrs_provider("bedrock", "", "m", None).unwrap(), "bedrock");
+        assert_eq!(map_aionrs_provider("gemini", "", "m", None).unwrap(), "openai");
+        assert_eq!(map_aionrs_provider("openai", "", "m", None).unwrap(), "openai");
         assert_eq!(
-            map_aionrs_provider("new-api", "claude-sonnet", Some(protocols)),
-            "anthropic"
+            map_aionrs_provider("gemini-vertex-ai", "", "m", None).unwrap(),
+            "vertex"
         );
-        assert_eq!(map_aionrs_provider("new-api", "gpt-4o", Some(protocols)), "openai");
+    }
+
+    #[test]
+    fn map_aionrs_provider_defaults_openai_for_custom_platforms_without_protocol() {
         assert_eq!(
-            map_aionrs_provider("new-api", "unknown-model", Some(protocols)),
+            map_aionrs_provider("custom", "https://api.deepseek.com/v1", "gpt-4o", None).unwrap(),
+            "openai"
+        );
+        assert_eq!(map_aionrs_provider("new-api", "", "m", None).unwrap(), "openai");
+        assert_eq!(map_aionrs_provider("unknown", "", "m", None).unwrap(), "openai");
+    }
+
+    #[test]
+    fn map_aionrs_provider_treats_official_openai_host_as_openai() {
+        assert_eq!(
+            map_aionrs_provider("custom", "https://api.openai.com/v1", "gpt-4o", None).unwrap(),
             "openai"
         );
     }
 
     #[test]
-    fn map_aionrs_provider_new_api_with_invalid_json() {
-        assert_eq!(map_aionrs_provider("new-api", "m", Some("not json")), "openai");
+    fn map_aionrs_provider_uses_model_protocols() {
+        let protocols = r#"{"claude-sonnet":"anthropic","gpt-4o":"openai"}"#;
+        assert_eq!(
+            map_aionrs_provider("new-api", "", "claude-sonnet", Some(protocols)).unwrap(),
+            "anthropic"
+        );
+        assert_eq!(
+            map_aionrs_provider("custom", "", "gpt-4o", Some(protocols)).unwrap(),
+            "openai"
+        );
+        assert_eq!(
+            map_aionrs_provider("new-api", "", "unknown-model", Some(protocols)).unwrap(),
+            "openai"
+        );
     }
 
     #[test]
-    fn map_aionrs_provider_non_new_api_ignores_protocols() {
+    fn map_aionrs_provider_with_invalid_json_returns_error() {
+        assert!(map_aionrs_provider("new-api", "", "m", Some("not json")).is_err());
+    }
+
+    #[test]
+    fn map_aionrs_provider_custom_reads_anthropic_protocol() {
         let protocols = r#"{"m":"anthropic"}"#;
-        assert_eq!(map_aionrs_provider("custom", "m", Some(protocols)), "openai");
+        assert_eq!(
+            map_aionrs_provider("custom", "", "m", Some(protocols)).unwrap(),
+            "anthropic"
+        );
     }
 
     #[test]
@@ -861,17 +880,18 @@ mod tests {
     #[test]
     fn resolve_openai_official_sets_max_completion_tokens() {
         let (base_url, compat) = resolve_aionrs_url_and_compat("custom", "https://api.openai.com/v1", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.openai.com"));
+        assert_eq!(base_url.as_deref(), Some("https://api.openai.com/v1"));
         assert_eq!(compat.max_tokens_field.as_deref(), Some("max_completion_tokens"));
-        assert!(compat.api_path.is_none());
+        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
     }
 
     #[test]
     fn resolve_non_openai_keeps_default_max_tokens() {
         let (base_url, compat) =
             resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com"));
+        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com/v1"));
         assert!(compat.max_tokens_field.is_none());
+        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
     }
 
     #[test]
@@ -893,6 +913,22 @@ mod tests {
         assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com"));
         assert!(compat.max_tokens_field.is_none());
         assert!(compat.api_path.is_none());
+    }
+
+    #[test]
+    fn resolve_custom_anthropic_sets_messages_path() {
+        let (base_url, compat) =
+            resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/anthropic", "anthropic", false);
+        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com/anthropic"));
+        assert_eq!(compat.api_path.as_deref(), Some("/messages"));
+    }
+
+    #[test]
+    fn resolve_anthropic_v1_base_sets_messages_path() {
+        let (base_url, compat) =
+            resolve_aionrs_url_and_compat("anthropic", "https://api.anthropic.com/v1", "anthropic", false);
+        assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com/v1"));
+        assert_eq!(compat.api_path.as_deref(), Some("/messages"));
     }
 
     #[test]
@@ -927,11 +963,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_full_url_false_still_normalizes() {
+    fn resolve_openai_base_url_keeps_user_prefix() {
         let (base_url, compat) =
             resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com"));
-        assert!(compat.api_path.is_none());
+        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
+    }
+
+    #[test]
+    fn resolve_glm_base_url_keeps_user_prefix() {
+        let (base_url, compat) =
+            resolve_aionrs_url_and_compat("custom", "https://open.bigmodel.cn/api/paas/v4", "openai", false);
+        assert_eq!(base_url.as_deref(), Some("https://open.bigmodel.cn/api/paas/v4"));
+        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
     }
 
     #[test]
