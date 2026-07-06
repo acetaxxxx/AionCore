@@ -120,8 +120,15 @@ if [[ -n "${AIONRS:-}" ]]; then
     verify_local_aionrs_patch
 fi
 
-if ((${#cargo_config[@]})); then
-    cargo "${cargo_config[@]}" "$@"
-else
-    cargo "$@"
-fi
+run_cargo() {
+    if ((${#cargo_config[@]})) && [[ "${1:-}" == "nextest" && "${2:-}" == "run" ]]; then
+        shift 2
+        cargo nextest run "${cargo_config[@]}" "$@"
+    elif ((${#cargo_config[@]})); then
+        cargo "${cargo_config[@]}" "$@"
+    else
+        cargo "$@"
+    fi
+}
+
+run_cargo "$@"
