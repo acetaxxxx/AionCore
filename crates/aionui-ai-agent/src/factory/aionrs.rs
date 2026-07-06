@@ -1160,6 +1160,242 @@ mod tests {
         }
     }
 
+    struct OpenAiPresetBaseUrlCase<'a> {
+        name: &'a str,
+        base_url: &'a str,
+        expected_max_tokens_field: Option<&'a str>,
+    }
+
+    #[test]
+    fn ui_model_platform_base_url_presets_default_to_openai_chat_completions() {
+        let cases = [
+            OpenAiPresetBaseUrlCase {
+                name: "OpenAI",
+                base_url: "https://api.openai.com/v1",
+                expected_max_tokens_field: Some("max_completion_tokens"),
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "DeepSeek",
+                base_url: "https://api.deepseek.com/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "MiniMax",
+                base_url: "https://api.minimaxi.com/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Novita",
+                base_url: "https://api.novita.ai/openai/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "OpenRouter",
+                base_url: "https://openrouter.ai/api/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Dashscope",
+                base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Dashscope Coding Plan",
+                base_url: "https://coding.dashscope.aliyuncs.com/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "SiliconFlow-CN",
+                base_url: "https://api.siliconflow.cn/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "SiliconFlow",
+                base_url: "https://api.siliconflow.com/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Zhipu",
+                base_url: "https://open.bigmodel.cn/api/paas/v4",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Moonshot (China)",
+                base_url: "https://api.moonshot.cn/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Moonshot (Global)",
+                base_url: "https://api.moonshot.ai/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "xAI",
+                base_url: "https://api.x.ai/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Ark",
+                base_url: "https://ark.cn-beijing.volces.com/api/v3",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Qianfan",
+                base_url: "https://qianfan.baidubce.com/v2",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Hunyuan",
+                base_url: "https://api.hunyuan.cloud.tencent.com/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Lingyi",
+                base_url: "https://api.lingyiwanwu.com/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Poe",
+                base_url: "https://api.poe.com/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "PPIO",
+                base_url: "https://api.ppinfra.com/v3/openai",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "ModelScope",
+                base_url: "https://api-inference.modelscope.cn/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "InfiniAI",
+                base_url: "https://cloud.infini-ai.com/maas/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "Ctyun",
+                base_url: "https://wishub-x1.ctyun.cn/v1",
+                expected_max_tokens_field: None,
+            },
+            OpenAiPresetBaseUrlCase {
+                name: "StepFun",
+                base_url: "https://api.stepfun.com/v1",
+                expected_max_tokens_field: None,
+            },
+        ];
+
+        for case in cases {
+            let provider = map_aionrs_provider("custom", "m", None).expect(case.name);
+            assert_eq!(provider, "openai", "{}", case.name);
+
+            let (base_url, compat) = resolve_aionrs_url_and_compat("custom", case.base_url, &provider, false);
+            assert_eq!(base_url.as_deref(), Some(case.base_url), "{}", case.name);
+            assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"), "{}", case.name);
+            assert_eq!(
+                compat.max_tokens_field.as_deref(),
+                case.expected_max_tokens_field,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                intended_aionrs_final_url(&provider, case.base_url, compat.api_path.as_deref()),
+                format!("{}/chat/completions", case.base_url),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    struct SpecialModelPlatformCase<'a> {
+        name: &'a str,
+        platform: &'a str,
+        base_url: &'a str,
+        expected_provider: &'a str,
+        expected_base_url: Option<&'a str>,
+        expected_api_path: Option<&'a str>,
+        expected_final_url: Option<&'a str>,
+    }
+
+    #[test]
+    fn ui_model_platform_special_presets_resolve_default_transports() {
+        let cases = [
+            SpecialModelPlatformCase {
+                name: "Custom",
+                platform: "custom",
+                base_url: "",
+                expected_provider: "openai",
+                expected_base_url: None,
+                expected_api_path: None,
+                expected_final_url: None,
+            },
+            SpecialModelPlatformCase {
+                name: "New API",
+                platform: "new-api",
+                base_url: "",
+                expected_provider: "openai",
+                expected_base_url: None,
+                expected_api_path: None,
+                expected_final_url: None,
+            },
+            SpecialModelPlatformCase {
+                name: "Gemini",
+                platform: "gemini",
+                base_url: "https://generativelanguage.googleapis.com",
+                expected_provider: "openai",
+                expected_base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+                expected_api_path: Some("/chat/completions"),
+                expected_final_url: Some("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"),
+            },
+            SpecialModelPlatformCase {
+                name: "Gemini (Vertex AI)",
+                platform: "gemini-vertex-ai",
+                base_url: "",
+                expected_provider: "vertex",
+                expected_base_url: None,
+                expected_api_path: None,
+                expected_final_url: None,
+            },
+            SpecialModelPlatformCase {
+                name: "Anthropic",
+                platform: "anthropic",
+                base_url: "https://api.anthropic.com",
+                expected_provider: "anthropic",
+                expected_base_url: Some("https://api.anthropic.com"),
+                expected_api_path: None,
+                expected_final_url: Some("https://api.anthropic.com/v1/messages"),
+            },
+            SpecialModelPlatformCase {
+                name: "AWS Bedrock",
+                platform: "bedrock",
+                base_url: "",
+                expected_provider: "bedrock",
+                expected_base_url: None,
+                expected_api_path: None,
+                expected_final_url: None,
+            },
+        ];
+
+        for case in cases {
+            let provider = map_aionrs_provider(case.platform, "m", None).expect(case.name);
+            assert_eq!(provider, case.expected_provider, "{}", case.name);
+
+            let (base_url, compat) = resolve_aionrs_url_and_compat(case.platform, case.base_url, &provider, false);
+            assert_eq!(base_url.as_deref(), case.expected_base_url, "{}", case.name);
+            assert_eq!(compat.api_path.as_deref(), case.expected_api_path, "{}", case.name);
+
+            if let (Some(base_url), Some(expected_final_url)) = (base_url.as_deref(), case.expected_final_url) {
+                assert_eq!(
+                    intended_aionrs_final_url(&provider, base_url, compat.api_path.as_deref()),
+                    expected_final_url,
+                    "{}",
+                    case.name
+                );
+            }
+        }
+    }
+
     struct FinalUrlCase<'a> {
         name: &'a str,
         provider: &'a str,
