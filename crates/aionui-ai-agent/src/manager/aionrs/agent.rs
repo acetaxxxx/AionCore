@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -16,7 +16,11 @@ use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
     GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
 };
-use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms};
+use aionui_common::{
+    AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms,
+};
+use aionui_common::constants::SUPPORTED_IMAGE_EXTENSIONS;
+use base64::Engine;
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
 use tracing::{debug, error, info, warn};
@@ -118,6 +122,64 @@ where
     let _lock = lock.lock().await;
     let _guard = RuntimeEnvGuard::apply(runtime_env);
     future.await
+}
+
+/// Convert file paths to base64 data URIs in the content string.
+/// The engine will then parse these data URIs and create proper content blocks.
+fn enrich_content_with_files(content: &str, files: &[String]) -> String {
+    if files.is_empty() {
+        return content.to_string();
+    }
+
+    let mut enriched_content = content.to_string();
+
+    for file_path in files {
+        let path = Path::new(file_path);
+
+        if !path.exists() {
+            warn!(file_path = %file_path, "Attached file does not exist, skipping");
+            continue;
+        }
+
+        let extension = path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase());
+        let is_image = extension
+            .as_ref()
+            .map(|ext| SUPPORTED_IMAGE_EXTENSIONS.contains(&format!(".{}", ext).as_str()))
+            .unwrap_or(false);
+
+        if !is_image {
+            continue;
+        }
+
+        let file_bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(file_path = %file_path, error = %e, "Failed to read attached file");
+                continue;
+            }
+        };
+
+        let mime_type = match extension.as_deref() {
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("png") => "image/png",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            Some("tiff") => "image/tiff",
+            Some("svg") => "image/svg+xml",
+            _ => "application/octet-stream",
+        };
+
+        let base64_data = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
+        let data_uri = format!("data:{};base64,{}", mime_type, base64_data);
+
+        if enriched_content.contains(file_path) {
+            enriched_content = enriched_content.replace(file_path, &data_uri);
+            info!(file_path = %file_path, mime_type = %mime_type, size = file_bytes.len(), "Inlined image as base64 data URI");
+        }
+    }
+
+    enriched_content
 }
 
 impl AionrsAgentManager {
@@ -296,10 +358,20 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         self.runtime.bump_activity();
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
 
+        // Enrich content with inline base64 images from attached files
+        info!(files = ?data.files, files_len = data.files.len(), "Send message received");
+        let enriched_content = if !data.files.is_empty() {
+            info!(files = ?data.files, content = %data.content, "Enriching content with file attachments");
+            enrich_content_with_files(&data.content, &data.files)
+        } else {
+            info!("No files attached, using content as-is");
+            data.content.clone()
+        };
+
         let mut engine = self.engine.lock().await;
 
         let result = tokio::select! {
-            res = run_with_runtime_env(&self.runtime_env, engine.run(&data.content, &data.msg_id)) => Some(res),
+            res = run_with_runtime_env(&self.runtime_env, engine.run(&enriched_content, &data.msg_id)) => Some(res),
             _ = self.cancel_notify.notified() => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
