@@ -84,6 +84,8 @@ impl AionrsAgentManager {
             system_prompt: config_extra.system_prompt.clone(),
             profile: None,
             auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
+            thinking: None,
+            thinking_budget: None,
             project_dir: Some(PathBuf::from(&workspace)),
         };
 

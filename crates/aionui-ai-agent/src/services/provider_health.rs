@@ -202,6 +202,8 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
         system_prompt: config_extra.system_prompt,
         profile: None,
         auto_approve: false,
+        thinking: None,
+        thinking_budget: None,
         project_dir: Some(PathBuf::from(&workspace)),
     };
     let mut config =
