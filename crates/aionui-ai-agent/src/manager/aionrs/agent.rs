@@ -12,14 +12,13 @@ use aion_config::config::{CliArgs, Config};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::SessionMode;
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
+use aion_types::message::{ContentBlock, ImageUrl, extension_to_image_media_type};
 use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
     GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
 };
-use aionui_common::{
-    AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms,
-};
-use aionui_common::constants::SUPPORTED_IMAGE_EXTENSIONS;
+use aionui_common::constants::AIONUI_FILES_MARKER;
+use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms};
 use base64::Engine;
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -124,62 +123,125 @@ where
     future.await
 }
 
-/// Convert file paths to base64 data URIs in the content string.
-/// The engine will then parse these data URIs and create proper content blocks.
-fn enrich_content_with_files(content: &str, files: &[String]) -> String {
-    if files.is_empty() {
-        return content.to_string();
+/// Maximum size for a single image file that will be inlined as base64 (20 MB).
+const MAX_INLINE_IMAGE_SIZE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Maximum number of images to inline in a single message.
+const MAX_INLINE_IMAGE_COUNT: usize = 32;
+
+/// Build structured content blocks from user text and attached file paths.
+///
+/// Supported images are read from disk and converted to `ContentBlock::Image`
+/// with a validated base64 data URI. Non-image files, unsupported image formats,
+/// missing files, and oversized files are preserved as `ContentBlock::Text`
+/// so the model still sees the attachment path.
+fn build_content_blocks(content: &str, files: &[String]) -> Vec<ContentBlock> {
+    // AionUI appends file paths after the marker. Split the content so the
+    // actual user text is not mixed with attachment metadata.
+    let user_text = content
+        .split(AIONUI_FILES_MARKER)
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let mut blocks = Vec::new();
+    if let Some(text) = user_text {
+        blocks.push(ContentBlock::Text { text });
     }
 
-    let mut enriched_content = content.to_string();
-
+    let mut inlined_images = 0;
     for file_path in files {
         let path = Path::new(file_path);
 
         if !path.exists() {
-            warn!(file_path = %file_path, "Attached file does not exist, skipping");
+            warn!(file_path = %file_path, "Attached file does not exist; preserving path as text");
+            blocks.push(ContentBlock::Text {
+                text: file_path.clone(),
+            });
             continue;
         }
 
-        let extension = path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase());
-        let is_image = extension
-            .as_ref()
-            .map(|ext| SUPPORTED_IMAGE_EXTENSIONS.contains(&format!(".{}", ext).as_str()))
-            .unwrap_or(false);
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_lowercase());
+        let Some(mime_type) = extension.as_deref().and_then(extension_to_image_media_type) else {
+            // Not a supported image format; preserve the path as text.
+            blocks.push(ContentBlock::Text {
+                text: file_path.clone(),
+            });
+            continue;
+        };
 
-        if !is_image {
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(file_path = %file_path, error = %e, "Failed to read attached file metadata");
+                blocks.push(ContentBlock::Text {
+                    text: file_path.clone(),
+                });
+                continue;
+            }
+        };
+
+        if metadata.len() > MAX_INLINE_IMAGE_SIZE_BYTES {
+            warn!(
+                file_path = %file_path,
+                size = metadata.len(),
+                max = MAX_INLINE_IMAGE_SIZE_BYTES,
+                "Attached image exceeds size limit; preserving path as text"
+            );
+            blocks.push(ContentBlock::Text {
+                text: file_path.clone(),
+            });
+            continue;
+        }
+
+        if inlined_images >= MAX_INLINE_IMAGE_COUNT {
+            warn!(
+                file_path = %file_path,
+                limit = MAX_INLINE_IMAGE_COUNT,
+                "Too many image attachments; preserving path as text"
+            );
+            blocks.push(ContentBlock::Text {
+                text: file_path.clone(),
+            });
             continue;
         }
 
         let file_bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) => {
-                warn!(file_path = %file_path, error = %e, "Failed to read attached file");
+                warn!(file_path = %file_path, error = %e, "Failed to read attached image");
+                blocks.push(ContentBlock::Text {
+                    text: file_path.clone(),
+                });
                 continue;
             }
         };
 
-        let mime_type = match extension.as_deref() {
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("png") => "image/png",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            Some("bmp") => "image/bmp",
-            Some("tiff") => "image/tiff",
-            Some("svg") => "image/svg+xml",
-            _ => "application/octet-stream",
-        };
-
         let base64_data = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
         let data_uri = format!("data:{};base64,{}", mime_type, base64_data);
-
-        if enriched_content.contains(file_path) {
-            enriched_content = enriched_content.replace(file_path, &data_uri);
-            info!(file_path = %file_path, mime_type = %mime_type, size = file_bytes.len(), "Inlined image as base64 data URI");
+        let image_url = ImageUrl { url: data_uri };
+        if let Err(e) = image_url.validate() {
+            warn!(
+                file_path = %file_path,
+                error = %e,
+                "Constructed invalid image data URI; preserving path as text"
+            );
+            blocks.push(ContentBlock::Text {
+                text: file_path.clone(),
+            });
+            continue;
         }
+
+        info!(file_path = %file_path, mime_type = %mime_type, size = file_bytes.len(), "Inlined image as base64 data URI");
+        blocks.push(ContentBlock::Image { image_url });
+        inlined_images += 1;
     }
 
-    enriched_content
+    blocks
 }
 
 impl AionrsAgentManager {
@@ -358,20 +420,17 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         self.runtime.bump_activity();
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
 
-        // Enrich content with inline base64 images from attached files
+        // Build structured content blocks from user text and attached files.
+        // Supported images are inlined as validated base64 data URIs; all other
+        // attachment paths are preserved as text blocks.
         info!(files = ?data.files, files_len = data.files.len(), "Send message received");
-        let enriched_content = if !data.files.is_empty() {
-            info!(files = ?data.files, content = %data.content, "Enriching content with file attachments");
-            enrich_content_with_files(&data.content, &data.files)
-        } else {
-            info!("No files attached, using content as-is");
-            data.content.clone()
-        };
+        let content_blocks = build_content_blocks(&data.content, &data.files);
+        info!(block_count = content_blocks.len(), "Built structured content blocks");
 
         let mut engine = self.engine.lock().await;
 
         let result = tokio::select! {
-            res = run_with_runtime_env(&self.runtime_env, engine.run(&enriched_content, &data.msg_id)) => Some(res),
+            res = run_with_runtime_env(&self.runtime_env, engine.run_with_blocks(content_blocks, &data.msg_id)) => Some(res),
             _ = self.cancel_notify.notified() => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
@@ -597,6 +656,7 @@ fn parse_session_mode(s: &str) -> SessionMode {
 mod tests {
     use super::*;
     use crate::agent_task::IAgentTask;
+    use tempfile::TempDir;
 
     async fn assert_no_stop_signal(agent: &AionrsAgentManager) {
         let notified = agent.cancel_notify.notified();
@@ -828,5 +888,78 @@ mod tests {
             AgentStreamEvent::Finish(_) => {}
             other => panic!("Expected Finish, got {:?}", other),
         }
+    }
+
+    // --- build_content_blocks ---
+
+    fn temp_file(dir: &TempDir, name: &str, bytes: &[u8]) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn build_content_blocks_text_only_without_marker() {
+        let blocks = build_content_blocks("hello", &[]);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "hello"));
+    }
+
+    #[test]
+    fn build_content_blocks_splits_at_aion_files_marker() {
+        let content = format!("hello\n\n{}\n/path/to/file.png", AIONUI_FILES_MARKER);
+        let blocks = build_content_blocks(&content, &[]);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "hello"));
+    }
+
+    #[test]
+    fn build_content_blocks_inlines_supported_image() {
+        let dir = TempDir::new().unwrap();
+        let image_path = temp_file(&dir, "image.png", b"fake-png");
+        let content = format!("look at this\n\n{}\n{}", AIONUI_FILES_MARKER, image_path);
+
+        let blocks = build_content_blocks(&content, &[image_path.clone()]);
+
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "look at this"));
+        assert!(matches!(&blocks[1], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn build_content_blocks_preserves_non_image_path_as_text() {
+        let dir = TempDir::new().unwrap();
+        let file_path = temp_file(&dir, "notes.txt", b"plain text");
+        let content = format!("see file\n\n{}\n{}", AIONUI_FILES_MARKER, file_path);
+
+        let blocks = build_content_blocks(&content, &[file_path.clone()]);
+
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "see file"));
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == &file_path));
+    }
+
+    #[test]
+    fn build_content_blocks_preserves_missing_image_path_as_text() {
+        let missing_path = "/tmp/does-not-exist.png".to_string();
+        let content = format!("image\n\n{}\n{}", AIONUI_FILES_MARKER, missing_path);
+
+        let blocks = build_content_blocks(&content, &[missing_path.clone()]);
+
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == &missing_path));
+    }
+
+    #[test]
+    fn build_content_blocks_unsupported_image_format_becomes_text() {
+        let dir = TempDir::new().unwrap();
+        // SVG is not accepted as a vision input by the supported providers.
+        let svg_path = temp_file(&dir, "diagram.svg", b"<svg></svg>");
+        let content = format!("diagram\n\n{}\n{}", AIONUI_FILES_MARKER, svg_path);
+
+        let blocks = build_content_blocks(&content, &[svg_path.clone()]);
+
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == &svg_path));
     }
 }
