@@ -14,6 +14,7 @@ use common::{
 };
 
 const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
+const DEFAULT_TEAM_AGENT_ID: &str = "2d23ff1c";
 
 fn team_agent(name: &str, role: &str) -> serde_json::Value {
     json!({
@@ -34,14 +35,47 @@ fn two_agent_body() -> serde_json::Value {
     })
 }
 
-async fn ensure_default_team_assistant(app: &mut axum::Router, token: &str, csrf: &str) {
+async fn ensure_default_team_agent_installed(services: &aionui_app::AppServices) {
+    let command = std::env::current_exe()
+        .expect("test executable path")
+        .to_string_lossy()
+        .to_string();
+    let source_info = json!({ "binary_name": command }).to_string();
+
+    sqlx::query(
+        "UPDATE agent_metadata \
+         SET agent_source = 'custom', agent_source_info = ?, command = ?, args = '[]', env = '[]', \
+             updated_at = unixepoch('now','subsec') * 1000 \
+         WHERE id = ?",
+    )
+    .bind(&source_info)
+    .bind(&command)
+    .bind(DEFAULT_TEAM_AGENT_ID)
+    .execute(services.database.pool())
+    .await
+    .expect("seed deterministic team agent");
+
+    services
+        .agent_registry
+        .reload_one(DEFAULT_TEAM_AGENT_ID)
+        .await
+        .expect("reload deterministic team agent");
+}
+
+async fn ensure_default_team_assistant(
+    app: &mut axum::Router,
+    services: &aionui_app::AppServices,
+    token: &str,
+    csrf: &str,
+) {
+    ensure_default_team_agent_installed(services).await;
     let req = json_with_token(
         "POST",
         "/api/assistants",
         json!({
             "id": DEFAULT_TEAM_ASSISTANT_ID,
             "name": "Team E2E Assistant",
-            "agent_id": "2d23ff1c"
+            "agent_id": DEFAULT_TEAM_AGENT_ID
         }),
         token,
         csrf,
@@ -54,8 +88,13 @@ async fn ensure_default_team_assistant(app: &mut axum::Router, token: &str, csrf
     );
 }
 
-async fn create_team(app: &mut axum::Router, token: &str, csrf: &str) -> serde_json::Value {
-    ensure_default_team_assistant(app, token, csrf).await;
+async fn create_team(
+    app: &mut axum::Router,
+    services: &aionui_app::AppServices,
+    token: &str,
+    csrf: &str,
+) -> serde_json::Value {
+    ensure_default_team_assistant(app, services, token, csrf).await;
     let req = json_with_token("POST", "/api/teams", two_agent_body(), token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -124,7 +163,7 @@ async fn tc1_create_team_with_multiple_agents() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     assert_eq!(data["name"], "Alpha");
     assert_eq!(data["assistants"].as_array().unwrap().len(), 2);
     assert_eq!(data["assistants"][0]["role"], "lead");
@@ -138,7 +177,7 @@ async fn tc1_create_team_with_multiple_agents() {
 async fn tc2_create_single_agent_team() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    ensure_default_team_assistant(&mut app, &token, &csrf).await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
 
     let body = json!({
         "name": "Solo",
@@ -188,7 +227,7 @@ async fn tc3_each_agent_has_conversation_id() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     for agent in data["assistants"].as_array().unwrap() {
         assert!(agent["conversation_id"].is_string());
         assert!(!agent["conversation_id"].as_str().unwrap().is_empty());
@@ -204,7 +243,7 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
 
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
@@ -219,24 +258,52 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
     assert_eq!(extra["current_model_id"], "claude");
 }
 
-// TC-4: First assistant defaults to lead
 #[tokio::test]
-async fn tc4_first_agent_is_lead() {
+async fn tc3c_team_conversation_rejects_standalone_runtime_ensure() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{conversation_id}/runtime/ensure"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], false);
+    assert_eq!(body["code"], "TEAM_RUNTIME_REQUIRED");
+    assert_eq!(body["details"]["conversation_id"], conversation_id);
+    assert_eq!(body["details"]["team_id"], data["id"]);
+}
+
+// TC-4: Explicit lead role is returned first
+#[tokio::test]
+async fn tc4_explicit_lead_is_returned_first() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    ensure_default_team_assistant(&mut app, &token, &csrf).await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
 
     let body = json!({
         "name": "T",
         "agents": [
             team_agent("A", "teammate"),
-            team_agent("B", "teammate")
+            team_agent("B", "lead")
         ]
     });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
+    assert_eq!(json["data"]["assistants"][0]["name"], "B");
     assert_eq!(json["data"]["assistants"][0]["role"], "lead");
+    assert_eq!(json["data"]["assistants"][1]["name"], "A");
+    assert_eq!(json["data"]["assistants"][1]["role"], "teammate");
     assert_eq!(
         json["data"]["leader_assistant_id"],
         json["data"]["assistants"][0]["slot_id"]
@@ -260,7 +327,7 @@ async fn tc5_empty_agents_returns_error() {
 async fn tc6_missing_name_returns_error() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    ensure_default_team_assistant(&mut app, &token, &csrf).await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
 
     let body = json!({ "agents": [json!({
         "name": "L",
@@ -277,7 +344,7 @@ async fn tc6_missing_name_returns_error() {
 async fn tc6b_workspace_with_whitespace_segment_is_accepted() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    ensure_default_team_assistant(&mut app, &token, &csrf).await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("Archive ");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -299,7 +366,7 @@ async fn tc6b_workspace_with_whitespace_segment_is_accepted() {
 async fn tc6c_create_team_rejects_missing_workspace_path() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    ensure_default_team_assistant(&mut app, &token, &csrf).await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
     let missing_workspace =
         std::env::temp_dir().join(format!("aionui-team-missing-{}", aionui_common::generate_short_id()));
 
@@ -365,8 +432,8 @@ async fn tl2_list_multiple_teams() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    create_team(&mut app, &token, &csrf).await;
-    ensure_default_team_assistant(&mut app, &token, &csrf).await;
+    create_team(&mut app, &services, &token, &csrf).await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
 
     let body = json!({
         "name": "Beta",
@@ -388,7 +455,7 @@ async fn team_api_rejects_cross_user_access() {
     let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let (other_token, other_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss2").await;
 
-    let data = create_team(&mut app, &owner_token, &owner_csrf).await;
+    let data = create_team(&mut app, &services, &owner_token, &owner_csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
 
@@ -457,7 +524,7 @@ async fn team_api_rejects_cross_user_access() {
 async fn pause_team_slot_endpoint_requires_owned_team_and_active_run() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let lead_slot_id = data["assistants"][0]["slot_id"].as_str().unwrap();
 
@@ -479,7 +546,7 @@ async fn pause_team_slot_endpoint_requires_owned_team_and_active_run() {
 async fn trs1_run_state_returns_null_for_existing_team_without_active_run() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let stop_req = delete_with_token(&format!("/api/teams/{team_id}/session"), &token, &csrf);
@@ -499,7 +566,7 @@ async fn trs1_run_state_returns_null_for_existing_team_without_active_run() {
 async fn trs2_run_state_returns_active_run_payload() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let send_req = json_with_token(
@@ -512,7 +579,11 @@ async fn trs2_run_state_returns_active_run_payload() {
     let send_resp = app.clone().oneshot(send_req).await.unwrap();
     assert_eq!(send_resp.status(), StatusCode::OK);
     let send_body = body_json(send_resp).await;
-    let team_run_id = send_body["data"]["team_run_id"].as_str().unwrap();
+    let team_run_id = send_body["data"]["run"]["team_run_id"].as_str().unwrap();
+    assert!(matches!(
+        send_body["data"]["enqueue_status"].as_str(),
+        Some("accepted" | "queued" | "blocked_runtime_starting")
+    ));
 
     let req = get_with_token(&format!("/api/teams/{team_id}/run-state"), &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -523,9 +594,12 @@ async fn trs2_run_state_returns_active_run_payload() {
     assert_eq!(body["data"]["active_run"]["team_id"], team_id);
     assert_eq!(body["data"]["active_run"]["team_run_id"], team_run_id);
     assert_eq!(body["data"]["active_run"]["source"], "user_message");
-    assert_eq!(body["data"]["active_run"]["has_user_intervention"], true);
+    assert_eq!(body["data"]["active_run"]["has_user_intervention"], false);
     assert_eq!(body["data"]["active_run"]["status"], "accepted");
-    assert_eq!(body["data"]["active_run"]["pending_wake_count"], 1);
+    assert!(body["data"]["active_run"]["queued_intent_count"].is_number());
+    assert!(body["data"]["active_run"]["starting_batch_count"].is_number());
+    assert!(body["data"]["active_run"]["running_batch_count"].is_number());
+    assert!(body["data"]["active_run"]["active_enqueue_lease_count"].is_number());
     assert!(body["data"]["active_run"]["slot_work"].as_array().unwrap().len() >= 1);
 }
 
@@ -555,7 +629,7 @@ async fn trs4_run_state_missing_team_returns_404() {
 async fn trs5_run_state_rejects_cross_user_access() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (admin_token, admin_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let data = create_team(&mut app, &admin_token, &admin_csrf).await;
+    let data = create_team(&mut app, &services, &admin_token, &admin_csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let (other_token, _other_csrf) = setup_and_login(&mut app, &services, "other", "StrongP@ss2").await;
@@ -573,7 +647,7 @@ async fn tl3_teams_contain_full_agent_info() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    create_team(&mut app, &token, &csrf).await;
+    create_team(&mut app, &services, &token, &csrf).await;
 
     let req = get_with_token("/api/teams", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -594,7 +668,7 @@ async fn tg1_get_existing_team() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = get_with_token(&format!("/api/teams/{team_id}"), &token);
@@ -622,7 +696,7 @@ async fn td1_delete_existing_team() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = delete_with_token(&format!("/api/teams/{team_id}"), &token, &csrf);
@@ -636,7 +710,7 @@ async fn td2_delete_then_list_empty() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = delete_with_token(&format!("/api/teams/{team_id}"), &token, &csrf);
@@ -665,7 +739,7 @@ async fn tr1_rename_existing_team() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = json_with_token(
@@ -685,7 +759,7 @@ async fn tr2_rename_then_get_confirms_new_name() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = json_with_token(
@@ -730,7 +804,7 @@ async fn aa1_add_agent_to_team() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let body = json!({
@@ -753,7 +827,7 @@ async fn aa2_add_agent_increases_count() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let body = json!({
@@ -794,7 +868,7 @@ async fn aa5_add_agent_missing_fields() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let body = json!({ "role": "teammate" });
@@ -809,7 +883,7 @@ async fn ar1_remove_agent_from_team() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
 
@@ -824,7 +898,7 @@ async fn ar2_after_removal_agent_gone() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
 
@@ -845,7 +919,7 @@ async fn ar4_remove_nonexistent_agent() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = delete_with_token(&format!("/api/teams/{team_id}/agents/nonexistent"), &token, &csrf);
@@ -859,7 +933,7 @@ async fn an1_rename_agent() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
 
@@ -880,7 +954,7 @@ async fn an2_rename_then_get_confirms_name() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
 
@@ -907,7 +981,7 @@ async fn an3_rename_nonexistent_agent() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = json_with_token(
@@ -931,7 +1005,7 @@ async fn es1_ensure_session() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = json_with_token(
@@ -950,7 +1024,7 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let lead = &data["assistants"][0];
     let lead_conversation_id = lead["conversation_id"].as_str().unwrap();
@@ -1033,7 +1107,7 @@ async fn es2_ensure_session_idempotent() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = json_with_token(
@@ -1074,7 +1148,7 @@ async fn ss1_stop_session() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = json_with_token(
@@ -1097,7 +1171,7 @@ async fn ss3_stop_session_noop() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = delete_with_token(&format!("/api/teams/{team_id}/session"), &token, &csrf);
@@ -1115,7 +1189,7 @@ async fn sm1_send_message_with_session() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     // Start session first
@@ -1144,7 +1218,7 @@ async fn sm1b_team_send_persists_user_bubble_through_projection_adapter() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let lead_conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
 
@@ -1181,7 +1255,7 @@ async fn sm1c_team_owned_conversation_regular_send_is_forbidden() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
 
     let req = json_with_token(
@@ -1202,7 +1276,7 @@ async fn sm1c_team_owned_conversation_regular_send_is_forbidden() {
 async fn sm1d_team_send_rejects_missing_csrf() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = axum::http::Request::builder()
@@ -1239,7 +1313,7 @@ async fn sm5_send_message_missing_content() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
     let req = json_with_token(
@@ -1259,7 +1333,7 @@ async fn sa1_send_message_to_agent() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
 
@@ -1295,7 +1369,7 @@ async fn full_team_lifecycle() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     // Create
-    let data = create_team(&mut app, &token, &csrf).await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     assert_eq!(data["assistants"].as_array().unwrap().len(), 2);
 

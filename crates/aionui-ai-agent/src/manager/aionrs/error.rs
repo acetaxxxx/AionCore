@@ -214,6 +214,22 @@ mod tests {
     }
 
     #[test]
+    fn aionrs_provider_rate_limited_is_retryable_provider_error() {
+        let error = AionrsAgentError::Provider(ProviderError::RateLimited { retry_after_ms: 5000 });
+        let send_error = aionrs_engine_error_to_send_error(&error);
+
+        assert_eq!(
+            send_error.code(),
+            Some(aionui_api_types::AgentErrorCode::UserLlmProviderRateLimited)
+        );
+        assert_eq!(
+            send_error.ownership(),
+            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
+        );
+        assert_eq!(send_error.stream_error().retryable, Some(true));
+    }
+
+    #[test]
     fn aionrs_provider_connection_error_is_user_llm_provider_error() {
         let error = AionrsAgentError::Provider(ProviderError::Connection(
             "Signable request error: failed to create canonical request".to_owned(),
