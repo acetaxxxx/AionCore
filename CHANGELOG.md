@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.1.44](https://github.com/iOfficeAI/AionCore/compare/v0.1.43...v0.1.44) (2026-07-08)
+
+
+### Features
+
+* **agent:** use aionrs runtime env API ([#586](https://github.com/iOfficeAI/AionCore/issues/586)) ([2f6f43f](https://github.com/iOfficeAI/AionCore/commit/2f6f43f305221701ca2baa58123180caf2342055))
+* **ai-agent:** surface upstream 429 body in AgentSendError detail ([#591](https://github.com/iOfficeAI/AionCore/issues/591)) ([b8fe5b6](https://github.com/iOfficeAI/AionCore/commit/b8fe5b6f3c6f93f7b8fc730b658772da3f4f83fa))
+* **system:** add feedback diagnostics report ([#585](https://github.com/iOfficeAI/AionCore/issues/585)) ([a3eb1e4](https://github.com/iOfficeAI/AionCore/commit/a3eb1e49396e715ce8464700dca5e50a966552ee))
+
+
+### Bug Fixes
+
+* **agent:** preserve ACP error cause detail ([#581](https://github.com/iOfficeAI/AionCore/issues/581)) ([220f682](https://github.com/iOfficeAI/AionCore/commit/220f6823c1d29fde640427cfdd77de7e981758b2))
+* **skills:** correct aionui-config butler skill drift (2026-07) ([#584](https://github.com/iOfficeAI/AionCore/issues/584)) ([e72e03f](https://github.com/iOfficeAI/AionCore/commit/e72e03ff6e1366f705352bcefec474887a85adfa))
+* use provider and model protocol to determine llm request. ([37f76a8](https://github.com/iOfficeAI/AionCore/commit/37f76a8bf1ba8aafabb5dd6b6062da40173ef010))
+
+## [0.1.43](https://github.com/iOfficeAI/AionCore/compare/v0.1.42...v0.1.43) (2026-07-06)
+
+
+### Features
+
+* **assistant:** persist thought-level defaults ([#574](https://github.com/iOfficeAI/AionCore/issues/574)) ([dd9f299](https://github.com/iOfficeAI/AionCore/commit/dd9f29967270f4e7263484532fad3b2199ba1894))
+
+
+### Bug Fixes
+
+* **agent:** project available commands in management rows ([#579](https://github.com/iOfficeAI/AionCore/issues/579)) ([689ee8f](https://github.com/iOfficeAI/AionCore/commit/689ee8f91cbabd7e57c4e882f86c1ceec167e36d))
+* **assistant:** filter generated assistants by installed agents ([#578](https://github.com/iOfficeAI/AionCore/issues/578)) ([5b7c366](https://github.com/iOfficeAI/AionCore/commit/5b7c366132006eb16e748e8fc5a0976da9a5b2a3))
+* **cron:** enforce full-auto mode for scheduled tasks ([#576](https://github.com/iOfficeAI/AionCore/issues/576)) ([cf0a9bd](https://github.com/iOfficeAI/AionCore/commit/cf0a9bd88ac295fe8b40a6c1f9f21174b574718d))
+
 ## [0.1.42](https://github.com/iOfficeAI/AionCore/compare/v0.1.41...v0.1.42) (2026-07-03)
 
 
