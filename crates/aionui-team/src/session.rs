@@ -602,6 +602,7 @@ impl TeamSession {
         from_slot_id: &str,
         to_slot_id: &str,
         content: &str,
+        files: Option<Vec<String>>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
         let to_agent = self.scheduler.get_agent(to_slot_id).await?;
         let from_agent = self.scheduler.get_agent(from_slot_id).await?;
@@ -616,13 +617,14 @@ impl TeamSession {
         })?;
         let mailbox_message = match self
             .mailbox
-            .write(
+            .write_with_files(
                 &self.team.id,
                 to_slot_id,
                 from_slot_id,
                 MailboxMessageType::Message,
                 content,
                 None,
+                files.as_deref(),
             )
             .await
         {
@@ -645,7 +647,7 @@ impl TeamSession {
                 sender_conversation_id: Some(from_agent.conversation_id),
             },
             content: content.to_owned(),
-            files: Vec::new(),
+            files: files.unwrap_or_default(),
             visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
             dedupe_key: Some(teammate_dedupe_key(
                 &self.team.id,

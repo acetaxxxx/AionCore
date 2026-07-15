@@ -4941,7 +4941,7 @@ async fn lead_send_agent_message_in_session_requires_active_team_run() {
         .expect("seeded teammate slot");
 
     let err = svc
-        .send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this")
+        .send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this", None)
         .await
         .expect_err("leader direct message should require active Team Run");
     assert!(err.to_string().contains("no active team run"));
