@@ -117,8 +117,7 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -148,8 +147,7 @@ dependencies = [
 
 [[package]]
 name = "aion-compact"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "regex",
  "serde",
@@ -160,8 +158,7 @@ dependencies = [
 
 [[package]]
 name = "aion-config"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "aion-compact",
  "aion-process",
@@ -185,8 +182,7 @@ dependencies = [
 
 [[package]]
 name = "aion-mcp"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -206,8 +202,7 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "aion-config",
  "chrono",
@@ -220,8 +215,7 @@ dependencies = [
 
 [[package]]
 name = "aion-process"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "libc",
  "tokio",
@@ -231,8 +225,7 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "aion-types",
  "serde",
@@ -244,8 +237,7 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -272,8 +264,7 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -299,8 +290,7 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "aion-config",
  "aion-process",
@@ -308,6 +298,7 @@ dependencies = [
  "aion-types",
  "anyhow",
  "async-trait",
+ "base64",
  "futures",
  "glob",
  "lru",
@@ -320,10 +311,10 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "serde",
  "serde_json",
@@ -360,6 +351,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hex",
+ "http 1.4.0",
  "libc",
  "regex",
  "rusqlite",
@@ -6104,7 +6096,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -6547,7 +6539,6 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
 dependencies = [
  "bitflags",
  "cc",

@@ -1937,6 +1937,7 @@ impl TeamSessionService {
         from_slot_id: &str,
         to_slot_id: &str,
         content: &str,
+        files: Option<Vec<String>>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
         self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
@@ -1947,7 +1948,7 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session
-            .send_agent_message_from_agent(from_slot_id, to_slot_id, content)
+            .send_agent_message_from_agent(from_slot_id, to_slot_id, content, files)
             .await
     }
 

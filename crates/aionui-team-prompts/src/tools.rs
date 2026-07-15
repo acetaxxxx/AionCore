@@ -62,12 +62,17 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: "team_send_message",
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Send a message to a teammate or broadcast to all (to=\"*\").",
+            description: "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "to": { "type": "string", "description": "Target agent slot_id or \"*\" for broadcast" },
-                    "message": { "type": "string", "description": "Message content" }
+                    "message": { "type": "string", "description": "Message content" },
+                    "files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Absolute attachment paths to forward to the target agent"
+                    }
                 },
                 "required": ["to", "message"]
             }),
@@ -297,6 +302,19 @@ mod tests {
         assert!(!props.contains_key("agent_type"));
         assert!(!props.contains_key("backend"));
         assert!(required_names.contains(&"assistant_id"));
+    }
+
+    #[test]
+    fn send_message_schema_exposes_optional_attachment_paths() {
+        let descriptor = visible_team_tool_descriptors(false)
+            .into_iter()
+            .find(|tool| tool.name == "team_send_message")
+            .expect("team_send_message descriptor");
+        let properties = descriptor.input_schema["properties"].as_object().unwrap();
+        let required = descriptor.input_schema["required"].as_array().unwrap();
+
+        assert!(properties.contains_key("files"));
+        assert!(!required.iter().any(|value| value.as_str() == Some("files")));
     }
 
     #[test]
