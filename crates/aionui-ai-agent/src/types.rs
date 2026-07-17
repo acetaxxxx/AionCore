@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use aion_config::compat::OpenAiApiMode;
 use serde::{Deserialize, Serialize};
 
 use crate::session_context::AgentSessionContext;
@@ -111,6 +112,7 @@ impl RuntimeCapabilities {
 /// Provider-specific compat overrides resolved in the factory.
 #[derive(Debug, Clone, Default)]
 pub struct AionrsCompatOverrides {
+    pub(crate) openai_api_mode: Option<OpenAiApiMode>,
     pub max_tokens_field: Option<String>,
     pub api_path: Option<String>,
 }
