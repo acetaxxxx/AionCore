@@ -178,6 +178,9 @@ impl AionrsAgentManager {
         config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
         config.compat.image_input = Some(image_input_capability);
 
+        if let Some(mode) = config_extra.compat_overrides.openai_api_mode {
+            config.compat.transport.openai_api_mode = Some(mode);
+        }
         if let Some(field) = config_extra.compat_overrides.max_tokens_field {
             config.compat.transport.max_tokens_field = Some(field);
         }
