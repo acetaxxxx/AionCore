@@ -250,7 +250,7 @@ struct DescribeAssistantParams {
 impl TeamStdioServer {
     #[tool(
         name = "team_send_message",
-        description = "Send a message to a teammate or broadcast to all (to=\"*\")."
+        description = "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
     )]
     async fn send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> CallToolResult {
         self.forward_to_tcp(
