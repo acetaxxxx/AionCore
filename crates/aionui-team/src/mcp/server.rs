@@ -689,7 +689,13 @@ async fn exec_send_message(
     let mut target_results = Vec::with_capacity(targets.len());
     for target in &targets {
         let result = service
-            .send_agent_message_from_agent(team_id, caller_slot_id, target, &input.message)
+            .send_agent_message_from_agent(
+                team_id,
+                caller_slot_id,
+                target,
+                &input.message,
+                Some(input.files.clone()),
+            )
             .await
             .map_err(|e| ToolCallError::from_message(e.to_string()))?;
         target_results.push(result);

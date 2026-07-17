@@ -46,6 +46,8 @@ pub fn authorize_tool(caller_role: TeammateRole, tool_name: &str) -> Result<(), 
 pub struct SendMessageInput {
     pub to: String,
     pub message: String,
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 /// Arguments for the `team_spawn_agent` MCP tool call.
@@ -135,6 +137,7 @@ pub fn parse_tool_call(
             Ok(SchedulerAction::SendMessage {
                 to: input.to,
                 message: input.message,
+                files: input.files,
             })
         }
         "team_spawn_agent" => Err("handled directly by server".into()),
@@ -281,12 +284,18 @@ mod tests {
 
     #[test]
     fn parse_send_message() {
-        let args = json!({"to": "slot-1", "message": "hello"});
+        let args = json!({
+            "to": "slot-1",
+            "message": "hello",
+            "files": ["/tmp/image.png"]
+        });
         let action = parse_tool_call("team_send_message", &args, TeammateRole::Teammate).unwrap();
         assert!(matches!(
             action,
-            SchedulerAction::SendMessage { to, message }
-            if to == "slot-1" && message == "hello"
+            SchedulerAction::SendMessage { to, message, files }
+            if to == "slot-1"
+                && message == "hello"
+                && files == vec!["/tmp/image.png".to_owned()]
         ));
     }
 
