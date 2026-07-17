@@ -196,3 +196,13 @@ incremental = false
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 incremental = false
+
+# Temporary cross-repository integration pin for iOfficeAI/aionrs#196.
+# Replace this patch with the official release tag before merging this PR.
+[patch."https://github.com/iOfficeAI/aionrs.git"]
+aion-agent = { git = "https://github.com/s-yanev/aionrs.git", rev = "d8905c0b9a2f9c5d97804426d7bba820d50a6b29" }
+aion-config = { git = "https://github.com/s-yanev/aionrs.git", rev = "d8905c0b9a2f9c5d97804426d7bba820d50a6b29" }
+aion-mcp = { git = "https://github.com/s-yanev/aionrs.git", rev = "d8905c0b9a2f9c5d97804426d7bba820d50a6b29" }
+aion-protocol = { git = "https://github.com/s-yanev/aionrs.git", rev = "d8905c0b9a2f9c5d97804426d7bba820d50a6b29" }
+aion-providers = { git = "https://github.com/s-yanev/aionrs.git", rev = "d8905c0b9a2f9c5d97804426d7bba820d50a6b29" }
+aion-types = { git = "https://github.com/s-yanev/aionrs.git", rev = "d8905c0b9a2f9c5d97804426d7bba820d50a6b29" }
