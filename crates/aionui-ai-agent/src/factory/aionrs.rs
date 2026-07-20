@@ -173,7 +173,7 @@ pub(super) async fn build(
         model: model_id,
         base_url,
         system_prompt: overrides.system_prompt,
-        max_tokens: overrides.max_tokens,
+        max_tokens: None,
         max_turns: overrides.max_turns,
         max_tool_call_malformed_turns: overrides.max_tool_call_malformed_turns,
         max_tool_call_failure_turns: overrides.max_tool_call_failure_turns,
