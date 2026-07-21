@@ -389,14 +389,11 @@ pub(crate) fn resolve_model_compat_overrides(
         AgentError::bad_request(format!("Invalid model settings config for model '{model_id}': {error}"))
     })?;
     let Some(settings) = settings.get(model_id) else {
-        return Ok(ModelCompatOverrides {
-            image_input: Some(ImageInputCapability::Unsupported),
-            ..Default::default()
-        });
+        return Ok(ModelCompatOverrides::default());
     };
 
     Ok(ModelCompatOverrides {
-        image_input: Some(match settings.image_input {
+        image_input: settings.image_input.map(|value| match value {
             ModelImageInputCapability::Supported => ImageInputCapability::Supported,
             ModelImageInputCapability::Unsupported => ImageInputCapability::Unsupported,
         }),

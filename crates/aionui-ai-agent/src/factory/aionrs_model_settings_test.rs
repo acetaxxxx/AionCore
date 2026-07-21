@@ -1,6 +1,8 @@
 use aion_config::compat::OpenAiApiMode;
 use aion_types::message::ImageInputCapability;
 
+use crate::capability::image_input::resolve_image_input_capability;
+
 use super::{resolve_aionrs_url_and_compat_with_mode, resolve_model_compat_overrides};
 
 #[test]
@@ -21,11 +23,21 @@ fn model_settings_resolve_explicit_vision_and_api_overrides() {
 }
 
 #[test]
-fn missing_model_settings_disable_vision_and_keep_api_automatic() {
+fn missing_model_settings_keep_vision_and_api_automatic() {
     let overrides = resolve_model_compat_overrides("gpt-5.6-sol", r#"{"gpt-4o":{"image_input":"supported"}}"#).unwrap();
 
-    assert_eq!(overrides.image_input, Some(ImageInputCapability::Unsupported));
+    assert_eq!(overrides.image_input, None);
     assert_eq!(overrides.openai_api_mode, None);
+}
+
+#[test]
+fn empty_model_settings_preserve_catalog_vision_support() {
+    let overrides = resolve_model_compat_overrides("gpt-4o", "{}").unwrap();
+    let capability = overrides
+        .image_input
+        .unwrap_or_else(|| resolve_image_input_capability("openai", Some("https://api.openai.com/v1"), "gpt-4o"));
+
+    assert_eq!(capability, ImageInputCapability::Supported);
 }
 
 #[test]
@@ -36,10 +48,10 @@ fn unsupported_image_input_explicitly_disables_vision() {
 }
 
 #[test]
-fn omitted_image_input_in_a_model_entry_defaults_to_unsupported() {
+fn omitted_image_input_in_a_model_entry_keeps_catalog_automatic() {
     let overrides = resolve_model_compat_overrides("gpt-4o", r#"{"gpt-4o":{"openai_api_mode":"responses"}}"#).unwrap();
 
-    assert_eq!(overrides.image_input, Some(ImageInputCapability::Unsupported));
+    assert_eq!(overrides.image_input, None);
     assert_eq!(overrides.openai_api_mode, Some(OpenAiApiMode::Responses));
 }
 
