@@ -38,22 +38,20 @@ pub enum ModelOpenAiApiMode {
 }
 
 /// Explicit image-input support configured for one model.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelImageInputCapability {
     Supported,
-    #[default]
     Unsupported,
 }
 
 /// User-configured overrides for one model.
 ///
-/// Image input is unsupported by default. A missing OpenAI API mode retains
-/// automatic protocol resolution.
+/// Missing values retain automatic capability and protocol resolution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSettings {
-    #[serde(default)]
-    pub image_input: ModelImageInputCapability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<ModelImageInputCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_api_mode: Option<ModelOpenAiApiMode>,
 }
