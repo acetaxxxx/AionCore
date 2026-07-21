@@ -47,6 +47,13 @@ fi
 
 base_ref="${AIONCORE_MIGRATION_BASE_REF:-}"
 if [[ -z "$base_ref" ]]; then
+    base_ref="$(
+        git tag --merged HEAD --list 'v*' --sort=-version:refname \
+            | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }'
+    )"
+fi
+
+if [[ -z "$base_ref" ]]; then
     if git rev-parse --verify --quiet origin/main >/dev/null; then
         base_ref="origin/main"
     elif git rev-parse --verify --quiet main >/dev/null; then
@@ -69,12 +76,12 @@ changed="$(
 
 if [[ -n "$changed" ]]; then
     cat >&2 <<'EOF'
-Existing migration files from main must not be modified or deleted.
+Released migration files must not be modified or deleted.
 
 Fix this by reverting changes to existing migration files and adding a new next-numbered migration instead.
 If this is an intentional high-risk exception, rerun with AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1.
 
-Changed existing migrations:
+Changed released migrations:
 EOF
     echo "$changed" >&2
     exit 1
