@@ -433,35 +433,28 @@ impl ManagedProcess {
     }
 }
 
-/// Validate a workspace cwd: non-empty, no whitespace segment (bundled runtime
-/// can't handle it), exists, is a directory.
+/// Validate a workspace cwd: non-empty, exists, is a directory.
+///
+/// Whitespace inside path segments is VALID (`#410` semantics): real user
+/// workspaces routinely contain spaces (iCloud Drive lives under
+/// `~/Library/Mobile Documents/…`), and the cwd is passed to the OS as a
+/// single argument — never through a shell — so no quoting hazard exists.
+/// An earlier revision rejected whitespace segments here, which made every
+/// claude/codex direct-CLI spawn fail instantly for such workspaces
+/// (Sentry ELECTRON-3PP); upstream removed the same check from the legacy
+/// spawn path in #410, and this port must stay aligned with it.
 pub(crate) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, ProcessError> {
     if cwd.trim().is_empty() {
         return Err(ProcessError::bad_request("workspace directory is empty"));
     }
     let path = PathBuf::from(cwd);
-    if path
-        .components()
-        .any(|c| c.as_os_str().to_string_lossy().contains(char::is_whitespace))
-    {
-        return Err(ProcessError::workspace_path_contains_whitespace_runtime_unsupported(
-            path.display().to_string(),
-        ));
-    }
+    // Missing / not-a-directory / not-accessible all classify as
+    // `WorkspaceUnavailable` carrying just the path — the legacy
+    // `workspace_path_runtime_unavailable` contract (#410), which the app
+    // layer maps to the dedicated workspace-unavailable API error.
     match std::fs::metadata(&path) {
         Ok(m) if m.is_dir() => Ok(path),
-        Ok(_) => Err(ProcessError::bad_request(format!(
-            "workspace path is not a directory: {}",
-            path.display()
-        ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ProcessError::bad_request(format!(
-            "workspace directory does not exist: {}",
-            path.display()
-        ))),
-        Err(e) => Err(ProcessError::bad_request(format!(
-            "workspace directory not accessible: {}: {e}",
-            path.display()
-        ))),
+        Ok(_) | Err(_) => Err(ProcessError::workspace_unavailable(path.display().to_string())),
     }
 }
 
@@ -627,5 +620,78 @@ pub(crate) mod job_windows {
         // SAFETY: close the snapshot handle we created.
         unsafe { CloseHandle(snap) };
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression pin for Sentry ELECTRON-3PP / upstream #410: a workspace with
+    /// whitespace in ANY path segment (iCloud Drive lives under
+    /// `~/Library/Mobile Documents/…`) must pass the cwd guard. An earlier
+    /// revision rejected it, instantly failing every claude/codex direct-CLI
+    /// spawn for such workspaces.
+    #[test]
+    fn prepare_command_cwd_allows_whitespace_in_any_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("Mobile Documents");
+        std::fs::create_dir(&parent).unwrap();
+        let cwd = parent.join("project");
+        std::fs::create_dir(&cwd).unwrap();
+
+        let resolved = prepare_command_cwd(&cwd.to_string_lossy()).unwrap();
+        assert_eq!(resolved, cwd);
+    }
+
+    /// #410 semantics: a trailing space in the LEAF name is also valid when the
+    /// directory really exists on disk (the guard checks availability, not
+    /// cosmetics). Unix-only — Windows strips trailing spaces from path names.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_command_cwd_allows_existing_dir_with_trailing_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("workspace ");
+        std::fs::create_dir(&cwd).unwrap();
+
+        let resolved = prepare_command_cwd(&cwd.to_string_lossy()).unwrap();
+        assert_eq!(resolved, cwd);
+    }
+
+    #[test]
+    fn prepare_command_cwd_rejects_empty_and_blank() {
+        for blank in ["", "   ", "\t"] {
+            let err = prepare_command_cwd(blank).unwrap_err();
+            assert!(
+                matches!(err, ProcessError::BadRequest(ref m) if m.contains("empty")),
+                "{blank:?} → expected BadRequest(empty), got {err:?}"
+            );
+        }
+    }
+
+    /// Missing / non-directory cwds classify as `WorkspaceUnavailable` with the
+    /// PATH as payload — the legacy `workspace_path_runtime_unavailable`
+    /// contract (#410) the app layer maps to the dedicated API error.
+    #[test]
+    fn prepare_command_cwd_rejects_missing_dir_as_workspace_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = prepare_command_cwd(&missing.to_string_lossy()).unwrap_err();
+        assert!(
+            matches!(err, ProcessError::WorkspaceUnavailable(ref p) if p == &missing.display().to_string()),
+            "expected WorkspaceUnavailable(path), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn prepare_command_cwd_rejects_file_as_workspace_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain-file");
+        std::fs::write(&file, b"x").unwrap();
+        let err = prepare_command_cwd(&file.to_string_lossy()).unwrap_err();
+        assert!(
+            matches!(err, ProcessError::WorkspaceUnavailable(ref p) if p == &file.display().to_string()),
+            "expected WorkspaceUnavailable(path), got {err:?}"
+        );
     }
 }
