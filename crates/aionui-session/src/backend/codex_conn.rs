@@ -558,9 +558,51 @@ pub fn codex_capabilities() -> Capabilities {
         // can_queue off steer here would be the MX-QUEUE-3 dead button.) Flips true
         // only when B5 wires Steer routing.
         accepts_proactive_input: false,
-        // #101: codex has no slash-command wire today — stays empty.
-        slash_commands: Vec::new(),
+        // #101: codex's app-server has no slash-command discovery wire (112 methods
+        // audited, none lists commands — samples/codex-cli/0.137.0/schema-full/
+        // ClientRequest.json). The legacy codex-acp bridge instead advertised a
+        // STATIC 6-command table and translated each to a native op at prompt time
+        // (zed-industries/codex-acp v0.14.0 thread.rs:2894 builtin_commands /
+        // :3252 handle_prompt). We replicate that table here; dispatch(Send)
+        // performs the same slash→native-op translation.
+        slash_commands: builtin_slash_commands(),
     }
+}
+
+/// The codex-acp bridge's static slash-command table, verbatim
+/// (zed-industries/codex-acp v0.14.0 src/thread.rs:2894-2924 `builtin_commands`;
+/// captured live: samples/codex-acp/0.14.0/freshmode.jsonl). codex itself has no
+/// command-discovery wire, so this is the authoritative catalog for the direct-CLI
+/// path — each entry is translated to its native app-server op in dispatch(Send)
+/// (`route_slash_command`).
+fn builtin_slash_commands() -> Vec<crate::capability::SlashCommandInfo> {
+    use crate::capability::SlashCommandInfo;
+    vec![
+        SlashCommandInfo {
+            name: "review".into(),
+            description: Some("Review my current changes and find issues".into()),
+        },
+        SlashCommandInfo {
+            name: "review-branch".into(),
+            description: Some("Review the code changes against a specific branch".into()),
+        },
+        SlashCommandInfo {
+            name: "review-commit".into(),
+            description: Some("Review the code changes introduced by a commit".into()),
+        },
+        SlashCommandInfo {
+            name: "init".into(),
+            description: Some("create an AGENTS.md file with instructions for Codex".into()),
+        },
+        SlashCommandInfo {
+            name: "compact".into(),
+            description: Some("summarize conversation to prevent hitting the context limit".into()),
+        },
+        SlashCommandInfo {
+            name: "logout".into(),
+            description: Some("logout of Codex".into()),
+        },
+    ]
 }
 
 /// Per-session codex handle. `&self`-concurrent (stdin write behind a Mutex).
@@ -599,6 +641,20 @@ pub struct CodexSessionBackend {
     /// or pre-seeded on Resume). All `turn/*` + `thread/*` client requests need
     /// it. Two-id (§4.1): the backend threadId never escapes upward.
     thread_binding: Arc<Mutex<Option<String>>>,
+    /// The rpc id of the in-flight `thread/resume` (Resume handshakes only). The
+    /// reader claims the response: an ERROR means the pre-seeded binding points at
+    /// a thread this codex cannot restore ("no rollout found for thread id …",
+    /// verified: samples/codex-cli/0.144.1/dead_resume.jsonl) — the binding is
+    /// cleared and `resume_poison` set. A success just drops the correlation
+    /// (the follow-up `thread/started` re-confirms the binding).
+    pending_resume: Arc<Mutex<Option<u64>>>,
+    /// Set when codex REJECTED the `thread/resume` (dead resume anchor). Carries
+    /// the codex error message; `bound_thread_within` fails FAST with it
+    /// (`BackendError::SessionNotFound`) instead of polling a binding that will
+    /// never arrive — the send-path then classifies it as a dead-session error
+    /// and the conversation's recovery (anchor clear + auto-replay) takes over.
+    /// Reset at the start of every handshake (a re-spawn is a fresh chance).
+    resume_poison: Arc<Mutex<Option<String>>>,
     /// The id of the in-flight turn (codex `turn/started.turn.id`), needed by
     /// `turn/interrupt{turnId}` and `turn/steer{expectedTurnId}` (optimistic
     /// concurrency token). Set on `turn/started`, cleared on terminal.
@@ -626,15 +682,17 @@ pub struct CodexSessionBackend {
     /// mirrors claude's `pending_perms`. Behind an Arc so the reader (cloned into
     /// every post-wake reader via `reader_state`) shares the one registry.
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
-    /// GAP-A: rpc-id → client_msg_id correlation for in-flight `turn/start`
-    /// requests. codex IS a bidirectional JSON-RPC client: `turn/start` gets a
-    /// synchronous response `{turn:{id,status:inProgress}}` keyed by the request
-    /// id — that response IS the "prompt accepted" receipt (NOT the `turn/started`
-    /// notification). dispatch(Send) inserts (rpc_id → client_msg_id); the reader
-    /// claims the matching response and emits `PromptAccepted{client_msg_id}` so
-    /// the conversation's pending queue drains (Addendum 3). Mirrors how any
-    /// JSON-RPC SDK correlates a reply to its request.
-    pending_sends: Arc<Mutex<HashMap<u64, String>>>,
+    /// GAP-A: rpc-id → [`PendingSend`] correlation for in-flight `turn/start`
+    /// (and review/compact/logout) requests. codex IS a bidirectional JSON-RPC
+    /// client: `turn/start` gets a synchronous response
+    /// `{turn:{id,status:inProgress}}` keyed by the request id — that response IS
+    /// the "prompt accepted" receipt (NOT the `turn/started` notification).
+    /// dispatch(Send) inserts; the reader claims the matching response: a result
+    /// emits `PromptAccepted{client_msg_id}` so the conversation's pending queue
+    /// drains (Addendum 3); an ERROR response terminates the turn (turn-flavored)
+    /// or surfaces a Notice (NoTurn) — NEVER a silent drop (a dropped rejection
+    /// left the turn hanging Running forever, ELECTRON-3Q0).
+    pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     /// B-CODEX-MODEL-LIST (§9.10 discovery): rpc ids of the `model/list` +
     /// `collaborationMode/list` calls `open_session` issues at handshake, mapped to
     /// which list they fill. The reader claims the matching responses and writes
@@ -655,6 +713,21 @@ pub struct CodexSessionBackend {
     /// `map_notification` → ConfigChanged, live-verified), so emitting here too would
     /// duplicate the ConfigChanged. The codex analogue of acp_conn's `pending_set`.
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+}
+
+/// One in-flight prompt-carrying client request (GAP-A correlation entry).
+/// `client_msg_id` is what a success response drains via `PromptAccepted`
+/// (None when the caller supplied no correlation id — nothing to drain, but the
+/// error path below still applies). `opens_turn` decides what a JSON-RPC ERROR
+/// response means: a turn-flavored request (turn/start, review/start,
+/// thread/compact/start) was REJECTED, so the turn that dispatch admitted must
+/// be terminated with an is_error terminal (the FSM already went Running via
+/// the lowered TurnStarted); a NoTurn request (/logout → account/logout) never
+/// opened a turn, so the rejection surfaces as a Notice instead.
+#[derive(Clone)]
+struct PendingSend {
+    client_msg_id: Option<String>,
+    opens_turn: bool,
 }
 
 /// Which pending response a claimed rpc id maps to. Models/Modes fill the
@@ -714,9 +787,11 @@ struct CodexReaderState {
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
-    pending_sends: Arc<Mutex<HashMap<u64, String>>>,
+    pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    pending_resume: Arc<Mutex<Option<u64>>>,
+    resume_poison: Arc<Mutex<Option<String>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     /// F-4 turn-active flag: set on dispatch(Send), cleared by the reader at a turn
@@ -747,6 +822,8 @@ fn start_codex_reader(
             state.pending_sends,
             state.pending_discovery,
             state.pending_set,
+            state.pending_resume,
+            state.resume_poison,
             state.discovered,
             state.stdin,
             state.turn_in_flight,
@@ -837,6 +914,15 @@ impl CodexSessionBackend {
         self.pending_set.lock().await.insert(rpc_id, label.into());
     }
 
+    /// Test-support seam: register a pending `thread/resume` rpc id so a hermetic
+    /// fixture can replay its ERROR response and assert the reader clears the
+    /// (seeded) binding + poisons the bound-thread wait. On the live path
+    /// `run_handshake` registers it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn register_pending_resume_for_test(&self, rpc_id: u64) {
+        *self.pending_resume.lock().await = Some(rpc_id);
+    }
+
     /// Test-only convenience: spawn an inert (never-suspending, no-spawner)
     /// backend. Production opens via `open_session` → `spawn_with_wake` with a real
     /// wake recipe; only the `build_with_io` test seam uses this.
@@ -864,6 +950,8 @@ impl CodexSessionBackend {
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
+        let pending_resume = Arc::new(Mutex::new(None));
+        let resume_poison = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (event_tx, _) = broadcast::channel(1024);
@@ -885,6 +973,8 @@ impl CodexSessionBackend {
             pending_sends: pending_sends.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
+            pending_resume: pending_resume.clone(),
+            resume_poison: resume_poison.clone(),
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
@@ -939,6 +1029,8 @@ impl CodexSessionBackend {
             pending_sends,
             pending_discovery,
             pending_set,
+            pending_resume,
+            resume_poison,
             discovered,
         }
     }
@@ -989,6 +1081,14 @@ impl CodexSessionBackend {
     async fn bound_thread_within(&self, budget: std::time::Duration) -> Result<String, BackendError> {
         let polls = (budget.as_millis() / 50).max(1) as u64;
         for _ in 0..polls {
+            // Dead resume anchor (ELECTRON-3Q0): codex rejected the thread/resume,
+            // so the binding this poll waits for will NEVER arrive. Fail fast with
+            // the codex message as a SessionNotFound — the send-path maps it to the
+            // dead-session error class, which clears the persisted anchor and lets
+            // the conversation's auto-replay reopen Fresh.
+            if let Some(poison) = self.resume_poison.lock().await.clone() {
+                return Err(BackendError::SessionNotFound(poison));
+            }
             if let Some(tid) = self.thread_binding.lock().await.clone() {
                 return Ok(tid);
             }
@@ -1007,6 +1107,9 @@ impl CodexSessionBackend {
     /// open) and `wake_handle` (an idle-wake re-attach), so the wire shape lives in
     /// one place.
     async fn run_handshake(&self, resume_thread_id: Option<&str>) -> Result<(), BackendError> {
+        // A handshake is a fresh chance: any prior resume rejection belonged to
+        // the previous process/attempt.
+        *self.resume_poison.lock().await = None;
         self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
             .await?;
         match resume_thread_id {
@@ -1016,10 +1119,16 @@ impl CodexSessionBackend {
                 // {threadId} resume silently drops the user's MCP servers and
                 // resets approvalPolicy to its default (LIVE 0.144.1, see
                 // `thread_resume_params`).
-                self.write_frame(
-                    thread_resume_params(&self.wake.config, tid).into_frame(self.next_rpc_id(), "thread/resume"),
-                )
-                .await?;
+                // Register the rpc id so the reader can claim the response: an
+                // ERROR ("no rollout found for thread id …", verified:
+                // samples/codex-cli/0.144.1/dead_resume.jsonl) means the
+                // pre-seeded binding is poisoned and must be cleared — leaving it
+                // in place made every turn/start hit the dead threadId and hang
+                // (ELECTRON-3Q0).
+                let resume_id = self.next_rpc_id();
+                *self.pending_resume.lock().await = Some(resume_id);
+                self.write_frame(thread_resume_params(&self.wake.config, tid).into_frame(resume_id, "thread/resume"))
+                    .await?;
             }
             None => {
                 self.write_frame(thread_start_params(&self.wake.config).into_frame(self.next_rpc_id(), "thread/start"))
@@ -1122,9 +1231,11 @@ async fn reader_task(
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
-    pending_sends: Arc<Mutex<HashMap<u64, String>>>,
+    pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    pending_resume: Arc<Mutex<Option<u64>>>,
+    resume_poison: Arc<Mutex<Option<String>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -1331,23 +1442,94 @@ async fn reader_task(
                         // no method). GAP-A: claim the `turn/start` response — it is
                         // codex's synchronous "prompt accepted" receipt (carries
                         // {turn:{id,status:inProgress}}). If its rpc id matches a
-                        // pending Send, emit PromptAccepted{client_msg_id} so the
-                        // conversation's pending queue drains (Addendum 3). A
-                        // JSON-RPC error response for a pending Send is NOT a
-                        // PromptAccepted (the turn never started) — drop the
-                        // correlation without emitting. Other responses (settings/
-                        // rollback/etc) flow via notifications; diagnostic only.
+                        // pending Send, a result emits PromptAccepted{client_msg_id}
+                        // so the conversation's pending queue drains (Addendum 3); an
+                        // ERROR terminates the turn / surfaces a Notice (below) —
+                        // never a silent drop. Other responses (settings/rollback/etc)
+                        // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
-                            let client_msg_id = pending_sends.lock().await.remove(&rid);
-                            if let Some(client_msg_id) = client_msg_id
-                                && frame.get("result").is_some()
-                            {
-                                emit(
-                                    &event_tx,
-                                    &session_id,
-                                    turn_gen.load(Ordering::SeqCst),
-                                    SessionEvent::PromptAccepted { client_msg_id },
+                            let error_message = frame.get("error").map(|e| {
+                                e.get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("request rejected (no error message)")
+                                    .to_string()
+                            });
+                            // (ELECTRON-3Q0 fix A) Claim the thread/resume response.
+                            // An ERROR ("no rollout found for thread id …", verified:
+                            // samples/codex-cli/0.144.1/dead_resume.jsonl) means the
+                            // pre-seeded binding points at a thread this codex cannot
+                            // restore: clear it and poison the bound-thread wait so a
+                            // Send fails fast with the real cause instead of writing
+                            // turn/start at a dead threadId (or timing out opaquely).
+                            let is_resume = {
+                                let mut pending = pending_resume.lock().await;
+                                match *pending {
+                                    Some(prid) if prid == rid => {
+                                        *pending = None;
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            };
+                            if is_resume && let Some(msg) = error_message.as_deref() {
+                                tracing::warn!(
+                                    conversation_id = %session_id,
+                                    error = %msg,
+                                    "codex thread/resume rejected — clearing poisoned thread binding (dead resume anchor)"
                                 );
+                                *thread_binding.lock().await = None;
+                                *resume_poison.lock().await = Some(format!("codex thread/resume failed: {msg}"));
+                                continue;
+                            }
+                            let pending_send = pending_sends.lock().await.remove(&rid);
+                            if let Some(send) = pending_send {
+                                if frame.get("result").is_some() {
+                                    if let Some(client_msg_id) = send.client_msg_id {
+                                        emit(
+                                            &event_tx,
+                                            &session_id,
+                                            turn_gen.load(Ordering::SeqCst),
+                                            SessionEvent::PromptAccepted { client_msg_id },
+                                        );
+                                    }
+                                } else if let Some(msg) = error_message.as_deref() {
+                                    // (ELECTRON-3Q0 fix B) codex REJECTED the request.
+                                    // Previously the correlation was dropped without
+                                    // emitting → the admitted turn hung Running forever
+                                    // (permanently locked conversation). Turn-flavored →
+                                    // synthesize the is_error terminal (same `terminated`
+                                    // discipline as the fatal-error arm; a late real
+                                    // terminal is absorbed by I10). NoTurn (/logout) →
+                                    // no turn to end; surface a Notice instead.
+                                    if send.opens_turn {
+                                        if !terminated {
+                                            terminated = true;
+                                            *active_turn_id.lock().await = None;
+                                            turn_in_flight.store(false, Ordering::SeqCst);
+                                            tracing::warn!(
+                                                conversation_id = %session_id,
+                                                error = %msg,
+                                                "codex rejected the turn request — synthesizing is_error terminal"
+                                            );
+                                            emit(
+                                                &event_tx,
+                                                &session_id,
+                                                turn_gen.load(Ordering::SeqCst),
+                                                synth_error_terminal(format!("codex rejected the turn request: {msg}")),
+                                            );
+                                        }
+                                    } else {
+                                        emit(
+                                            &event_tx,
+                                            &session_id,
+                                            turn_gen.load(Ordering::SeqCst),
+                                            SessionEvent::Notice {
+                                                level: crate::event::NoticeLevel::Warning,
+                                                message: format!("Codex logout failed: {msg}"),
+                                            },
+                                        );
+                                    }
+                                }
                             }
                             // B-CODEX-MODEL-LIST / O2: claim a discovery response.
                             // model/list + collaborationMode/list fill the
@@ -1385,7 +1567,11 @@ async fn reader_task(
                                             SessionEvent::CatalogUpdated {
                                                 models,
                                                 modes,
-                                                slash_commands: Vec::new(),
+                                                // The static bridge-parity command table (codex has
+                                                // no discovery wire) — carried on the catalog event
+                                                // so the agent_metadata writeback + the frontend
+                                                // AvailableCommands push see it (ELECTRON-3PX).
+                                                slash_commands: builtin_slash_commands(),
                                             },
                                         );
                                     }
@@ -2327,7 +2513,25 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
 
     match item_type {
         "agentMessage" => {
-            // the final text already streamed via deltas; the bracket is the signal.
+            // A STREAMED agentMessage starts with `text:""` and arrives via
+            // item/agentMessage/delta — for it the bracket is the whole signal.
+            // But a PRE-FILLED agentMessage exists: the `review/start` verdict
+            // (item id `review_rollout_assistant`) carries its full `text` on
+            // item/started and NO deltas ever follow (live-verified:
+            // samples/codex-cli/0.144.1/review_start_uncommitted.jsonl). Emit the
+            // STARTED edge's initial text as a MessageDelta so a delta-less
+            // message is not silently dropped; started.text + subsequent deltas
+            // compose the same final text under both shapes. Only the started
+            // edge — the completed frame repeats the same text (double-emit).
+            if !completed
+                && let Some(text) = item.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                out.push(SessionEvent::MessageDelta {
+                    item_id: id.clone(),
+                    text: text.to_string(),
+                });
+            }
         }
         "commandExecution" | "mcpToolCall" | "dynamicToolCall" | "fileChange" | "webSearch" | "imageGeneration" => {
             if completed {
@@ -2866,6 +3070,53 @@ impl SessionBackend for CodexSessionBackend {
                         command: crate::capability::block_kind_name(bad),
                     });
                 }
+                // Bridge-parity slash routing (ELECTRON-3PX): the 6 advertised
+                // commands (builtin_slash_commands) translate to native ops the way
+                // the codex-acp bridge did in-process (v0.14.0 thread.rs:3252
+                // handle_prompt) — codex does NOT interpret slash text itself.
+                let route = route_slash_command(&content);
+
+                // /logout → account/logout. No turn lifecycle follows (bridge:
+                // auth.logout() then auth_required), so it is handled before the
+                // flight-check and returns NoTurn: no turn_gen bump, no
+                // turn_in_flight. The response still drains the pending queue via
+                // pending_sends → PromptAccepted; a Notice tells the user what
+                // happened (there is no other visible output).
+                if matches!(route, Some(SlashRoute::Logout)) {
+                    self.suspend
+                        .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                        .await?;
+                    let id = self.next_rpc_id();
+                    // NoTurn: an error response surfaces as a Notice (there is no
+                    // turn to terminate); a result drains the pending queue.
+                    self.pending_sends.lock().await.insert(
+                        id,
+                        PendingSend {
+                            client_msg_id: metadata.client_msg_id,
+                            opens_turn: false,
+                        },
+                    );
+                    // params is `null` per schema (AccountLogoutParams: {"type":"null"},
+                    // samples/codex-cli/0.137.0/schema-full/ClientRequest.json).
+                    let frame = json!({
+                        "jsonrpc": "2.0", "id": id, "method": "account/logout", "params": Value::Null
+                    });
+                    self.write_frame(frame).await?;
+                    emit(
+                        &self.event_tx,
+                        &self.session_id,
+                        self.turn_gen.load(Ordering::SeqCst),
+                        SessionEvent::Notice {
+                            level: crate::event::NoticeLevel::Warning,
+                            message: "Logged out of Codex. New turns will require re-authentication.".into(),
+                        },
+                    );
+                    return Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::NoTurn,
+                        turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                    });
+                }
                 // 009 R1c: a flight-period Send (a turn is already active) must NOT
                 // open a second turn_gen. codex's app-server merges an overlapping
                 // input into the live turn under a SINGLE turnId (verified:
@@ -2873,6 +3124,8 @@ impl SessionBackend for CodexSessionBackend {
                 // + fetch_add would phantom-split one wire turn across two turn_gen
                 // buckets downstream (GROUP BY turn_gen). Mirror the Cancel arm's
                 // active_turn_id probe: accept as NoTurn, no frame, no fetch_add.
+                // (Slash commands during a live turn fold in as plain text — same
+                // merge semantics as any other flight-period input.)
                 if self.active_turn_id.lock().await.is_some() {
                     return Ok(CommandReceipt {
                         accepted: true,
@@ -2892,22 +3145,58 @@ impl SessionBackend for CodexSessionBackend {
                 self.turn_in_flight.store(true, Ordering::SeqCst);
                 // REAL codex 0.137.0 turn-driver: `turn/start{threadId, input}`
                 // (verified against the aion-probe transcripts). Needs the bound
-                // threadId (waits briefly for the async thread/started).
-                let tid = self.bound_thread().await?;
+                // threadId (waits briefly for the async thread/started; fails FAST
+                // when the resume was rejected — see `resume_poison`).
+                let tid = match self.bound_thread().await {
+                    Ok(tid) => tid,
+                    Err(e) => {
+                        // The turn never reached the wire — undo the in-flight mark
+                        // so a failed dispatch doesn't pin the idle timer awake.
+                        self.turn_in_flight.store(false, Ordering::SeqCst);
+                        return Err(e);
+                    }
+                };
                 let id = self.next_rpc_id();
-                // GAP-A: register rpc_id → client_msg_id so the reader can emit
+                // GAP-A: register the correlation so the reader can emit
                 // PromptAccepted when codex's synchronous turn/start RESPONSE lands
                 // (that response is the "accepted" receipt; the conversation drains
-                // its pending queue on it). Only when the caller supplied a
-                // client_msg_id (otherwise there's nothing to correlate/drain).
-                if let Some(cmid) = metadata.client_msg_id {
-                    self.pending_sends.lock().await.insert(id, cmid);
-                }
+                // its pending queue on it). Registered even without a client_msg_id:
+                // an ERROR response must terminate the admitted turn regardless
+                // (ELECTRON-3Q0 — a dropped rejection hung the turn forever).
+                // review/start's response is the same turn object and
+                // thread/compact/start's is `{}` — both drain identically (verified
+                // live: samples/codex-cli/0.144.1/review_start_uncommitted.jsonl +
+                // thread_compact.jsonl).
+                self.pending_sends.lock().await.insert(
+                    id,
+                    PendingSend {
+                        client_msg_id: metadata.client_msg_id,
+                        opens_turn: true,
+                    },
+                );
+                // All three turn-flavored routes run a REAL wire turn on the thread
+                // (turn/started → items → turn/completed; verified live 0.144.1, files
+                // above), so the existing reader/FSM lifecycle applies unchanged.
+                let (method, params) = match route {
+                    None => ("turn/start", json!({ "threadId": tid, "input": build_input(&content) })),
+                    // /init → the bridge's canned AGENTS.md prompt as a normal turn
+                    // (bridge: Op::UserInput{INIT_COMMAND_PROMPT}).
+                    Some(SlashRoute::Init) => (
+                        "turn/start",
+                        json!({ "threadId": tid, "input": [{ "type": "text", "text": CODEX_INIT_PROMPT }] }),
+                    ),
+                    // /compact → thread/compact/start{threadId} (bridge: Op::Compact).
+                    Some(SlashRoute::Compact) => ("thread/compact/start", json!({ "threadId": tid })),
+                    // /review* → review/start{threadId, target} (bridge: Op::Review;
+                    // delivery omitted = inline on this thread, the bridge's behavior).
+                    Some(SlashRoute::Review(target)) => ("review/start", json!({ "threadId": tid, "target": target })),
+                    Some(SlashRoute::Logout) => unreachable!("handled above"),
+                };
                 let frame = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "method": "turn/start",
-                    "params": { "threadId": tid, "input": build_input(&content) }
+                    "method": method,
+                    "params": params
                 });
                 self.write_frame(frame).await?;
                 let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3354,6 +3643,73 @@ impl SessionBackend for CodexSessionBackend {
 /// (`resource:true` → `Mention`). Audio/at_mention are not advertised in
 /// codex_capabilities, so dispatch (§C6, `BlockSet::allows`) rejects them before
 /// reaching here — the `_ => None` arm is a defensive belt-and-suspenders.
+/// The canned `/init` prompt, verbatim from the codex-acp bridge
+/// (zed-industries/codex-acp v0.14.0 src/prompt_for_init_command.md, wired at
+/// thread.rs:3255-3264 as `Op::UserInput{INIT_COMMAND_PROMPT}`).
+const CODEX_INIT_PROMPT: &str = include_str!("./codex_init_prompt.md");
+
+/// Where a Send's slash command routes (bridge parity, ELECTRON-3PX). codex has
+/// no slash-command wire of its own — the codex-acp bridge intercepted the 6
+/// advertised names in `handle_prompt` (v0.14.0 thread.rs:3252-3320) and mapped
+/// each to a native op; we replicate that mapping onto app-server JSON-RPC.
+#[derive(Debug, PartialEq)]
+enum SlashRoute {
+    /// `/init` → the canned AGENTS.md prompt as a normal `turn/start`.
+    Init,
+    /// `/compact` → `thread/compact/start{threadId}`.
+    Compact,
+    /// `/review [instructions]` / `/review-branch <b>` / `/review-commit <sha>`
+    /// → `review/start{threadId, target}`; payload = the wire `ReviewTarget`
+    /// (schema: samples/codex-cli/0.137.0/schema-full/ClientRequest.json).
+    Review(Value),
+    /// `/logout` → `account/logout` (no turn follows).
+    Logout,
+}
+
+/// Parse a leading slash command from the first Text block. Faithful port of the
+/// bridge's `extract_slash_command` (thread.rs:4195): the text must START with
+/// `/`, the name runs to the first whitespace, `rest` is the trimmed remainder.
+/// An unknown name (or `/review-branch`//`/review-commit` with no argument, per
+/// the bridge's `if !rest.is_empty()` guards) returns `None` → the text goes to
+/// codex verbatim as a plain turn, exactly like the bridge's `_ =>` arm.
+fn route_slash_command(content: &[ContentBlock]) -> Option<SlashRoute> {
+    let Some(ContentBlock::Text(text)) = content.first() else {
+        return None;
+    };
+    let stripped = text.strip_prefix('/')?;
+    let name_end = stripped
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or(stripped.len());
+    let name = &stripped[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+    let rest = stripped[name_end..].trim_start();
+    match name {
+        "compact" => Some(SlashRoute::Compact),
+        "init" => Some(SlashRoute::Init),
+        "review" => {
+            let instructions = rest.trim();
+            let target = if instructions.is_empty() {
+                json!({ "type": "uncommittedChanges" })
+            } else {
+                json!({ "type": "custom", "instructions": instructions })
+            };
+            Some(SlashRoute::Review(target))
+        }
+        "review-branch" if !rest.is_empty() => Some(SlashRoute::Review(
+            json!({ "type": "baseBranch", "branch": rest.trim() }),
+        )),
+        "review-commit" if !rest.is_empty() => {
+            Some(SlashRoute::Review(json!({ "type": "commit", "sha": rest.trim() })))
+        }
+        "logout" => Some(SlashRoute::Logout),
+        _ => None,
+    }
+}
+
 fn build_input(content: &[ContentBlock]) -> Vec<Value> {
     content
         .iter()
@@ -4100,6 +4456,49 @@ mod tests {
 
     // ===== notification → SessionEvent mapping (transport-agnostic fold) =====
 
+    #[test]
+    fn prefilled_agent_message_emits_text_streamed_one_does_not() {
+        // The review/start verdict is a PRE-FILLED agentMessage: full `text` on
+        // item/started, no deltas ever (live: samples/codex-cli/0.144.1/
+        // review_start_uncommitted.jsonl, id `review_rollout_assistant`). Its text
+        // must surface as a MessageDelta or the review verdict is silently lost.
+        let prefilled: Value = serde_json::from_str(
+            r#"{"item":{"type":"agentMessage","id":"review_rollout_assistant","text":"The change reverses the operator."},"threadId":"th1","turnId":"t1"}"#,
+        )
+        .unwrap();
+        let events = map_item(&prefilled, false);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::MessageDelta { text, .. } if text == "The change reverses the operator."
+            )),
+            "pre-filled agentMessage text must not be dropped, got: {events:?}"
+        );
+
+        // A STREAMED agentMessage starts empty (text carried by later deltas) —
+        // no MessageDelta from the started edge (double-emit guard).
+        let streamed: Value = serde_json::from_str(
+            r#"{"item":{"type":"agentMessage","id":"m1","text":""},"threadId":"th1","turnId":"t1"}"#,
+        )
+        .unwrap();
+        let events = map_item(&streamed, false);
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::MessageDelta { .. })),
+            "empty started text must not emit, got: {events:?}"
+        );
+
+        // The COMPLETED frame repeats the same text — must not re-emit it.
+        let completed: Value = serde_json::from_str(
+            r#"{"item":{"type":"agentMessage","id":"review_rollout_assistant","text":"The change reverses the operator."},"threadId":"th1","turnId":"t1"}"#,
+        )
+        .unwrap();
+        let events = map_item(&completed, true);
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::MessageDelta { .. })),
+            "completed frame must not double-emit, got: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn full_codex_turn_maps_to_canonical_events() {
         // A realistic codex turn: thread/started → turn/started → item deltas →
@@ -4711,6 +5110,217 @@ mod tests {
         assert!(
             !written.contains("sendUserTurn"),
             "must NOT use the fictional sendUserTurn method"
+        );
+    }
+
+    /// Bridge-parity slash routing (ELECTRON-3PX): the parser is a faithful port
+    /// of codex-acp v0.14.0 `extract_slash_command` + `handle_prompt` match arms
+    /// (thread.rs:4195 / :3252) — including the "unknown or arg-less
+    /// review-branch/commit falls through as plain text" behavior.
+    #[test]
+    fn route_slash_command_maps_bridge_table() {
+        let text = |s: &str| vec![ContentBlock::Text(s.into())];
+        assert_eq!(route_slash_command(&text("/compact")), Some(SlashRoute::Compact));
+        assert_eq!(route_slash_command(&text("/init")), Some(SlashRoute::Init));
+        assert_eq!(route_slash_command(&text("/logout")), Some(SlashRoute::Logout));
+        assert_eq!(
+            route_slash_command(&text("/review")),
+            Some(SlashRoute::Review(json!({ "type": "uncommittedChanges" })))
+        );
+        assert_eq!(
+            route_slash_command(&text("/review focus on error handling")),
+            Some(SlashRoute::Review(
+                json!({ "type": "custom", "instructions": "focus on error handling" })
+            ))
+        );
+        assert_eq!(
+            route_slash_command(&text("/review-branch main")),
+            Some(SlashRoute::Review(json!({ "type": "baseBranch", "branch": "main" })))
+        );
+        assert_eq!(
+            route_slash_command(&text("/review-commit abc123")),
+            Some(SlashRoute::Review(json!({ "type": "commit", "sha": "abc123" })))
+        );
+        // Arg-less branch/commit reviews fall through as plain text (bridge guards).
+        assert_eq!(route_slash_command(&text("/review-branch")), None);
+        assert_eq!(route_slash_command(&text("/review-commit")), None);
+        // Unknown command / plain text / bare slash / non-text first block → None.
+        assert_eq!(route_slash_command(&text("/frobnicate now")), None);
+        assert_eq!(route_slash_command(&text("hello")), None);
+        assert_eq!(route_slash_command(&text("/")), None);
+        assert_eq!(route_slash_command(&[]), None);
+    }
+
+    /// #101/ELECTRON-3PX: codex advertises the bridge's static 6-command table
+    /// (codex-acp v0.14.0 thread.rs:2894 builtin_commands) so the in-session `/`
+    /// menu is no longer empty on the direct-CLI path.
+    #[test]
+    fn capabilities_advertise_bridge_slash_commands() {
+        let names: Vec<String> = codex_capabilities()
+            .slash_commands
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["review", "review-branch", "review-commit", "init", "compact", "logout"]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_slash_review_writes_review_start() {
+        // `/review` → review/start{threadId, target:{uncommittedChanges}} and runs
+        // as a REAL turn (Started + turn_gen bump) — the wire lifecycle is a normal
+        // turn/started→turn/completed (verified live:
+        // samples/codex-cli/0.144.1/review_start_uncommitted.jsonl).
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/review".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::Started);
+        assert_eq!(receipt.turn_gen, 1);
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"review/start""#),
+            "wrote review/start, got: {written}"
+        );
+        assert!(
+            written.contains(r#""type":"uncommittedChanges""#),
+            "bare /review targets uncommitted changes, got: {written}"
+        );
+        assert!(
+            written.contains(r#""threadId":"th-77""#),
+            "carries the bound threadId, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_slash_compact_writes_thread_compact_start() {
+        // `/compact` → thread/compact/start{threadId}; also a real wire turn
+        // (verified live: samples/codex-cli/0.144.1/thread_compact.jsonl).
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/compact".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::Started);
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"thread/compact/start""#),
+            "wrote thread/compact/start, got: {written}"
+        );
+        assert!(
+            !written.contains(r#""input""#),
+            "compact carries no input payload, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_slash_init_sends_canned_prompt_as_turn() {
+        // `/init` → a normal turn/start whose input is the bridge's canned
+        // AGENTS.md prompt (codex-acp v0.14.0 thread.rs:3255), NOT the literal
+        // "/init" text (codex would treat that as a prompt about a slash).
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/init".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::Started);
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"turn/start""#),
+            "init rides a normal turn, got: {written}"
+        );
+        assert!(
+            written.contains("AGENTS.md"),
+            "carries the canned init prompt, got: {written}"
+        );
+        assert!(
+            !written.contains("/init"),
+            "the literal slash text must not reach codex, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_slash_logout_writes_account_logout_noturn() {
+        use futures_util::StreamExt as _;
+        // `/logout` → account/logout{params:null}; NO turn lifecycle follows
+        // (bridge: auth.logout() then auth_required) → NoTurn, no turn_gen bump,
+        // and a user-visible Notice (there is no other output for this command).
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/logout".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::NoTurn);
+        assert_eq!(receipt.turn_gen, 0, "no turn_gen bump for logout");
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"account/logout""#),
+            "wrote account/logout, got: {written}"
+        );
+        let notice = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::Notice { message, .. } = env.event {
+                    return Some(message);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        assert!(
+            notice.is_some_and(|m| m.contains("Logged out")),
+            "logout emits a user-visible Notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_unknown_slash_passes_through_as_plain_text() {
+        // Unknown slash names fall through verbatim (bridge `_ =>` arm) — never a
+        // rejection, never a silent drop.
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/frobnicate the widgets".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::Started);
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"turn/start""#),
+            "unknown slash rides a normal turn, got: {written}"
+        );
+        assert!(
+            written.contains("/frobnicate the widgets"),
+            "text reaches codex verbatim, got: {written}"
         );
     }
 
@@ -6625,28 +7235,32 @@ mod tests {
         );
     }
 
-    /// 🔴 R10 (pending-sends leak on error response) — a `turn/start` ERROR response
-    /// (codex_conn.rs:658-660: PromptAccepted emitted ONLY when `result` present)
-    /// removes the rpc_id→client_msg_id correlation WITHOUT emitting PromptAccepted.
-    /// The conversation's pending queue drains on PromptAccepted{client_msg_id}
-    /// (drain_pending_on), so that message NEVER drains → a ghost "in flight"
-    /// message stuck forever in the composer's pending list. This pins the current
-    /// behavior: an error response yields NO PromptAccepted (the leak source).
+    /// R10 (ELECTRON-3Q0 fix B) — a `turn/start` ERROR response is codex REJECTING
+    /// the turn. It must NOT emit PromptAccepted, and it must NOT be a silent drop
+    /// (the pre-fix behavior: the correlation was removed and nothing emitted → the
+    /// admitted turn hung Running forever, permanently locking the conversation).
+    /// The reader now synthesizes an is_error terminal carrying the codex message,
+    /// and a LATE real `turn/completed` is absorbed (I10 — exactly one terminal).
     #[tokio::test]
-    async fn r10_turn_start_error_response_emits_no_prompt_accepted_leaks_pending() {
-        // A turn/start ERROR response (id=1, the first next_rpc_id) — codex rejected
-        // the turn. The reader removes the pending_sends entry but emits nothing.
-        let err_resp = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"turn rejected"}}"#;
+    async fn r10_turn_start_error_response_synthesizes_single_error_terminal() {
+        // A turn/start ERROR response (id=1, the first next_rpc_id) followed by a
+        // late turn/completed — the terminal must fire once, from the error.
+        let tail = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"turn rejected"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th-r10","turn":{"id":"t1","status":"completed"}}}"#,
+            "\n"
+        );
         let prefix = format!(
             "{}\n",
             r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-r10"}}}"#
         )
         .into_bytes();
-        let fake = FakeAgentIo::new(prefix, None).with_gated_tail(format!("{err_resp}\n").into_bytes());
+        let fake = FakeAgentIo::new(prefix, None).with_gated_tail(tail.as_bytes().to_vec());
         let release = fake.stdout_releaser();
         let backend = CodexSessionBackend::build_with_io("codex-r10", Box::new(fake)).await;
         let mut events = backend.events();
-        // Send with a client_msg_id → registers pending_sends[1] = "m-1".
+        // Send with a client_msg_id → registers pending_sends[1].
         let receipt = backend
             .dispatch(Command::Send {
                 content: vec![ContentBlock::Text("hi".into())],
@@ -6658,28 +7272,150 @@ mod tests {
             .await
             .expect("send accepted (codex turn/start written)");
         assert!(receipt.accepted);
-        // Release the error response into the reader.
+        // Release the error response (+ late turn/completed) into the reader.
         release();
-        // Collect events briefly; assert NO PromptAccepted for m-1 surfaces.
         let mut saw_prompt_accepted = false;
-        for _ in 0..8 {
+        let mut terminals: Vec<(bool, String)> = Vec::new();
+        for _ in 0..12 {
             match tokio::time::timeout(std::time::Duration::from_millis(100), events.next()).await {
-                Ok(Some(env)) => {
-                    if matches!(env.event, SessionEvent::PromptAccepted { .. }) {
-                        saw_prompt_accepted = true;
-                        break;
-                    }
-                }
+                Ok(Some(env)) => match env.event {
+                    SessionEvent::PromptAccepted { .. } => saw_prompt_accepted = true,
+                    SessionEvent::TurnResult {
+                        is_error, result_text, ..
+                    } => terminals.push((is_error, result_text)),
+                    _ => {}
+                },
                 _ => break,
             }
         }
         assert!(
             !saw_prompt_accepted,
-            "R10: a turn/start ERROR response must NOT emit PromptAccepted — but then the \
-             conversation's pending m-1 never drains (ghost in-flight message). This pins \
-             the leak: the error path needs a 'send failed → drop pending' signal the \
-             conversation can act on. If a future fix emits a failure/drain signal here, \
-             this assertion + its rationale change."
+            "a turn/start ERROR response must NOT emit PromptAccepted (the turn never started)"
+        );
+        assert_eq!(
+            terminals.len(),
+            1,
+            "exactly ONE terminal: the synthesized error; the late turn/completed is absorbed (I10), got {terminals:?}"
+        );
+        assert!(
+            terminals[0].0 && terminals[0].1.contains("turn rejected"),
+            "the terminal is is_error and carries the codex message verbatim, got {terminals:?}"
+        );
+    }
+
+    /// ELECTRON-3Q0 fix A — codex REJECTED the `thread/resume` (dead resume anchor,
+    /// "no rollout found for thread id …", verified:
+    /// samples/codex-cli/0.144.1/dead_resume.jsonl). The reader must clear the
+    /// pre-seeded binding and poison the bound-thread wait so the next Send fails
+    /// FAST with `BackendError::SessionNotFound` carrying the codex message —
+    /// previously the poisoned binding made turn/start hit the dead threadId and
+    /// the turn hung forever.
+    #[tokio::test]
+    async fn thread_resume_error_clears_binding_and_poisons_dispatch() {
+        let err_resp =
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32600,"message":"no rollout found for thread id th-dead"}}"#;
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(format!("{err_resp}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-resume-dead", Box::new(fake)).await;
+        // Mirror run_handshake's Resume arm: pre-seeded binding + registered rpc id.
+        backend.seed_thread_binding_for_test("th-dead").await;
+        backend.register_pending_resume_for_test(7).await;
+        release();
+        // The reader claims the error response: binding cleared, poison set.
+        for _ in 0..40 {
+            if backend.thread_binding.lock().await.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            backend.thread_binding.lock().await.is_none(),
+            "the poisoned pre-seeded binding must be cleared on the thread/resume error"
+        );
+        let res = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("hi".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await;
+        assert!(
+            matches!(&res, Err(BackendError::SessionNotFound(m)) if m.contains("no rollout found for thread id th-dead")),
+            "a Send after the rejected resume fails FAST as SessionNotFound with the codex cause (got {res:?})"
+        );
+        assert!(
+            !backend.turn_in_flight.load(Ordering::SeqCst),
+            "a dispatch that never reached the wire must not leave the turn-in-flight mark set"
+        );
+    }
+
+    /// The happy-path counterpart: a `thread/resume` SUCCESS response leaves the
+    /// pre-seeded binding intact and sets no poison.
+    #[tokio::test]
+    async fn thread_resume_success_leaves_binding_intact() {
+        let ok_resp = r#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(format!("{ok_resp}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-resume-ok", Box::new(fake)).await;
+        backend.seed_thread_binding_for_test("th-live").await;
+        backend.register_pending_resume_for_test(7).await;
+        release();
+        // Give the reader a beat to process the response.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            backend.thread_binding.lock().await.as_deref(),
+            Some("th-live"),
+            "a successful resume keeps the pre-seeded binding"
+        );
+        assert!(
+            backend.resume_poison.lock().await.is_none(),
+            "a successful resume must not poison the bound-thread wait"
+        );
+    }
+
+    /// ELECTRON-3Q0 fix B, NoTurn flavor — an `account/logout` ERROR response has
+    /// no turn to terminate (dispatch admitted it as NoTurn): it surfaces as a
+    /// `Notice`, and NO TurnResult is synthesized.
+    #[tokio::test]
+    async fn logout_error_response_surfaces_notice_not_terminal() {
+        // dispatch(/logout) issues rpc id 1 (first next_rpc_id).
+        let err_resp = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"not signed in"}}"#;
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(format!("{err_resp}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-logout-err", Box::new(fake)).await;
+        let mut events = backend.events();
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/logout".into())],
+                metadata: super::super::types::CommandMeta {
+                    client_msg_id: Some("m-1".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("logout dispatch accepted");
+        assert!(matches!(receipt.admission, Admission::NoTurn));
+        release();
+        let mut saw_failure_notice = false;
+        let mut saw_terminal = false;
+        for _ in 0..12 {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), events.next()).await {
+                Ok(Some(env)) => match env.event {
+                    SessionEvent::Notice { message, .. } if message.contains("logout failed") => {
+                        saw_failure_notice = true;
+                    }
+                    SessionEvent::TurnResult { .. } => saw_terminal = true,
+                    _ => {}
+                },
+                _ => break,
+            }
+        }
+        assert!(
+            saw_failure_notice,
+            "a rejected account/logout must surface a Notice with the codex cause"
+        );
+        assert!(
+            !saw_terminal,
+            "a NoTurn request must NOT synthesize a turn terminal on rejection"
         );
     }
 
