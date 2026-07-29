@@ -58,7 +58,10 @@ async fn setup() -> (
     let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
 
     let dir = tempfile::tempdir().unwrap();
-    let created = service.create_standard(to_file_uri(dir.path()).unwrap()).await.unwrap();
+    let created = service
+        .create_standard("system_default_user", to_file_uri(dir.path()).unwrap())
+        .await
+        .unwrap();
     let pe_id = created.project_explorer.pe_id;
 
     let push = RecordingPush::default();
@@ -88,7 +91,11 @@ fn canon(path: &std::path::Path) -> String {
 async fn initialize_negotiates_version() {
     let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
     actor
-        .dispatch_frame("1", request(0, "initialize", json!({"protocol_version": 1})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(0, "initialize", json!({"protocol_version": 1})),
+        )
         .await;
     let reply = push.last_for("1").unwrap();
     assert_eq!(reply["id"], 0);
@@ -99,7 +106,11 @@ async fn initialize_negotiates_version() {
 async fn initialize_rejects_unsupported_version() {
     let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
     actor
-        .dispatch_frame("1", request(0, "initialize", json!({"protocol_version": 0})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(0, "initialize", json!({"protocol_version": 0})),
+        )
         .await;
     let reply = push.last_for("1").unwrap();
     assert_eq!(reply["error"]["code"], -32010);
@@ -113,7 +124,11 @@ async fn subscribe_root_returns_baseline_snapshot() {
     std::fs::write(dir.path().join("README.md"), b"x").unwrap();
 
     actor
-        .dispatch_frame("1", request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+        )
         .await;
 
     let reply = push.last_for("1").unwrap();
@@ -146,6 +161,7 @@ async fn subscribe_multiple_targets_returns_snapshot_per_target() {
     actor
         .dispatch_frame(
             "1",
+            "system_default_user",
             request(
                 1,
                 "fs/subscribe",
@@ -174,6 +190,7 @@ async fn subscribe_unknown_pe_is_out_of_scope() {
     actor
         .dispatch_frame(
             "1",
+            "system_default_user",
             request(2, "fs/subscribe", json!({"targets":[dir_ref("pe-nope", "")]})),
         )
         .await;
@@ -189,6 +206,7 @@ async fn subscribe_parent_escape_is_invalid_relative_path() {
     actor
         .dispatch_frame(
             "1",
+            "system_default_user",
             request(3, "fs/subscribe", json!({"targets":[dir_ref(&pe, "../escape")]})),
         )
         .await;
@@ -203,7 +221,11 @@ async fn read_existing_file_returns_utf8() {
     std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
 
     actor
-        .dispatch_frame("1", request(4, "fs/read", json!({"file":dir_ref(&pe, "a.txt")})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(4, "fs/read", json!({"file":dir_ref(&pe, "a.txt")})),
+        )
         .await;
     let reply = push.last_for("1").unwrap();
     assert_eq!(reply["result"]["content"], "hello");
@@ -214,7 +236,11 @@ async fn read_existing_file_returns_utf8() {
 async fn read_missing_file_is_resource_not_found() {
     let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
     actor
-        .dispatch_frame("1", request(5, "fs/read", json!({"file":dir_ref(&pe, "missing.txt")})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(5, "fs/read", json!({"file":dir_ref(&pe, "missing.txt")})),
+        )
         .await;
     let reply = push.last_for("1").unwrap();
     assert_eq!(reply["error"]["code"], -32002);
@@ -227,7 +253,11 @@ async fn read_non_utf8_falls_back_to_base64() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
     std::fs::write(dir.path().join("bin"), [0xff, 0xfe, 0x00]).unwrap();
     actor
-        .dispatch_frame("1", request(6, "fs/read", json!({"file":dir_ref(&pe, "bin")})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(6, "fs/read", json!({"file":dir_ref(&pe, "bin")})),
+        )
         .await;
     let reply = push.last_for("1").unwrap();
     assert_eq!(reply["result"]["encoding"], "base64");
@@ -240,6 +270,7 @@ async fn write_then_read_roundtrip() {
     actor
         .dispatch_frame(
             "1",
+            "system_default_user",
             request(
                 7,
                 "fs/write",
@@ -250,7 +281,11 @@ async fn write_then_read_roundtrip() {
     assert!(push.last_for("1").unwrap()["result"].is_object());
 
     actor
-        .dispatch_frame("1", request(8, "fs/read", json!({"file":dir_ref(&pe, "new.txt")})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(8, "fs/read", json!({"file":dir_ref(&pe, "new.txt")})),
+        )
         .await;
     assert_eq!(push.last_for("1").unwrap()["result"]["content"], "written");
 }
@@ -262,6 +297,7 @@ async fn write_base64_decodes_to_bytes() {
     actor
         .dispatch_frame(
             "1",
+            "system_default_user",
             request(
                 9,
                 "fs/write",
@@ -277,12 +313,20 @@ async fn write_base64_decodes_to_bytes() {
 async fn mkdir_then_remove_roundtrip() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
     actor
-        .dispatch_frame("1", request(10, "fs/mkdir", json!({"dir":dir_ref(&pe, "sub")})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(10, "fs/mkdir", json!({"dir":dir_ref(&pe, "sub")})),
+        )
         .await;
     assert!(dir.path().join("sub").is_dir());
 
     actor
-        .dispatch_frame("1", request(11, "fs/remove", json!({"target":dir_ref(&pe, "sub")})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(11, "fs/remove", json!({"target":dir_ref(&pe, "sub")})),
+        )
         .await;
     assert!(push.last_for("1").unwrap()["result"].is_object());
     assert!(!dir.path().join("sub").exists());
@@ -295,6 +339,7 @@ async fn rename_moves_entry() {
     actor
         .dispatch_frame(
             "1",
+            "system_default_user",
             request(
                 12,
                 "fs/rename",
@@ -315,7 +360,11 @@ async fn mkdir_existing_dir_is_provider_unavailable() {
     // mkdir over an existing dir → AlreadyExists → provider_unavailable (-32006).
     // Platform-independent trigger of the command→FsError→code wiring.
     actor
-        .dispatch_frame("1", request(30, "fs/mkdir", json!({"dir":dir_ref(&pe, "sub")})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(30, "fs/mkdir", json!({"dir":dir_ref(&pe, "sub")})),
+        )
         .await;
     let reply = push.last_for("1").unwrap();
     assert_eq!(reply["error"]["code"], -32006);
@@ -327,7 +376,11 @@ async fn mkdir_existing_dir_is_provider_unavailable() {
 async fn initialize_bad_params_is_invalid_params() {
     let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
     actor
-        .dispatch_frame("1", request(31, "initialize", json!({"wrong": "shape"})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(31, "initialize", json!({"wrong": "shape"})),
+        )
         .await;
     let reply = push.last_for("1").unwrap();
     assert_eq!(reply["error"]["code"], -32602);
@@ -336,7 +389,9 @@ async fn initialize_bad_params_is_invalid_params() {
 #[tokio::test]
 async fn unknown_method_is_method_not_found() {
     let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
-    actor.dispatch_frame("1", request(13, "fs/teleport", json!({}))).await;
+    actor
+        .dispatch_frame("1", "system_default_user", request(13, "fs/teleport", json!({})))
+        .await;
     let reply = push.last_for("1").unwrap();
     assert_eq!(reply["error"]["code"], -32601);
 }
@@ -345,7 +400,9 @@ async fn unknown_method_is_method_not_found() {
 async fn malformed_frame_is_invalid_request() {
     let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
     // No `method` field → not a valid JSON-RPC request.
-    actor.dispatch_frame("1", json!({"jsonrpc":"2.0","id":1})).await;
+    actor
+        .dispatch_frame("1", "system_default_user", json!({"jsonrpc":"2.0","id":1}))
+        .await;
     let reply = push.last_for("1").unwrap();
     assert_eq!(reply["error"]["code"], -32600);
 }
@@ -354,13 +411,18 @@ async fn malformed_frame_is_invalid_request() {
 async fn unsubscribe_is_notification_no_reply() {
     let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
     actor
-        .dispatch_frame("1", request(0, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})))
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(0, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+        )
         .await;
     let before = push.frames().len();
     // notification (the id is ignored by unsubscribe; it emits no response)
     actor
         .dispatch_frame(
             "1",
+            "system_default_user",
             json!({"jsonrpc":"2.0","method":"fs/unsubscribe","params":{"targets":[dir_ref(&pe, "")]}}),
         )
         .await;
@@ -383,6 +445,7 @@ async fn command_symlink_escape_is_resource_outside_folder() {
     actor
         .dispatch_frame(
             "1",
+            "system_default_user",
             request(20, "fs/read", json!({"file":dir_ref(&pe, "link/secret.txt")})),
         )
         .await;
@@ -474,6 +537,7 @@ async fn live_change_fans_delta_to_subscriber_only() {
     // Session 1 subscribes the root; session 2 stays silent (scoped-push check).
     tx.send(FsInbound::Frame {
         session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
         frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
     })
     .unwrap();
@@ -507,6 +571,7 @@ async fn overflow_fans_full_snapshot_through_event_loop() {
 
     tx.send(FsInbound::Frame {
         session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
         frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
     })
     .unwrap();
@@ -548,6 +613,7 @@ async fn disconnect_drops_session_subscriptions() {
 
     tx.send(FsInbound::Frame {
         session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
         frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
     })
     .unwrap();

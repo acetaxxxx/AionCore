@@ -35,8 +35,14 @@ impl WebSocketManager {
 
     /// Register a new client connection and return its assigned ID.
     pub fn add_client(&self, token: String, tx: mpsc::Sender<WsOutbound>) -> ConnectionId {
+        self.add_client_for_user("system_default_user".to_owned(), token, tx)
+    }
+
+    /// Register a new authenticated client connection for an internal user ID.
+    pub fn add_client_for_user(&self, user_id: String, token: String, tx: mpsc::Sender<WsOutbound>) -> ConnectionId {
         let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let info = ClientInfo {
+            user_id,
             token,
             last_ping: Instant::now(),
             tx,
@@ -65,6 +71,57 @@ impl WebSocketManager {
         self.connections.len()
     }
 
+    /// Returns the number of active connections authenticated as `user_id`.
+    pub fn client_count_for_user(&self, user_id: &str) -> usize {
+        self.connections
+            .iter()
+            .filter(|entry| entry.value().user_id == user_id)
+            .count()
+    }
+
+    /// Close and remove every active connection authenticated as `user_id`.
+    ///
+    /// Returns the number of connections removed. The close is best-effort:
+    /// saturated or already-closed outbound queues are still removed from the
+    /// manager so no future events are delivered to revoked sessions.
+    pub fn disconnect_user(&self, user_id: &str, reason: &str) -> usize {
+        let mut to_remove = Vec::new();
+
+        for entry in self.connections.iter() {
+            let conn_id = *entry.key();
+            let client = entry.value();
+            if client.user_id != user_id {
+                continue;
+            }
+
+            let outbound = terminal_realtime_error(conn_id, RealtimeError::AuthExpired, reason);
+            match client.tx.try_send(outbound) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                    to_remove.push(conn_id);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        %conn_id,
+                        user_id = %user_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, user disconnect close dropped"
+                    );
+                    to_remove.push(conn_id);
+                }
+            }
+        }
+
+        for conn_id in &to_remove {
+            self.remove_client(*conn_id);
+        }
+
+        let removed = to_remove.len();
+        if removed > 0 {
+            info!(user_id = %user_id, removed, "websocket user connections disconnected");
+        }
+        removed
+    }
+
     /// Send a message to all connected clients.
     ///
     /// Uses `try_send` for backpressure. A saturated channel cannot reliably
@@ -90,6 +147,45 @@ impl WebSocketManager {
                         %conn_id,
                         code = RealtimeError::Backpressure.code(),
                         "outbound channel full, broadcast message dropped"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    disconnected.push(conn_id);
+                }
+            }
+        }
+
+        for conn_id in disconnected {
+            self.remove_client(conn_id);
+        }
+    }
+
+    /// Send a message to all connections authenticated as `user_id`.
+    pub fn broadcast_to_user(&self, user_id: &str, msg: WebSocketMessage<serde_json::Value>) {
+        let text = match serde_json::to_string(&msg) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(user_id = %user_id, error = %e, "failed to serialize user broadcast message");
+                return;
+            }
+        };
+
+        let mut disconnected = Vec::new();
+        for entry in self.connections.iter() {
+            let conn_id = *entry.key();
+            let client = entry.value();
+            if client.user_id != user_id {
+                continue;
+            }
+
+            match client.tx.try_send(WsOutbound::Text(text.clone())) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        %conn_id,
+                        user_id = %user_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, user broadcast message dropped"
                     );
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -209,7 +305,19 @@ impl Default for WebSocketManager {
 
 impl EventBroadcaster for WebSocketManager {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
-        self.broadcast_all(event);
+        let Some(user_id) = event
+            .data
+            .get("user_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+        else {
+            warn!(
+                event_name = %event.name,
+                "dropping websocket manager event without user_id"
+            );
+            return;
+        };
+        self.broadcast_to_user(&user_id, event);
     }
 }
 
@@ -405,6 +513,72 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_to_user_delivers_only_matching_connections() {
+        let mgr = WebSocketManager::new();
+        let (tx1, mut rx1) = new_client_tx();
+        let (tx2, mut rx2) = new_client_tx();
+        let (tx3, mut rx3) = new_client_tx();
+
+        mgr.add_client_for_user("user-a".into(), "t1".into(), tx1);
+        mgr.add_client_for_user("user-b".into(), "t2".into(), tx2);
+        mgr.add_client_for_user("user-a".into(), "t3".into(), tx3);
+
+        assert_eq!(mgr.client_count_for_user("user-a"), 2);
+        assert_eq!(mgr.client_count_for_user("user-b"), 1);
+
+        let event = WebSocketMessage::new("scoped-event", json!({"user_id": "user-a"}));
+        mgr.broadcast_to_user("user-a", event);
+
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_err());
+        assert!(rx3.try_recv().is_ok());
+    }
+
+    #[test]
+    fn disconnect_user_closes_and_removes_only_matching_connections() {
+        let mgr = WebSocketManager::new();
+        let (tx1, mut rx1) = new_client_tx();
+        let (tx2, mut rx2) = new_client_tx();
+        let (tx3, mut rx3) = new_client_tx();
+
+        mgr.add_client_for_user("user-a".into(), "t1".into(), tx1);
+        mgr.add_client_for_user("user-b".into(), "t2".into(), tx2);
+        mgr.add_client_for_user("user-a".into(), "t3".into(), tx3);
+
+        let removed = mgr.disconnect_user("user-a", "session revoked");
+
+        assert_eq!(removed, 2);
+        assert_eq!(mgr.client_count_for_user("user-a"), 0);
+        assert_eq!(mgr.client_count_for_user("user-b"), 1);
+        for msg in [rx1.try_recv().unwrap(), rx3.try_recv().unwrap()] {
+            match msg {
+                WsOutbound::TextThenClose(text, code, reason) => {
+                    assert_realtime_auth_expired(&text);
+                    assert_eq!(code, WebSocketCloseCode::PolicyViolation);
+                    assert_eq!(reason, "session revoked");
+                }
+                other => panic!("expected terminal auth close, got {other:?}"),
+            }
+        }
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[test]
+    fn disconnect_user_removes_matching_connections_when_queue_is_full() {
+        let mgr = WebSocketManager::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(WsOutbound::Text("queued".into())).unwrap();
+        mgr.add_client_for_user("user-a".into(), "token".into(), tx);
+
+        let removed = mgr.disconnect_user("user-a", "session revoked");
+
+        assert_eq!(removed, 1);
+        assert_eq!(mgr.client_count(), 0);
+        assert_eq!(rx.try_recv().unwrap(), WsOutbound::Text("queued".into()));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn broadcast_all_removes_closed_channels() {
         let mgr = WebSocketManager::new();
         let (tx1, rx1) = new_client_tx();
@@ -522,6 +696,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "valid".into(),
                 last_ping: Instant::now(),
                 tx,
@@ -556,6 +731,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "valid".into(),
                 last_ping: old_ping,
                 tx,
@@ -587,6 +763,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "expired-token".into(),
                 last_ping: Instant::now(),
                 tx,
@@ -620,6 +797,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "expired-token".into(),
                 last_ping: Instant::now(),
                 tx,
@@ -643,6 +821,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "expired".into(),
                 last_ping: old_ping,
                 tx,
@@ -676,6 +855,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "good".into(),
                 last_ping: Instant::now(),
                 tx: tx1,
@@ -687,6 +867,7 @@ mod tests {
         connections.insert(
             ConnectionId(2),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "good".into(),
                 last_ping: Instant::now() - (HEARTBEAT_TIMEOUT * 2),
                 tx: tx2,
@@ -702,13 +883,15 @@ mod tests {
     }
 
     #[test]
-    fn event_broadcaster_impl_delegates_to_broadcast_all() {
+    fn event_broadcaster_impl_routes_to_event_user() {
         let mgr = WebSocketManager::new();
         let (tx, mut rx) = new_client_tx();
-        mgr.add_client("tok".into(), tx);
+        mgr.add_client_for_user("user-a".into(), "tok".into(), tx);
+        let (tx_other, mut rx_other) = new_client_tx();
+        mgr.add_client_for_user("user-b".into(), "tok-other".into(), tx_other);
 
         let broadcaster: &dyn EventBroadcaster = &mgr;
-        broadcaster.broadcast(WebSocketMessage::new("via-trait", json!({})));
+        broadcaster.broadcast(WebSocketMessage::new("via-trait", json!({"user_id": "user-a"})));
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -717,6 +900,19 @@ mod tests {
             }
             _ => panic!("expected Text"),
         }
+        assert!(rx_other.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_broadcaster_impl_drops_unscoped_events() {
+        let mgr = WebSocketManager::new();
+        let (tx, mut rx) = new_client_tx();
+        mgr.add_client_for_user("user-a".into(), "tok".into(), tx);
+
+        let broadcaster: &dyn EventBroadcaster = &mgr;
+        broadcaster.broadcast(WebSocketMessage::new("via-trait", json!({})));
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -33,11 +33,22 @@ async fn setup() -> (Router, String, String, TempDir, Database) {
     let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
 
     let dir = tempfile::tempdir().unwrap();
-    let created = service.create_standard(to_file_uri(dir.path()).unwrap()).await.unwrap();
+    let created = service
+        .create_standard("system_default_user", to_file_uri(dir.path()).unwrap())
+        .await
+        .unwrap();
     let project_id = created.project.project_id;
     let workspace_pe_id = created.project_explorer.pe_id;
 
-    let router = project_routes(ProjectRouterState { project: service });
+    // Handlers extract `Extension<CurrentUser>`; production wiring injects it
+    // via the auth middleware — tests inject the seeded default user directly.
+    let router =
+        project_routes(ProjectRouterState { project: service }).layer(axum::Extension(aionui_auth::CurrentUser {
+            id: "system_default_user".to_owned(),
+            username: "admin".to_owned(),
+            user_type: aionui_db::UserType::Local,
+            status: aionui_db::UserStatus::Active,
+        }));
     (router, project_id, workspace_pe_id, dir, db)
 }
 

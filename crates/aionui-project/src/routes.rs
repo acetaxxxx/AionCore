@@ -19,12 +19,13 @@
 use std::sync::Arc;
 
 use aionui_api_types::{ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer};
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
-use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
+use axum::{Extension, Router};
 use serde_json::json;
 
 use crate::canonical;
@@ -52,9 +53,10 @@ pub fn project_routes(state: ProjectRouterState) -> Router {
 /// call (frontend does not fan out per root).
 async fn get_project(
     State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(project_id): Path<String>,
 ) -> Result<Json<ApiResponse<ProjectDetailResponse>>, ApiError> {
-    let detail = state.project.get_project(&project_id).await?;
+    let detail = state.project.get_project(&user.id, &project_id).await?;
     Ok(Json(ApiResponse::ok(to_detail_response(detail))))
 }
 
@@ -63,24 +65,28 @@ async fn get_project(
 /// without re-fetching the project.
 async fn attach_folder(
     State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(project_id): Path<String>,
     body: Result<Json<AttachFolderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProjectEntry>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let row = state
         .project
-        .attach_folder(AttachInput {
-            project_id: project_id.clone(),
-            uri: req.uri,
-            display_name: req.display_name,
-        })
+        .attach_folder(
+            &user.id,
+            AttachInput {
+                project_id: project_id.clone(),
+                uri: req.uri,
+                display_name: req.display_name,
+            },
+        )
         .await?;
 
     // `attach_folder` returns the bare explorer row (no folder metadata). Re-read
     // the project to build the fully-shaped entry (display_path + runtime_status).
     // A descendant-attach focuses an existing entry, so match on the returned
     // pe_id rather than assuming the last row.
-    let detail = state.project.get_project(&project_id).await?;
+    let detail = state.project.get_project(&user.id, &project_id).await?;
     let entry = detail
         .explorer
         .entries
@@ -94,9 +100,10 @@ async fn attach_folder(
 /// folder. The workspace root is immutable (`workspace_entry_immutable`).
 async fn remove_folder(
     State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path((_project_id, pe_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    state.project.remove_attached(&pe_id).await?;
+    state.project.remove_attached(&user.id, &pe_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

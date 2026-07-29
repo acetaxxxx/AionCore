@@ -491,7 +491,10 @@ async fn copy_files_to_workspace() {
     // it has a pe_id the backend resolves to the absolute directory.
     let created = services
         .project_service
-        .create_standard(aionui_project::canonical::to_file_uri(ws_dir.path()).unwrap())
+        .create_standard(
+            "system_default_user",
+            aionui_project::canonical::to_file_uri(ws_dir.path()).unwrap(),
+        )
         .await
         .unwrap();
     let pe_id = created.project_explorer.pe_id;
@@ -529,7 +532,10 @@ async fn copy_files_to_workspace_accepts_non_sandbox_source_and_target_roots() {
     // pe-addressed destination (the workspace dir need not be under file roots).
     let created = services
         .project_service
-        .create_standard(aionui_project::canonical::to_file_uri(workspace.path()).unwrap())
+        .create_standard(
+            "system_default_user",
+            aionui_project::canonical::to_file_uri(workspace.path()).unwrap(),
+        )
         .await
         .unwrap();
     let pe_id = created.project_explorer.pe_id;

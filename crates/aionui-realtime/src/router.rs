@@ -10,7 +10,9 @@ pub trait MessageRouter: Send + Sync {
     ///
     /// Called for any message whose `name` is not handled internally
     /// by the WebSocket layer (i.e. not `pong` or `subscribe-show-open`).
-    fn route(&self, conn_id: ConnectionId, name: &str, data: serde_json::Value) -> bool;
+    /// `user_id` is the authenticated Core user of the connection, resolved at
+    /// connect time — routers gate all user-scoped reads/writes on it.
+    fn route(&self, conn_id: ConnectionId, user_id: &str, name: &str, data: serde_json::Value) -> bool;
 
     /// Notify the router that a connection has closed.
     ///
@@ -31,7 +33,7 @@ pub trait MessageRouter: Send + Sync {
 pub struct NoopMessageRouter;
 
 impl MessageRouter for NoopMessageRouter {
-    fn route(&self, conn_id: ConnectionId, name: &str, _data: serde_json::Value) -> bool {
+    fn route(&self, conn_id: ConnectionId, _user_id: &str, name: &str, _data: serde_json::Value) -> bool {
         tracing::debug!(
             %conn_id,
             message_name = name,
@@ -49,7 +51,7 @@ mod tests {
     #[test]
     fn noop_router_does_not_panic() {
         let router = NoopMessageRouter;
-        let handled = router.route(ConnectionId(1), "some-event", json!({"key": "val"}));
+        let handled = router.route(ConnectionId(1), "user-1", "some-event", json!({"key": "val"}));
 
         assert!(!handled);
     }
@@ -57,7 +59,7 @@ mod tests {
     #[test]
     fn noop_router_is_trait_object_compatible() {
         let router: Box<dyn MessageRouter> = Box::new(NoopMessageRouter);
-        let handled = router.route(ConnectionId(42), "test", json!(null));
+        let handled = router.route(ConnectionId(42), "user-1", "test", json!(null));
 
         assert!(!handled);
     }
@@ -77,7 +79,7 @@ mod tests {
             disconnected: Mutex<Vec<ConnectionId>>,
         }
         impl MessageRouter for RecordingRouter {
-            fn route(&self, _conn_id: ConnectionId, _name: &str, _data: serde_json::Value) -> bool {
+            fn route(&self, _conn_id: ConnectionId, _user_id: &str, _name: &str, _data: serde_json::Value) -> bool {
                 false
             }
             fn on_disconnect(&self, conn_id: ConnectionId) {

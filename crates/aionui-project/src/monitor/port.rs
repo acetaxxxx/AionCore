@@ -26,7 +26,13 @@ pub trait FsWirePush: Send + Sync {
 #[derive(Debug, Clone)]
 pub enum FsInbound {
     /// An outer-envelope `fs` frame's payload (the inner JSON-RPC value).
-    Frame { session: SessionId, frame: Value },
+    /// `user_id` is the connection's authenticated Core user (resolved at WS
+    /// connect); every user-scoped resolve in the actor is gated on it.
+    Frame {
+        session: SessionId,
+        user_id: String,
+        frame: Value,
+    },
     /// The connection closed — release its subscriptions (`drop_session`).
     Disconnect { session: SessionId },
 }

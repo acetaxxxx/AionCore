@@ -31,7 +31,7 @@ struct FsMessageRouter {
 }
 
 impl MessageRouter for FsMessageRouter {
-    fn route(&self, conn_id: ConnectionId, name: &str, data: Value) -> bool {
+    fn route(&self, conn_id: ConnectionId, user_id: &str, name: &str, data: Value) -> bool {
         if name != "fs" {
             return false;
         }
@@ -39,6 +39,7 @@ impl MessageRouter for FsMessageRouter {
         // dropped (the connection will observe silence and can reconnect).
         let _ = self.inbound.send(FsInbound::Frame {
             session: conn_id.0.to_string(),
+            user_id: user_id.to_owned(),
             frame: data,
         });
         true
@@ -104,12 +105,17 @@ mod tests {
         let (inbound, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let router = FsMessageRouter { inbound };
 
-        let handled = router.route(ConnectionId(5), "fs", json!({"method": "initialize"}));
+        let handled = router.route(ConnectionId(5), "user-1", "fs", json!({"method": "initialize"}));
         assert!(handled, "fs frames are claimed");
 
         match rx.try_recv().unwrap() {
-            FsInbound::Frame { session, frame } => {
+            FsInbound::Frame {
+                session,
+                user_id,
+                frame,
+            } => {
                 assert_eq!(session, "5", "ConnectionId is stringified into the session id");
+                assert_eq!(user_id, "user-1", "connection user is threaded into the frame");
                 assert_eq!(frame["method"], "initialize");
             }
             other => panic!("expected Frame, got {other:?}"),
@@ -121,7 +127,7 @@ mod tests {
         let (inbound, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let router = FsMessageRouter { inbound };
 
-        let handled = router.route(ConnectionId(1), "conversation.send-message", json!({}));
+        let handled = router.route(ConnectionId(1), "user-1", "conversation.send-message", json!({}));
         assert!(!handled, "non-fs messages fall through to other routing");
         assert!(rx.try_recv().is_err(), "nothing forwarded for non-fs");
     }
