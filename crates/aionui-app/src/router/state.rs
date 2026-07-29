@@ -36,7 +36,8 @@ use aionui_mcp::{
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
-use aionui_realtime::{NoopMessageRouter, WsHandlerState};
+use aionui_project::ProjectRouterState;
+use aionui_realtime::{MessageRouter, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
@@ -129,6 +130,7 @@ pub struct ModuleStates {
 
     pub connection_test: ConnectionTestRouterState,
     pub file: FileRouterState,
+    pub project: ProjectRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
@@ -289,6 +291,7 @@ pub async fn build_module_states(
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
+        project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -446,6 +449,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         file_service,
         watch_service,
         snapshot_service,
+        project: Arc::new(services.project_service.clone()),
         allowed_roots,
         browse_roots,
     })
@@ -453,6 +457,13 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
 
 fn file_watch_init_error(error: aionui_file::FileError) -> RouterBuildError {
     RouterBuildError::new("router.file_watch", "failed to initialize file watch service").with_source(error)
+}
+
+/// Build the project control-plane router state from application services.
+pub fn build_project_state(services: &AppServices) -> ProjectRouterState {
+    ProjectRouterState {
+        project: Arc::new(services.project_service.clone()),
+    }
 }
 
 /// Build the default `McpRouterState` from application services.
@@ -848,12 +859,14 @@ pub async fn build_extension_states(
     (ext_state, hub_state, skill_state)
 }
 
-/// Build the default `WsHandlerState` from application services.
-pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
+/// Build the `WsHandlerState` from application services with an explicit inbound
+/// `router`. Callers supply the filesystem-monitor router in production and a
+/// no-op router for router-only/test assembly.
+pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) -> WsHandlerState {
     if services.local {
         return WsHandlerState {
             manager: services.ws_manager.clone(),
-            router: Arc::new(NoopMessageRouter),
+            router,
             token_validator: Arc::new(|_| true),
             token_extractor: Arc::new(|_| Some("local".into())),
         };
@@ -866,7 +879,7 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
-        router: Arc::new(NoopMessageRouter),
+        router,
         token_validator,
         token_extractor,
     }
