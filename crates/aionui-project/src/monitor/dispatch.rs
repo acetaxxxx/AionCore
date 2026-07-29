@@ -29,7 +29,7 @@ use super::wire::{
 impl FsMonitorActor {
     /// Decode one inbound frame and route it by method. Malformed frames get a
     /// JSON-RPC error; unknown methods get `method_not_found`.
-    pub(super) async fn dispatch_frame(&mut self, session: &str, frame: Value) {
+    pub(super) async fn dispatch_frame(&mut self, session: &str, user_id: &str, frame: Value) {
         let parsed = serde_json::from_value::<wire::IncomingFrame>(frame);
         let Ok(incoming) = parsed else {
             // Malformed inbound frame — safely handled (client bug / protocol drift).
@@ -46,13 +46,13 @@ impl FsMonitorActor {
         tracing::debug!(session, method = %incoming.method, "fs dispatch");
         match incoming.method.as_str() {
             "initialize" => self.handle_initialize(session, id, params),
-            "fs/subscribe" => self.handle_subscribe(session, id, params).await,
-            "fs/unsubscribe" => self.handle_unsubscribe(session, params).await,
-            "fs/read" => self.handle_read(session, id, params).await,
-            "fs/write" => self.handle_write(session, id, params).await,
-            "fs/mkdir" => self.handle_mkdir(session, id, params).await,
-            "fs/remove" => self.handle_remove(session, id, params).await,
-            "fs/rename" => self.handle_rename(session, id, params).await,
+            "fs/subscribe" => self.handle_subscribe(session, user_id, id, params).await,
+            "fs/unsubscribe" => self.handle_unsubscribe(session, user_id, params).await,
+            "fs/read" => self.handle_read(session, user_id, id, params).await,
+            "fs/write" => self.handle_write(session, user_id, id, params).await,
+            "fs/mkdir" => self.handle_mkdir(session, user_id, id, params).await,
+            "fs/remove" => self.handle_remove(session, user_id, id, params).await,
+            "fs/rename" => self.handle_rename(session, user_id, id, params).await,
             other => {
                 tracing::warn!(session, method = %other, "fs dispatch: unknown method");
                 self.push(
@@ -89,7 +89,7 @@ impl FsMonitorActor {
 
     // ── subscribe / unsubscribe ─────────────────────────────────────────────
 
-    async fn handle_subscribe(&mut self, session: &str, id: Option<Value>, params: Value) {
+    async fn handle_subscribe(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
         let Ok(parsed) = serde_json::from_value::<SubscribeParams>(params) else {
             self.push(session, invalid_params(id));
             return;
@@ -101,7 +101,7 @@ impl FsMonitorActor {
         // so a bad target fails the whole request atomically (no partial mount).
         let mut plan: Vec<(ResourceRef, String)> = Vec::new();
         for target in parsed.targets {
-            let resolved = match self.resolve(&target, FileOp::Browse).await {
+            let resolved = match self.resolve(user_id, &target, FileOp::Browse).await {
                 Ok(r) => r,
                 Err((code, message)) => {
                     tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
@@ -168,7 +168,7 @@ impl FsMonitorActor {
     /// `fs/unsubscribe` is a notification: best-effort, no reply. A target that
     /// no longer resolves is silently ignored (the live subscription, if any,
     /// self-heals on the next full re-declare).
-    async fn handle_unsubscribe(&mut self, session: &str, params: Value) {
+    async fn handle_unsubscribe(&mut self, session: &str, user_id: &str, params: Value) {
         let Ok(parsed) = serde_json::from_value::<UnsubscribeParams>(params) else {
             return;
         };
@@ -176,7 +176,7 @@ impl FsMonitorActor {
         tracing::info!(session, targets = parsed.targets.len(), "fs unsubscribe");
         let now = self.now();
         for target in parsed.targets {
-            let Ok(resolved) = self.resolve(&target, FileOp::Browse).await else {
+            let Ok(resolved) = self.resolve(user_id, &target, FileOp::Browse).await else {
                 continue;
             };
             let Ok(canonical) = canonical::canonicalize(&resolved.resource_uri) else {
@@ -199,12 +199,12 @@ impl FsMonitorActor {
 
     // ── file commands ───────────────────────────────────────────────────────
 
-    async fn handle_read(&mut self, session: &str, id: Option<Value>, params: Value) {
+    async fn handle_read(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
         let Ok(p) = serde_json::from_value::<ReadParams>(params) else {
             self.push(session, invalid_params(id));
             return;
         };
-        let resolved = match self.resolve_guarded(&p.file, FileOp::Read).await {
+        let resolved = match self.resolve_guarded(user_id, &p.file, FileOp::Read).await {
             Ok(r) => r,
             Err((code, message)) => {
                 self.push(session, wire::error(id, code, message, ref_data(&p.file)));
@@ -229,7 +229,7 @@ impl FsMonitorActor {
         }
     }
 
-    async fn handle_write(&mut self, session: &str, id: Option<Value>, params: Value) {
+    async fn handle_write(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
         let Ok(p) = serde_json::from_value::<WriteParams>(params) else {
             self.push(session, invalid_params(id));
             return;
@@ -241,7 +241,7 @@ impl FsMonitorActor {
                 return;
             }
         };
-        let resolved = match self.resolve_guarded(&p.file, FileOp::Write).await {
+        let resolved = match self.resolve_guarded(user_id, &p.file, FileOp::Write).await {
             Ok(r) => r,
             Err((code, message)) => {
                 self.push(session, wire::error(id, code, message, ref_data(&p.file)));
@@ -252,12 +252,12 @@ impl FsMonitorActor {
         self.reply_unit(session, id, "write", &p.file, outcome);
     }
 
-    async fn handle_mkdir(&mut self, session: &str, id: Option<Value>, params: Value) {
+    async fn handle_mkdir(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
         let Ok(p) = serde_json::from_value::<MkdirParams>(params) else {
             self.push(session, invalid_params(id));
             return;
         };
-        let resolved = match self.resolve_guarded(&p.dir, FileOp::Write).await {
+        let resolved = match self.resolve_guarded(user_id, &p.dir, FileOp::Write).await {
             Ok(r) => r,
             Err((code, message)) => {
                 self.push(session, wire::error(id, code, message, ref_data(&p.dir)));
@@ -268,12 +268,12 @@ impl FsMonitorActor {
         self.reply_unit(session, id, "mkdir", &p.dir, outcome);
     }
 
-    async fn handle_remove(&mut self, session: &str, id: Option<Value>, params: Value) {
+    async fn handle_remove(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
         let Ok(p) = serde_json::from_value::<RemoveParams>(params) else {
             self.push(session, invalid_params(id));
             return;
         };
-        let resolved = match self.resolve_guarded(&p.target, FileOp::Remove).await {
+        let resolved = match self.resolve_guarded(user_id, &p.target, FileOp::Remove).await {
             Ok(r) => r,
             Err((code, message)) => {
                 self.push(session, wire::error(id, code, message, ref_data(&p.target)));
@@ -288,19 +288,19 @@ impl FsMonitorActor {
         self.reply_unit(session, id, "remove", &p.target, outcome);
     }
 
-    async fn handle_rename(&mut self, session: &str, id: Option<Value>, params: Value) {
+    async fn handle_rename(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
         let Ok(p) = serde_json::from_value::<RenameParams>(params) else {
             self.push(session, invalid_params(id));
             return;
         };
-        let from = match self.resolve_guarded(&p.from, FileOp::Rename).await {
+        let from = match self.resolve_guarded(user_id, &p.from, FileOp::Rename).await {
             Ok(r) => r,
             Err((code, message)) => {
                 self.push(session, wire::error(id, code, message, ref_data(&p.from)));
                 return;
             }
         };
-        let to = match self.resolve_guarded(&p.to, FileOp::Rename).await {
+        let to = match self.resolve_guarded(user_id, &p.to, FileOp::Rename).await {
             Ok(r) => r,
             Err((code, message)) => {
                 self.push(session, wire::error(id, code, message, ref_data(&p.to)));
@@ -319,22 +319,32 @@ impl FsMonitorActor {
 
     /// Resolve a reference to identity + lexical containment, mapping the
     /// bind-domain error to a protocol `(code, message)`.
-    async fn resolve(&self, target: &ResourceRef, op: FileOp) -> Result<ResolvedResource, (i64, &'static str)> {
+    async fn resolve(
+        &self,
+        user_id: &str,
+        target: &ResourceRef,
+        op: FileOp,
+    ) -> Result<ResolvedResource, (i64, &'static str)> {
         let input = ReferenceInput {
             pe_id: target.pe_id.clone(),
             relative_path: target.relative_path.clone(),
             op,
         };
         self.project()
-            .resolve_reference(input)
+            .resolve_reference(user_id, input)
             .await
             .map_err(|e| wire::project_error_to_rpc(&e))
     }
 
     /// Resolve + realpath-guard: identity/lexical containment first, then the
     /// access-time symlink/alias escape check before any command IO.
-    async fn resolve_guarded(&self, target: &ResourceRef, op: FileOp) -> Result<ResolvedResource, (i64, &'static str)> {
-        let resolved = self.resolve(target, op).await?;
+    async fn resolve_guarded(
+        &self,
+        user_id: &str,
+        target: &ResourceRef,
+        op: FileOp,
+    ) -> Result<ResolvedResource, (i64, &'static str)> {
+        let resolved = self.resolve(user_id, target, op).await?;
         guard_realpath(&resolved)?;
         Ok(resolved)
     }

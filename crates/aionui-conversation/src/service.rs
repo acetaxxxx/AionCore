@@ -424,8 +424,8 @@ impl ConversationService {
         self
     }
 
-    pub fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, ConversationError> {
-        let ws_path = auto_workspace_parent(&self.workspace_root).join(format!("team-temp-{team_id}"));
+    pub fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, ConversationError> {
+        let ws_path = auto_workspace_parent(&self.workspace_root, user_id).join(format!("team-temp-{team_id}"));
         std::fs::create_dir_all(&ws_path)
             .map_err(|e| ConversationError::internal(format!("Failed to create Team temporary workspace: {e}")))?;
         Ok(ws_path.to_string_lossy().into_owned())
@@ -455,7 +455,7 @@ impl ConversationService {
     /// backfilled + the row update succeeded), so a lazy-read caller can emit a
     /// `conversation.listChanged` and let the client refetch the now-bound id.
     /// All failure modes return `false` and are swallowed (best-effort contract).
-    async fn bind_project_best_effort(&self, conversation_id: &str, workspace_path: &str) -> bool {
+    async fn bind_project_best_effort(&self, user_id: &str, conversation_id: &str, workspace_path: &str) -> bool {
         let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
         let Some(project_service) = project_service else {
             return false;
@@ -467,7 +467,7 @@ impl ConversationService {
                 return false;
             }
         };
-        match project_service.resolve_existing(uri).await {
+        match project_service.resolve_existing(user_id, uri).await {
             Ok(out) => {
                 let update = ConversationRowUpdate {
                     project_id: Some(out.project.project_id),
@@ -475,7 +475,7 @@ impl ConversationService {
                     updated_at: Some(now_ms()),
                     ..Default::default()
                 };
-                match self.conversation_repo.update(conversation_id, &update).await {
+                match self.conversation_repo.update(user_id, conversation_id, &update).await {
                     Ok(_) => true,
                     Err(err) => {
                         warn!(conversation_id = %conversation_id, error = %ErrorChain(&err), "project bind: backfill update failed");
@@ -497,6 +497,7 @@ impl ConversationService {
     /// project service.
     async fn resolve_message_attachments(
         &self,
+        user_id: &str,
         content: &str,
         files: &[ChatFileRef],
     ) -> Result<ResolvedChatMessage, ConversationError> {
@@ -516,7 +517,7 @@ impl ConversationService {
             })?;
         let upload_root = std::env::temp_dir().join("aionui");
         project
-            .resolve_chat_message(content, files, &upload_root)
+            .resolve_chat_message(user_id, content, files, &upload_root)
             .await
             .map_err(|err| ConversationError::BadRequest {
                 reason: err.to_string(),
@@ -556,8 +557,9 @@ impl ConversationService {
     /// Register a hook to be notified when a conversation is deleted.
     ///
     /// Hooks are dispatched sequentially in registration order before
-    /// `delete()` removes the conversation row. Used by `aionui-app` to wire up `WorkerTaskManagerImpl`
-    /// (kill the agent process) and `CronService` (cascade-delete cron jobs).
+    /// `delete()` removes the conversation row. Used by `aionui-app` to wire
+    /// up `WorkerTaskManagerImpl` (kill the agent process) and `CronService`
+    /// (clear deleted workspace references from cron jobs).
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
             guard.push(hook);
@@ -645,8 +647,9 @@ impl ConversationService {
         RuntimePersistenceCoordinator::new(self.runtime_state())
     }
 
-    pub(crate) fn completion_publisher(&self) -> RuntimeCompletionPublisher {
+    pub(crate) fn completion_publisher(&self, user_id: &str) -> RuntimeCompletionPublisher {
         RuntimeCompletionPublisher::new(
+            user_id.to_owned(),
             self.conversation_repo.clone(),
             self.broadcaster.clone(),
             self.runtime_persistence(),
@@ -675,6 +678,51 @@ impl ConversationService {
             .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
     }
 
+    pub async fn active_count_for_user(&self, user_id: &str) -> Result<usize, ConversationError> {
+        let mut count = 0;
+        for conversation_id in self.task_manager.active_conversation_ids() {
+            let belongs_to_user = self
+                .conversation_repo
+                .get(user_id, &conversation_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+                .is_some();
+            if belongs_to_user {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub async fn terminate_runtime_for_user(&self, user_id: &str) -> Result<usize, ConversationError> {
+        let mut terminated = 0;
+        for conversation_id in self.task_manager.active_conversation_ids() {
+            let belongs_to_user = self
+                .conversation_repo
+                .get(user_id, &conversation_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+                .is_some();
+            if !belongs_to_user {
+                continue;
+            }
+
+            self.task_manager
+                .kill_and_wait(&conversation_id, Some(AgentKillReason::SessionRevoked))
+                .await;
+            self.runtime_state.clear_conversation(&conversation_id);
+            terminated += 1;
+        }
+        if terminated > 0 {
+            tracing::info!(
+                user_id,
+                terminated,
+                "terminated conversation runtimes for revoked session"
+            );
+        }
+        Ok(terminated)
+    }
+
     async fn send_message_response(
         &self,
         conversation_id: &str,
@@ -688,14 +736,20 @@ impl ConversationService {
         }
     }
 
-    pub async fn complete_turn(&self, conversation_id: &str, turn_id: &str) {
+    pub async fn complete_turn(&self, user_id: &str, conversation_id: &str, turn_id: &str) {
         let runtime = self.runtime_summary_for(conversation_id).await;
-        self.completion_publisher()
+        self.completion_publisher(user_id)
             .publish(conversation_id, turn_id, Some(runtime))
             .await;
     }
 
-    pub(crate) async fn complete_released_turn(&self, conversation_id: &str, turn_id: &str, was_deleting: bool) {
+    pub(crate) async fn complete_released_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        was_deleting: bool,
+    ) {
         if was_deleting {
             debug!(
                 conversation_id,
@@ -704,20 +758,28 @@ impl ConversationService {
             return;
         }
 
-        self.complete_turn(conversation_id, turn_id).await;
+        self.complete_turn(user_id, conversation_id, turn_id).await;
     }
 }
 
 // ── Conversation CRUD ───────────────────────────────────────────────
 
 impl ConversationService {
-    async fn attach_assistant_identity(&self, response: &mut ConversationResponse) -> Result<(), ConversationError> {
+    async fn attach_assistant_identity(
+        &self,
+        user_id: &str,
+        response: &mut ConversationResponse,
+    ) -> Result<(), ConversationError> {
         if response.assistant.is_some() {
             return Ok(());
         }
 
-        if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(&response.id).await? {
-            response.assistant = Some(self.assistant_identity_from_snapshot(&snapshot).await?);
+        if let Some(snapshot) = self
+            .conversation_repo
+            .get_assistant_snapshot(user_id, &response.id)
+            .await?
+        {
+            response.assistant = Some(self.assistant_identity_from_snapshot(user_id, &snapshot).await?);
         }
 
         Ok(())
@@ -725,14 +787,17 @@ impl ConversationService {
 
     async fn assistant_identity_from_snapshot(
         &self,
+        user_id: &str,
         snapshot: &ConversationAssistantSnapshotRow,
     ) -> Result<aionui_api_types::ConversationAssistantIdentityResponse, ConversationError> {
         let runtime_backend = self
-            .resolve_assistant_agent_binding(&snapshot.agent_id)
+            .resolve_assistant_agent_binding(user_id, &snapshot.agent_id)
             .await?
             .map(|binding| binding.runtime_backend)
             .unwrap_or_else(|| snapshot.agent_id.clone());
-        let current_definition = self.current_assistant_definition(&snapshot.assistant_id).await?;
+        let current_definition = self
+            .current_assistant_definition(user_id, &snapshot.assistant_id)
+            .await?;
         let (source, name, avatar) = match current_definition {
             Some(definition) => (
                 definition.source,
@@ -763,13 +828,14 @@ impl ConversationService {
 
     async fn current_assistant_definition(
         &self,
+        user_id: &str,
         assistant_id: &str,
     ) -> Result<Option<AssistantDefinitionRow>, ConversationError> {
         let Some(definition_repo) = self.assistant_definition_repo() else {
             return Ok(None);
         };
         definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))
     }
@@ -789,6 +855,7 @@ impl ConversationService {
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
         let mut extra = req.extra;
+        strip_request_owner_user_id(&mut extra);
 
         let assistant_id = req
             .assistant
@@ -809,7 +876,7 @@ impl ConversationService {
             .unwrap_or_default();
         let assistant_snapshot = match assistant_id.as_deref() {
             Some(id) => {
-                self.resolve_assistant_snapshot(id, assistant_locale.as_deref(), &assistant_overrides, &extra)
+                self.resolve_assistant_snapshot(user_id, id, assistant_locale.as_deref(), &assistant_overrides, &extra)
                     .await?
             }
             None => None,
@@ -892,7 +959,7 @@ impl ConversationService {
                     .map(|backend| serde_json::Value::String(backend.clone()))
                     .as_ref(),
             );
-            let ws_path = auto_workspace_parent(&self.workspace_root).join(format!("{label}-temp-{id}"));
+            let ws_path = auto_workspace_parent(&self.workspace_root, user_id).join(format!("{label}-temp-{id}"));
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
             extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
@@ -1045,6 +1112,7 @@ impl ConversationService {
             && !initial_skills.is_empty()
             && let Some(rel_dirs) = native_skills_dirs(
                 &self.agent_metadata_repo,
+                user_id,
                 &effective_type,
                 effective_backend
                     .as_ref()
@@ -1053,7 +1121,10 @@ impl ConversationService {
             )
             .await
         {
-            let resolved = self.skill_resolver.resolve_skills(&initial_skills).await;
+            let resolved = self
+                .skill_resolver
+                .resolve_skills_for_user(user_id, &initial_skills)
+                .await;
             if !resolved.is_empty() {
                 let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
                 let n = self
@@ -1103,7 +1174,9 @@ impl ConversationService {
             None => None,
         };
 
-        let mcp_support = self.resolve_mcp_support_policy(&effective_type, &extra).await?;
+        let mcp_support = self
+            .resolve_mcp_support_policy(user_id, &effective_type, &extra)
+            .await?;
         let mut selected_row_ids: Vec<String> = Vec::new();
         let mut selected_mcp_names: Vec<String> = Vec::new();
         let mut selected_mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
@@ -1117,11 +1190,11 @@ impl ConversationService {
         if let Some(repo) = repo {
             let rows = match selected_mcp_server_ids.as_ref() {
                 Some(ids) => repo
-                    .list_by_ids_any(ids)
+                    .list_by_ids_any(user_id, ids)
                     .await
                     .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
                 None => repo
-                    .list()
+                    .list(user_id)
                     .await
                     .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
             };
@@ -1217,7 +1290,7 @@ impl ConversationService {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
-            self.bind_project_best_effort(&id, workspace).await;
+            self.bind_project_best_effort(user_id, &id, workspace).await;
         }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
@@ -1234,25 +1307,28 @@ impl ConversationService {
                 .map_err(|e| ConversationError::internal(format!("Failed to serialize assistant MCP snapshot: {e}")))?;
 
             self.conversation_repo
-                .upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
-                    conversation_id: &row.id,
-                    assistant_definition_id: &snapshot.assistant_definition_id,
-                    assistant_id: &snapshot.assistant_id,
-                    assistant_source: &snapshot.assistant_source,
-                    agent_id: &snapshot.agent_id,
-                    rules_content: &snapshot.rules.content,
-                    default_model_mode: &snapshot.default_modes.model,
-                    resolved_model_id: snapshot.resolved_defaults.model.as_deref(),
-                    default_permission_mode: &snapshot.default_modes.permission,
-                    resolved_permission_value: snapshot.resolved_defaults.permission.as_deref(),
-                    default_thought_level_mode: &snapshot.default_modes.thought_level,
-                    resolved_thought_level_value: snapshot.resolved_defaults.thought_level.as_deref(),
-                    default_skills_mode: &snapshot.default_modes.skills,
-                    resolved_skill_ids: &resolved_skill_ids,
-                    resolved_disabled_builtin_skill_ids: &resolved_disabled_builtin_skill_ids,
-                    default_mcps_mode: &snapshot.default_modes.mcps,
-                    resolved_mcp_ids: &resolved_mcp_ids,
-                })
+                .upsert_assistant_snapshot(
+                    user_id,
+                    &UpsertConversationAssistantSnapshotParams {
+                        conversation_id: &row.id,
+                        assistant_definition_id: &snapshot.assistant_definition_id,
+                        assistant_id: &snapshot.assistant_id,
+                        assistant_source: &snapshot.assistant_source,
+                        agent_id: &snapshot.agent_id,
+                        rules_content: &snapshot.rules.content,
+                        default_model_mode: &snapshot.default_modes.model,
+                        resolved_model_id: snapshot.resolved_defaults.model.as_deref(),
+                        default_permission_mode: &snapshot.default_modes.permission,
+                        resolved_permission_value: snapshot.resolved_defaults.permission.as_deref(),
+                        default_thought_level_mode: &snapshot.default_modes.thought_level,
+                        resolved_thought_level_value: snapshot.resolved_defaults.thought_level.as_deref(),
+                        default_skills_mode: &snapshot.default_modes.skills,
+                        resolved_skill_ids: &resolved_skill_ids,
+                        resolved_disabled_builtin_skill_ids: &resolved_disabled_builtin_skill_ids,
+                        default_mcps_mode: &snapshot.default_modes.mcps,
+                        resolved_mcp_ids: &resolved_mcp_ids,
+                    },
+                )
                 .await?
                 .ok_or_else(|| ConversationError::internal("assistant snapshot upsert returned no row"))?;
         }
@@ -1261,12 +1337,13 @@ impl ConversationService {
         // conversation_id). Other agent types have no session-level
         // state so we only create it for ACP.
         if effective_type == AgentType::Acp {
-            self.create_acp_session_row(&id, &extra, assistant_snapshot.as_ref())
+            self.create_acp_session_row(user_id, &id, &extra, assistant_snapshot.as_ref())
                 .await?;
         }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
-            self.persist_assistant_preferences_from_snapshot(snapshot).await?;
+            self.persist_assistant_preferences_from_snapshot(user_id, snapshot)
+                .await?;
         }
 
         let mut response = row_to_response(row, &self.workspace_root)?;
@@ -1285,7 +1362,7 @@ impl ConversationService {
             });
         }
 
-        self.broadcast_list_changed(&response.id, "created", response.source.as_ref());
+        self.broadcast_list_changed(user_id, &response.id, "created", response.source.as_ref());
 
         log_conversation_created(&response, &extra);
 
@@ -1295,6 +1372,7 @@ impl ConversationService {
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
     async fn create_acp_session_row(
         &self,
+        user_id: &str,
         conversation_id: &str,
         extra: &serde_json::Value,
         assistant_snapshot: Option<&AssistantSnapshot>,
@@ -1337,7 +1415,7 @@ impl ConversationService {
             Some(id) => id.to_owned(),
             None if !backend.is_empty() && agent_source == "builtin" => self
                 .agent_metadata_repo
-                .find_builtin_by_backend(backend)
+                .find_builtin_by_backend_for_user(user_id, backend)
                 .await
                 .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?
                 .map(|row| row.id)
@@ -1346,6 +1424,7 @@ impl ConversationService {
         };
 
         let params = CreateAcpSessionParams {
+            user_id,
             conversation_id,
             agent_source,
             agent_id: &resolved_agent_id,
@@ -1375,7 +1454,7 @@ impl ConversationService {
                 context_usage_json: None,
             };
             self.acp_session_repo
-                .save_runtime_state(conversation_id, &params)
+                .save_runtime_state_for_user(user_id, conversation_id, &params)
                 .await
                 .map_err(|e| ConversationError::internal(format!("Failed to seed acp_session runtime state: {e}")))?;
         }
@@ -1384,11 +1463,12 @@ impl ConversationService {
 
     async fn resolve_assistant_agent_binding(
         &self,
+        user_id: &str,
         value: &str,
     ) -> Result<Option<AgentBindingResolution>, ConversationError> {
         let rows = self
             .agent_metadata_repo
-            .list_all()
+            .list_all_for_user(user_id)
             .await
             .map_err(|e| ConversationError::internal(format!("agent_metadata lookup failed: {e}")))?;
         Ok(resolve_agent_binding_from_rows(&rows, value))
@@ -1396,6 +1476,7 @@ impl ConversationService {
 
     async fn resolve_assistant_snapshot(
         &self,
+        user_id: &str,
         assistant_id: &str,
         locale: Option<&str>,
         overrides: &AssistantConversationOverrides,
@@ -1410,7 +1491,7 @@ impl ConversationService {
         };
 
         let Some(definition) = definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
         else {
@@ -1418,11 +1499,11 @@ impl ConversationService {
         };
 
         let state = state_repo
-            .get(&definition.id)
+            .get_for_user(user_id, &definition.id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant state lookup failed: {e}")))?;
         let preference = preference_repo
-            .get(&definition.id)
+            .get_for_user(user_id, &definition.id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference lookup failed: {e}")))?;
 
@@ -1494,7 +1575,7 @@ impl ConversationService {
 
         let rules_content = if let Some(dispatcher) = self.assistant_dispatcher() {
             dispatcher
-                .read_rule(assistant_id, locale)
+                .read_rule(user_id, assistant_id, locale)
                 .await
                 .map_err(|e| ConversationError::internal(format!("assistant rule lookup failed: {e}")))?
         } else {
@@ -1510,7 +1591,7 @@ impl ConversationService {
             .and_then(|row| row.agent_id_override.clone())
             .unwrap_or_else(|| definition.agent_id.clone());
         let agent_binding = self
-            .resolve_assistant_agent_binding(&effective_agent_id)
+            .resolve_assistant_agent_binding(user_id, &effective_agent_id)
             .await?
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: format!("assistant agent `{effective_agent_id}` is not registered in agent_metadata"),
@@ -1556,6 +1637,7 @@ impl ConversationService {
 
     async fn persist_assistant_preferences_from_snapshot(
         &self,
+        user_id: &str,
         snapshot: &AssistantSnapshot,
     ) -> Result<(), ConversationError> {
         let Some(preference_repo) = self.assistant_preference_repo() else {
@@ -1563,7 +1645,7 @@ impl ConversationService {
         };
 
         let existing_preference = preference_repo
-            .get(&snapshot.assistant_definition_id)
+            .get_for_user(user_id, &snapshot.assistant_definition_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference lookup failed: {e}")))?;
         let last_model_id = if snapshot.default_modes.model == "auto" {
@@ -1614,15 +1696,18 @@ impl ConversationService {
         };
 
         preference_repo
-            .upsert(&aionui_db::UpsertAssistantPreferenceParams {
-                assistant_definition_id: &snapshot.assistant_definition_id,
-                last_model_id: last_model_id.as_deref(),
-                last_permission_value: last_permission_value.as_deref(),
-                last_thought_level_value: last_thought_level_value.as_deref(),
-                last_skill_ids: &last_skill_ids,
-                last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids,
-                last_mcp_ids: &last_mcp_ids,
-            })
+            .upsert_for_user(
+                user_id,
+                &aionui_db::UpsertAssistantPreferenceParams {
+                    assistant_definition_id: &snapshot.assistant_definition_id,
+                    last_model_id: last_model_id.as_deref(),
+                    last_permission_value: last_permission_value.as_deref(),
+                    last_thought_level_value: last_thought_level_value.as_deref(),
+                    last_skill_ids: &last_skill_ids,
+                    last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids,
+                    last_mcp_ids: &last_mcp_ids,
+                },
+            )
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference upsert failed: {e}")))?;
 
@@ -1631,12 +1716,13 @@ impl ConversationService {
 
     pub(crate) async fn persist_runtime_assistant_snapshot(
         &self,
+        user_id: &str,
         conversation_id: &str,
         updates: AssistantRuntimePreferenceUpdate<'_>,
     ) -> Result<(), ConversationError> {
         let Some(snapshot) = self
             .conversation_repo
-            .get_assistant_snapshot(conversation_id)
+            .get_assistant_snapshot(user_id, conversation_id)
             .await
             .map_err(|e| {
                 ConversationError::internal(format!(
@@ -1648,27 +1734,30 @@ impl ConversationService {
         };
 
         self.conversation_repo
-            .upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
-                conversation_id: &snapshot.conversation_id,
-                assistant_definition_id: &snapshot.assistant_definition_id,
-                assistant_id: &snapshot.assistant_id,
-                assistant_source: &snapshot.assistant_source,
-                agent_id: &snapshot.agent_id,
-                rules_content: &snapshot.rules_content,
-                default_model_mode: &snapshot.default_model_mode,
-                resolved_model_id: updates.model.or(snapshot.resolved_model_id.as_deref()),
-                default_permission_mode: &snapshot.default_permission_mode,
-                resolved_permission_value: updates.permission.or(snapshot.resolved_permission_value.as_deref()),
-                default_thought_level_mode: &snapshot.default_thought_level_mode,
-                resolved_thought_level_value: updates
-                    .thought_level
-                    .or(snapshot.resolved_thought_level_value.as_deref()),
-                default_skills_mode: &snapshot.default_skills_mode,
-                resolved_skill_ids: &snapshot.resolved_skill_ids,
-                resolved_disabled_builtin_skill_ids: &snapshot.resolved_disabled_builtin_skill_ids,
-                default_mcps_mode: &snapshot.default_mcps_mode,
-                resolved_mcp_ids: &snapshot.resolved_mcp_ids,
-            })
+            .upsert_assistant_snapshot(
+                user_id,
+                &UpsertConversationAssistantSnapshotParams {
+                    conversation_id: &snapshot.conversation_id,
+                    assistant_definition_id: &snapshot.assistant_definition_id,
+                    assistant_id: &snapshot.assistant_id,
+                    assistant_source: &snapshot.assistant_source,
+                    agent_id: &snapshot.agent_id,
+                    rules_content: &snapshot.rules_content,
+                    default_model_mode: &snapshot.default_model_mode,
+                    resolved_model_id: updates.model.or(snapshot.resolved_model_id.as_deref()),
+                    default_permission_mode: &snapshot.default_permission_mode,
+                    resolved_permission_value: updates.permission.or(snapshot.resolved_permission_value.as_deref()),
+                    default_thought_level_mode: &snapshot.default_thought_level_mode,
+                    resolved_thought_level_value: updates
+                        .thought_level
+                        .or(snapshot.resolved_thought_level_value.as_deref()),
+                    default_skills_mode: &snapshot.default_skills_mode,
+                    resolved_skill_ids: &snapshot.resolved_skill_ids,
+                    resolved_disabled_builtin_skill_ids: &snapshot.resolved_disabled_builtin_skill_ids,
+                    default_mcps_mode: &snapshot.default_mcps_mode,
+                    resolved_mcp_ids: &snapshot.resolved_mcp_ids,
+                },
+            )
             .await
             .map_err(|e| ConversationError::internal(format!("assistant snapshot upsert failed: {e}")))?;
 
@@ -1677,6 +1766,7 @@ impl ConversationService {
 
     pub(crate) async fn persist_runtime_assistant_preferences(
         &self,
+        user_id: &str,
         conversation_id: &str,
         updates: AssistantRuntimePreferenceUpdate<'_>,
     ) -> Result<(), ConversationError> {
@@ -1688,7 +1778,7 @@ impl ConversationService {
 
         let persisted_snapshot = self
             .conversation_repo
-            .get_assistant_snapshot(conversation_id)
+            .get_assistant_snapshot(user_id, conversation_id)
             .await
             .map_err(|e| {
                 ConversationError::internal(format!(
@@ -1697,11 +1787,15 @@ impl ConversationService {
             })?;
 
         let fallback = if persisted_snapshot.is_none() {
-            let Some(conversation) = self.conversation_repo.get(conversation_id).await.map_err(|e| {
-                ConversationError::internal(format!(
-                    "Failed to load conversation for assistant preference sync: {e}"
-                ))
-            })?
+            let Some(conversation) = self
+                .conversation_repo
+                .get(user_id, conversation_id)
+                .await
+                .map_err(|e| {
+                    ConversationError::internal(format!(
+                        "Failed to load conversation for assistant preference sync: {e}"
+                    ))
+                })?
             else {
                 return Ok(());
             };
@@ -1735,7 +1829,7 @@ impl ConversationService {
                 return Ok(());
             };
             let Some(definition) = definition_repo
-                .get_by_assistant_id(&assistant_id)
+                .get_by_assistant_id_for_user(user_id, &assistant_id)
                 .await
                 .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
             else {
@@ -1773,7 +1867,7 @@ impl ConversationService {
         };
 
         let existing_preference = preference_repo
-            .get(&definition_id)
+            .get_for_user(user_id, &definition_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference lookup failed: {e}")))?;
 
@@ -1809,24 +1903,27 @@ impl ConversationService {
         };
 
         preference_repo
-            .upsert(&aionui_db::UpsertAssistantPreferenceParams {
-                assistant_definition_id: &definition_id,
-                last_model_id: last_model_id.as_deref(),
-                last_permission_value: last_permission_value.as_deref(),
-                last_thought_level_value: last_thought_level_value.as_deref(),
-                last_skill_ids: existing_preference
-                    .as_ref()
-                    .map(|row| row.last_skill_ids.as_str())
-                    .unwrap_or("[]"),
-                last_disabled_builtin_skill_ids: existing_preference
-                    .as_ref()
-                    .map(|row| row.last_disabled_builtin_skill_ids.as_str())
-                    .unwrap_or("[]"),
-                last_mcp_ids: existing_preference
-                    .as_ref()
-                    .map(|row| row.last_mcp_ids.as_str())
-                    .unwrap_or("[]"),
-            })
+            .upsert_for_user(
+                user_id,
+                &aionui_db::UpsertAssistantPreferenceParams {
+                    assistant_definition_id: &definition_id,
+                    last_model_id: last_model_id.as_deref(),
+                    last_permission_value: last_permission_value.as_deref(),
+                    last_thought_level_value: last_thought_level_value.as_deref(),
+                    last_skill_ids: existing_preference
+                        .as_ref()
+                        .map(|row| row.last_skill_ids.as_str())
+                        .unwrap_or("[]"),
+                    last_disabled_builtin_skill_ids: existing_preference
+                        .as_ref()
+                        .map(|row| row.last_disabled_builtin_skill_ids.as_str())
+                        .unwrap_or("[]"),
+                    last_mcp_ids: existing_preference
+                        .as_ref()
+                        .map(|row| row.last_mcp_ids.as_str())
+                        .unwrap_or("[]"),
+                },
+            )
             .await
             .map_err(|e| ConversationError::internal(format!("assistant runtime preference upsert failed: {e}")))?;
 
@@ -1841,14 +1938,13 @@ impl ConversationService {
     pub async fn get(&self, user_id: &str, id: &str) -> Result<ConversationResponse, ConversationError> {
         let row = self
             .conversation_repo
-            .get(id)
+            .get(user_id, id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
-        self.backfill_extra_inplace(&row.id, &mut extra).await;
+        self.backfill_extra_inplace(user_id, &row.id, &mut extra).await;
         // Project-bind side branch: lazily backfill owner binding on read. The
         // `row` snapshot predates the backfill, so this response still carries
         // the old (null) project_id; on a real None→Some backfill we broadcast
@@ -1860,15 +1956,15 @@ impl ConversationService {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
         {
-            self.bind_project_best_effort(&row.id, workspace).await
+            self.bind_project_best_effort(user_id, &row.id, workspace).await
         } else {
             false
         };
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
-        self.attach_assistant_identity(&mut response).await?;
+        self.attach_assistant_identity(user_id, &mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
         if project_backfilled {
-            self.broadcast_list_changed(id, "updated", response.source.as_ref());
+            self.broadcast_list_changed(user_id, id, "updated", response.source.as_ref());
         }
         Ok(response)
     }
@@ -1908,10 +2004,10 @@ impl ConversationService {
                     continue;
                 }
             };
-            self.backfill_extra_inplace(&row_id, &mut extra).await;
+            self.backfill_extra_inplace(user_id, &row_id, &mut extra).await;
             match row_to_response_with_extra(row, extra, &self.workspace_root) {
                 Ok(mut resp) => {
-                    self.attach_assistant_identity(&mut resp).await?;
+                    self.attach_assistant_identity(user_id, &mut resp).await?;
                     items.push(resp);
                 }
                 Err(err) => warn!(
@@ -1944,9 +2040,8 @@ impl ConversationService {
     ) -> Result<ConversationResponse, ConversationError> {
         let existing = self
             .conversation_repo
-            .get(id)
+            .get(user_id, id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
@@ -2000,6 +2095,7 @@ impl ConversationService {
             let mut existing_extra: serde_json::Value =
                 serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
             merge_json(&mut existing_extra, new_extra);
+            strip_request_owner_user_id(&mut existing_extra);
             if existing_type == AgentType::Aionrs
                 && let Some(obj) = existing_extra.as_object_mut()
                 && obj.remove("model").is_some()
@@ -2047,11 +2143,12 @@ impl ConversationService {
             folder_id: None,
         };
 
-        self.conversation_repo.update(id, &updates).await?;
+        self.conversation_repo.update(user_id, id, &updates).await?;
 
         if let Some(model) = req.model.as_ref() {
             let selected_model = model.use_model.as_deref().unwrap_or(model.model.as_str());
             self.persist_runtime_assistant_snapshot(
+                user_id,
                 id,
                 AssistantRuntimePreferenceUpdate {
                     model: Some(selected_model),
@@ -2060,6 +2157,7 @@ impl ConversationService {
             )
             .await?;
             self.persist_runtime_assistant_preferences(
+                user_id,
                 id,
                 AssistantRuntimePreferenceUpdate {
                     model: Some(selected_model),
@@ -2082,14 +2180,14 @@ impl ConversationService {
         // Re-fetch to return the updated version
         let updated = self
             .conversation_repo
-            .get(id)
+            .get(user_id, id)
             .await?
             .ok_or_else(|| ConversationError::internal("Conversation vanished after update"))?;
 
         let response = row_to_response(updated, &self.workspace_root)?;
 
         info!("Conversation updated");
-        self.broadcast_list_changed(id, "updated", response.source.as_ref());
+        self.broadcast_list_changed(user_id, id, "updated", response.source.as_ref());
 
         Ok(response)
     }
@@ -2099,15 +2197,20 @@ impl ConversationService {
     /// (e.g. `TeamSessionService::ensure_session` writing
     /// `team_mcp_stdio_config`) where a full `update()` would kill the agent
     /// on a spurious model comparison.
-    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
-    pub async fn update_extra(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), ConversationError> {
-        let existing =
-            self.conversation_repo
-                .get(conversation_id)
-                .await?
-                .ok_or_else(|| ConversationError::NotFound {
-                    id: conversation_id.to_owned(),
-                })?;
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn update_extra(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        patch: serde_json::Value,
+    ) -> Result<(), ConversationError> {
+        let existing = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let mut merged: serde_json::Value =
             serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
@@ -2124,15 +2227,29 @@ impl ConversationService {
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        self.conversation_repo.update(conversation_id, &updates).await?;
+        self.conversation_repo
+            .update(user_id, conversation_id, &updates)
+            .await?;
         debug!("Conversation extra merged");
         Ok(())
     }
 
-    pub async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), ConversationError> {
+    pub async fn save_acp_runtime_mode(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        mode: &str,
+    ) -> Result<(), ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
         let runtime_state = self
             .acp_session_repo
-            .load_runtime_state(conversation_id)
+            .load_runtime_state_for_user(user_id, conversation_id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load runtime mode state: {e}")))?;
         let mut config_selections = runtime_state
@@ -2148,7 +2265,7 @@ impl ConversationService {
             ..Default::default()
         };
         self.acp_session_repo
-            .save_runtime_state(conversation_id, &params)
+            .save_runtime_state_for_user(user_id, conversation_id, &params)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to persist runtime mode: {e}")))?;
         Ok(())
@@ -2162,9 +2279,8 @@ impl ConversationService {
         // Get existing to retrieve source for broadcast and verify ownership
         let existing = self
             .conversation_repo
-            .get(id)
+            .get(user_id, id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let source: Option<ConversationSource> = existing
@@ -2181,10 +2297,10 @@ impl ConversationService {
         let hooks: Vec<Arc<dyn OnConversationDelete>> =
             self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
         for hook in hooks {
-            hook.on_conversation_deleted(id).await;
+            hook.on_conversation_deleted(user_id, id).await;
         }
 
-        if let Err(err) = self.conversation_repo.delete(id).await {
+        if let Err(err) = self.conversation_repo.delete(user_id, id).await {
             self.runtime_state.clear_deleting(id);
             return Err(err.into());
         }
@@ -2194,7 +2310,7 @@ impl ConversationService {
         // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
         // conversations that used to be ACP (shouldn't happen but is
         // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete(id).await {
+        if let Err(err) = self.acp_session_repo.delete_for_user(user_id, id).await {
             warn!(
                 error = %ErrorChain(&err),
                 "Failed to delete acp_session row on conversation delete"
@@ -2227,7 +2343,7 @@ impl ConversationService {
         }
 
         info!("Conversation deleted");
-        self.broadcast_list_changed(id, "deleted", source.as_ref());
+        self.broadcast_list_changed(user_id, id, "deleted", source.as_ref());
 
         Ok(())
     }
@@ -2253,14 +2369,17 @@ impl ConversationService {
     pub async fn reset(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         // Verify existence and ownership
         self.conversation_repo
-            .get(id)
+            .get(user_id, id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         // Delete all messages
-        self.conversation_repo.delete_messages_by_conversation(id).await?;
-        self.conversation_repo.delete_artifacts_by_conversation(id).await?;
+        self.conversation_repo
+            .delete_messages_by_conversation(user_id, id)
+            .await?;
+        self.conversation_repo
+            .delete_artifacts_by_conversation(user_id, id)
+            .await?;
 
         // Reset status to pending
         let now = now_ms();
@@ -2269,7 +2388,7 @@ impl ConversationService {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.conversation_repo.update(id, &updates).await?;
+        self.conversation_repo.update(user_id, id, &updates).await?;
 
         info!("Conversation reset");
         Ok(())
@@ -2282,16 +2401,15 @@ impl ConversationService {
         id: &str,
     ) -> Result<Vec<ConversationResponse>, ConversationError> {
         self.conversation_repo
-            .get(id)
+            .get(user_id, id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let rows = self.conversation_repo.list_associated(user_id, id).await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
             let mut response = row_to_response(row, &self.workspace_root)?;
-            self.attach_assistant_identity(&mut response).await?;
+            self.attach_assistant_identity(user_id, &mut response).await?;
             items.push(response);
         }
         Ok(items)
@@ -2307,7 +2425,7 @@ impl ConversationService {
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
             let mut response = row_to_response(row, &self.workspace_root)?;
-            self.attach_assistant_identity(&mut response).await?;
+            self.attach_assistant_identity(user_id, &mut response).await?;
             items.push(response);
         }
         Ok(items)
@@ -2342,9 +2460,8 @@ impl ConversationService {
     ) -> Result<MessageListResponse, ConversationError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
@@ -2373,7 +2490,7 @@ impl ConversationService {
 
         let page = self
             .conversation_repo
-            .list_messages_page(conversation_id, &MessagePageParams { limit, direction })
+            .list_messages_page(user_id, conversation_id, &MessagePageParams { limit, direction })
             .await?;
 
         let mut compacted_count = 0usize;
@@ -2443,16 +2560,15 @@ impl ConversationService {
         message_id: &str,
     ) -> Result<MessageResponse, ConversationError> {
         self.conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
 
         let row = self
             .conversation_repo
-            .get_message(conversation_id, message_id)
+            .get_message(user_id, conversation_id, message_id)
             .await?
             .ok_or_else(|| ConversationError::MessageNotFound {
                 id: message_id.to_owned(),
@@ -2480,16 +2596,15 @@ impl ConversationService {
         conversation_id: &str,
     ) -> Result<ConversationArtifactListResponse, ConversationError> {
         self.conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
 
         let mut items = self
             .conversation_repo
-            .list_artifacts(conversation_id)
+            .list_artifacts(user_id, conversation_id)
             .await?
             .into_iter()
             .map(row_to_artifact_response)
@@ -2497,7 +2612,7 @@ impl ConversationService {
 
         let mut legacy_items = self
             .conversation_repo
-            .list_legacy_cron_trigger_messages(conversation_id)
+            .list_legacy_cron_trigger_messages(user_id, conversation_id)
             .await?
             .into_iter()
             .filter_map(|row| legacy_cron_trigger_to_artifact(row).ok())
@@ -2522,9 +2637,8 @@ impl ConversationService {
         req: UpdateConversationArtifactRequest,
     ) -> Result<ConversationArtifactResponse, ConversationError> {
         self.conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
@@ -2536,18 +2650,20 @@ impl ConversationService {
 
         let row = self
             .conversation_repo
-            .update_artifact_status(conversation_id, artifact_id, &status, now_ms())
+            .update_artifact_status(user_id, conversation_id, artifact_id, &status, now_ms())
             .await?
             .ok_or_else(|| ConversationError::ArtifactNotFound {
                 id: artifact_id.to_owned(),
             })?;
 
         let response = row_to_artifact_response(row)?;
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "conversation.artifact",
-            serde_json::to_value(&response)
-                .map_err(|e| ConversationError::internal(format!("Failed to serialize artifact event: {e}")))?,
-        ));
+        let mut payload = serde_json::to_value(&response)
+            .map_err(|e| ConversationError::internal(format!("Failed to serialize artifact event: {e}")))?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("user_id".to_owned(), serde_json::Value::String(user_id.to_owned()));
+        }
+        self.broadcaster
+            .broadcast(WebSocketMessage::new("conversation.artifact", payload));
 
         Ok(response)
     }
@@ -2597,9 +2713,8 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConfirmationListResponse, ConversationError> {
         self.conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
@@ -2625,9 +2740,8 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
         self.conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
@@ -2648,6 +2762,7 @@ impl ConversationService {
 
         if let Some(conf_id) = conf_id {
             let payload = serde_json::json!({
+                "user_id": user_id,
                 "conversation_id": conversation_id,
                 "id": conf_id,
             });
@@ -2668,9 +2783,8 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ApprovalCheckResponse, ConversationError> {
         self.conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
@@ -2711,9 +2825,8 @@ impl ConversationService {
         // Verify conversation exists and belongs to user
         let row = self
             .conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
@@ -2736,7 +2849,9 @@ impl ConversationService {
         // Resolve file attachments at the send boundary before any persist/claim
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
-        let resolved = self.resolve_message_attachments(&req.content, &req.files).await?;
+        let resolved = self
+            .resolve_message_attachments(user_id, &req.content, &req.files)
+            .await?;
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
@@ -2763,11 +2878,11 @@ impl ConversationService {
         {
             let mut turn_claim = turn_claim;
             let was_deleting = turn_claim.release();
-            self.complete_released_turn(conversation_id, &turn_id, was_deleting)
+            self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
                 .await;
             return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
-        if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
+        if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
             warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
             return Err(e.into());
         }
@@ -2777,6 +2892,7 @@ impl ConversationService {
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.userCreated",
             serde_json::json!({
+                "user_id": user_id,
                 "conversation_id": conversation_id,
                 "msg_id": &user_msg_id,
                 "content": &resolved.content,
@@ -2799,6 +2915,7 @@ impl ConversationService {
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
                 self.persist_and_broadcast_send_failure_tip(
+                    user_id,
                     conversation_id,
                     &turn_id,
                     &send_error,
@@ -2807,7 +2924,7 @@ impl ConversationService {
                 .await;
                 let mut turn_claim = turn_claim;
                 let was_deleting = turn_claim.release();
-                self.complete_released_turn(conversation_id, &turn_id, was_deleting)
+                self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
                     .await;
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
@@ -2858,9 +2975,8 @@ impl ConversationService {
 
         let row = self
             .conversation_repo
-            .get(&request.conversation_id)
+            .get(&request.user_id, &request.conversation_id)
             .await?
-            .filter(|r| r.user_id == request.user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: request.conversation_id.clone(),
             })?;
@@ -2885,7 +3001,7 @@ impl ConversationService {
             if self
                 .runtime_persistence()
                 .allows(&request.conversation_id, RuntimeWriteKind::UserMessage)
-                && let Err(e) = self.conversation_repo.insert_message(&user_msg).await
+                && let Err(e) = self.conversation_repo.insert_message(&request.user_id, &user_msg).await
             {
                 warn!(
                     msg_id = %user_msg.id,
@@ -2894,7 +3010,7 @@ impl ConversationService {
                 );
                 let mut turn_claim = turn_claim;
                 let was_deleting = turn_claim.release();
-                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
+                self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting)
                     .await;
                 return Err(e.into());
             }
@@ -2913,6 +3029,7 @@ impl ConversationService {
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
                 self.persist_and_broadcast_send_failure_tip(
+                    &request.user_id,
                     &request.conversation_id,
                     &turn_id,
                     &send_error,
@@ -2921,7 +3038,7 @@ impl ConversationService {
                 .await;
                 let mut turn_claim = turn_claim;
                 let was_deleting = turn_claim.release();
-                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
+                self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting)
                     .await;
                 return Ok(ConversationAgentTurnOutcome {
                     conversation_id: request.conversation_id.clone(),
@@ -2966,11 +3083,13 @@ impl ConversationService {
 
     pub async fn latest_conversation_error_message(
         &self,
+        user_id: &str,
         conversation_id: &str,
     ) -> Result<Option<String>, ConversationError> {
         let page = self
             .conversation_repo
             .list_messages_page(
+                user_id,
                 conversation_id,
                 &MessagePageParams {
                     limit: 30,
@@ -2984,13 +3103,14 @@ impl ConversationService {
 
     pub(crate) async fn persist_and_broadcast_send_failure_tip(
         &self,
+        user_id: &str,
         conversation_id: &str,
         turn_id: &str,
         err: &AgentSendError,
         top_level_code: Option<&'static str>,
     ) {
         let Some(row) = self
-            .persist_send_failure_tip(conversation_id, err, top_level_code)
+            .persist_send_failure_tip(user_id, conversation_id, err, top_level_code)
             .await
         else {
             return;
@@ -3002,6 +3122,7 @@ impl ConversationService {
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.stream",
             serde_json::json!({
+                "user_id": user_id,
                 "conversation_id": row.conversation_id,
                 "msg_id": msg_id,
                 "turn_id": turn_id,
@@ -3022,13 +3143,14 @@ impl ConversationService {
     /// Used by paths outside the normal user→agent turn (e.g. the team
     /// scheduler writing an incoming teammate message as a left bubble in the
     /// target agent's conversation so the UI shows who spoke).
-    pub async fn insert_raw_message(&self, row: &MessageRow) -> Result<(), ConversationError> {
-        self.conversation_repo.insert_message(row).await?;
+    pub async fn insert_raw_message(&self, user_id: &str, row: &MessageRow) -> Result<(), ConversationError> {
+        self.conversation_repo.insert_message(user_id, row).await?;
 
         let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
         let content_value: serde_json::Value =
             serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
         let payload = serde_json::json!({
+            "user_id": user_id,
             "conversation_id": row.conversation_id,
             "msg_id": msg_id,
             "type": row.r#type,
@@ -3054,9 +3176,8 @@ impl ConversationService {
     ) -> Result<CancelConversationResponse, ConversationError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
@@ -3127,7 +3248,7 @@ impl ConversationService {
         conversation_id: &str,
         active_leases: &ActiveLeaseRegistry,
     ) -> Result<(), ConversationError> {
-        let row = match self.conversation_repo.get(conversation_id).await {
+        let row = match self.conversation_repo.get(user_id, conversation_id).await {
             Ok(row) => row,
             Err(error) => {
                 warn!(
@@ -3141,7 +3262,7 @@ impl ConversationService {
             }
         };
 
-        let Some(row) = row.filter(|row| row.user_id == user_id) else {
+        let Some(row) = row else {
             debug!(
                 kind = "conversation",
                 conversation_id, user_id, "Conversation active lease renew rejected"
@@ -3188,9 +3309,8 @@ impl ConversationService {
     ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
         let row = self
             .conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
@@ -3230,9 +3350,8 @@ impl ConversationService {
     ) -> Result<(AgentInstance, bool), ConversationError> {
         let row = self
             .conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
-            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
@@ -3274,7 +3393,7 @@ impl ConversationService {
         };
 
         // Persist auto-resolved workspace if factory picked a different path.
-        self.maybe_persist_workspace(conversation_id, &stored_workspace, agent.workspace())
+        self.maybe_persist_workspace(user_id, conversation_id, &stored_workspace, agent.workspace())
             .await?;
 
         info!(conversation_id, phase, "Conversation runtime recovered");
@@ -3360,7 +3479,7 @@ impl ConversationService {
         }
         let snapshot = self
             .conversation_repo
-            .get_assistant_snapshot(&row.id)
+            .get_assistant_snapshot(&row.user_id, &row.id)
             .await
             .map_err(|e| {
                 ConversationError::internal(format!(
@@ -3439,14 +3558,15 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) -> Option<String> {
-        build_opts.context.team.as_ref()?;
         let service = self.runtime_token_service.as_ref()?;
-        let issue = service.issue(
-            user_id,
-            conversation_id,
-            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-        );
+        // Every conversation gets a helper-scoped token so the in-conversation
+        // CLI (`aioncore config` / `diagnose`) can authenticate in AionPro
+        // mode; team-bound conversations additionally get the team-tools scopes.
+        let mut scopes = vec![RuntimeTokenScope::ConversationHelper];
+        if build_opts.context.team.is_some() {
+            scopes.extend([RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall]);
+        }
+        let issue = service.issue(user_id, conversation_id, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, scopes);
         Some(issue.token)
     }
 
@@ -3461,6 +3581,7 @@ impl ConversationService {
         if !context.workspace.is_custom {
             let expected_workspace = expected_auto_workspace_path(
                 &self.workspace_root,
+                &row.user_id,
                 &row.id,
                 &context.conversation.agent_type,
                 backend.as_ref(),
@@ -3478,6 +3599,7 @@ impl ConversationService {
 
         let Some(rel_dirs) = native_skills_dirs(
             &self.agent_metadata_repo,
+            &context.conversation.user_id,
             &context.conversation.agent_type,
             backend.as_ref(),
         )
@@ -3489,7 +3611,10 @@ impl ConversationService {
             return;
         }
 
-        let resolved = self.skill_resolver.resolve_skills(&skill_names).await;
+        let resolved = self
+            .skill_resolver
+            .resolve_skills_for_user(&context.conversation.user_id, &skill_names)
+            .await;
         if resolved.is_empty() {
             return;
         }
@@ -3515,6 +3640,7 @@ impl ConversationService {
     /// path here so the frontend can display the workspace panel correctly.
     pub(crate) async fn maybe_persist_workspace(
         &self,
+        user_id: &str,
         conversation_id: &str,
         stored_workspace: &str,
         resolved_workspace: &str,
@@ -3532,7 +3658,7 @@ impl ConversationService {
         // Fetch latest extra, merge the resolved workspace path in, and persist.
         let row = self
             .conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::internal("Conversation vanished during workspace sync"))?;
 
@@ -3547,7 +3673,7 @@ impl ConversationService {
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        self.conversation_repo.update(conversation_id, &update).await?;
+        self.conversation_repo.update(user_id, conversation_id, &update).await?;
 
         debug!(
             conversation_id,
@@ -3560,11 +3686,13 @@ impl ConversationService {
     /// Broadcast a `conversation.listChanged` WebSocket event.
     pub(crate) fn broadcast_list_changed(
         &self,
+        user_id: &str,
         conversation_id: &str,
         action: &str,
         source: Option<&ConversationSource>,
     ) {
         let payload = serde_json::json!({
+            "user_id": user_id,
             "conversation_id": conversation_id,
             "action": action,
             "source": source,
@@ -3581,7 +3709,7 @@ impl ConversationService {
     /// Persists the mutation asynchronously; failures are logged and
     /// swallowed so a read path never 500s because of a backfill write
     /// failure.
-    async fn backfill_extra_inplace(&self, conversation_id: &str, extra: &mut serde_json::Value) {
+    async fn backfill_extra_inplace(&self, user_id: &str, conversation_id: &str, extra: &mut serde_json::Value) {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
         let mut mutated = backfill_skills_if_missing(extra, &auto_inject);
         mutated |= backfill_cron_job_id_alias(extra);
@@ -3603,7 +3731,7 @@ impl ConversationService {
             extra: Some(serialized),
             ..Default::default()
         };
-        if let Err(e) = self.conversation_repo.update(conversation_id, &update).await {
+        if let Err(e) = self.conversation_repo.update(user_id, conversation_id, &update).await {
             warn!(
                 conversation_id,
                 error = %ErrorChain(&e),
@@ -3663,6 +3791,12 @@ fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), Conver
     Ok(())
 }
 
+fn strip_request_owner_user_id(extra: &mut serde_json::Value) {
+    if let Some(obj) = extra.as_object_mut() {
+        obj.remove("user_id");
+    }
+}
+
 fn team_id_from_extra(extra: &str) -> Option<String> {
     TeamSessionBinding::team_id_marker_from_extra_str(extra)
 }
@@ -3704,20 +3838,24 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
 
 fn expected_auto_workspace_path(
     workspace_root: &std::path::Path,
+    user_id: &str,
     conversation_id: &str,
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> PathBuf {
-    auto_workspace_parent(workspace_root).join(format!(
+    auto_workspace_parent(workspace_root, user_id).join(format!(
         "{}-temp-{conversation_id}",
         conversation_label(agent_type, backend)
     ))
 }
 
-fn auto_workspace_parent(workspace_root: &Path) -> PathBuf {
+fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
+    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
     let now = chrono::Local::now();
     workspace_root
         .join("conversations")
+        .join("users")
+        .join(dir)
         .join(format!("{:04}", now.year()))
         .join(format!("{:02}", now.month()))
         .join(format!("{:02}", now.day()))
@@ -3762,16 +3900,21 @@ fn is_auto_workspace_relative_path(relative: &Path) -> bool {
         return false;
     };
 
+    let dated = |year: &str, month: &str, day: &str| {
+        year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && year.chars().all(|ch| ch.is_ascii_digit())
+            && month.chars().all(|ch| ch.is_ascii_digit())
+            && day.chars().all(|ch| ch.is_ascii_digit())
+    };
+
     match parts.as_slice() {
+        // legacy: bare leaf, or {Y}/{M}/{D}/leaf
         [_file_name] => true,
-        [year, month, day, _file_name] => {
-            year.len() == 4
-                && month.len() == 2
-                && day.len() == 2
-                && year.chars().all(|ch| ch.is_ascii_digit())
-                && month.chars().all(|ch| ch.is_ascii_digit())
-                && day.chars().all(|ch| ch.is_ascii_digit())
-        }
+        [year, month, day, _file_name] => dated(year, month, day),
+        // per-user, type-first: users/{user_dir}/{Y}/{M}/{D}/leaf
+        ["users", _user_dir, year, month, day, _file_name] => dated(year, month, day),
         _ => false,
     }
 }
@@ -3823,15 +3966,23 @@ fn is_dated_auto_workspace_relative_path(relative: &Path) -> bool {
         return false;
     };
 
+    // Per-user, type-first layout: users/{user_dir}/{Y}/{M}/{D}/{file}. The
+    // legacy userless {Y}/{M}/{D}/{file} form is still accepted so old
+    // conversations' empty date dirs are pruned on delete.
+    let dated = |year: &str, month: &str, day: &str| {
+        year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && year.chars().all(|ch| ch.is_ascii_digit())
+            && month.chars().all(|ch| ch.is_ascii_digit())
+            && day.chars().all(|ch| ch.is_ascii_digit())
+    };
     matches!(
         parts.as_slice(),
-        [year, month, day, _file_name]
-            if year.len() == 4
-                && month.len() == 2
-                && day.len() == 2
-                && year.chars().all(|ch| ch.is_ascii_digit())
-                && month.chars().all(|ch| ch.is_ascii_digit())
-                && day.chars().all(|ch| ch.is_ascii_digit())
+        [year, month, day, _file_name] if dated(year, month, day)
+    ) || matches!(
+        parts.as_slice(),
+        ["users", _user_dir, year, month, day, _file_name] if dated(year, month, day)
     )
 }
 
@@ -3867,6 +4018,7 @@ fn context_skill_names(context: &AgentSessionContext) -> Vec<String> {
 /// rely on prompt injection instead.
 async fn native_skills_dirs(
     repo: &Arc<dyn IAgentMetadataRepository>,
+    user_id: &str,
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> Option<Vec<String>> {
@@ -3874,7 +4026,11 @@ async fn native_skills_dirs(
         && let Some(serde_json::Value::String(vendor)) = backend
         && !vendor.is_empty()
     {
-        let row = repo.find_builtin_by_backend(vendor).await.ok().flatten()?;
+        let row = repo
+            .find_builtin_by_backend_for_user(user_id, vendor)
+            .await
+            .ok()
+            .flatten()?;
         let raw = row.native_skills_dirs?;
         return serde_json::from_str::<Vec<String>>(&raw).ok();
     }
@@ -3886,11 +4042,12 @@ async fn native_skills_dirs(
 impl ConversationService {
     async fn resolve_mcp_support_policy(
         &self,
+        user_id: &str,
         agent_type: &AgentType,
         extra: &serde_json::Value,
     ) -> Result<McpSupportPolicy, ConversationError> {
         match agent_type {
-            AgentType::Acp => resolve_acp_mcp_support_policy(&self.agent_metadata_repo, extra).await,
+            AgentType::Acp => resolve_acp_mcp_support_policy(&self.agent_metadata_repo, user_id, extra).await,
             AgentType::Aionrs => Ok(McpSupportPolicy::AIONRS),
             _ => Ok(McpSupportPolicy::AIONRS),
         }
@@ -3899,6 +4056,7 @@ impl ConversationService {
 
 async fn resolve_acp_mcp_support_policy(
     repo: &Arc<dyn IAgentMetadataRepository>,
+    user_id: &str,
     extra: &serde_json::Value,
 ) -> Result<McpSupportPolicy, ConversationError> {
     let agent_id = extra
@@ -3916,12 +4074,12 @@ async fn resolve_acp_mcp_support_policy(
 
     let row = match agent_id {
         Some(id) => repo
-            .get(id)
+            .get_for_user(user_id, id)
             .await
             .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?,
         None if agent_source == "builtin" => match backend {
             Some(vendor) => repo
-                .find_builtin_by_backend(vendor)
+                .find_builtin_by_backend_for_user(user_id, vendor)
                 .await
                 .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?,
             None => None,
@@ -4097,6 +4255,7 @@ fn enum_to_db<T: serde::Serialize>(val: &T) -> Result<String, ConversationError>
 pub(crate) async fn persist_session_key(
     repo: &Arc<dyn IConversationRepository>,
     persistence: &RuntimePersistenceCoordinator,
+    user_id: &str,
     conversation_id: &str,
     session_key: &str,
 ) {
@@ -4104,7 +4263,7 @@ pub(crate) async fn persist_session_key(
         return;
     }
 
-    let row = match repo.get(conversation_id).await {
+    let row = match repo.get(user_id, conversation_id).await {
         Ok(Some(r)) => r,
         _ => return,
     };
@@ -4130,7 +4289,7 @@ pub(crate) async fn persist_session_key(
         updated_at: Some(now_ms()),
         ..Default::default()
     };
-    if let Err(e) = repo.update(conversation_id, &update).await {
+    if let Err(e) = repo.update(user_id, conversation_id, &update).await {
         warn!(conversation_id, error = %ErrorChain(&e), "Failed to persist session key");
     } else {
         debug!(conversation_id, "Persisted session key to conversation.extra");

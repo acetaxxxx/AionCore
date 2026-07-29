@@ -141,7 +141,11 @@ impl FsMonitorActor {
     /// Handle one inbound transport event.
     async fn on_inbound(&mut self, event: FsInbound) {
         match event {
-            FsInbound::Frame { session, frame } => self.dispatch_frame(&session, frame).await,
+            FsInbound::Frame {
+                session,
+                user_id,
+                frame,
+            } => self.dispatch_frame(&session, &user_id, frame).await,
             FsInbound::Disconnect { session } => {
                 // Connection teardown — lifecycle boundary; releases the session's
                 // subscriptions (nodes go warm, reaper unmounts later).

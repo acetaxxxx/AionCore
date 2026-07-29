@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 aionui-api-types.workspace = true
+aionui-auth.workspace = true
 aionui-common.workspace = true
 aionui-db.workspace = true
 axum.workspace = true

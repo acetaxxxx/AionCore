@@ -16,7 +16,10 @@ async fn setup() -> (Arc<ProjectService>, String, TempDir, TempDir) {
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
     let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
     let dir = tempfile::tempdir().unwrap();
-    let created = service.create_standard(to_file_uri(dir.path()).unwrap()).await.unwrap();
+    let created = service
+        .create_standard("system_default_user", to_file_uri(dir.path()).unwrap())
+        .await
+        .unwrap();
     let upload_root = tempfile::tempdir().unwrap();
     (service, created.project_explorer.pe_id, dir, upload_root)
 }
@@ -28,6 +31,7 @@ async fn resolves_project_file_and_inlines_marker() {
 
     let out = service
         .resolve_chat_message(
+            "system_default_user",
             "please review",
             &[ChatFileRef::Project {
                 pe_id: pe_id.clone(),
@@ -57,6 +61,7 @@ async fn resolves_project_directory_ref() {
     // be rejected as a missing file.
     let out = service
         .resolve_chat_message(
+            "system_default_user",
             "look here",
             &[ChatFileRef::Project {
                 pe_id,
@@ -74,7 +79,7 @@ async fn resolves_project_directory_ref() {
 async fn empty_files_leaves_content_unchanged() {
     let (service, _pe, _dir, upload_root) = setup().await;
     let out = service
-        .resolve_chat_message("hi", &[], upload_root.path())
+        .resolve_chat_message("system_default_user", "hi", &[], upload_root.path())
         .await
         .unwrap();
     assert_eq!(out.content, "hi");
@@ -86,6 +91,7 @@ async fn missing_project_file_is_atomic_error() {
     let (service, pe_id, _dir, upload_root) = setup().await;
     let err = service
         .resolve_chat_message(
+            "system_default_user",
             "x",
             &[ChatFileRef::Project {
                 pe_id,
@@ -106,7 +112,12 @@ async fn upload_under_root_is_accepted() {
     let path = up.to_string_lossy().into_owned();
 
     let out = service
-        .resolve_chat_message("", &[ChatFileRef::Upload { path: path.clone() }], upload_root.path())
+        .resolve_chat_message(
+            "system_default_user",
+            "",
+            &[ChatFileRef::Upload { path: path.clone() }],
+            upload_root.path(),
+        )
         .await
         .unwrap();
     assert_eq!(out.files, vec![path]);
@@ -123,7 +134,12 @@ async fn local_readable_file_resolves_and_inlines_marker() {
     let path = f.to_string_lossy().into_owned();
 
     let out = service
-        .resolve_chat_message("see this", &[ChatFileRef::Local { path }], upload_root.path())
+        .resolve_chat_message(
+            "system_default_user",
+            "see this",
+            &[ChatFileRef::Local { path }],
+            upload_root.path(),
+        )
         .await
         .unwrap();
 
@@ -150,6 +166,7 @@ async fn local_canonicalizes_symlink_to_target_path() {
 
     let out = service
         .resolve_chat_message(
+            "system_default_user",
             "x",
             &[ChatFileRef::Local {
                 path: link_path.clone(),
@@ -179,7 +196,12 @@ async fn local_nonexistent_is_rejected() {
     let missing = upload_root.path().join("nope.txt").to_string_lossy().into_owned();
 
     let err = service
-        .resolve_chat_message("x", &[ChatFileRef::Local { path: missing }], upload_root.path())
+        .resolve_chat_message(
+            "system_default_user",
+            "x",
+            &[ChatFileRef::Local { path: missing }],
+            upload_root.path(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, ProjectError::LocalPathNotReadable { .. }), "got {err:?}");
@@ -193,7 +215,12 @@ async fn local_directory_is_rejected() {
     let path = d.path().to_string_lossy().into_owned();
 
     let err = service
-        .resolve_chat_message("x", &[ChatFileRef::Local { path }], upload_root.path())
+        .resolve_chat_message(
+            "system_default_user",
+            "x",
+            &[ChatFileRef::Local { path }],
+            upload_root.path(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, ProjectError::LocalPathNotReadable { .. }), "got {err:?}");
@@ -209,6 +236,7 @@ async fn upload_outside_root_is_rejected() {
 
     let err = service
         .resolve_chat_message(
+            "system_default_user",
             "x",
             &[ChatFileRef::Upload {
                 path: ext.to_string_lossy().into_owned(),

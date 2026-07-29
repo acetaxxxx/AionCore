@@ -691,6 +691,17 @@ impl crate::traits::IFileService for FileService {
     }
 
     async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, FileError> {
+        self.write_file_for_user("system_default_user", path, data, workspace)
+            .await
+    }
+
+    async fn write_file_for_user(
+        &self,
+        user_id: &str,
+        path: &str,
+        data: &[u8],
+        workspace: &str,
+    ) -> Result<bool, FileError> {
         if has_traversal(path) {
             return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
@@ -724,7 +735,8 @@ impl crate::traits::IFileService for FileService {
             relative_path,
             operation: ContentUpdateOperation::Write,
         };
-        let payload = serde_json::to_value(&event).unwrap_or_default();
+        let mut payload = serde_json::to_value(&event).unwrap_or_default();
+        payload["user_id"] = serde_json::Value::String(user_id.to_owned());
         let msg = WebSocketMessage::new("fileStream.contentUpdate", payload);
         self.broadcaster.broadcast(msg);
 
@@ -817,6 +829,10 @@ impl crate::traits::IFileService for FileService {
     }
 
     async fn remove_entry(&self, path: &str, workspace: &str) -> Result<(), FileError> {
+        self.remove_entry_for_user("system_default_user", path, workspace).await
+    }
+
+    async fn remove_entry_for_user(&self, user_id: &str, path: &str, workspace: &str) -> Result<(), FileError> {
         if has_traversal(path) {
             return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
@@ -848,7 +864,8 @@ impl crate::traits::IFileService for FileService {
             relative_path,
             operation: ContentUpdateOperation::Delete,
         };
-        let payload = serde_json::to_value(&event).unwrap_or_default();
+        let mut payload = serde_json::to_value(&event).unwrap_or_default();
+        payload["user_id"] = serde_json::Value::String(user_id.to_owned());
         let msg = WebSocketMessage::new("fileStream.contentUpdate", payload);
         self.broadcaster.broadcast(msg);
 

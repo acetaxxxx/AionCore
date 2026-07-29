@@ -622,7 +622,11 @@ impl AcpAgentManager {
             ..Default::default()
         };
         if init_handshake.agent_capabilities.is_some() || init_handshake.auth_methods.is_some() {
-            catalog_tx.send_partial(self.params.metadata.id.clone(), init_handshake);
+            catalog_tx.send_partial(
+                self.params.user_id.clone(),
+                self.params.metadata.id.clone(),
+                init_handshake,
+            );
         }
 
         // Seed the observed/advertised layers (observed mode/model, cached
