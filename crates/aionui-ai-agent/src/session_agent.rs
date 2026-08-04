@@ -1328,12 +1328,26 @@ fn spec_mode_model(
 ) -> (aionui_session::SessionSpec, Option<String>, Option<String>) {
     use aionui_session::SessionSpec;
     let spec = match &backend_session_id {
+        // A bound session ALWAYS resumes — even on a forked conversation
+        // (its fork completed; the spec is now pure lineage data).
         Some(_) => SessionSpec::Resume {
             session_id: conversation_id.to_owned(),
             backend_session_id,
         },
-        None => SessionSpec::Fresh {
-            session_id: conversation_id.to_owned(),
+        // Unbound + fork spec = the fork has not materialized yet → open in
+        // Fork mode against the parent's snapshotted sid. This also makes a
+        // post-fork dead-anchor self-heal (clear_session_id) RE-FORK back to
+        // the fork point instead of silently opening Fresh — strictly better
+        // than the plain conversation's lost-anchor behavior.
+        None => match &config.fork {
+            Some(fork) => SessionSpec::Fork {
+                session_id: conversation_id.to_owned(),
+                parent_backend_session_id: fork.parent_session_id.clone(),
+                at_turn_id: fork.last_turn_id.clone(),
+            },
+            None => SessionSpec::Fresh {
+                session_id: conversation_id.to_owned(),
+            },
         },
     };
     // Normalize the resolved mode alias into the backend-native id — the SAME
@@ -1550,17 +1564,17 @@ pub async fn build_session_instance(
         model,
         mode,
         init,
-        // Packaged app: resolve the bundled claude/codex binary and forward its
-        // absolute path so the backend spawns OUR CLI, not the user's PATH one.
-        // Bundled-missing / dev falls back to a PATH lookup via
+        // A user-selected launch path wins so the process uses the same binary
+        // that the registry health check accepted. Otherwise the packaged app
+        // resolves the bundled claude/codex binary and forwards its absolute
+        // path. Bundled-missing / dev falls back to a PATH lookup via
         // `resolve_command_path` (NOT the bare name): on Windows, npm installs
         // ship `claude.cmd`/`codex.cmd` shims which `CreateProcess` does not
         // find from a bare name (#299 parity; Rust std runs `.cmd` via
         // `cmd.exe` since the BatBadBut fix). `None` (nothing on PATH either)
         // keeps the bare name so the spawn error stays diagnosable. Detection
         // (cli_probe) stays PATH-only and is unaffected.
-        cli_program: aionui_runtime::resolve_bundled_cli(backend_label)
-            .or_else(|| aionui_runtime::resolve_command_path(backend_label)),
+        cli_program: resolve_session_cli_program(backend_label, metadata),
         ..Default::default()
     };
 
@@ -1753,6 +1767,24 @@ pub async fn build_session_instance(
         Some(broadcaster),
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
+}
+
+fn resolve_session_cli_program(
+    backend_label: &str,
+    metadata: &aionui_api_types::AgentMetadata,
+) -> Option<std::path::PathBuf> {
+    if metadata.has_command_override {
+        return metadata.resolved_command.clone().or_else(|| {
+            metadata
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .map(std::path::PathBuf::from)
+        });
+    }
+
+    aionui_runtime::resolve_bundled_cli(backend_label).or_else(|| aionui_runtime::resolve_command_path(backend_label))
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
@@ -3683,6 +3715,12 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // `TurnStarted` (never reaches this stream) — are therefore NOT re-projected
         // to Start here, or the frontend would see a late/duplicate turn boundary.
         SessionEvent::PromptAccepted { .. } | SessionEvent::TurnStarted { .. } => Vec::new(),
+        // Fork anchoring: forward the backend's own turn id as an internal-only
+        // relay frame so message rows persisted during this turn carry it
+        // (`messages.backend_turn_id`). Never reaches the WebSocket.
+        SessionEvent::BackendTurnBound { backend_turn_id } => {
+            vec![AgentStreamEvent::BackendTurnBound(backend_turn_id)]
+        }
         SessionEvent::MessageDelta { text, .. } => {
             vec![AgentStreamEvent::Text(TextEventData { content: text })]
         }
@@ -4249,6 +4287,19 @@ mod build_mapping_tests {
     }
 
     #[test]
+    fn session_cli_program_prefers_explicit_command_override() {
+        let mut metadata = test_metadata(Some("claude"), None);
+        metadata.has_command_override = true;
+        metadata.command = Some("claude".into());
+        metadata.resolved_command = Some(std::path::PathBuf::from("/custom/claude"));
+
+        assert_eq!(
+            resolve_session_cli_program("claude", &metadata),
+            Some(std::path::PathBuf::from("/custom/claude"))
+        );
+    }
+
+    #[test]
     fn spec_fresh_when_no_anchor() {
         let cfg = AcpBuildExtra::default();
         let (spec, mode, model) = spec_mode_model("conv_1", None, &cfg, None, &test_metadata(Some("claude"), None));
@@ -4277,6 +4328,48 @@ mod build_mapping_tests {
         ));
         assert_eq!(mode.as_deref(), Some("plan"));
         assert_eq!(model.as_deref(), Some("claude-x"));
+    }
+
+    /// Fork-spec quadrant matrix (sid x fork): a bound sid ALWAYS resumes (the
+    /// fork completed; the spec is lineage data); unbound + fork spec opens in
+    /// Fork mode against the parent's snapshotted sid; unbound + no spec stays
+    /// Fresh.
+    #[test]
+    fn spec_fork_quadrants() {
+        let fork_cfg = AcpBuildExtra {
+            fork: Some(aionui_api_types::ForkSpec {
+                parent_conversation_id: "conv_parent".into(),
+                parent_message_id: "msg_9".into(),
+                parent_session_id: "parent-sid".into(),
+                last_turn_id: Some("turn-4".into()),
+            }),
+            ..Default::default()
+        };
+        let plain_cfg = AcpBuildExtra::default();
+        let md = test_metadata(Some("codex"), None);
+
+        // (None, fork) -> Fork with the parent anchor + turn id.
+        let (spec, _, _) = spec_mode_model("conv_f", None, &fork_cfg, None, &md);
+        assert!(matches!(
+            spec,
+            SessionSpec::Fork { ref parent_backend_session_id, ref at_turn_id, .. }
+                if parent_backend_session_id == "parent-sid" && at_turn_id.as_deref() == Some("turn-4")
+        ));
+
+        // (Some, fork) -> Resume (fork already materialized; never re-fork).
+        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &fork_cfg, None, &md);
+        assert!(matches!(
+            spec,
+            SessionSpec::Resume { backend_session_id: Some(ref b), .. } if b == "own-sid"
+        ));
+
+        // (None, no fork) -> Fresh.
+        let (spec, _, _) = spec_mode_model("conv_f", None, &plain_cfg, None, &md);
+        assert!(matches!(spec, SessionSpec::Fresh { .. }));
+
+        // (Some, no fork) -> Resume (unchanged baseline).
+        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &plain_cfg, None, &md);
+        assert!(matches!(spec, SessionSpec::Resume { .. }));
     }
 
     // The interactive-switch-persisted snapshot selection MUST win over the
