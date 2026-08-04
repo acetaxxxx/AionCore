@@ -312,6 +312,14 @@ impl StreamRelay {
                             // the catch-all below does not forward it to the WebSocket, and
                             // it is never persisted.
                         }
+                        AgentStreamEvent::BackendTurnBound(backend_turn_id) => {
+                            // Internal-only fork anchor (codex Turn.id): stamp it on the
+                            // adapter so every message row persisted for this turn carries
+                            // `messages.backend_turn_id` — the `thread/fork` lastTurnId
+                            // lookup key. Never forwarded to the WS, never persisted as an
+                            // event itself.
+                            self.adapter.set_backend_turn_id(backend_turn_id.clone());
+                        }
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
                                 self.complete_active_thinking(&mut active_thinking).await;
@@ -675,6 +683,7 @@ impl StreamRelay {
             AgentStreamEvent::RequestTrace(_) => "RequestTrace",
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
+            AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
             AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
         }
@@ -892,6 +901,13 @@ impl StreamRelay {
                 .or_insert_with(|| serde_json::Value::String(self.user_id.clone()));
             obj.entry("turn_id")
                 .or_insert_with(|| serde_json::Value::String(self.turn_id.clone()));
+            // Fork anchoring parity with persistence: live frames carry the
+            // backend turn anchor so the UI can show mid-history fork entries
+            // during the session, not only after a history reload.
+            if let Some(anchor) = self.adapter.current_backend_turn_id() {
+                obj.entry("backend_turn_id")
+                    .or_insert_with(|| serde_json::Value::String(anchor));
+            }
         }
         let msg = WebSocketMessage::new("message.stream", payload);
         self.broadcaster.broadcast(msg);
