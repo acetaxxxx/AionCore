@@ -169,13 +169,16 @@ pub use system::{
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, PauseTeamSlotRequest,
-    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput,
-    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
-    TeamListResponse, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus, TeamResponse, TeamRunAckResponse, TeamRunPayload,
-    TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed,
-    TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamSlotBlockedReason, TeamSlotWorkChangedPayload, TeamSlotWorkPayload, TeamSlotWorkState, TeammateMessagePayload,
+    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamActivityCursor,
+    TeamActivityItemResponse, TeamActivityKind, TeamActivityPageResponse, TeamAgentInput, TeamAgentRemovedPayload,
+    TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
+    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamListResponse, TeamMailboxChange,
+    TeamMailboxChangedPayload, TeamMailboxMessageResponse, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus,
+    TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse, TeamRunStatus,
+    TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase,
+    TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkChangedPayload,
+    TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange, TeamTaskChangedPayload, TeamTaskResponse,
+    TeammateMessagePayload,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{
