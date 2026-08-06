@@ -241,7 +241,15 @@ async fn spawn_and_connect_acp_once(
     // 70ms in — ELECTRON-1BT), so we explicitly watch the child. If
     // it dies before init completes, surface a `StartupCrash` carrying
     // the buffered stderr instead of waiting out the timeout.
-    let connect_fut = AcpProtocol::connect(stdin, stdout, runtime.event_sender(), permission_tx, notification_tx);
+    let connect_fut = AcpProtocol::connect(
+        stdin,
+        stdout,
+        runtime.event_sender(),
+        permission_tx,
+        notification_tx,
+        &params.conversation_id,
+        Some(std::path::PathBuf::from(&params.workspace.path)),
+    );
     tokio::pin!(connect_fut);
     let protocol = tokio::select! {
         biased;
@@ -681,6 +689,13 @@ impl AcpAgentManager {
     fn record_user_cancel_request(runtime: &AgentRuntime, session: &mut AcpSession) {
         session.record_close_reason(Some(CloseReason::UserCancel));
         runtime.bump_activity();
+    }
+
+    /// User-initiated stop of one client-hosted terminal (the terminal
+    /// card's stop button). Returns false when the id is unknown (already
+    /// released or never ours).
+    pub async fn kill_client_terminal(&self, terminal_id: &str) -> bool {
+        self.protocol.terminal_registry().kill(terminal_id, "user").await
     }
 
     fn ensure_protocol_connected_for_operation(&self, operation: &'static str) -> Result<(), AgentError> {
