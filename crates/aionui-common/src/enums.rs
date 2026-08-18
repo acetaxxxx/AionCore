@@ -259,6 +259,9 @@ pub enum AgentKillReason {
     /// `team_mcp_stdio_config`. The conversation is preserved; only the
     /// in-memory ACP CLI is recycled.
     TeamMcpRebuild,
+    /// A Team member is being rebuilt after its persisted backend session
+    /// anchor was cleared. The conversation row and visible history remain.
+    TeamContextReset,
     /// Team is being deleted; every agent process under it must be torn
     /// down before the team's conversations / rows are removed.
     TeamDeleted,
@@ -270,6 +273,10 @@ pub enum AgentKillReason {
     /// watchdog timeout. The stale ACP process is recycled while the user turn
     /// is treated as a clean cancellation.
     UserCancelTimeout,
+    /// The user explicitly requested a runtime restart. Any active turn is
+    /// intentionally cancelled and must converge without a user-facing error
+    /// before the old process is replaced.
+    RuntimeRestart,
     /// The requested runtime capabilities changed, so the in-memory task must
     /// be rebuilt before handling the next turn.
     RuntimeCapabilityChanged,
