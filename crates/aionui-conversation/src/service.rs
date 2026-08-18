@@ -16,21 +16,25 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
-    ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
-    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
+    AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
+    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
+    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
     PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
     PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
-use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
+use aionui_db::models::{
+    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
+};
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -1256,110 +1260,93 @@ impl ConversationService {
             );
         }
 
+        let is_team_conversation = extra.get("teamId").is_some();
         let selected_mcp_server_ids = match extra.as_object_mut() {
             Some(obj) => {
-                let has_selection = obj.contains_key("selected_mcp_server_ids");
-                let ids = take_string_array(obj, &["selected_mcp_server_ids"]);
-                if has_selection {
-                    Some(ids)
+                if obj.contains_key("selected_mcp_server_ids") {
+                    Some(take_string_array(obj, &["selected_mcp_server_ids"]))
+                } else if is_team_conversation && obj.contains_key("mcp_server_ids") {
+                    Some(take_string_array(obj, &["mcp_server_ids"]))
                 } else {
                     assistant_snapshot
                         .as_ref()
                         .map(|snapshot| snapshot.resolved_defaults.mcp_ids.clone())
-                        .filter(|ids| !ids.is_empty())
                 }
             }
             None => None,
         };
         let selected_session_mcp_servers = match extra.as_object_mut() {
-            Some(obj) => match obj.remove("selected_session_mcp_servers") {
+            Some(obj) => match obj.remove("selected_session_mcp_servers").or_else(|| {
+                (is_team_conversation)
+                    .then(|| obj.remove("session_mcp_servers"))
+                    .flatten()
+            }) {
                 Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
                     ConversationError::BadRequest {
-                        reason: format!("Invalid selected_session_mcp_servers: {e}"),
+                        reason: format!("Invalid session MCP snapshot: {e}"),
                     }
                 })?),
                 None => None,
             },
             None => None,
         };
+        let selected_mcp_statuses = if is_team_conversation {
+            match extra.as_object_mut().and_then(|obj| obj.remove("mcp_statuses")) {
+                Some(value) => serde_json::from_value::<Vec<ConversationMcpStatus>>(value).map_err(|e| {
+                    ConversationError::BadRequest {
+                        reason: format!("Invalid MCP status snapshot: {e}"),
+                    }
+                })?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
-        let mcp_support = self
-            .resolve_mcp_support_policy(user_id, &effective_type, &extra)
+        let mcp_snapshot = self
+            .build_runtime_mcp_snapshot(
+                user_id,
+                selected_mcp_server_ids.as_deref(),
+                selected_session_mcp_servers.as_deref().unwrap_or(&[]),
+                &selected_mcp_statuses,
+                &effective_type,
+                &extra,
+            )
             .await?;
-        let mut selected_row_ids: Vec<String> = Vec::new();
-        let mut selected_mcp_names: Vec<String> = Vec::new();
-        let mut selected_mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
-        let mut seen_mcp_names = HashSet::new();
-        let mut status_index_by_name: HashMap<String, usize> = HashMap::new();
-        let repo = self
-            .mcp_server_repo
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned());
-        if let Some(repo) = repo {
-            let rows = match selected_mcp_server_ids.as_ref() {
-                Some(ids) => repo
-                    .list_by_ids_any(user_id, ids)
-                    .await
-                    .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
-                None => repo
-                    .list(user_id)
-                    .await
-                    .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
-            };
-            let selected_rows = rows
-                .into_iter()
-                .filter(|row| !row.builtin)
-                .filter(|row| match selected_mcp_server_ids.as_ref() {
-                    Some(ids) => ids.iter().any(|id| id == &row.id),
-                    None => row.enabled,
-                })
-                .collect::<Vec<_>>();
-            selected_row_ids = selected_rows.iter().map(|row| row.id.clone()).collect();
-            for row in &selected_rows {
-                if seen_mcp_names.insert(row.name.clone()) {
-                    selected_mcp_names.push(row.name.clone());
-                }
-                upsert_conversation_mcp_status(
-                    &mut selected_mcp_statuses,
-                    &mut status_index_by_name,
-                    classify_repo_mcp_status(row, mcp_support),
-                );
-            }
-        }
-
-        if let Some(session_servers) = selected_session_mcp_servers.as_ref() {
-            for server in session_servers {
-                if seen_mcp_names.insert(server.name.clone()) {
-                    selected_mcp_names.push(server.name.clone());
-                }
-                upsert_conversation_mcp_status(
-                    &mut selected_mcp_statuses,
-                    &mut status_index_by_name,
-                    classify_session_mcp_status(server, mcp_support),
-                );
-            }
-        }
 
         if let Some(obj) = extra.as_object_mut() {
             obj.insert(
                 "mcp_server_ids".to_owned(),
-                serde_json::Value::Array(selected_row_ids.into_iter().map(serde_json::Value::String).collect()),
+                serde_json::Value::Array(
+                    mcp_snapshot
+                        .mcp_server_ids
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
             );
             obj.insert(
                 "mcp_servers".to_owned(),
-                serde_json::Value::Array(selected_mcp_names.into_iter().map(serde_json::Value::String).collect()),
+                serde_json::Value::Array(
+                    mcp_snapshot
+                        .mcp_servers
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
             );
             obj.insert(
                 "mcp_statuses".to_owned(),
-                serde_json::to_value(&selected_mcp_statuses).map_err(|e| {
+                serde_json::to_value(&mcp_snapshot.mcp_statuses).map_err(|e| {
                     ConversationError::internal(format!("Failed to serialize MCP status snapshot: {e}"))
                 })?,
             );
-            if let Some(session_servers) = selected_session_mcp_servers.as_ref() {
+            if selected_session_mcp_servers.is_some() {
                 obj.insert(
                     "session_mcp_servers".to_owned(),
-                    serde_json::to_value(session_servers).map_err(|e| {
+                    serde_json::to_value(&mcp_snapshot.session_mcp_servers).map_err(|e| {
                         ConversationError::internal(format!("Failed to serialize session MCP snapshot: {e}"))
                     })?,
                 );
@@ -1813,6 +1800,16 @@ impl ConversationService {
                 .map(|row| row.last_mcp_ids.clone())
                 .unwrap_or_else(|| "[]".to_string())
         };
+        // Computed BEFORE the upsert overwrites the stored value: in `auto` mode
+        // this preference IS the assistant's effective MCP binding (see
+        // `resolve_effective_assistant_mcp_ids`), so changing it here is the same
+        // event a live team session gets from an assistant update. Only an
+        // already-seeded preference counts — first-time seeding is not a change.
+        let mcp_binding_fingerprint = changed_assistant_mcp_fingerprint(
+            &snapshot.default_modes.mcps,
+            &snapshot.resolved_defaults.mcp_ids,
+            existing_preference.as_ref().map(|row| row.last_mcp_ids.as_str()),
+        )?;
 
         preference_repo
             .upsert_for_user(
@@ -1830,7 +1827,40 @@ impl ConversationService {
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference upsert failed: {e}")))?;
 
+        if let Some(fingerprint) = mcp_binding_fingerprint {
+            self.publish_assistant_mcp_binding_changed(user_id, &snapshot.assistant_id, fingerprint);
+        }
+
         Ok(())
+    }
+
+    /// Announce that an assistant's effective MCP binding changed.
+    ///
+    /// The assistant domain publishes the same event on assistant create/update.
+    /// Preferences are the OTHER half of the same binding for `auto`-mode
+    /// assistants, and a running team session that never hears about this half
+    /// keeps its members on the previous MCP set until their next attach.
+    fn publish_assistant_mcp_binding_changed(&self, user_id: &str, assistant_id: &str, fingerprint: String) {
+        let payload = AssistantMcpBindingChanged {
+            user_id: user_id.to_owned(),
+            assistant_id: assistant_id.to_owned(),
+            fingerprint,
+        };
+        match serde_json::to_value(&payload) {
+            Ok(value) => {
+                info!(
+                    user_id,
+                    assistant_id,
+                    fingerprint = %payload.fingerprint,
+                    "assistant MCP binding changed through a conversation preference"
+                );
+                self.broadcaster
+                    .broadcast(WebSocketMessage::new(ASSISTANT_MCP_BINDING_CHANGED_EVENT, value));
+            }
+            Err(error) => {
+                warn!(user_id, assistant_id, error = %error, "failed to encode assistant MCP binding event");
+            }
+        }
     }
 
     pub(crate) async fn persist_runtime_assistant_snapshot(
@@ -2425,6 +2455,51 @@ impl ConversationService {
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to persist runtime mode: {e}")))?;
         Ok(())
+    }
+
+    /// Whether this owned conversation has the ACP session row required for
+    /// an in-place Fresh-session reset. AionRS conversations intentionally do
+    /// not create `acp_session` state and therefore return `false`.
+    pub async fn supports_acp_context_reset(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, ConversationError> {
+        let conversation = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if conversation.r#type != AgentType::Acp.serde_name() {
+            return Ok(false);
+        }
+        self.acp_session_repo
+            .get_for_user(user_id, conversation_id)
+            .await
+            .map(|row| row.is_some())
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect ACP session anchor: {error}")))
+    }
+
+    /// Drop only the persisted backend resume anchor. Runtime mode/model and
+    /// the visible conversation history are preserved, so the next rebuilt
+    /// ACP runtime opens `SessionSpec::Fresh` with the same conversation id.
+    pub async fn clear_acp_context_anchor(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        self.acp_session_repo
+            .clear_session_id_for_user(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to clear ACP session anchor: {error}")))
     }
 
     /// Delete a conversation (messages cascade via FK).
@@ -4310,6 +4385,86 @@ impl ConversationService {
         })
     }
 
+    /// Cancel any active turn, recycle the agent process, and eagerly rebuild it.
+    ///
+    /// Conversation messages, artifacts, and the persisted backend session anchor
+    /// are intentionally left untouched so the rebuilt runtime can resume the
+    /// existing backend session.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn restart_runtime(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if let Some(team_id) = team_id_from_extra(&row.extra) {
+            info!(
+                conversation_id,
+                team_id, "Rejected standalone runtime restart for team-owned conversation"
+            );
+            return Err(ConversationError::TeamRuntimeRequired {
+                conversation_id: conversation_id.to_owned(),
+                team_id,
+            });
+        }
+
+        // Checked BEFORE readiness: a restart in flight has already killed the
+        // task, so the readiness gate below would report a duplicate restart as
+        // "not ready to restart" — misleading, and a different code than the one
+        // the turn/config gates report for the very same state. `begin_restart`
+        // remains the authoritative guard for a genuine race.
+        if self.runtime_state.is_restarting(conversation_id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+
+        if task_manager.get_task(conversation_id).is_none() {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} runtime is not ready to restart"),
+            });
+        }
+
+        self.runtime_state.begin_restart(conversation_id)?;
+        let restart_result = async {
+            if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
+                self.cancel(user_id, conversation_id, &turn_id, task_manager).await?;
+            }
+
+            info!(conversation_id, "Restarting conversation runtime");
+            task_manager
+                .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))
+                .await;
+            self.runtime_state.clear_turn_state_for_restart(conversation_id);
+
+            let (agent, recovered) = self
+                .ensure_runtime_agent(user_id, conversation_id, task_manager, "runtime_restart")
+                .await?;
+            let config_options = agent
+                .get_config_options()
+                .await
+                .map_err(ConversationError::from)?
+                .config_options;
+            Ok::<_, ConversationError>((recovered, config_options))
+        }
+        .await;
+        self.runtime_state.clear_restarting(conversation_id);
+        let (recovered, config_options) = restart_result?;
+
+        Ok(EnsureConversationRuntimeResponse {
+            recovered,
+            config_options,
+            runtime: self.runtime_summary_for(conversation_id).await,
+        })
+    }
+
     async fn ensure_runtime_agent(
         &self,
         user_id: &str,
@@ -5023,6 +5178,202 @@ async fn native_skills_dirs(
 }
 
 impl ConversationService {
+    /// Build the typed four-field runtime MCP snapshot from explicit request
+    /// selections (or the global enabled fallback when `selected_ids` is
+    /// `None`), deduped by name and classified against the agent's transport
+    /// support. Shared by `create()` and the team refresh path so both persist
+    /// the exact same snapshot shape.
+    async fn build_runtime_mcp_snapshot(
+        &self,
+        user_id: &str,
+        selected_ids: Option<&[String]>,
+        session_servers: &[SessionMcpServer],
+        additional_statuses: &[ConversationMcpStatus],
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+    ) -> Result<McpRuntimeSnapshot, ConversationError> {
+        let mcp_support = self.resolve_mcp_support_policy(user_id, agent_type, extra).await?;
+        let mut mcp_server_ids: Vec<String> = Vec::new();
+        let mut mcp_servers: Vec<String> = Vec::new();
+        let mut mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
+        let mut seen_mcp_names = HashSet::new();
+        let mut status_index_by_name: HashMap<String, usize> = HashMap::new();
+        let repo = self
+            .mcp_server_repo
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some(repo) = repo {
+            let rows = match selected_ids {
+                Some(ids) => repo
+                    .list_by_ids_any(user_id, ids)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
+                None => repo
+                    .list(user_id)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
+            };
+            let selected_rows = rows
+                .into_iter()
+                .filter(|row| !row.builtin && row.name != TEAM_MCP_SERVER_NAME)
+                .filter(|row| match selected_ids {
+                    Some(ids) => ids.iter().any(|id| id == &row.id),
+                    None => row.enabled,
+                })
+                .collect::<Vec<_>>();
+            mcp_server_ids = selected_rows.iter().map(|row| row.id.clone()).collect();
+            for row in &selected_rows {
+                if seen_mcp_names.insert(row.name.clone()) {
+                    mcp_servers.push(row.name.clone());
+                }
+                upsert_conversation_mcp_status(
+                    &mut mcp_statuses,
+                    &mut status_index_by_name,
+                    classify_repo_mcp_status(row, mcp_support),
+                );
+            }
+        }
+        let mut selected_session_servers = Vec::with_capacity(session_servers.len());
+        for server in session_servers {
+            if server.name == TEAM_MCP_SERVER_NAME {
+                continue;
+            }
+            selected_session_servers.push(server.clone());
+            if seen_mcp_names.insert(server.name.clone()) {
+                mcp_servers.push(server.name.clone());
+            }
+            upsert_conversation_mcp_status(
+                &mut mcp_statuses,
+                &mut status_index_by_name,
+                classify_session_mcp_status(server, mcp_support),
+            );
+        }
+        for status in additional_statuses {
+            if status.name == TEAM_MCP_SERVER_NAME {
+                continue;
+            }
+            if seen_mcp_names.insert(status.name.clone()) {
+                mcp_servers.push(status.name.clone());
+            }
+            upsert_conversation_mcp_status(&mut mcp_statuses, &mut status_index_by_name, status.clone());
+        }
+        Ok(McpRuntimeSnapshot {
+            mcp_server_ids,
+            session_mcp_servers: selected_session_servers,
+            mcp_servers,
+            mcp_statuses,
+        })
+    }
+
+    /// Resolve one assistant's effective MCP binding using the same fixed/auto
+    /// precedence as ordinary conversation creation. Explicit ids are loaded
+    /// regardless of the MCP row's global `enabled` flag.
+    pub async fn resolve_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<TeamMcpSelection>, ConversationError> {
+        let definition_repo = self
+            .assistant_definition_repo()
+            .ok_or_else(|| ConversationError::internal("Assistant definition repository is unavailable"))?;
+        let preference_repo = self
+            .assistant_preference_repo()
+            .ok_or_else(|| ConversationError::internal("Assistant preference repository is unavailable"))?;
+        let Some(definition) = definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant definition: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let preference = preference_repo
+            .get_for_user(user_id, &definition.id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant MCP preference: {e}")))?;
+        let selected_ids = resolve_effective_assistant_mcp_ids(
+            &definition.default_mcps_mode,
+            &definition.default_mcp_ids,
+            preference.as_ref().map(|row| row.last_mcp_ids.as_str()),
+        )?;
+
+        let repo = {
+            let guard = self
+                .mcp_server_repo
+                .read()
+                .map_err(|_| ConversationError::internal("MCP server repository lock is poisoned"))?;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?
+        };
+        let rows = repo
+            .list_by_ids_any(user_id, &selected_ids)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?;
+        let mut rows_by_id = rows
+            .into_iter()
+            .map(|row| (row.id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let mut mcp_server_ids = Vec::new();
+        let mut session_mcp_servers = Vec::new();
+        let mut mcp_statuses = Vec::new();
+        for id in &selected_ids {
+            let Some(row) = rows_by_id.remove(id) else {
+                continue;
+            };
+            if !assistant_mcp_row_is_injectable(&row) {
+                continue;
+            }
+            if row.builtin {
+                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(&row).await {
+                    Ok(server) => session_mcp_servers.push(server),
+                    Err(err) => mcp_statuses.push(ConversationMcpStatus {
+                        id: row.id,
+                        name: row.name,
+                        status: ConversationMcpStatusKind::Failed,
+                        reason: Some(err),
+                    }),
+                }
+            } else {
+                mcp_server_ids.push(row.id);
+            }
+        }
+        Ok(Some(TeamMcpSelection {
+            selected_ids,
+            mcp_server_ids,
+            session_mcp_servers,
+            mcp_statuses,
+        }))
+    }
+
+    /// Resolve and classify one assistant's current MCP binding for an existing
+    /// conversation. `None` means the assistant no longer exists; an empty
+    /// snapshot is still `Some` and therefore remains an explicit no-MCP bind.
+    pub async fn resolve_assistant_mcp_snapshot(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+    ) -> Result<Option<(McpRuntimeSnapshot, String)>, ConversationError> {
+        let Some(selection) = self.resolve_assistant_mcp_selection(user_id, assistant_id).await? else {
+            return Ok(None);
+        };
+        let fingerprint = assistant_mcp_binding_fingerprint(&selection.selected_ids);
+        let snapshot = self
+            .build_runtime_mcp_snapshot(
+                user_id,
+                Some(&selection.mcp_server_ids),
+                &selection.session_mcp_servers,
+                &selection.mcp_statuses,
+                agent_type,
+                extra,
+            )
+            .await?;
+        Ok(Some((snapshot, fingerprint)))
+    }
+
     async fn resolve_mcp_support_policy(
         &self,
         user_id: &str,
@@ -5358,6 +5709,52 @@ fn parse_json_string_list(raw: Option<&str>, field: &str) -> Result<Vec<String>,
             .map_err(|e| ConversationError::internal(format!("failed to parse assistant field {field}: {e}"))),
         _ => Ok(Vec::new()),
     }
+}
+
+/// The new binding fingerprint when writing `resolved_mcp_ids` changes an
+/// `auto`-mode assistant's effective MCP selection, else `None`.
+///
+/// `fixed` mode is excluded because its effective ids come from the definition
+/// rather than the preference — `persist_assistant_preferences_from_snapshot`
+/// does not rewrite the preference in that mode at all, so it can never be a
+/// binding change. A missing `stored_mcp_ids` is first-time seeding, not a
+/// change: announcing it would restart a member that is already starting with
+/// exactly this selection.
+fn changed_assistant_mcp_fingerprint(
+    mode: &str,
+    resolved_mcp_ids: &[String],
+    stored_mcp_ids: Option<&str>,
+) -> Result<Option<String>, ConversationError> {
+    if mode != "auto" {
+        return Ok(None);
+    }
+    let Some(stored) = stored_mcp_ids else {
+        return Ok(None);
+    };
+    let previous = parse_json_string_list(Some(stored), "last_mcp_ids")?;
+    let next = assistant_mcp_binding_fingerprint(resolved_mcp_ids);
+    // Compare fingerprints rather than raw JSON: the fingerprint sorts and
+    // dedups, so a reordered selection is correctly treated as unchanged.
+    Ok((assistant_mcp_binding_fingerprint(&previous) != next).then_some(next))
+}
+
+fn resolve_effective_assistant_mcp_ids(
+    mode: &str,
+    default_mcp_ids: &str,
+    last_mcp_ids: Option<&str>,
+) -> Result<Vec<String>, ConversationError> {
+    if mode == "fixed" {
+        parse_json_string_list(Some(default_mcp_ids), "default_mcp_ids")
+    } else {
+        last_mcp_ids
+            .map(|value| parse_json_string_list(Some(value), "last_mcp_ids"))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
+fn assistant_mcp_row_is_injectable(row: &McpServerRow) -> bool {
+    row.name != TEAM_MCP_SERVER_NAME
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -5705,6 +6102,83 @@ mod tests {
         );
 
         assert_eq!(status.status, ConversationMcpStatusKind::Failed);
+    }
+
+    #[test]
+    fn fixed_empty_mcp_binding_stays_explicitly_empty() {
+        let ids = resolve_effective_assistant_mcp_ids("fixed", "[]", Some(r#"["globally-enabled"]"#)).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn overwriting_an_auto_mcp_preference_reports_the_new_fingerprint() {
+        let fingerprint =
+            changed_assistant_mcp_fingerprint("auto", &["mcp-b".to_owned()], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint.as_deref(), Some(r#"["mcp-b"]"#));
+    }
+
+    #[test]
+    fn reordered_auto_mcp_preference_is_not_a_binding_change() {
+        let fingerprint = changed_assistant_mcp_fingerprint(
+            "auto",
+            &["mcp-b".to_owned(), "mcp-a".to_owned()],
+            Some(r#"["mcp-a","mcp-b"]"#),
+        )
+        .unwrap();
+
+        assert_eq!(fingerprint, None, "sorting/dedup must absorb pure reordering");
+    }
+
+    #[test]
+    fn clearing_an_auto_mcp_preference_reports_the_empty_fingerprint() {
+        // "no MCP" is a real selection, not a no-op: a member left running the
+        // previous set would keep tools the user just removed.
+        let fingerprint = changed_assistant_mcp_fingerprint("auto", &[], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint.as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn first_time_auto_mcp_seeding_is_not_a_binding_change() {
+        let fingerprint = changed_assistant_mcp_fingerprint("auto", &["mcp-a".to_owned()], None).unwrap();
+
+        assert_eq!(
+            fingerprint, None,
+            "seeding a brand new preference must not restart a member that is already starting with it"
+        );
+    }
+
+    #[test]
+    fn fixed_mode_never_reports_a_preference_binding_change() {
+        // In `fixed` mode the effective ids come from the definition, and the
+        // preference is copied through untouched — it can never be the change.
+        let fingerprint =
+            changed_assistant_mcp_fingerprint("fixed", &["mcp-b".to_owned()], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint, None);
+    }
+
+    #[test]
+    fn explicitly_selected_disabled_mcp_row_remains_injectable() {
+        let row = McpServerRow {
+            id: "mcp-disabled".into(),
+            user_id: "user-1".into(),
+            name: "selected-disabled".into(),
+            description: None,
+            enabled: false,
+            transport_type: "stdio".into(),
+            transport_config: r#"{"command":"node"}"#.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin: false,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(assistant_mcp_row_is_injectable(&row));
     }
 
     #[tokio::test]

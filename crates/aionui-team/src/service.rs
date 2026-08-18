@@ -9,11 +9,13 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamActivityCursor, TeamActivityPageResponse,
-    TeamAgentResponse, TeamAgentRuntimeStatus, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
-    TeamToolTransport, WebSocketMessage,
+    AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
+    InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
+    TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
+    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse,
+    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
+    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
+    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -48,9 +50,15 @@ use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort
 use crate::runtime_tools::{
     ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
 };
-use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
+use crate::session::{
+    AgentMessageQueueResult, TeamSession, attach_member_runtime, attach_member_runtime_after_kill,
+    spawn_attach_agent_process_bg,
+};
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
+use crate::work_coordinator::{
+    McpRefreshDisposition, ObserveMessagesResult, RuntimeConstraint, RuntimeRestartRejection,
+};
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -76,6 +84,29 @@ pub enum ActivityKind {
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
         extra["workspace"] = serde_json::Value::String(workspace.to_owned());
+    }
+}
+
+/// Why a member's model selection is being persisted. Decides whether a runtime
+/// that is mid-start may block the write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPersistTrigger {
+    /// A direct preference update from the model endpoint. Nothing has been
+    /// applied yet, so a runtime that is mid-start is a legitimate reason to
+    /// refuse — the caller can retry once it settles.
+    ExplicitRequest,
+    /// The member's runtime has already accepted the switch through the generic
+    /// config-option path. Persistence must go through regardless of runtime
+    /// state: refusing would leave the roster disagreeing with a live runtime.
+    RuntimeConfirmed,
+}
+
+impl ModelPersistTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitRequest => "explicit_request",
+            Self::RuntimeConfirmed => "runtime_confirmed",
+        }
     }
 }
 
@@ -281,6 +312,109 @@ impl TeamSessionService {
             self.conversation_port.clone(),
             self.capability_port.clone(),
         )
+    }
+
+    /// Apply an assistant MCP binding event to matching members in active team
+    /// sessions. Persisted snapshots update immediately; ready idle runtimes are
+    /// rebuilt now, while active work records a deferred refresh.
+    pub async fn handle_assistant_mcp_binding_changed(&self, event: AssistantMcpBindingChanged) {
+        let sessions = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.session.user_id() == event.user_id)
+            .map(|entry| Arc::clone(&entry.session))
+            .collect::<Vec<_>>();
+        for session in sessions {
+            let agents = session.scheduler().list_agents().await;
+            for agent in agents
+                .into_iter()
+                .filter(|agent| agent.assistant_id.as_deref() == Some(event.assistant_id.as_str()))
+            {
+                self.refresh_member_mcp_binding(&session, &event.user_id, &agent).await;
+            }
+        }
+    }
+
+    /// Re-resolve the MCP binding of EVERY member in EVERY active session.
+    ///
+    /// Recovery path for when binding-change events were missed rather than
+    /// observed — the shared event bus can drop events under load, and a dropped
+    /// event would otherwise leave a member running a stale MCP set until its
+    /// next attach. Idempotent: members whose fingerprint already matches take
+    /// the `Unchanged` branch and are left alone.
+    pub async fn reconcile_all_assistant_mcp_bindings(&self) {
+        let sessions = self
+            .sessions
+            .iter()
+            .map(|entry| Arc::clone(&entry.session))
+            .collect::<Vec<_>>();
+        let session_count = sessions.len();
+        let mut member_count = 0usize;
+        for session in sessions {
+            let user_id = session.user_id().to_owned();
+            for agent in session.scheduler().list_agents().await {
+                member_count += 1;
+                self.refresh_member_mcp_binding(&session, &user_id, &agent).await;
+            }
+        }
+        info!(
+            session_count,
+            member_count, "reconciled assistant MCP bindings across active team sessions"
+        );
+    }
+
+    /// Refresh one member's persisted MCP snapshot and decide what to do with its
+    /// runtime: leave dormant/failed slots alone, defer while attaching or
+    /// removing, and restart a ready idle runtime so it picks the new set up.
+    async fn refresh_member_mcp_binding(&self, session: &Arc<TeamSession>, user_id: &str, agent: &TeamAgent) {
+        let fingerprint = match self.provisioner().refresh_agent_mcp_snapshot(user_id, agent).await {
+            Ok(Some(fingerprint)) => fingerprint,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    team_id = session.team_id(),
+                    slot_id = agent.slot_id,
+                    assistant_id = agent.assistant_id.as_deref().unwrap_or_default(),
+                    error = %error,
+                    "assistant MCP snapshot refresh failed"
+                );
+                return;
+            }
+        };
+        match session.member_runtimes().snapshot(&agent.slot_id) {
+            MemberRuntimeSnapshot::Absent
+            | MemberRuntimeSnapshot::Failed { .. }
+            | MemberRuntimeSnapshot::SessionStopped => {}
+            MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => {
+                session
+                    .work_coordinator()
+                    .defer_mcp_refresh(&agent.slot_id, &fingerprint);
+            }
+            MemberRuntimeSnapshot::Ready => {
+                match session
+                    .work_coordinator()
+                    .request_mcp_refresh(&agent.slot_id, &fingerprint)
+                {
+                    McpRefreshDisposition::Unchanged | McpRefreshDisposition::Deferred => {}
+                    McpRefreshDisposition::RestartNow => {
+                        if let Err(error) = self
+                            .restart_agent_runtime_for_mcp_refresh(user_id, session.team_id(), &agent.slot_id)
+                            .await
+                        {
+                            session
+                                .work_coordinator()
+                                .defer_mcp_refresh(&agent.slot_id, &fingerprint);
+                            warn!(
+                                team_id = session.team_id(),
+                                slot_id = agent.slot_id,
+                                error = %error,
+                                "assistant MCP runtime refresh deferred after restart race"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Inject the project-bind service (project-bind side branch). When unset,
@@ -689,11 +823,22 @@ impl TeamSessionService {
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
         let row = self.load_owned_team_row(user_id, team_id).await?;
         // Project-bind side branch: lazily backfill binding only when a single
         // team is opened (never during list_teams / lease renew).
         self.backfill_team_binding_best_effort(&row).await;
         let team = Team::from_row(&row)?;
+        // Deliberately does NOT reconcile legacy model facts. That repair reads
+        // three extra tables PER MEMBER, and this is a plain read endpoint the
+        // frontend hits whenever a team is opened. Session start owns the repair
+        // (`ensure_session`), which is the point where a stale roster would
+        // actually feed a rebuilt runtime.
         self.build_team_response(user_id, &team).await
     }
 
@@ -810,7 +955,7 @@ impl TeamSessionService {
             );
         }
 
-        self.build_agent_response(user_id, &agent).await
+        self.build_agent_response(user_id, team_id, &agent).await
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
@@ -1025,6 +1170,158 @@ impl TeamSessionService {
         Ok(())
     }
 
+    pub async fn update_agent_model(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        model: &str,
+    ) -> Result<(), TeamError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(TeamError::InvalidRequest("model must not be empty".into()));
+        }
+        self.persist_member_model_selection(user_id, team_id, slot_id, model, ModelPersistTrigger::ExplicitRequest)
+            .await
+    }
+
+    /// Record that a team member's model is now `model`, in every place a rebuilt
+    /// member runtime reads it from.
+    ///
+    /// Sole implementation on purpose. A model switch has to land in three places
+    /// — the conversation's persisted runtime state, the team roster, and the live
+    /// session's in-memory agent — and both entry points (the explicit model
+    /// endpoint and the generic config-option path) must update all three.
+    /// Previously each did half and the frontend chained them, so a failure
+    /// between the two calls left the runtime switched and the roster stale.
+    async fn persist_member_model_selection(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        model: &str,
+        trigger: ModelPersistTrigger,
+    ) -> Result<(), TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let mut team = self.load_owned_team(user_id, team_id).await?;
+        let target = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == slot_id)
+            .cloned()
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        // Only an explicit preference update is refused mid-start. When the
+        // runtime has ALREADY accepted the switch, refusing here would drop the
+        // persistence and silently revert the member on its next rebuild.
+        if trigger == ModelPersistTrigger::ExplicitRequest && self.member_runtime_is_starting(team_id, &target.slot_id)
+        {
+            return Err(Self::member_runtime_starting_error(team_id, &target));
+        }
+        let agent = team
+            .agents
+            .iter_mut()
+            .find(|agent| agent.slot_id == slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        let conversation_id = agent.conversation_id.clone();
+
+        self.conversation_port
+            .persist_confirmed_model(&conversation_id, model)
+            .await?;
+        agent.model = model.to_owned();
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    agents: Some(serde_json::to_string(&team.agents)?),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+            session.update_agent_model(slot_id, model).await?;
+        }
+        info!(
+            team_id,
+            slot_id,
+            conversation_id,
+            model,
+            trigger = trigger.as_str(),
+            "team agent model preference persisted"
+        );
+        Ok(())
+    }
+
+    async fn reconcile_legacy_team_models(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        team: &mut Team,
+    ) -> Result<(), TeamError> {
+        let mut roster_changed = false;
+        let mut repaired = Vec::new();
+
+        for agent in &mut team.agents {
+            let facts = self
+                .conversation_port
+                .conversation_model_facts(&agent.conversation_id)
+                .await?;
+            let Some(model) = facts
+                .confirmed_model_id
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let seed_changed = facts.runtime_seed_model_id.as_deref() != Some(model.as_str());
+            if seed_changed {
+                self.conversation_port
+                    .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "current_model_id": model }))
+                    .await?;
+            }
+            let agent_changed = agent.model != model;
+            if agent_changed {
+                agent.model.clone_from(&model);
+                roster_changed = true;
+            }
+            if seed_changed || agent_changed {
+                repaired.push((agent.slot_id.clone(), model));
+            }
+        }
+
+        if roster_changed {
+            self.repo
+                .update_team(
+                    user_id,
+                    team_id,
+                    &UpdateTeamParams {
+                        agents: Some(serde_json::to_string(&team.agents)?),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+        }
+        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+            for (slot_id, model) in &repaired {
+                session.update_agent_model(slot_id, model).await?;
+            }
+        }
+        if !repaired.is_empty() {
+            info!(
+                team_id,
+                repaired_agent_count = repaired.len(),
+                "reconciled legacy team model facts"
+            );
+        }
+        Ok(())
+    }
+
     /// Start the team's MCP server and rebuild every agent process so it
     /// carries a fresh `team_mcp_stdio_config` pointing at the new server.
     ///
@@ -1084,7 +1381,8 @@ impl TeamSessionService {
             }
         };
         let user_id = row.user_id.clone();
-        let team = Team::from_row(&row)?;
+        let mut team = Team::from_row(&row)?;
+        self.reconcile_legacy_team_models(&user_id, team_id, &mut team).await?;
         let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
 
         if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
@@ -1508,12 +1806,110 @@ impl TeamSessionService {
         let row = self.load_owned_team_row(user_id, team_id).await?;
 
         let team = Team::from_row(&row)?;
-        let member = team.agents.iter().any(|agent| agent.conversation_id == conversation_id);
-        if !member {
-            return Err(TeamError::AgentNotFound(conversation_id.to_owned()));
+        let member = team
+            .agents
+            .iter()
+            .find(|agent| agent.conversation_id == conversation_id)
+            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        if self.member_runtime_is_starting(team_id, &member.slot_id) {
+            return Err(Self::member_runtime_starting_error(team_id, member));
         }
 
         self.conversation_port.get_config_options(conversation_id).await
+    }
+
+    pub async fn set_conversation_config_option(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+        option_id: &str,
+        request: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, TeamError> {
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let team = Team::from_row(&row)?;
+        let member = team
+            .agents
+            .iter()
+            .find(|agent| agent.conversation_id == conversation_id)
+            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        if self.member_runtime_is_starting(team_id, &member.slot_id) {
+            return Err(Self::member_runtime_starting_error(team_id, member));
+        }
+
+        let options = self.conversation_port.get_config_options(conversation_id).await?;
+        let is_global_mode = member.role == TeammateRole::Lead
+            && options.config_options.iter().any(|option| {
+                option.id == option_id && (option.category.as_deref() == Some("mode") || option.id == "mode")
+            });
+        if is_global_mode
+            && let Some(starting_member) = team
+                .agents
+                .iter()
+                .find(|agent| self.member_runtime_is_starting(team_id, &agent.slot_id))
+        {
+            return Err(Self::member_runtime_starting_error(team_id, starting_member));
+        }
+        // Matches the frontend's own model-option lookup (category first, then a
+        // literal `model` id), so both sides agree on which option is the model.
+        let is_model_option = options.config_options.iter().any(|option| {
+            option.id == option_id && (option.category.as_deref() == Some("model") || option.id == "model")
+        });
+        let slot_id = member.slot_id.clone();
+        // Captured before the call moves `request`. This is the value to persist,
+        // NOT the option's `current_value` in the response: a `PendingNextTurn`
+        // confirmation deliberately still reads back the OLD value, so echoing the
+        // readback would persist the model the user just switched away from.
+        let requested_model = is_model_option.then(|| request.value.trim().to_owned());
+
+        let response = self
+            .conversation_port
+            .set_config_option(conversation_id, option_id, request)
+            .await?;
+
+        // The runtime accepted the switch, so the roster and the persisted
+        // conversation state must follow — including for `PendingNextTurn`, where
+        // the value governs from the next turn and would otherwise be lost on the
+        // next rebuild. A persistence failure must NOT be reported as a failed
+        // switch, because the switch already happened; log it and let the
+        // session-start reconcile repair the roster.
+        if let Some(model) = requested_model.filter(|value| !value.is_empty())
+            && let Err(error) = self
+                .persist_member_model_selection(
+                    user_id,
+                    team_id,
+                    &slot_id,
+                    &model,
+                    ModelPersistTrigger::RuntimeConfirmed,
+                )
+                .await
+        {
+            warn!(
+                team_id,
+                slot_id,
+                conversation_id,
+                model,
+                error = %error,
+                "team member model switch applied but could not be persisted"
+            );
+        }
+
+        Ok(response)
+    }
+
+    fn member_runtime_is_starting(&self, team_id: &str, slot_id: &str) -> bool {
+        self.sessions
+            .get(team_id)
+            .and_then(|entry| entry.session.work_coordinator().slot_snapshot(slot_id))
+            .is_some_and(|snapshot| matches!(snapshot.runtime_constraint, RuntimeConstraint::Starting { .. }))
+    }
+
+    fn member_runtime_starting_error(team_id: &str, member: &TeamAgent) -> TeamError {
+        TeamError::MemberRuntimeStarting {
+            team_id: team_id.to_owned(),
+            slot_id: member.slot_id.clone(),
+            conversation_id: member.conversation_id.clone(),
+        }
     }
 
     fn broadcast_session_status<F>(
@@ -2046,13 +2442,7 @@ impl TeamSessionService {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
-        };
+        let session = self.published_session(team_id)?;
         session.send_message(&content, files).await
     }
 
@@ -2067,14 +2457,52 @@ impl TeamSessionService {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
-        };
+        let session = self.published_session(team_id)?;
         session.send_message_to_agent(slot_id, &content, files).await
+    }
+
+    pub async fn interrupt_agent(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        request: InterruptTeamAgentRequest,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
+        let (message, files) = self
+            .resolve_message_attachments(user_id, &request.message, request.files)
+            .await?;
+        self.published_session(team_id)?
+            .interrupt_agent_from_user(slot_id, &message, files, request.reason, request.queued_policy)
+            .await
+    }
+
+    fn published_session(&self, team_id: &str) -> Result<Arc<TeamSession>, TeamError> {
+        self.sessions
+            .get(team_id)
+            .map(|entry| Arc::clone(&entry.session))
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.to_owned()))
+    }
+
+    pub(crate) async fn peek_agent_messages(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<crate::session::AgentInboxPeek, TeamError> {
+        self.published_session(team_id)?.peek_agent_messages(slot_id).await
+    }
+
+    pub(crate) async fn observe_agent_messages(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+        expected_batch_id: &str,
+        message_ids: &[String],
+    ) -> Result<ObserveMessagesResult, TeamError> {
+        self.published_session(team_id)?
+            .observe_agent_messages(slot_id, expected_batch_id, message_ids)
+            .await
     }
 
     /// Resolve a send's attachments to absolute paths and re-inline them into
@@ -2142,6 +2570,420 @@ impl TeamSessionService {
         Ok(())
     }
 
+    /// Force-rebuild one team member runtime while preserving its conversation
+    /// and resume anchor. This waits for the shared attach path to reach a
+    /// terminal outcome so callers only receive success once the runtime is
+    /// ready.
+    pub async fn restart_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        self.restart_agent_runtime_inner(user_id, team_id, slot_id, false).await
+    }
+
+    pub(crate) async fn restart_agent_runtime_for_mcp_refresh(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<(), TeamError> {
+        self.restart_agent_runtime_inner(user_id, team_id, slot_id, true).await
+    }
+
+    async fn restart_agent_runtime_inner(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        allow_queued: bool,
+    ) -> Result<(), TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+        let requested_agent = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        if allow_queued {
+            self.ensure_session_inner(team_id, Some(user_id)).await?;
+        }
+        let session = {
+            let entry = self.sessions.get(team_id).ok_or_else(|| TeamError::RuntimeNotReady {
+                conversation_id: requested_agent.conversation_id.clone(),
+            })?;
+            Arc::clone(&entry.session)
+        };
+        let agent = session.scheduler().get_agent(slot_id).await?;
+        let service = self
+            .self_ref
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("team service is shutting down".to_owned()))?;
+        let busy_error = || TeamError::MemberBusy {
+            team_id: team_id.to_owned(),
+            slot_id: slot_id.to_owned(),
+            conversation_id: agent.conversation_id.clone(),
+        };
+        if !allow_queued {
+            match session.member_runtimes().snapshot(slot_id) {
+                MemberRuntimeSnapshot::Ready => {}
+                MemberRuntimeSnapshot::Attaching { .. } => {
+                    return Err(TeamError::MemberRuntimeStarting {
+                        team_id: team_id.to_owned(),
+                        slot_id: slot_id.to_owned(),
+                        conversation_id: agent.conversation_id.clone(),
+                    });
+                }
+                MemberRuntimeSnapshot::Removing { .. } => {
+                    return Err(TeamError::InvalidRequest(format!(
+                        "team member runtime is being removed: {slot_id}"
+                    )));
+                }
+                MemberRuntimeSnapshot::Absent
+                | MemberRuntimeSnapshot::Failed { .. }
+                | MemberRuntimeSnapshot::SessionStopped => {
+                    return Err(TeamError::RuntimeNotReady {
+                        conversation_id: agent.conversation_id.clone(),
+                    });
+                }
+            }
+        }
+        let restart_gate = if allow_queued {
+            session.work_coordinator().begin_mcp_runtime_restart(slot_id)
+        } else {
+            session.work_coordinator().begin_runtime_restart(slot_id)
+        }
+        .map_err(|rejection| match rejection {
+            RuntimeRestartRejection::Busy => busy_error(),
+            RuntimeRestartRejection::Removing => {
+                TeamError::InvalidRequest(format!("team member runtime is being removed: {slot_id}"))
+            }
+            RuntimeRestartRejection::SessionStopped => TeamError::SessionNotFound(team_id.to_owned()),
+        })?;
+
+        let lease = match session.member_runtimes().reserve_restart(slot_id) {
+            ReserveAttach::Start(lease) => lease,
+            ReserveAttach::Join(_) | ReserveAttach::AlreadyReady => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(busy_error());
+            }
+            ReserveAttach::Removing(_) => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(TeamError::InvalidRequest(format!(
+                    "team member runtime is being removed: {slot_id}"
+                )));
+            }
+            ReserveAttach::SessionStopped => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(TeamError::SessionNotFound(team_id.to_owned()));
+            }
+        };
+
+        self.broadcast_agent_runtime_status(user_id, team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+        info!(
+            team_id,
+            slot_id,
+            conversation_id = agent.conversation_id,
+            "team member runtime restart requested"
+        );
+        match attach_member_runtime(
+            service,
+            Arc::clone(&session),
+            user_id.to_owned(),
+            agent.clone(),
+            self.task_manager.clone(),
+            lease,
+            false,
+        )
+        .await
+        {
+            AttachOutcome::Ready => Ok(()),
+            AttachOutcome::Failed(failure) => Err(TeamError::MemberRuntimeFailed {
+                team_id: team_id.to_owned(),
+                slot_id: slot_id.to_owned(),
+                conversation_id: agent.conversation_id,
+                public_reason: failure.public_reason,
+            }),
+            AttachOutcome::Removed => Err(TeamError::AgentNotFound(slot_id.to_owned())),
+            AttachOutcome::SessionStopped => Err(TeamError::SessionNotFound(team_id.to_owned())),
+        }
+    }
+
+    /// Reset one team member's ACP resume anchor and synchronously rebuild its
+    /// runtime. Conversation metadata and visible history are deliberately
+    /// retained; only the backend thread identity is cleared.
+    pub async fn clear_agent_context(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<TeamContextResetResponse, TeamError> {
+        self.clear_agent_context_inner(user_id, team_id, slot_id).await
+    }
+
+    /// MCP calls originate from an already-running team session. Keeping this
+    /// variant free of `ensure_session` avoids a recursive async type through
+    /// `TeamMcpServer::start` while retaining the same reset orchestration.
+    pub(crate) async fn clear_agent_context_in_session(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<TeamContextResetResponse, TeamError> {
+        self.clear_agent_context_inner(user_id, team_id, slot_id).await
+    }
+
+    async fn clear_agent_context_inner(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<TeamContextResetResponse, TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+        let agent = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == slot_id)
+            .cloned()
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        let capability = self
+            .context_reset_capability_for_session(user_id, &agent, session.as_deref())
+            .await?;
+        match capability.availability {
+            TeamContextResetAvailability::Ready => {}
+            TeamContextResetAvailability::LeaderNotTargetable => {
+                return Err(TeamError::ContextResetLeaderNotTargetable {
+                    team_id: team_id.to_owned(),
+                    slot_id: slot_id.to_owned(),
+                    conversation_id: agent.conversation_id,
+                });
+            }
+            TeamContextResetAvailability::Unsupported => {
+                return Err(TeamError::MemberUnsupported {
+                    team_id: team_id.to_owned(),
+                    slot_id: slot_id.to_owned(),
+                    conversation_id: agent.conversation_id,
+                    backend: agent.backend,
+                });
+            }
+            availability => {
+                return Err(TeamError::ContextResetUnavailable {
+                    team_id: team_id.to_owned(),
+                    slot_id: slot_id.to_owned(),
+                    conversation_id: agent.conversation_id,
+                    availability,
+                });
+            }
+        }
+        let session = session.ok_or_else(|| TeamError::ContextResetUnavailable {
+            team_id: team_id.to_owned(),
+            slot_id: slot_id.to_owned(),
+            conversation_id: agent.conversation_id.clone(),
+            availability: TeamContextResetAvailability::SessionStopped,
+        })?;
+        let service = self
+            .self_ref
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("team service is shutting down".to_owned()))?;
+        let busy_error = || TeamError::MemberBusy {
+            team_id: team_id.to_owned(),
+            slot_id: slot_id.to_owned(),
+            conversation_id: agent.conversation_id.clone(),
+        };
+        let restart_gate = session
+            .work_coordinator()
+            .begin_runtime_restart(slot_id)
+            .map_err(|rejection| match rejection {
+                RuntimeRestartRejection::Busy => busy_error(),
+                RuntimeRestartRejection::Removing => TeamError::ContextResetUnavailable {
+                    team_id: team_id.to_owned(),
+                    slot_id: slot_id.to_owned(),
+                    conversation_id: agent.conversation_id.clone(),
+                    availability: TeamContextResetAvailability::Removing,
+                },
+                RuntimeRestartRejection::SessionStopped => TeamError::ContextResetUnavailable {
+                    team_id: team_id.to_owned(),
+                    slot_id: slot_id.to_owned(),
+                    conversation_id: agent.conversation_id.clone(),
+                    availability: TeamContextResetAvailability::SessionStopped,
+                },
+            })?;
+
+        let preserved_unread_count = match session.mailbox().peek_unread(team_id, slot_id).await {
+            Ok(messages) => messages.len(),
+            Err(error) => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(error);
+            }
+        };
+
+        let lease = match session.member_runtimes().reserve_restart(slot_id) {
+            ReserveAttach::Start(lease) => lease,
+            ReserveAttach::Join(_) | ReserveAttach::AlreadyReady => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(busy_error());
+            }
+            ReserveAttach::Removing(_) => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(TeamError::ContextResetUnavailable {
+                    team_id: team_id.to_owned(),
+                    slot_id: slot_id.to_owned(),
+                    conversation_id: agent.conversation_id.clone(),
+                    availability: TeamContextResetAvailability::Removing,
+                });
+            }
+            ReserveAttach::SessionStopped => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(TeamError::ContextResetUnavailable {
+                    team_id: team_id.to_owned(),
+                    slot_id: slot_id.to_owned(),
+                    conversation_id: agent.conversation_id.clone(),
+                    availability: TeamContextResetAvailability::SessionStopped,
+                });
+            }
+        };
+        let operation_id = lease.operation_id();
+
+        self.broadcast_agent_runtime_status(user_id, team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+        info!(
+            team_id,
+            slot_id,
+            conversation_id = agent.conversation_id,
+            operation_id,
+            preserved_unread_count,
+            "team member context reset requested"
+        );
+        self.task_manager
+            .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamContextReset))
+            .await;
+        let cleared = match self
+            .conversation_port
+            .clear_context_anchor(user_id, &agent.conversation_id)
+            .await
+        {
+            Ok(cleared) => cleared,
+            Err(error) => {
+                let recovery = attach_member_runtime_after_kill(
+                    Arc::clone(&service),
+                    Arc::clone(&session),
+                    user_id.to_owned(),
+                    agent.clone(),
+                    self.task_manager.clone(),
+                    lease,
+                    false,
+                )
+                .await;
+                warn!(
+                    team_id,
+                    slot_id,
+                    conversation_id = agent.conversation_id,
+                    operation_id,
+                    recovery_ready = matches!(recovery, AttachOutcome::Ready),
+                    error = %error,
+                    "team member context reset failed before anchor clear"
+                );
+                return Err(error);
+            }
+        };
+        if !cleared {
+            let recovery = attach_member_runtime_after_kill(
+                Arc::clone(&service),
+                Arc::clone(&session),
+                user_id.to_owned(),
+                agent.clone(),
+                self.task_manager.clone(),
+                lease,
+                false,
+            )
+            .await;
+            let runtime_status = if matches!(recovery, AttachOutcome::Ready) {
+                TeamContextResetRuntimeStatus::Ready
+            } else {
+                TeamContextResetRuntimeStatus::Failed
+            };
+            warn!(
+                team_id,
+                slot_id,
+                conversation_id = agent.conversation_id,
+                operation_id,
+                preserved_unread_count,
+                runtime_ready = runtime_status == TeamContextResetRuntimeStatus::Ready,
+                "team member context reset was not applied"
+            );
+            return Ok(TeamContextResetResponse {
+                reset_status: TeamContextResetStatus::NotApplied,
+                runtime_status,
+                preserved_unread_count,
+            });
+        }
+
+        info!(
+            team_id,
+            slot_id,
+            conversation_id = agent.conversation_id,
+            operation_id,
+            preserved_unread_count,
+            "team member context reset anchor cleared"
+        );
+        let role_prompt_error = session.scheduler().require_role_prompt(slot_id).await.err();
+        if let Some(error) = &role_prompt_error {
+            warn!(
+                team_id,
+                slot_id,
+                conversation_id = agent.conversation_id,
+                operation_id,
+                error = %error,
+                "team member context reset could not schedule role prompt reinjection"
+            );
+        }
+
+        let attach_outcome = attach_member_runtime_after_kill(
+            service,
+            Arc::clone(&session),
+            user_id.to_owned(),
+            agent.clone(),
+            self.task_manager.clone(),
+            lease,
+            false,
+        )
+        .await;
+        let runtime_status = if role_prompt_error.is_none() && matches!(attach_outcome, AttachOutcome::Ready) {
+            TeamContextResetRuntimeStatus::Ready
+        } else {
+            TeamContextResetRuntimeStatus::Failed
+        };
+        if let Err(error) = session.project_context_reset_notice(slot_id, runtime_status).await {
+            warn!(
+                team_id,
+                slot_id,
+                conversation_id = agent.conversation_id,
+                operation_id,
+                error = %error,
+                "team member context reset notice projection failed"
+            );
+        }
+        if runtime_status == TeamContextResetRuntimeStatus::Ready {
+            info!(
+                team_id,
+                slot_id,
+                conversation_id = agent.conversation_id,
+                operation_id,
+                preserved_unread_count,
+                "team member context reset completed"
+            );
+        } else {
+            warn!(
+                team_id,
+                slot_id,
+                conversation_id = agent.conversation_id,
+                operation_id,
+                preserved_unread_count,
+                "team member context reset completed but runtime attach failed"
+            );
+        }
+        Ok(TeamContextResetResponse {
+            reset_status: TeamContextResetStatus::Completed,
+            runtime_status,
+            preserved_unread_count,
+        })
+    }
+
     pub async fn cancel_run(
         &self,
         user_id: &str,
@@ -2204,6 +3046,13 @@ impl TeamSessionService {
 
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
+        if let Some(starting_member) = team
+            .agents
+            .iter()
+            .find(|agent| self.member_runtime_is_starting(team_id, &agent.slot_id))
+        {
+            return Err(Self::member_runtime_starting_error(team_id, starting_member));
+        }
         let provisioner = self.provisioner();
         self.repo
             .update_team(
@@ -2264,6 +3113,20 @@ impl TeamSessionService {
         };
         session
             .send_agent_message_from_agent(from_slot_id, to_slot_id, content, files)
+            .await
+    }
+
+    pub async fn interrupt_agent_from_agent(
+        &self,
+        team_id: &str,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        message: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.published_session(team_id)?
+            .interrupt_agent_from_agent(from_slot_id, to_slot_id, message, files, reason)
             .await
     }
 
@@ -2330,18 +3193,26 @@ mod tests {
         ActiveLeaseRegistry, AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent,
         IWorkerTaskManager, IdleCleanupCoordinator,
     };
-    use aionui_api_types::{AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionResponse};
+    use aionui_api_types::{
+        AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionRequest, SetConfigOptionResponse,
+        TeamContextResetAvailability, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamRunTargetRole,
+    };
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
     use aionui_db::{IConversationRepository, ITeamRepository};
     use tokio::sync::broadcast;
 
     use super::TeamIdleCleanupCoordinator;
+    use crate::member_runtime::{MemberRuntimeFailure, ReserveAttach};
     use crate::test_utils::workspace_harness::{
         setup_with_factory_metadata_team_repo_and_conversation_repo,
         setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster,
         setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager,
         single_agent_team_request,
     };
+    use crate::types::MailboxMessageType;
+    use crate::work_coordinator::{CausalBinding, EnqueueRequest, ReconcileDecision, RuntimeConstraint};
+    use crate::work_source::WorkSource;
+    use crate::{TeamError, TeamSession};
 
     struct ModeSettingAgent {
         conversation_id: String,
@@ -2588,6 +3459,17 @@ mod tests {
         request
     }
 
+    fn mark_member_runtime_ready(session: &TeamSession, slot_id: &str) {
+        let lease = match session.member_runtimes().reserve_attach(slot_id, false) {
+            ReserveAttach::Start(lease) => lease,
+            other => panic!("ready-state seed must start, got {other:?}"),
+        };
+        assert!(session.member_runtimes().commit_ready(&lease));
+        session
+            .work_coordinator()
+            .set_runtime_constraint(slot_id, RuntimeConstraint::Ready);
+    }
+
     #[async_trait::async_trait]
     impl IWorkerTaskManager for MutableTaskManager {
         fn get_task(&self, conversation_id: &str) -> Option<AgentInstance> {
@@ -2757,6 +3639,690 @@ mod tests {
             .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
             .collect();
         assert_eq!(worker_statuses, vec!["dormant"]);
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_forces_a_ready_member_through_the_attach_chain() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Restart Ready"))
+            .await
+            .unwrap();
+        let lead = created.assistants.first().unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        task_manager.reset_kills();
+
+        svc.restart_agent_runtime("user-test", &created.id, &lead.slot_id)
+            .await
+            .unwrap();
+
+        assert_eq!(task_manager.kills(), vec![lead.conversation_id.clone()]);
+        let statuses = broadcaster
+            .events_by_name("team.agentRuntimeStatusChanged")
+            .into_iter()
+            .filter(|event| {
+                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(lead.slot_id.as_str())
+            })
+            .filter_map(|event| {
+                event
+                    .data
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, vec!["pending", "ready", "pending", "ready"]);
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_rejects_absent_and_failed_members() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Runtime Restart Dormant"))
+            .await
+            .unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.reset_kills();
+
+        let absent_error = svc
+            .restart_agent_runtime("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            absent_error,
+            TeamError::RuntimeNotReady { conversation_id }
+                if conversation_id == worker.conversation_id
+        ));
+        assert!(task_manager.kills().is_empty());
+
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        let failed_lease = match session.member_runtimes().reserve_restart(&worker.slot_id) {
+            ReserveAttach::Start(lease) => lease,
+            other => panic!("failed state seed must start, got {other:?}"),
+        };
+        let attaching_error = svc
+            .restart_agent_runtime("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            attaching_error,
+            TeamError::MemberRuntimeStarting {
+                team_id,
+                slot_id,
+                conversation_id,
+            } if team_id == created.id
+                && slot_id == worker.slot_id
+                && conversation_id == worker.conversation_id
+        ));
+        assert!(task_manager.kills().is_empty());
+
+        assert!(session.member_runtimes().commit_failed(
+            &failed_lease,
+            MemberRuntimeFailure {
+                classification: "transport",
+                public_reason: "Agent runtime failed to start".to_owned(),
+            },
+        ));
+        session.work_coordinator().set_runtime_constraint(
+            &worker.slot_id,
+            RuntimeConstraint::Failed {
+                operation_id: failed_lease.operation_id(),
+                classification: "transport",
+            },
+        );
+        task_manager.reset_kills();
+
+        let failed_error = svc
+            .restart_agent_runtime("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failed_error,
+            TeamError::RuntimeNotReady { conversation_id }
+                if conversation_id == worker.conversation_id
+        ));
+        assert!(task_manager.kills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_does_not_start_an_unpublished_team_session() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Restart Starting"))
+            .await
+            .unwrap();
+        let lead = created.assistants.first().unwrap();
+
+        let error = svc
+            .restart_agent_runtime("user-test", &created.id, &lead.slot_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TeamError::RuntimeNotReady { conversation_id }
+                if conversation_id == lead.conversation_id
+        ));
+        assert!(!svc.sessions.contains_key(&created.id));
+        assert!(task_manager.kills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_rejects_active_work_without_killing_the_runtime() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Restart Busy"))
+            .await
+            .unwrap();
+        let lead = created.assistants.first().unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        let lease = session
+            .work_coordinator()
+            .acquire_enqueue(EnqueueRequest {
+                slot_id: lead.slot_id.clone(),
+                role: TeamRunTargetRole::Lead,
+                source: WorkSource::UserMessage,
+                binding: CausalBinding::UserVisible,
+            })
+            .unwrap();
+        session
+            .work_coordinator()
+            .commit_enqueue(&lease, Some("message-1".to_owned()))
+            .unwrap();
+        assert!(matches!(
+            session.work_coordinator().next(&lead.slot_id),
+            ReconcileDecision::Claim(_)
+        ));
+        task_manager.reset_kills();
+
+        let error = svc
+            .restart_agent_runtime("user-test", &created.id, &lead.slot_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TeamError::MemberBusy {
+                team_id,
+                slot_id,
+                conversation_id,
+            } if team_id == created.id
+                && slot_id == lead.slot_id
+                && conversation_id == lead.conversation_id
+        ));
+        assert!(task_manager.kills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_rejects_a_stopped_member_registry() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Restart Stopped"))
+            .await
+            .unwrap();
+        let lead = created.assistants.first().unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        assert!(session.member_runtimes().stop());
+        task_manager.reset_kills();
+
+        let error = svc
+            .restart_agent_runtime("user-test", &created.id, &lead.slot_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TeamError::RuntimeNotReady { conversation_id }
+                if conversation_id == lead.conversation_id
+        ));
+        assert!(task_manager.kills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn starting_member_blocks_only_its_config_and_model_updates() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Starting Config Gate"))
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        session
+            .work_coordinator()
+            .set_runtime_constraint(&lead.slot_id, RuntimeConstraint::Ready);
+        session
+            .work_coordinator()
+            .set_runtime_constraint(&worker.slot_id, RuntimeConstraint::Starting { operation_id: 42 });
+
+        let lead_result = svc
+            .set_conversation_config_option(
+                "user-test",
+                &created.id,
+                &lead.conversation_id,
+                "model",
+                SetConfigOptionRequest {
+                    value: "ready-slot-model".to_owned(),
+                },
+            )
+            .await
+            .expect("a Ready slot remains configurable");
+        assert_eq!(lead_result.confirmation, ConfigOptionConfirmation::Observed);
+
+        let global_mode_error = svc
+            .set_conversation_config_option(
+                "user-test",
+                &created.id,
+                &lead.conversation_id,
+                "mode",
+                SetConfigOptionRequest {
+                    value: "full_auto".to_owned(),
+                },
+            )
+            .await
+            .expect_err("leader mode must not partially update while another member is Starting");
+        assert!(matches!(
+            global_mode_error,
+            TeamError::MemberRuntimeStarting { ref slot_id, .. } if slot_id == &worker.slot_id
+        ));
+
+        let config_error = svc
+            .set_conversation_config_option(
+                "user-test",
+                &created.id,
+                &worker.conversation_id,
+                "model",
+                SetConfigOptionRequest {
+                    value: "blocked-model".to_owned(),
+                },
+            )
+            .await
+            .expect_err("a Starting slot must reject config changes");
+        assert!(matches!(
+            config_error,
+            TeamError::MemberRuntimeStarting { ref slot_id, .. } if slot_id == &worker.slot_id
+        ));
+
+        let model_error = svc
+            .update_agent_model("user-test", &created.id, &worker.slot_id, "blocked-model")
+            .await
+            .expect_err("the model endpoint must share the Starting gate");
+        assert!(matches!(
+            model_error,
+            TeamError::MemberRuntimeStarting { ref slot_id, .. } if slot_id == &worker.slot_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_mode_update_is_rejected_before_persistence_when_any_member_is_starting() {
+        let (svc, repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Starting Mode Gate"))
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        session
+            .work_coordinator()
+            .set_runtime_constraint(&worker.slot_id, RuntimeConstraint::Starting { operation_id: 42 });
+        let before = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row")
+            .session_mode;
+
+        let error = svc
+            .set_session_mode("user-test", &created.id, "full_auto")
+            .await
+            .expect_err("global mode must wait for every member runtime");
+
+        assert!(matches!(
+            error,
+            TeamError::MemberRuntimeStarting { ref slot_id, .. } if slot_id == &worker.slot_id
+        ));
+        let after = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row")
+            .session_mode;
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn clear_agent_context_resets_anchor_and_runtime_state_without_membership_noise() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Clear Context"))
+            .await
+            .unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        mark_member_runtime_ready(&session, &worker.slot_id);
+        assert!(session.scheduler().take_needs_role_prompt(&worker.slot_id).await);
+        session
+            .mailbox()
+            .write(
+                &created.id,
+                &worker.slot_id,
+                "lead",
+                MailboxMessageType::Message,
+                "stale unread",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .mailbox()
+                .peek_unread(&created.id, &worker.slot_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        svc.set_session_mode("user-test", &created.id, "full_auto")
+            .await
+            .unwrap();
+        let original_mode = conv_repo.get_extra(&worker.conversation_id).unwrap()["session_mode"].clone();
+        let original_model = worker.model.clone();
+        task_manager.insert_mode_agent(&worker.conversation_id);
+        task_manager.reset_kills();
+        let spawned_before = broadcaster.events_by_name("team.agentSpawned").len();
+        let removed_before = broadcaster.events_by_name("team.agentRemoved").len();
+        let notices_before = broadcaster.events_by_name("team.teammateMessage").len();
+
+        let outcome = svc
+            .clear_agent_context_in_session("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.reset_status, TeamContextResetStatus::Completed);
+        assert_eq!(outcome.runtime_status, TeamContextResetRuntimeStatus::Ready);
+        assert_eq!(outcome.preserved_unread_count, 1);
+        assert_eq!(task_manager.kills(), vec![worker.conversation_id.clone()]);
+        let extra = conv_repo.get_extra(&worker.conversation_id).unwrap();
+        assert_eq!(extra["mock_acp_session_id"], serde_json::Value::Null);
+        assert_eq!(extra["session_mode"], original_mode);
+        assert_eq!(
+            svc.get_team("user-test", &created.id)
+                .await
+                .unwrap()
+                .assistants
+                .into_iter()
+                .find(|agent| agent.slot_id == worker.slot_id)
+                .unwrap()
+                .model,
+            original_model
+        );
+        let unread = session
+            .mailbox()
+            .peek_unread(&created.id, &worker.slot_id)
+            .await
+            .unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].content, "stale unread");
+        assert!(session.scheduler().take_needs_role_prompt(&worker.slot_id).await);
+        assert_eq!(broadcaster.events_by_name("team.agentSpawned").len(), spawned_before);
+        assert_eq!(broadcaster.events_by_name("team.agentRemoved").len(), removed_before);
+        let notices = broadcaster.events_by_name("team.teammateMessage");
+        assert_eq!(notices.len(), notices_before + 1);
+        let notice: aionui_api_types::TeamContextResetNotice = serde_json::from_str(
+            notices
+                .last()
+                .and_then(|event| event.data.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .expect("semantic reset notice"),
+        )
+        .unwrap();
+        assert_eq!(notice.kind, "context_reset");
+        assert_eq!(notice.member_name, worker.name);
+        assert_eq!(notice.runtime_status, TeamContextResetRuntimeStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn clear_agent_context_rejects_queued_work_without_kill_or_anchor_change() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Clear Busy"))
+            .await
+            .unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        mark_member_runtime_ready(&session, &worker.slot_id);
+        let lease = session
+            .work_coordinator()
+            .acquire_enqueue(EnqueueRequest {
+                slot_id: worker.slot_id.clone(),
+                role: TeamRunTargetRole::Teammate,
+                source: WorkSource::UserMessage,
+                binding: CausalBinding::UserVisible,
+            })
+            .unwrap();
+        session
+            .work_coordinator()
+            .commit_enqueue(&lease, Some("queued-message".to_owned()))
+            .unwrap();
+        task_manager.reset_kills();
+
+        let error = svc
+            .clear_agent_context_in_session("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TeamError::ContextResetUnavailable {
+                availability: TeamContextResetAvailability::Busy,
+                ..
+            }
+        ));
+        assert!(task_manager.kills().is_empty());
+        assert_eq!(
+            conv_repo.get_extra(&worker.conversation_id).unwrap()["mock_acp_session_id"],
+            "anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_agent_context_rejects_stopped_session_without_starting_or_mutating_it() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Clear Stopped"))
+            .await
+            .unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+
+        let error = svc
+            .clear_agent_context("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TeamError::ContextResetUnavailable {
+                availability: TeamContextResetAvailability::SessionStopped,
+                ..
+            }
+        ));
+        assert!(!svc.sessions.contains_key(&created.id));
+        assert!(task_manager.kills().is_empty());
+        assert_eq!(
+            conv_repo.get_extra(&worker.conversation_id).unwrap()["mock_acp_session_id"],
+            "anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_agent_context_reports_completed_when_fresh_runtime_attach_fails() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Clear Partial"))
+            .await
+            .unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        mark_member_runtime_ready(&session, &worker.slot_id);
+        task_manager.insert_mode_agent(&worker.conversation_id);
+        conv_repo.mark_runtime_attach_failed(&worker.conversation_id);
+
+        let outcome = svc
+            .clear_agent_context("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.reset_status, TeamContextResetStatus::Completed);
+        assert_eq!(outcome.runtime_status, TeamContextResetRuntimeStatus::Failed);
+        assert_eq!(
+            conv_repo.get_extra(&worker.conversation_id).unwrap()["mock_acp_session_id"],
+            serde_json::Value::Null
+        );
+        let notices = broadcaster.events_by_name("team.teammateMessage");
+        let notice: aionui_api_types::TeamContextResetNotice = serde_json::from_str(
+            notices
+                .last()
+                .and_then(|event| event.data.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .expect("partial-success semantic reset notice"),
+        )
+        .unwrap();
+        assert_eq!(notice.runtime_status, TeamContextResetRuntimeStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn clear_agent_context_rejects_wrong_owner_and_aionrs_before_kill() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", team_with_aionrs_worker_request("Clear Unsupported"))
+            .await
+            .unwrap();
+        let butler = created.assistants.iter().find(|agent| agent.name == "Butler").unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        task_manager.reset_kills();
+
+        let ownership_error = svc
+            .clear_agent_context("other-user", &created.id, &butler.slot_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(ownership_error, TeamError::TeamNotFound(_)));
+        assert!(task_manager.kills().is_empty());
+
+        let refreshed = svc.get_team("user-test", &created.id).await.unwrap();
+        let leader_capability = &refreshed
+            .assistants
+            .iter()
+            .find(|agent| agent.slot_id == lead.slot_id)
+            .unwrap()
+            .context_reset;
+        assert!(!leader_capability.supported);
+        assert_eq!(
+            leader_capability.availability,
+            TeamContextResetAvailability::LeaderNotTargetable
+        );
+        let unsupported_capability = &refreshed
+            .assistants
+            .iter()
+            .find(|agent| agent.slot_id == butler.slot_id)
+            .unwrap()
+            .context_reset;
+        assert!(!unsupported_capability.supported);
+        assert_eq!(
+            unsupported_capability.availability,
+            TeamContextResetAvailability::Unsupported
+        );
+
+        let leader_error = svc
+            .clear_agent_context("user-test", &created.id, &lead.slot_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            leader_error,
+            TeamError::ContextResetLeaderNotTargetable { .. }
+        ));
+        assert!(task_manager.kills().is_empty());
+
+        let unsupported = svc
+            .clear_agent_context("user-test", &created.id, &butler.slot_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(unsupported, TeamError::MemberUnsupported { backend, .. } if backend == "aionrs"));
+        assert!(task_manager.kills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_messages_follow_normal_team_send_paths_without_resetting_context() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, repo, _task_manager, conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let mut request = two_agent_team_request("Clear Slash");
+        request.agents[1].name = "My Worker".into();
+        let created = svc.create_team("user-test", request).await.unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        task_manager.insert_mode_agent(&worker.conversation_id);
+        task_manager.reset_kills();
+
+        let leader_ack = svc
+            .send_message("user-test", &created.id, "/clear", None)
+            .await
+            .unwrap();
+        let member_ack = svc
+            .send_message_to_agent("user-test", &created.id, &worker.slot_id, "/clear", None)
+            .await
+            .unwrap();
+        let named_ack = svc
+            .send_message("user-test", &created.id, " \t/clear\t  My Worker \t", None)
+            .await
+            .unwrap();
+
+        assert_eq!(leader_ack.run.target_slot_id, lead.slot_id);
+        assert_eq!(named_ack.run.target_slot_id, lead.slot_id);
+        let worker_messages = repo
+            .list_messages_by_ids(std::slice::from_ref(&member_ack.message_id))
+            .await
+            .unwrap();
+        assert!(
+            worker_messages
+                .iter()
+                .any(|message| { message.id == member_ack.message_id && message.content == "/clear" })
+        );
+        assert_eq!(
+            conv_repo.get_extra(&lead.conversation_id).unwrap()["mock_acp_session_id"],
+            "anchor"
+        );
+        assert_eq!(
+            conv_repo.get_extra(&worker.conversation_id).unwrap()["mock_acp_session_id"],
+            "anchor"
+        );
+        assert!(broadcaster.events_by_name("team.teammateMessage").is_empty());
     }
 
     #[tokio::test]
