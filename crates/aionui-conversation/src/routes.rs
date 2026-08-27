@@ -71,6 +71,12 @@ impl From<ConversationError> for ApiError {
                     "requested": requested,
                 })),
             ),
+            ConversationError::RuntimeRestarting { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "runtime_restarting",
+                "Conversation runtime is restarting",
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
+            ),
             ConversationError::TeamRuntimeRequired {
                 conversation_id,
                 team_id,
@@ -125,6 +131,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
             post(kill_terminal),
         )
         .route("/api/conversations/{id}/runtime/ensure", post(ensure_runtime))
+        .route("/api/conversations/{id}/runtime/restart", post(restart_runtime))
         .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
         .route("/api/conversations/{id}/confirmations", get(list_confirmations))
@@ -284,7 +291,14 @@ async fn send_msg(
         .send_message(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
-    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+    // B5: a mid-turn delivery already handed the message to the RUNNING turn —
+    // that is a completed delivery (200), not a scheduled one (202).
+    let status = if response.delivered_midturn {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(ApiResponse::ok(response))))
 }
 
 async fn list_artifacts(
@@ -358,6 +372,19 @@ async fn ensure_runtime(
     let response = state
         .service
         .ensure_runtime(&user.id, &id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn restart_runtime(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<EnsureConversationRuntimeResponse>>, ApiError> {
+    let response = state
+        .service
+        .restart_runtime(&user.id, &id, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(response)))

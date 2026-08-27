@@ -81,6 +81,11 @@ pub struct MkdirParams {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CreateFileParams {
+    pub file: ResourceRef,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct RemoveParams {
     pub target: ResourceRef,
     #[serde(default)]
@@ -91,6 +96,17 @@ pub struct RemoveParams {
 pub struct RenameParams {
     pub from: ResourceRef,
     pub to: ResourceRef,
+}
+
+/// `fs/copy` and `fs/move` params. Unlike rename, `to_dir` names the *target
+/// directory* (not the full destination path): the source basename is preserved
+/// and auto-renamed to a non-colliding sibling (`name copy`, `name copy 2`, …)
+/// when it already exists there. One shape serves both methods — a move is a
+/// copy whose source is removed after it lands.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferParams {
+    pub from: ResourceRef,
+    pub to_dir: ResourceRef,
 }
 
 // ── Filename search (fs/search) ───────────────────────────────────────────

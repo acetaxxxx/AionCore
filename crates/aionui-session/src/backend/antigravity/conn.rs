@@ -110,6 +110,32 @@ fn final_turn_text(is_error: bool, result_text: &str, buffered: &str) -> Option<
         .filter(|t| !t.is_empty())
 }
 
+/// Append one `text_delta` to the turn's buffered reply, collapsing the
+/// U+FFFD run agy leaves at the join.
+///
+/// A multi-byte character agy cuts across two deltas arrives as a U+FFFD run —
+/// a suffix on one delta plus a prefix on the next — that together stand for
+/// exactly ONE lost character (measured against agy 1.1.14:
+/// samples/antigravity-cli/1.1.14/print_stream-json_long_chinese_fffd.ndjson,
+/// 49 of 49 splits are a 1+2 or 2+1 suffix/prefix pair, never mid-delta).
+/// The bytes are gone before agy serializes the frame, so the character cannot
+/// be restored — but it can be shown as one U+FFFD instead of three. Only the
+/// join case is touched: a U+FFFD away from a boundary passes through, since
+/// only the buffered fallback of a failed or cancelled turn ever renders this
+/// text (a successful turn is replaced wholesale by `result.response`).
+fn append_delta(buffered: &mut String, delta: &str) {
+    const REPLACEMENT: char = '\u{FFFD}';
+    let mut delta = delta;
+    if buffered.ends_with(REPLACEMENT) && delta.starts_with(REPLACEMENT) {
+        while buffered.ends_with(REPLACEMENT) {
+            buffered.pop();
+        }
+        delta = delta.trim_start_matches(REPLACEMENT);
+        buffered.push(REPLACEMENT);
+    }
+    buffered.push_str(delta);
+}
+
 /// agy's declared capability surface.
 pub fn antigravity_capabilities() -> Capabilities {
     Capabilities {
@@ -147,6 +173,11 @@ pub fn antigravity_capabilities() -> Capabilities {
         // take input mid-turn, but its next turn is a fresh process anyway, so
         // the input box can stay usable instead of locking until the turn ends.
         accepts_proactive_input: true,
+        // agy runs ONE PROCESS PER TURN and ignores stdin mid-turn (see the
+        // `capabilities_allow_queueing_but_not_steering` test), so a message sent
+        // during a turn cannot reach it — it waits for the next process. agy MUST
+        // therefore behave exactly like ACP in the UI.
+        supports_midturn_delivery: false,
         ..Default::default()
     }
 }
@@ -703,7 +734,7 @@ impl AntigravitySessionBackend {
                                 if text_item_id.is_empty() {
                                     text_item_id = item_id;
                                 }
-                                buffered_text.push_str(&text);
+                                append_delta(&mut buffered_text, &text);
                             }
                             SessionEvent::TurnResult {
                                 ref is_error,
@@ -1202,6 +1233,7 @@ mod tests {
         let err = backend
             .dispatch(Command::Steer {
                 content: vec![ContentBlock::Text("stop".into())],
+                client_msg_id: None,
             })
             .await
             .expect_err("steer must not be silently accepted");
@@ -1818,6 +1850,14 @@ mod tests {
         assert!(c.accepts_proactive_input);
     }
 
+    /// Verified backend matrix (task-1 brief): agy MUST NOT advertise
+    /// `supports_midturn_delivery` — it is one-process-per-turn and ignores
+    /// stdin mid-turn, so it must behave like ACP in the UI.
+    #[test]
+    fn capabilities_do_not_advertise_midturn_delivery() {
+        assert!(!antigravity_capabilities().supports_midturn_delivery);
+    }
+
     #[test]
     fn capabilities_reflect_the_one_process_per_turn_shape() {
         let c = antigravity_capabilities();
@@ -1934,6 +1974,43 @@ mod tests {
         // A tool-only turn must not produce an empty assistant bubble.
         assert_eq!(final_turn_text(false, "", ""), None);
         assert_eq!(final_turn_text(true, "", ""), None);
+    }
+
+    #[test]
+    fn a_split_character_collapses_to_one_replacement_at_the_join() {
+        // agy 1.1.14 splits a 3-byte character into a 2-U+FFFD suffix plus a
+        // 1-U+FFFD prefix, or the 1+2 mirror (samples/antigravity-cli/1.1.14/
+        // print_stream-json_long_chinese_fffd.ndjson). One lost character must
+        // render as ONE marker, not three.
+        let mut buf = String::from("报告概述与背\u{fffd}\u{fffd}");
+        append_delta(&mut buf, "\u{fffd}\n\n在现代");
+        assert_eq!(buf, "报告概述与背\u{fffd}\n\n在现代");
+
+        let mut buf = String::from("性能\u{fffd}");
+        append_delta(&mut buf, "\u{fffd}\u{fffd}优化");
+        assert_eq!(buf, "性能\u{fffd}优化");
+    }
+
+    #[test]
+    fn a_replacement_on_only_one_side_of_the_join_is_kept() {
+        // A marker without a counterpart across the join is not a split
+        // character — it must survive untouched.
+        let mut buf = String::from("结尾\u{fffd}");
+        append_delta(&mut buf, "继续");
+        assert_eq!(buf, "结尾\u{fffd}继续");
+
+        let mut buf = String::from("结尾");
+        append_delta(&mut buf, "\u{fffd}继续");
+        assert_eq!(buf, "结尾\u{fffd}继续");
+    }
+
+    #[test]
+    fn a_replacement_away_from_the_join_passes_through() {
+        // Only join runs are collapsed; anything mid-delta is the model's own
+        // text, and the capture shows agy never mangles mid-delta.
+        let mut buf = String::from("前文");
+        append_delta(&mut buf, "中间\u{fffd}\u{fffd}还在");
+        assert_eq!(buf, "前文中间\u{fffd}\u{fffd}还在");
     }
 
     #[test]

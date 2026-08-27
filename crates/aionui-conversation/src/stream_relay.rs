@@ -657,6 +657,12 @@ impl StreamRelay {
                             attempt.saw_tool_or_side_effect = true;
                             self.forward_to_websocket(&event);
                         }
+                        AgentStreamEvent::MessageLifecycle(_) => {
+                            // Internal-only correlation frame (mid-turn interjection
+                            // Task 3): consumed by the BackgroundStreamWatcher between
+                            // turns; inside a turn it is pure bookkeeping. Never
+                            // forwarded to the WebSocket.
+                        }
                         // NOTE: AcpSessionInfo (agent session titles) is deliberately
                         // NOT consumed here. Titles arrive at session-open and at the
                         // turn's final instant (pi/omp race the relay's exit by ~1ms;
@@ -769,6 +775,7 @@ impl StreamRelay {
             AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
             AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
+            AgentStreamEvent::MessageLifecycle(_) => "MessageLifecycle",
         }
     }
 
@@ -1457,6 +1464,7 @@ mod tests {
                     input: None,
                     output: Some("Phase 1  Run   [0/1]".into()),
                     description: Some("Run [0/1] · run:A · 1 agents".into()),
+                    parent_call_id: None,
                 },
                 agents: vec![ToolGroupEntry {
                     call_id: "1".into(),
@@ -1509,6 +1517,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            parent_call_id: None,
         }))
         .await;
         assert_eq!(
@@ -1589,6 +1598,7 @@ mod tests {
             args: json!({"path": "a.ts"}),
             status: ToolCallStatus::Running,
             description: None,
+            parent_call_id: None,
             input: None,
             output: None,
         }))
@@ -1947,6 +1957,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            parent_call_id: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData {
@@ -2205,6 +2216,7 @@ mod tests {
             args: json!({"path": "a.ts"}),
             status: ToolCallStatus::Running,
             description: None,
+            parent_call_id: None,
             input: None,
             output: None,
         }))
@@ -2271,6 +2283,7 @@ mod tests {
             args: json!({"path": "a.ts"}),
             status: ToolCallStatus::Running,
             description: None,
+            parent_call_id: None,
             input: None,
             output: None,
         }))
@@ -2476,6 +2489,7 @@ mod tests {
             input: Some(json!({"prompt": "a cat", "size": "1024x1024"})),
             output: None,
             description: Some("Generate image".into()),
+            parent_call_id: None,
         }))
         .unwrap();
         // Second event: Completed with output but no input
@@ -2487,6 +2501,7 @@ mod tests {
             input: None,
             output: Some("image.png".into()),
             description: None,
+            parent_call_id: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();

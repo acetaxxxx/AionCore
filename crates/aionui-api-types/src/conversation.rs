@@ -5,6 +5,7 @@ use aionui_common::{
 use serde::{Deserialize, Serialize};
 
 use crate::acp::AcpConfigOptionDto;
+use crate::agent_build_extra::SessionMcpServer;
 use crate::chat_file::ChatFileRef;
 
 /// Per-MCP snapshot status stored in `conversation.extra`.
@@ -24,6 +25,26 @@ pub struct ConversationMcpStatus {
     pub status: ConversationMcpStatusKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Typed runtime MCP snapshot for a conversation, persisted in
+/// `conversation.extra` as the four fields `mcp_server_ids` /
+/// `session_mcp_servers` / `mcp_servers` / `mcp_statuses`.
+///
+/// Shared by `aionui-conversation` (which builds it), `aionui-team` (which
+/// refreshes it on attach) and `aionui-app` (which wires the two), so the team
+/// refresh path never has to reason about raw JSON or raw DB rows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct McpRuntimeSnapshot {
+    /// Selected non-builtin MCP row ids (the `mcp_server_ids` extra field).
+    pub mcp_server_ids: Vec<String>,
+    /// Selected builtin MCP servers in neutral form (the `session_mcp_servers`
+    /// extra field); stdio launch commands are already resolved.
+    pub session_mcp_servers: Vec<SessionMcpServer>,
+    /// Merged display names, deduped by name (the `mcp_servers` extra field).
+    pub mcp_servers: Vec<String>,
+    /// Per-server load status classification (the `mcp_statuses` extra field).
+    pub mcp_statuses: Vec<ConversationMcpStatus>,
 }
 
 // ── Request types ──────────────────────────────────────────────────
@@ -158,6 +179,12 @@ pub struct SendMessageRequest {
 pub struct SendMessageResponse {
     pub msg_id: String,
     pub turn_id: String,
+    /// B5 mid-turn interjection: `true` when the message was delivered INTO the
+    /// already-running turn (`turn_id` is then the ACTIVE turn's id, no new
+    /// turn was opened, and the HTTP status is 200 instead of the normal 202).
+    /// Absent/false for an ordinary send that opened a new turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivered_midturn: bool,
     pub runtime: ConversationRuntimeSummary,
 }
 
@@ -180,6 +207,7 @@ pub enum ConversationRuntimeStateKind {
     Starting,
     Running,
     Cancelling,
+    Restarting,
     WaitingConfirmation,
 }
 
@@ -192,6 +220,12 @@ pub struct ConversationRuntimeSummary {
     pub is_processing: bool,
     pub pending_confirmations: usize,
     pub turn_id: Option<String>,
+    /// Whether a message sent right now reaches the agent without waiting for the
+    /// current turn to end. The ONLY capability bit the frontend may gate mid-turn
+    /// UI on — see `Capabilities::supports_midturn_delivery` for why
+    /// `accepts_proactive_input` must never be exposed.
+    #[serde(default)]
+    pub supports_midturn_delivery: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -378,6 +412,21 @@ pub type ConversationArtifactListResponse = Vec<ConversationArtifactResponse>;
 pub struct ConversationNameUpdatedPayload {
     pub conversation_id: String,
     pub name: String,
+}
+
+/// Payload of the `message.statusChanged` websocket event (B5 mid-turn
+/// interjection): a persisted message's `status` field changed outside the
+/// normal stream flow. Today it carries the mid-turn user-message receipt
+/// transition — `"pending"` (delivered to the CLI, not yet consumed) →
+/// `"finish"` (the agent took it: claude `command_lifecycle` echo / codex
+/// steer ack). The frontend flips the 待接收/已接收 badge on it, keyed by
+/// `msg_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageStatusChangedPayload {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub msg_id: String,
+    pub status: String,
 }
 
 /// A single item from cross-conversation message search.

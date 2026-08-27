@@ -313,6 +313,10 @@ impl ClaudeAdapter {
             // message_stop) carries no FSM signal — the regular `assistant`/`user`
             // frames already deliver the content — so they stay opaque.
             "stream_event" => self.parse_stream_event(v),
+            // Task 2 (mid-turn interjection observability): claude echoes back the
+            // uuid WE minted on the user frame, reporting where it landed in the
+            // turn lifecycle (verified 2.1.226, design spec §6.1).
+            "command_lifecycle" => self.parse_command_lifecycle(v),
             // unknown top-level type → opaque catch-all (I8/I13, never panic).
             other => vec![SessionEvent::AdapterSpecific {
                 tag: other.to_string(),
@@ -428,7 +432,8 @@ impl ClaudeAdapter {
                     }
                 }
                 "tool_use" => {
-                    let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let raw_name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                    let name = raw_name.to_string();
                     // #486 (parity with aionrs output_sink): DROP a malformed empty-name
                     // tool_use before it reaches persistence. claude occasionally emits a
                     // tool_use block with a missing/blank `name`; emitting it produces a
@@ -440,16 +445,20 @@ impl ClaudeAdapter {
                     if name.trim().is_empty() {
                         tracing::warn!(item_id = %item_id, "claude tool_use has an empty name; dropping malformed call");
                     } else {
+                        let input = b.get("input").cloned().unwrap_or(Value::Null);
                         out.push(SessionEvent::ToolCall {
                             tool_use_id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-                            name,
+                            // Presentation only: a bare tool name ("Bash" × 73% of all
+                            // calls) says nothing about what the step is doing. The raw
+                            // `input` below is untouched.
+                            name: tool_call_display_name(raw_name, &input),
                             // 002/F1 single-agent path: inline tool. subagent topology
                             // (Task/Workflow → Spawned/Workflow) is the new ClaudeConnection's
                             // job (007 §9.14); this legacy adapter stays Inline.
                             subagent: crate::event::SubagentKind::Inline,
                             // Gap #4 / H2: carry the tool ARGUMENTS (Anthropic `input` object).
                             // Absent → Value::Null. TIO-13: never logged at info.
-                            input: b.get("input").cloned().unwrap_or(Value::Null),
+                            input,
                             // 009 H5: attribute to the subagent's turn (frame-level), main = None.
                             parent_tool_use_id: parent_tool_use_id.clone(),
                         });
@@ -965,6 +974,28 @@ impl ClaudeAdapter {
             }],
         }
     }
+
+    /// A `command_lifecycle` frame: claude echoing back the `uuid` WE minted on
+    /// a user frame, reporting where it landed (§6.1). `command_uuid` is that
+    /// SAME correlation key; missing it degrades to no event (never guess an id).
+    fn parse_command_lifecycle(&self, v: &Value) -> Vec<SessionEvent> {
+        let Some(id) = v.get("command_uuid").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        // An unrecognised phase degrades to NO event rather than a guess: this
+        // frame is additive and claude may grow states we have not probed.
+        let phase = match v.get("state").and_then(Value::as_str) {
+            Some("queued") => crate::event::MessageLifecyclePhase::Queued,
+            Some("started") => crate::event::MessageLifecyclePhase::Started,
+            Some("completed") => crate::event::MessageLifecyclePhase::Completed,
+            Some("cancelled") | Some("canceled") => crate::event::MessageLifecyclePhase::Cancelled,
+            _ => return Vec::new(),
+        };
+        vec![SessionEvent::MessageLifecycle {
+            client_msg_id: id.to_string(),
+            phase,
+        }]
+    }
 }
 
 #[async_trait::async_trait]
@@ -1183,7 +1214,12 @@ impl BackendAdapter for ClaudeAdapter {
                 terminal_result: true,
             },
             supported_commands: crate::capability::CommandSet {
-                steer: false,
+                // B5: mid-turn delivery routes Command::Steer to a direct stdin
+                // user-frame write (claude's persistent stdin accepts writes any
+                // time; the CLI queues and consumes them itself — command_lifecycle
+                // echoes our uuid, design spec §6.1/§6甲.2). No turn_gen bump, no
+                // FSM involvement (NoTurn admission).
+                steer: true,
                 cancel_tool: false,
                 answer_permission: true,
                 answer_auth: false,
@@ -1238,9 +1274,13 @@ impl BackendAdapter for ClaudeAdapter {
             auth_methods: Vec::new(), // no mid-session re-auth on local path
             // 009 R2: claude's persistent stdin is a FIFO — a write while a turn
             // is in flight is buffered and consumed as the next turn, so the conv
-            // layer CAN proactively queue. This (NOT supported_commands.steer,
-            // which is false here anyway) is what can_queue gates on.
+            // layer CAN proactively queue. This (NOT supported_commands.steer)
+            // is what can_queue gates on.
             accepts_proactive_input: true,
+            // Verified backend matrix (see `Capabilities::supports_midturn_delivery`):
+            // claude is a direct-CLI backend that can deliver a mid-turn message to
+            // the agent without waiting for the current turn to end.
+            supports_midturn_delivery: true,
             // #101: static default empty; the clean-slate ClaudeConnection fills it
             // from the control_request{initialize} response (the legacy adapter has
             // no discovery wire). capabilities() merges the discovered set on read.
@@ -1337,6 +1377,92 @@ async fn write_ndjson_line(stdin: &mut BoxedStdin, value: &Value) -> Result<(), 
         .await
         .map_err(|e| ProcessError::internal(format!("flush stdin: {e}")))?;
     Ok(())
+}
+
+/// Turn a claude `tool_use` into a compact, user-facing step label.
+///
+/// A bare tool name is useless in the step list — "Bash" three times in a row
+/// says nothing about what ran. Mirrors what `command_execution_display_name`
+/// does for codex's `commandExecution`: presentation only, the raw `input` still
+/// rides along on `ToolCall.input`, so no detail is discarded.
+///
+/// Shapes are taken from real traffic (10969 persisted `tool_call` rows), not
+/// from assumptions about the tool set:
+/// - `Bash`/`Monitor` `{command, description}` — `description` is authored for
+///   humans, so it wins; the command is the fallback
+/// - `Read`/`Edit`/`Write` `{file_path, …}` — the file NAME, since a full path
+///   is mostly shared prefix and the meaningful tail is what truncation eats
+/// - `Grep` `{pattern}`, `WebSearch`/`ToolSearch` `{query}`, `Skill` `{skill}`,
+///   `WebFetch` `{url}`, `Agent`/`Task` `{description}`
+///
+/// Anything else — including every `mcp__*` tool, whose input shape we have not
+/// verified — keeps the name claude gave it. Never guess a shape.
+fn tool_call_display_name(name: &str, input: &Value) -> String {
+    const MAX_DETAIL_CHARS: usize = 96;
+
+    fn bounded(value: &str) -> String {
+        // Collapse all whitespace runs: a heredoc command must not turn one
+        // step into a wall of text.
+        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut chars = value.chars();
+        let head: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
+        if chars.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    }
+
+    let raw = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let field = |key: &str| raw(key).map(bounded).filter(|s| !s.is_empty());
+    // The trailing path segment, taken from the RAW value and bounded only
+    // afterwards. Bounding first would cut a real project path (well over
+    // MAX_DETAIL_CHARS) mid-directory and leave that fragment as the "file
+    // name": `.../components/Markdown/CodeBlock.tsx` became "Markdown…".
+    // A path ending in a separator falls back to the whole value.
+    let file_name = || {
+        raw("file_path").map(|path| {
+            let tail = path.rsplit(['/', '\\']).find(|seg| !seg.is_empty()).unwrap_or(path);
+            bounded(tail)
+        })
+    };
+
+    let labeled = |verb: &str, detail: Option<String>| match detail {
+        Some(detail) => format!("{verb} {detail}"),
+        None => format!("{verb} command"),
+    };
+
+    match name {
+        // claude authors `description` for a human reader — prefer it verbatim.
+        "Bash" | "Monitor" => field("description").unwrap_or_else(|| labeled("Run", field("command"))),
+        "Agent" | "Task" => field("description").unwrap_or_else(|| name.to_string()),
+        "Read" => labeled("Read", file_name()),
+        "Edit" | "NotebookEdit" => labeled("Edit", file_name()),
+        "Write" => labeled("Write", file_name()),
+        "Grep" => labeled("Search", field("pattern")),
+        "Glob" => labeled("Glob", field("pattern")),
+        "WebSearch" | "ToolSearch" => labeled("Search", field("query")),
+        "WebFetch" => labeled("Fetch", field("url")),
+        "Skill" => labeled("Skill", field("skill")),
+        // A plan is a run of TaskCreate calls; without the subject they all read
+        // identically and the work is only visible after expanding each row.
+        "TaskCreate" => field("subject").unwrap_or_else(|| name.to_string()),
+        "TaskUpdate" => match (field("taskId"), field("status")) {
+            (Some(id), Some(status)) => format!("Task {id} → {status}"),
+            (Some(id), None) => format!("Task {id}"),
+            _ => name.to_string(),
+        },
+        "TaskStop" => labeled("Stop task", field("task_id")),
+        "SendMessage" => labeled("Message", field("to")),
+        // Unverified shape (every mcp__* tool lands here): keep claude's name.
+        _ => name.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1468,6 +1594,50 @@ mod tests {
     }
 
     /// 009 R8: a STRING tool_result content → one Text part (e.g. Bash stdout).
+    /// Verified backend matrix (task-1 brief): claude MUST advertise
+    /// `supports_midturn_delivery` so mid-turn UI can gate on it.
+    #[test]
+    fn capabilities_advertise_midturn_delivery() {
+        let a = ClaudeAdapter::new();
+        assert!(a.capabilities().supports_midturn_delivery);
+        // Lock the backend-static table against the real constructor (claude
+        // has no pub capability constructor, so the lock lives here).
+        assert_eq!(
+            crate::capability::backend_supports_midturn_delivery("claude"),
+            a.capabilities().supports_midturn_delivery,
+        );
+    }
+
+    /// Task 2: claude echoes back the uuid WE minted on a user frame via a
+    /// `command_lifecycle` frame (verified 2.1.226, design spec §6.1) — the
+    /// adapter must normalize it into `SessionEvent::MessageLifecycle`.
+    #[test]
+    fn parses_command_lifecycle_into_message_lifecycle_events() {
+        let a = ClaudeAdapter::new();
+        let frame = r#"{"type":"command_lifecycle","command_uuid":"u-1","state":"queued"}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        match a.parse_command_lifecycle(&v).as_slice() {
+            [SessionEvent::MessageLifecycle { client_msg_id, phase }] => {
+                assert_eq!(client_msg_id, "u-1");
+                assert_eq!(*phase, crate::event::MessageLifecyclePhase::Queued);
+            }
+            other => panic!("expected one MessageLifecycle, got {other:?}"),
+        }
+    }
+
+    /// An unrecognised `state` degrades to NO event rather than a guess — this
+    /// frame is additive and claude may grow states we have not probed.
+    #[test]
+    fn unknown_command_lifecycle_state_is_ignored_not_panicked() {
+        let a = ClaudeAdapter::new();
+        let frame = r#"{"type":"command_lifecycle","command_uuid":"u-1","state":"future_state"}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        assert!(
+            a.parse_command_lifecycle(&v).is_empty(),
+            "an unknown phase must degrade to no event"
+        );
+    }
+
     #[test]
     fn parse_user_tool_result_string_content_to_text() {
         let a = ClaudeAdapter::new();
@@ -1532,7 +1702,10 @@ mod tests {
                 },
             ] => {
                 assert_eq!(tool_use_id, "t-ok");
-                assert_eq!(name, "Read");
+                // `name` is the user-facing step label now, not the bare tool
+                // name — `Read {file_path:"/x"}` reads as "Read x". The raw tool
+                // identity and arguments still live in `input`, pinned below.
+                assert_eq!(name, "Read x");
                 // The tool ARGUMENTS (Gap #4 / H2) are load-bearing — the conversation
                 // layer renders/persists them. A regression that dropped `input` would
                 // pass a name-only assertion, so pin the full payload here.
@@ -1940,8 +2113,197 @@ mod tests {
         assert!(
             consolidated
                 .iter()
-                .any(|e| matches!(e, SessionEvent::ToolCall { name, .. } if name == "Bash")),
+                .any(|e| matches!(e, SessionEvent::ToolCall { tool_use_id, .. } if tool_use_id == "t1")),
             "tool_use is never deduped, got {consolidated:?}"
+        );
+    }
+
+    /// Step labels must say what the tool is DOING, not just name the tool.
+    /// Shapes below are the real ones (10969 persisted tool_call rows on this
+    /// machine): Bash/Monitor carry `{command, description}`, Read/Edit/Write
+    /// carry `file_path`, Grep carries `pattern`, Agent/Task carry
+    /// `description`, WebSearch/ToolSearch carry `query`.
+    #[test]
+    fn tool_call_label_prefers_claudes_own_description() {
+        // Bash is 73% of all calls and already ships a human-readable
+        // description — use it verbatim.
+        assert_eq!(
+            tool_call_display_name(
+                "Bash",
+                &serde_json::json!({"command": "cargo test -p aionui-session", "description": "Re-run format tests"})
+            ),
+            "Re-run format tests"
+        );
+        // No description → fall back to the command itself.
+        assert_eq!(
+            tool_call_display_name("Bash", &serde_json::json!({"command": "ls -la"})),
+            "Run ls -la"
+        );
+        // Neither → a bare verb, never an empty label.
+        assert_eq!(tool_call_display_name("Bash", &serde_json::json!({})), "Run command");
+        // Agent/Task also carry a description.
+        assert_eq!(
+            tool_call_display_name(
+                "Agent",
+                &serde_json::json!({"description": "Audit the login flow", "prompt": "…"})
+            ),
+            "Audit the login flow"
+        );
+    }
+
+    /// A REAL project path is longer than the detail bound, and the bound must
+    /// not be applied before the file name is extracted — doing so truncates the
+    /// path mid-directory and leaves that directory fragment as the "file name":
+    /// `.../renderer/components/Markdown/CodeBlock.tsx` (116 chars) rendered as
+    /// "Read Ma…" because the cut landed inside "Markdown".
+    #[test]
+    fn long_paths_still_yield_the_file_name() {
+        for (path, expected) in [
+            (
+                "/Users/z/Documents/github/AionUi-worktrees/rtl/packages/desktop/src/renderer/components/Markdown/CodeBlock.tsx",
+                "Read CodeBlock.tsx",
+            ),
+            (
+                "/Users/z/Documents/github/AionUi-worktrees/rtl/packages/desktop/src/renderer/services/i18n/index.ts",
+                "Read index.ts",
+            ),
+        ] {
+            assert!(path.chars().count() > 96, "fixture must exceed the detail bound");
+            assert_eq!(
+                tool_call_display_name("Read", &serde_json::json!({"file_path": path})),
+                expected
+            );
+        }
+    }
+
+    /// A pathological file NAME (not path) still has to be bounded.
+    #[test]
+    fn an_absurdly_long_file_name_is_still_elided() {
+        let name = format!("{}.rs", "n".repeat(200));
+        let label = tool_call_display_name("Write", &serde_json::json!({"file_path": format!("/a/b/{name}")}));
+        assert!(label.starts_with("Write nnn"), "label: {label}");
+        assert!(label.ends_with('…'), "an over-long file name must be elided: {label}");
+        assert!(label.chars().count() <= 103, "label was not bounded: {label}");
+    }
+
+    #[test]
+    fn file_tool_labels_show_the_file_name_not_the_whole_path() {
+        // A full path is mostly shared prefix; the tail (the part that matters)
+        // is exactly what gets truncated away. Show the file name instead.
+        assert_eq!(
+            tool_call_display_name(
+                "Read",
+                &serde_json::json!({"file_path": "/Users/z/repo/tests/unit/renderer/i18nFormat.test.ts"})
+            ),
+            "Read i18nFormat.test.ts"
+        );
+        assert_eq!(
+            tool_call_display_name("Edit", &serde_json::json!({"file_path": "/a/b/service.rs"})),
+            "Edit service.rs"
+        );
+        assert_eq!(
+            tool_call_display_name("Write", &serde_json::json!({"file_path": "/a/b/new_mod.rs"})),
+            "Write new_mod.rs"
+        );
+        assert_eq!(
+            tool_call_display_name("Grep", &serde_json::json!({"pattern": "tool_call_display_name"})),
+            "Search tool_call_display_name"
+        );
+    }
+
+    /// The task/messaging tools were left on the bare name by #870, so a plan of
+    /// five `TaskCreate` steps read as five identical rows — the subject was only
+    /// visible after expanding each one. Shapes from real traffic:
+    /// `TaskCreate {activeForm, description, subject}` (26 rows),
+    /// `TaskUpdate {status, taskId}` (37), `TaskStop {task_id}` (14),
+    /// `SendMessage {to, message, …}` (12).
+    #[test]
+    fn task_and_messaging_tools_say_what_they_act_on() {
+        assert_eq!(
+            tool_call_display_name(
+                "TaskCreate",
+                &serde_json::json!({
+                    "subject": "P1: dir/lang sync + Arco rtl + LTR code islands",
+                    "description": "Add direction.ts helper …",
+                    "activeForm": "Implementing P1 direction plumbing"
+                })
+            ),
+            "P1: dir/lang sync + Arco rtl + LTR code islands"
+        );
+        assert_eq!(
+            tool_call_display_name("TaskUpdate", &serde_json::json!({"taskId": "3", "status": "completed"})),
+            "Task 3 → completed"
+        );
+        // A status-less update still names the task rather than falling back to
+        // the tool name.
+        assert_eq!(
+            tool_call_display_name("TaskUpdate", &serde_json::json!({"taskId": "3"})),
+            "Task 3"
+        );
+        assert_eq!(
+            tool_call_display_name("TaskStop", &serde_json::json!({"task_id": "b4p422pva"})),
+            "Stop task b4p422pva"
+        );
+        assert_eq!(
+            tool_call_display_name("SendMessage", &serde_json::json!({"to": "reviewer", "message": "ping"})),
+            "Message reviewer"
+        );
+    }
+
+    #[test]
+    fn unrecognized_and_mcp_tools_keep_their_own_name() {
+        // Never guess at a shape we have not verified — an unknown tool keeps
+        // the name claude gave it.
+        for name in [
+            "mcp__sentry__search_issues",
+            "mcp__aionui-team__team_send_message",
+            "AskUserQuestion",
+            "TodoWrite",
+        ] {
+            assert_eq!(
+                tool_call_display_name(name, &serde_json::json!({"whatever": 1})),
+                name,
+                "unknown tool must keep its name"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_labels_are_bounded_and_single_line() {
+        // A pasted heredoc must not turn one step into a wall of text.
+        let long = "x".repeat(400);
+        let label = tool_call_display_name("Bash", &serde_json::json!({"command": long}));
+        assert!(label.starts_with("Run xxx"), "label: {label}");
+        assert!(label.ends_with('…'), "long label must be elided: {label}");
+        assert!(label.chars().count() <= 101, "label was not bounded: {label}");
+
+        let multi = tool_call_display_name(
+            "Bash",
+            &serde_json::json!({"description": "line one\nline two\r\nline three"}),
+        );
+        assert_eq!(multi, "line one line two line three");
+    }
+
+    /// The label must reach the emitted event, not just exist as a helper.
+    #[test]
+    fn parsed_tool_use_carries_the_label_as_its_name() {
+        let mut a = ClaudeAdapter::default();
+        let frame = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t9","name":"Bash","input":{"command":"git status","description":"Show working tree status"}}]}}"#;
+        let events = a.parse_chunk(format!("{frame}\n").as_bytes());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ToolCall { name, .. } if name == "Show working tree status")),
+            "the ToolCall must carry the readable label, got {events:?}"
+        );
+        // The raw input is still there — this changes presentation only.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::ToolCall { input, .. }
+                    if input.get("command").and_then(serde_json::Value::as_str) == Some("git status")
+            )),
+            "raw input must be preserved, got {events:?}"
         );
     }
 

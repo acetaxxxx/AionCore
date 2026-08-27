@@ -3,7 +3,7 @@
 //! Parses one inner frame, routes by `method`, and drives the runtime:
 //! `initialize` handshakes; `fs/subscribe`/`fs/unsubscribe` go through the shard
 //! (identity resolved via [`ProjectService::resolve_reference`]); the file
-//! commands (`fs/mkdir|remove|rename`) resolve + realpath-guard, then
+//! commands (`fs/mkdir|createFile|remove|rename`) resolve + realpath-guard, then
 //! hit the provider directly. Responses/notifications go out via the actor's
 //! push port. Errors map to protocol codes ([`wire`]) with `pe_id`/`relative_path`
 //! context in `error.data`.
@@ -15,15 +15,24 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::canonical;
-use crate::runtime::{Budget, CancellationToken, Command, MatchMode, NameMatcher, ShardOutput, Subscriber};
+use crate::runtime::{Budget, CancellationToken, Command, Kind, MatchMode, NameMatcher, ShardOutput, Subscriber};
 use crate::types::{FileOp, ReferenceInput, ResolvedResource};
 
 use super::actor::FsMonitorActor;
 use super::search::{self, ActiveSearch, SearchRoot};
 use super::wire::{
-    self, InitializeParams, MkdirParams, RemoveParams, RenameParams, ResourceRef, SearchCancelParams, SearchParams,
-    SubscribeParams, UnsubscribeParams,
+    self, CreateFileParams, InitializeParams, MkdirParams, RemoveParams, RenameParams, ResourceRef, SearchCancelParams,
+    SearchParams, SubscribeParams, TransferParams, UnsubscribeParams,
 };
+
+/// Whether a transfer keeps the source (`Copy`) or removes it after it lands
+/// (`Move`). Both share [`handle_transfer`]; this only branches source op intent
+/// and the post-landing cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transfer {
+    Copy,
+    Move,
+}
 
 impl FsMonitorActor {
     /// Decode one inbound frame and route it by method. Malformed frames get a
@@ -48,8 +57,11 @@ impl FsMonitorActor {
             "fs/subscribe" => self.handle_subscribe(session, user_id, id, params).await,
             "fs/unsubscribe" => self.handle_unsubscribe(session, user_id, params).await,
             "fs/mkdir" => self.handle_mkdir(session, user_id, id, params).await,
+            "fs/createFile" => self.handle_create_file(session, user_id, id, params).await,
             "fs/remove" => self.handle_remove(session, user_id, id, params).await,
             "fs/rename" => self.handle_rename(session, user_id, id, params).await,
+            "fs/copy" => self.handle_transfer(session, user_id, id, params, Transfer::Copy).await,
+            "fs/move" => self.handle_transfer(session, user_id, id, params, Transfer::Move).await,
             "fs/search" => self.handle_search(session, user_id, id, params).await,
             "fs/searchCancel" => self.handle_search_cancel(session, params),
             other => {
@@ -214,6 +226,26 @@ impl FsMonitorActor {
         self.reply_unit(session, id, "mkdir", &p.dir, outcome);
     }
 
+    /// `fs/createFile`: create an empty file at `file`. Mirrors [`Self::handle_mkdir`]
+    /// — same resolve + realpath guard, then the provider's `create_new` open, which
+    /// fails `AlreadyExists` rather than truncating an existing file. Neither this nor
+    /// `mkdir` creates missing parent directories; the client creates ancestors first.
+    async fn handle_create_file(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
+        let Ok(p) = serde_json::from_value::<CreateFileParams>(params) else {
+            self.push(session, invalid_params(id));
+            return;
+        };
+        let resolved = match self.resolve_guarded(user_id, &p.file, FileOp::Write).await {
+            Ok(r) => r,
+            Err((code, message)) => {
+                self.push(session, wire::error(id, code, message, ref_data(&p.file)));
+                return;
+            }
+        };
+        let outcome = self.runtime().provider().create_file(&resolved.resource_uri).await;
+        self.reply_unit(session, id, "createFile", &p.file, outcome);
+    }
+
     async fn handle_remove(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
         let Ok(p) = serde_json::from_value::<RemoveParams>(params) else {
             self.push(session, invalid_params(id));
@@ -259,6 +291,188 @@ impl FsMonitorActor {
             .rename(&from.resource_uri, &to.resource_uri)
             .await;
         self.reply_unit(session, id, "rename", &p.from, outcome);
+    }
+
+    /// `fs/copy` / `fs/move`: transfer `from` into the directory `to_dir`,
+    /// preserving the source basename and auto-renaming to a non-colliding
+    /// sibling on conflict. Copy keeps the source; move removes it after it lands
+    /// (atomic `rename` within one folder root, else copy-then-remove across roots).
+    async fn handle_transfer(
+        &mut self,
+        session: &str,
+        user_id: &str,
+        id: Option<Value>,
+        params: Value,
+        mode: Transfer,
+    ) {
+        let Ok(p) = serde_json::from_value::<TransferParams>(params) else {
+            self.push(session, invalid_params(id));
+            return;
+        };
+        // The workspace root has no basename to carry and is never itself a
+        // transfer source — reject rather than silently no-op.
+        if p.from.relative_path.is_empty() {
+            self.push(
+                session,
+                wire::error(id, wire::CODE_INVALID_PARAMS, "invalid_params", ref_data(&p.from)),
+            );
+            return;
+        }
+        let src_op = match mode {
+            Transfer::Copy => FileOp::Read,
+            Transfer::Move => FileOp::Rename,
+        };
+        let from = match self.resolve_guarded(user_id, &p.from, src_op).await {
+            Ok(r) => r,
+            Err((code, message)) => {
+                self.push(session, wire::error(id, code, message, ref_data(&p.from)));
+                return;
+            }
+        };
+        let to_dir = match self.resolve_guarded(user_id, &p.to_dir, FileOp::Write).await {
+            Ok(r) => r,
+            Err((code, message)) => {
+                self.push(session, wire::error(id, code, message, ref_data(&p.to_dir)));
+                return;
+            }
+        };
+
+        // Source kind drives recursive dir copy and the extension-aware rename.
+        // A missing source is a resource_not_found, not a silent success.
+        let is_dir = match self.runtime().provider().stat(&from.resource_uri).await {
+            Ok(Some(fact)) => matches!(fact.kind, Kind::Dir),
+            Ok(None) => {
+                self.push(
+                    session,
+                    wire::error(
+                        id,
+                        wire::CODE_RESOURCE_NOT_FOUND,
+                        "resource_not_found",
+                        ref_data(&p.from),
+                    ),
+                );
+                return;
+            }
+            Err(err) => {
+                let (code, message) = wire::fs_error_to_rpc(&err);
+                self.push(session, wire::error(id, code, message, ref_data(&p.from)));
+                return;
+            }
+        };
+
+        // A directory cannot be transferred into itself or one of its own
+        // descendants — that would recurse without end. Compare the resolved,
+        // realpath-guarded resource URIs.
+        if is_dir && uri_within_or_equal(&to_dir.resource_uri, &from.resource_uri) {
+            self.push(
+                session,
+                wire::error(id, wire::CODE_INVALID_PARAMS, "invalid_params", ref_data(&p.to_dir)),
+            );
+            return;
+        }
+
+        // Moving an entry into the directory it already sits in is a no-op — the
+        // frontend blocks it, but guard here too rather than manufacture a
+        // spurious "name copy". (Copy into the same dir is a deliberate duplicate.)
+        let base = basename_of(&from);
+        if mode == Transfer::Move && parent_uri(&from.resource_uri).as_deref() == Some(to_dir.resource_uri.as_str()) {
+            self.push(
+                session,
+                wire::success(id, transfer_result(&p.from.pe_id, &p.from.relative_path, &base)),
+            );
+            return;
+        }
+
+        // Resolve a non-colliding destination child under `to_dir`; each candidate
+        // is re-resolved so it inherits the same lexical + realpath containment guard.
+        let dest = match self.resolve_free_dest(user_id, &p.to_dir, &base, is_dir).await {
+            Ok(Some(dest)) => dest,
+            Ok(None) => {
+                self.push(
+                    session,
+                    wire::error(
+                        id,
+                        wire::CODE_PROVIDER_UNAVAILABLE,
+                        "provider_unavailable",
+                        ref_data(&p.to_dir),
+                    ),
+                );
+                return;
+            }
+            Err((code, message)) => {
+                self.push(session, wire::error(id, code, message, ref_data(&p.to_dir)));
+                return;
+            }
+        };
+
+        let provider = self.runtime().provider();
+        let outcome = match mode {
+            Transfer::Copy => provider.copy(&from.resource_uri, &dest.resource_uri, is_dir).await,
+            Transfer::Move => {
+                // Same folder root → atomic rename. Across roots (or filesystems)
+                // rename may fail EXDEV, so fall back to copy-then-remove.
+                if from.root_resource_canonical == to_dir.root_resource_canonical {
+                    provider.rename(&from.resource_uri, &dest.resource_uri).await
+                } else {
+                    match provider.copy(&from.resource_uri, &dest.resource_uri, is_dir).await {
+                        Ok(()) => provider.remove(&from.resource_uri, is_dir).await,
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            Ok(()) => {
+                let op = match mode {
+                    Transfer::Copy => "copy",
+                    Transfer::Move => "move",
+                };
+                tracing::info!(session, op, pe_id = %p.to_dir.pe_id, rel = %dest.relative_path, "fs command ok");
+                let name = last_segment(&dest.relative_path);
+                self.push(
+                    session,
+                    wire::success(id, transfer_result(&p.to_dir.pe_id, &dest.relative_path, name)),
+                );
+            }
+            Err(err) => {
+                let (code, message) = wire::fs_error_to_rpc(&err);
+                let op = match mode {
+                    Transfer::Copy => "copy",
+                    Transfer::Move => "move",
+                };
+                tracing::warn!(session, op, pe_id = %p.from.pe_id, rel = %p.from.relative_path, code = message, "fs command failed");
+                self.push(session, wire::error(id, code, message, ref_data(&p.from)));
+            }
+        }
+    }
+
+    /// Find and resolve the first non-colliding destination child under
+    /// `to_dir_ref` for `base` (`name` → `name copy` → `name copy 2` …). Returns
+    /// the resolved, realpath-guarded destination, or `Ok(None)` if every attempt
+    /// up to the cap is taken (never overwrites).
+    async fn resolve_free_dest(
+        &self,
+        user_id: &str,
+        to_dir_ref: &ResourceRef,
+        base: &str,
+        is_dir: bool,
+    ) -> Result<Option<ResolvedResource>, (i64, &'static str)> {
+        const MAX_ATTEMPTS: usize = 10_000;
+        for attempt in 0..MAX_ATTEMPTS {
+            let name = candidate_name(base, attempt, is_dir);
+            let candidate = ResourceRef {
+                pe_id: to_dir_ref.pe_id.clone(),
+                relative_path: join_rel(&to_dir_ref.relative_path, &name),
+            };
+            let resolved = self.resolve_guarded(user_id, &candidate, FileOp::Write).await?;
+            match self.runtime().provider().stat(&resolved.resource_uri).await {
+                Ok(None) => return Ok(Some(resolved)),
+                Ok(Some(_)) => continue,
+                Err(err) => return Err(wire::fs_error_to_rpc(&err)),
+            }
+        }
+        Ok(None)
     }
 
     // ── filename search ───────────────────────────────────────────────────
@@ -421,6 +635,76 @@ fn ref_data(target: &ResourceRef) -> Value {
     json!({ "pe_id": target.pe_id, "relative_path": target.relative_path })
 }
 
+/// Success `result` for `fs/copy` / `fs/move`: the landed entry's pe-relative
+/// identity + its final (possibly auto-renamed) name, so the client can reveal
+/// or select it without waiting for the destination's delta.
+fn transfer_result(pe_id: &str, relative_path: &str, name: &str) -> Value {
+    json!({ "to": { "pe_id": pe_id, "relative_path": relative_path }, "name": name })
+}
+
+/// Join a directory-relative path with a child name (wire form: forward slashes,
+/// no leading slash; an empty dir yields the bare name).
+fn join_rel(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// The last `/`-segment of a wire relative path (the entry's own name).
+fn last_segment(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+/// Basename of a resolved resource — the real on-disk name (case preserved),
+/// falling back to the reference's own last relative segment.
+fn basename_of(resolved: &ResolvedResource) -> String {
+    resolved
+        .absolute_path
+        .as_deref()
+        .and_then(|abs| Path::new(abs).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| last_segment(&resolved.relative_path).to_owned())
+}
+
+/// Parent URI of a canonical `file:` child URI: everything up to the last `/`.
+/// `None` when there is no separator (should not happen for a resolved child).
+fn parent_uri(uri: &str) -> Option<String> {
+    uri.rfind('/').map(|i| uri[..i].to_owned())
+}
+
+/// Whether `inner` is `outer` itself or nested under it, by canonical URI prefix.
+/// A trailing separator on `outer` avoids the `/a/foo` vs `/a/foobar` false match.
+fn uri_within_or_equal(inner: &str, outer: &str) -> bool {
+    inner == outer || inner.starts_with(&format!("{outer}/"))
+}
+
+/// The conflict-free candidate name for the `attempt`-th try (0 = the original).
+/// Files keep their extension (`report.txt` → `report copy.txt`); directories and
+/// dotfiles take the suffix wholesale (`.env` → `.env copy`).
+fn candidate_name(base: &str, attempt: usize, is_dir: bool) -> String {
+    if attempt == 0 {
+        return base.to_owned();
+    }
+    let (stem, ext) = if is_dir { (base, "") } else { split_ext(base) };
+    if attempt == 1 {
+        format!("{stem} copy{ext}")
+    } else {
+        format!("{stem} copy {attempt}{ext}")
+    }
+}
+
+/// Split a filename into `(stem, extension-including-dot)` at the last interior
+/// dot. A leading dot (dotfile) is not an extension separator, so `.gitignore`
+/// → `(".gitignore", "")`.
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    }
+}
+
 /// Realpath containment: the access-time symlink/alias escape guard that stage 0
 /// deferred. `resolve_reference` already did lexical containment; here the target
 /// (or its deepest existing ancestor, for not-yet-created paths) is realpath'd
@@ -436,6 +720,10 @@ fn guard_realpath(resolved: &ResolvedResource) -> Result<(), (i64, &'static str)
         Err((wire::CODE_RESOURCE_OUTSIDE_FOLDER, "resource_outside_folder"))
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_test.rs"]
+mod dispatch_test;
 
 /// Whether `target`'s deepest existing ancestor realpath is inside `root`'s
 /// realpath. Walking to the deepest existing ancestor lets not-yet-created

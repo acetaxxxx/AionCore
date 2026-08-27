@@ -1188,6 +1188,59 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     }
 }
 
+#[tokio::test]
+async fn clear_acp_context_anchor_drops_only_the_resume_anchor() {
+    let runtime_state = PersistedSessionState {
+        current_mode_id: Some("full_auto".to_owned()),
+        current_model_id: Some("model-preserved".to_owned()),
+        ..Default::default()
+    };
+    let acp_session_repo = Arc::new(StubAcpSessionRepo {
+        create_calls: Mutex::new(Vec::new()),
+        runtime_state_saves: Mutex::new(Vec::new()),
+        session_id: Mutex::new(Some("session-to-clear".to_owned())),
+        runtime_state: Mutex::new(Some(runtime_state.clone())),
+    });
+    let (service, _broadcaster, _repo, _task_manager) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo.clone(),
+    );
+    let conversation = service.create("user_1", make_create_req()).await.unwrap();
+
+    assert!(
+        service
+            .supports_acp_context_reset("user_1", &conversation.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        service
+            .clear_acp_context_anchor("user_1", &conversation.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(*acp_session_repo.session_id.lock().unwrap(), None);
+    assert_eq!(*acp_session_repo.runtime_state.lock().unwrap(), Some(runtime_state));
+}
+
+#[tokio::test]
+async fn aionrs_conversation_does_not_support_acp_context_reset() {
+    let (service, _broadcaster, _repo, _task_manager) = make_service();
+    let request = serde_json::from_value(json!({
+        "type": "aionrs",
+        "extra": { "workspace": ensure_test_workspace_path() }
+    }))
+    .unwrap();
+    let conversation = service.create("user_1", request).await.unwrap();
+
+    assert!(
+        !service
+            .supports_acp_context_reset("user_1", &conversation.id)
+            .await
+            .unwrap()
+    );
+}
+
 fn make_service() -> (
     ConversationService,
     Arc<MockBroadcaster>,
@@ -3618,6 +3671,78 @@ struct SlowBuildTaskManager {
     built: AtomicBool,
 }
 
+struct SlowRestartTaskManager {
+    delay: Duration,
+    agent: Mutex<Option<AgentInstance>>,
+    rebuilt: AtomicBool,
+}
+
+impl SlowRestartTaskManager {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            agent: Mutex::new(None),
+            rebuilt: AtomicBool::new(false),
+        }
+    }
+
+    fn insert_agent(&self, conversation_id: &str) {
+        self.agent
+            .lock()
+            .unwrap()
+            .replace(AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id))));
+    }
+
+    fn was_rebuilt(&self) -> bool {
+        self.rebuilt.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for SlowRestartTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        self.agent.lock().unwrap().clone()
+    }
+
+    async fn get_or_build_task(
+        &self,
+        conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        tokio::time::sleep(self.delay).await;
+        let agent = AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id)));
+        self.agent.lock().unwrap().replace(agent.clone());
+        self.rebuilt.store(true, Ordering::SeqCst);
+        Ok(agent)
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        self.agent.lock().unwrap().take();
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        conversation_id: &str,
+        reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let _ = self.kill(conversation_id, reason);
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {
+        self.agent.lock().unwrap().take();
+    }
+
+    fn active_count(&self) -> usize {
+        usize::from(self.agent.lock().unwrap().is_some())
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 impl SlowBuildTaskManager {
     fn new(delay: Duration) -> Self {
         Self {
@@ -3897,6 +4022,271 @@ async fn send_message_returns_accepted() {
     assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
 }
 
+/// B5 test double: a mid-turn-capable agent that records `deliver_midturn`
+/// calls; `scripted_error` lets a test replay a steer rejection. `held_claim`
+/// (when set) is dropped BEFORE the rejection returns — modelling the live
+/// race where codex's turn ends (claim released) between the routing check and
+/// the steer write, so the fallback's fresh claim succeeds deterministically.
+struct MidturnMockAgent {
+    conversation_id: String,
+    event_tx: broadcast::Sender<AgentStreamEvent>,
+    delivered: Mutex<Vec<SendMessageData>>,
+    scripted_error: Mutex<Option<AgentSendError>>,
+    held_claim: Mutex<Option<crate::runtime_state::TurnClaim>>,
+    /// Pending permission confirmations (spec §4.6 gate): while non-empty the
+    /// mid-turn routing branch must fall through to the 409 claim path.
+    confirmations: Mutex<Vec<Confirmation>>,
+}
+
+impl MidturnMockAgent {
+    fn new(conversation_id: &str) -> Self {
+        let (event_tx, _) = broadcast::channel(16);
+        Self {
+            conversation_id: conversation_id.to_owned(),
+            event_tx,
+            delivered: Mutex::new(Vec::new()),
+            scripted_error: Mutex::new(None),
+            held_claim: Mutex::new(None),
+            confirmations: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentTask for MidturnMockAgent {
+    fn agent_type(&self) -> AgentType {
+        AgentType::Acp
+    }
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+    fn workspace(&self) -> &str {
+        "/tmp/test"
+    }
+    fn status(&self) -> Option<ConversationStatus> {
+        None
+    }
+    fn last_activity_at(&self) -> aionui_common::TimestampMs {
+        aionui_common::now_ms()
+    }
+    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+        self.event_tx.subscribe()
+    }
+    fn supports_midturn_delivery(&self) -> bool {
+        true
+    }
+    async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+        // Emit finish so a fallback-opened normal turn's relay completes.
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
+        Ok(())
+    }
+    async fn cancel(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl IMockAgent for MidturnMockAgent {
+    fn get_confirmations(&self) -> Vec<Confirmation> {
+        self.confirmations.lock().unwrap().clone()
+    }
+    async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        if let Some(err) = self.scripted_error.lock().unwrap().take() {
+            // The turn "ended": release the held claim so the fallback's
+            // fresh claim succeeds (deterministic stand-in for the live race).
+            self.held_claim.lock().unwrap().take();
+            return Err(err);
+        }
+        self.delivered.lock().unwrap().push(data);
+        Ok(())
+    }
+}
+
+/// B5 routing (spec §4.3): an ACTIVE turn + a supporting backend → the message
+/// is delivered mid-turn (no 409, no new turn id), persisted with the
+/// pending-receipt status, and `message.userCreated` carries the correlation
+/// id.
+#[tokio::test]
+async fn midturn_send_delivers_into_the_active_turn() {
+    let (svc, broadcaster, repo, _d) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn_active")
+        .expect("claim the active turn");
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    broadcaster.take_events();
+
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .expect("mid-turn send must not 409");
+
+    assert_eq!(response.turn_id, "turn_active", "response carries the ACTIVE turn id");
+    assert!(response.delivered_midturn, "response flags the mid-turn delivery");
+    let delivered = agent.delivered.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1, "delivered through the mid-turn path exactly once");
+    assert_eq!(delivered[0].content, "Hello");
+    assert_eq!(
+        delivered[0].msg_id, response.msg_id,
+        "the wire correlation id IS the persisted msg_id"
+    );
+    assert_eq!(delivered[0].turn_id.as_deref(), Some("turn_active"));
+    // The active claim was never stolen and no new turn id was minted.
+    assert_eq!(
+        svc.runtime_state().active_turn_id_for(&conv.id).as_deref(),
+        Some("turn_active")
+    );
+    // userCreated carries the correlation id + pending-receipt status.
+    let events = broadcaster.take_events();
+    let created = events
+        .iter()
+        .find(|e| e.name == "message.userCreated")
+        .expect("userCreated broadcast");
+    assert_eq!(created.data["client_msg_id"], response.msg_id.as_str());
+    assert_eq!(created.data["status"], "pending");
+    // Persisted with the pending-receipt status.
+    let rows: Vec<_> = repo
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.msg_id.as_deref() == Some(response.msg_id.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(rows.len(), 1, "persisted exactly once");
+    assert_eq!(rows[0].status.as_deref(), Some("pending"));
+}
+
+/// B5 fallback (spec §6甲.1): codex rejected the steer because the turn ended
+/// → the send falls back to opening a NEW turn; the already-persisted message
+/// is reused (no duplicate row) and its status leaves the pending state.
+#[tokio::test]
+async fn midturn_steer_rejection_turn_ended_falls_back_to_a_new_turn() {
+    let (svc, _broadcaster, repo, _d) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn_active")
+        .expect("claim the active turn");
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    // codex wording verbatim (locked): both rejections are -32600; only the
+    // message text distinguishes them.
+    *agent.scripted_error.lock().unwrap() = Some(AgentSendError::from_agent_error(AgentError::bad_gateway(
+        "backend transport error: no active turn to steer",
+    )));
+    *agent.held_claim.lock().unwrap() = Some(claim);
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .expect("the fallback must open a new turn, not fail");
+
+    assert_ne!(response.turn_id, "turn_active", "a NEW turn id is minted on fallback");
+    assert!(response.turn_id.starts_with("turn_"));
+    assert!(
+        !response.delivered_midturn,
+        "a fallback send is an ordinary new-turn send"
+    );
+    assert!(
+        agent.delivered.lock().unwrap().is_empty(),
+        "nothing was delivered mid-turn"
+    );
+    // Exactly ONE persisted user row (reused, not duplicated), no longer pending.
+    let rows: Vec<_> = repo
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.msg_id.as_deref() == Some(response.msg_id.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(rows.len(), 1, "the fallback must reuse the row, not duplicate it");
+    assert_eq!(rows[0].status.as_deref(), Some("finish"));
+    wait_for_turn_released(&svc, &conv.id).await;
+}
+
+/// §4.6 (review fix): a turn blocked on a pending permission confirmation
+/// must NOT be steered into, even for a supporting backend — the mid-turn
+/// branch falls through to the claim, restoring the exact pre-B5 409 at the
+/// HTTP API (the frontend gate alone does not bind direct API clients).
+#[tokio::test]
+async fn midturn_send_during_pending_confirmation_stays_409() {
+    let (svc, broadcaster, repo, _d) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn_active")
+        .expect("claim the active turn");
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    *agent.confirmations.lock().unwrap() = vec![Confirmation {
+        id: "c1".into(),
+        call_id: "call-1".into(),
+        title: Some("Allow file edit".into()),
+        action: Some("edit_file".into()),
+        description: "Edit main.rs".into(),
+        command_type: Some("bash".into()),
+        questions: None,
+        options: vec![],
+    }];
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    broadcaster.take_events();
+
+    let err = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .expect_err("a send during requires_action must be rejected");
+    assert!(
+        err.to_string().contains("already running"),
+        "the pre-B5 running-conversation conflict is preserved, got: {err}"
+    );
+    // Nothing was delivered, persisted, or broadcast.
+    assert!(
+        agent.delivered.lock().unwrap().is_empty(),
+        "no mid-turn delivery may happen while a confirmation is pending"
+    );
+    assert!(
+        repo.messages.lock().unwrap().is_empty(),
+        "the rejected message must not be persisted"
+    );
+    let events = broadcaster.take_events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.name == "message.userCreated" || e.name == "message.statusChanged"),
+        "no message events for a rejected send, got: {:?}",
+        events.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
+    );
+}
+
+/// The §6甲.1 message-text classification is load-bearing — lock it so a codex
+/// wording change (or an error-mapping change that drops the text) fails here
+/// instead of silently degrading every turn-ended fallback into a hard error.
+#[test]
+fn steer_rejection_classifier_matches_only_the_turn_ended_text() {
+    let turn_ended = AgentSendError::from_agent_error(AgentError::bad_gateway(
+        "backend transport error: no active turn to steer",
+    ));
+    assert!(crate::service::steer_rejection_is_turn_ended(&turn_ended));
+    let other = AgentSendError::from_agent_error(AgentError::bad_gateway(
+        "backend transport error: turn/steer rejected: expected active turn id `a` but found `b`",
+    ));
+    assert!(!crate::service::steer_rejection_is_turn_ended(&other));
+    let unrelated = AgentSendError::from_agent_error(AgentError::bad_gateway("boom"));
+    assert!(!crate::service::steer_rejection_is_turn_ended(&unrelated));
+}
+
 #[tokio::test]
 async fn send_message_injects_conversation_runtime_context() {
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
@@ -4019,6 +4409,45 @@ async fn send_message_returns_msg_id_and_turn_id_and_summary_tracks_turn() {
     assert_eq!(runtime.turn_id.as_deref(), Some(response.turn_id.as_str()));
     assert!(runtime.is_processing);
     assert!(!runtime.can_send_message);
+}
+
+/// Bugfix: `supports_midturn_delivery` is a STATIC property of the
+/// conversation's backend type, not of agent liveness. A fresh (pre-ensure)
+/// or dormant claude conversation must still report `true`, otherwise the
+/// frontend hydrate fetch races the send accept and gates the whole first
+/// turn into the client queue panel.
+#[tokio::test]
+async fn runtime_summary_reports_backend_static_midturn_bit_without_live_agent() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    // No runtime/ensure has run: MockTaskManager holds no task for any of
+    // these conversations, so the bit must come from the backend identity.
+    for (backend, expected) in [
+        ("claude", true),
+        ("codex", true),
+        ("antigravity", false),
+        ("gemini", false),
+    ] {
+        let conv = svc
+            .create("user_1", make_create_req_with_backend(backend))
+            .await
+            .unwrap();
+        let runtime = svc.runtime_summary_for(&conv.id).await;
+        assert!(!runtime.has_task, "precondition: no live agent for {backend}");
+        assert_eq!(
+            runtime.supports_midturn_delivery, expected,
+            "backend {backend} must report static supports_midturn_delivery={expected} without a live agent"
+        );
+    }
+
+    // No backend identity at all (legacy/unknown row) → conservative false.
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let runtime = svc.runtime_summary_for(&conv.id).await;
+    assert!(!runtime.supports_midturn_delivery);
+
+    // Unknown conversation id → conservative false, no panic.
+    let runtime = svc.runtime_summary_for("conv-does-not-exist").await;
+    assert!(!runtime.supports_midturn_delivery);
 }
 
 #[tokio::test]
@@ -4215,6 +4644,225 @@ async fn ensure_runtime_uses_existing_agent_snapshot_without_recovery() {
     assert!(result.runtime.has_task);
     assert_eq!(result.config_options[0].id, "model");
     assert_eq!(result.config_options[0].current_value.as_deref(), Some("gpt-5.5"));
+}
+
+#[tokio::test]
+async fn restart_runtime_without_existing_task_is_rejected() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let error = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::Busy { reason }
+            if reason == format!("conversation {} runtime is not ready to restart", conv.id)
+    ));
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert!(task_mgr.get_task(&conv.id).is_none());
+}
+
+#[tokio::test]
+async fn restart_runtime_evicts_existing_task_before_rebuild() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let old_agent = MockAgent::new(&conv.id).with_config_options(vec![AcpConfigOptionDto {
+        id: "model".to_owned(),
+        name: Some("Old Model".to_owned()),
+        label: None,
+        description: None,
+        category: Some("model".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some("old-model".to_owned()),
+        options: Vec::new(),
+    }]);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(old_agent)));
+
+    let result = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::RuntimeRestart))]
+    );
+    assert!(result.recovered);
+    assert!(result.runtime.has_task);
+    assert!(
+        result.config_options.is_empty(),
+        "response must come from the newly built task, not the evicted instance"
+    );
+}
+
+#[tokio::test]
+async fn restart_runtime_cancels_active_turn_before_rebuild() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let old_agent = Arc::new(BlockingCancelAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(old_agent.clone()));
+    let _turn_claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn-before-restart")
+        .unwrap();
+
+    let result = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    assert_eq!(old_agent.cancel_count.load(Ordering::SeqCst), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert!(result.runtime.has_task);
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+}
+
+#[tokio::test]
+async fn restart_runtime_blocks_duplicate_restart_send_and_config_until_ready() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let task_mgr = Arc::new(SlowRestartTaskManager::new(Duration::from_millis(150)));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster,
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn.clone(),
+        repo,
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id);
+
+    let restart_service = svc.clone();
+    let restart_conversation_id = conv.id.clone();
+    let restart_task_manager = task_mgr_dyn.clone();
+    let restart = tokio::spawn(async move {
+        restart_service
+            .restart_runtime("user_1", &restart_conversation_id, &restart_task_manager)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !svc.runtime_state().is_restarting(&conv.id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restart gate should become observable");
+
+    let summary = svc.runtime_summary_for(&conv.id).await;
+    assert_eq!(
+        summary.state,
+        aionui_api_types::ConversationRuntimeStateKind::Restarting
+    );
+
+    // All three gates report the SAME coded error, so a client has one rule to
+    // retry on rather than having to match each entry point's message text.
+    let duplicate = svc
+        .restart_runtime("user_1", &conv.id, &task_mgr_dyn)
+        .await
+        .expect_err("duplicate restart must fail");
+    assert!(matches!(duplicate, ConversationError::RuntimeRestarting { .. }));
+    assert_eq!(duplicate.error_code(), "runtime_restarting");
+
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .expect_err("send must fail at the backend gate while restart is in progress");
+    assert!(matches!(send, ConversationError::RuntimeRestarting { .. }));
+    assert_eq!(send.error_code(), "runtime_restarting");
+
+    let config = svc
+        .get_config_options("user_1", &conv.id)
+        .await
+        .expect_err("config access must fail while restart is in progress");
+    assert!(matches!(config, ConversationError::RuntimeRestarting { .. }));
+    assert_eq!(config.error_code(), "runtime_restarting");
+
+    let response = restart.await.expect("restart task should not panic").unwrap();
+    assert!(task_mgr.was_rebuilt());
+    assert_eq!(
+        response.runtime.state,
+        aionui_api_types::ConversationRuntimeStateKind::Idle
+    );
+    assert!(!svc.runtime_state().is_restarting(&conv.id));
+}
+
+#[tokio::test]
+async fn restart_runtime_preserves_persisted_messages() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: "message-before-restart".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("message-before-restart".into()),
+            r#type: "user".into(),
+            content: json!({ "text": "keep me" }).to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1234,
+            backend_turn_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    let messages = repo_messages_asc(&repo, &conv.id, 10).await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "message-before-restart");
+}
+
+#[tokio::test]
+async fn restart_runtime_not_found_does_not_touch_task_manager() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+
+    let error = svc
+        .restart_runtime(
+            "user_1",
+            "missing-conversation",
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::NotFound { .. }));
+    assert_eq!(task_mgr.kill_count(), 0);
+}
+
+#[tokio::test]
+async fn restart_runtime_rejects_cross_user_access_without_eviction() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let error = svc
+        .restart_runtime("user_2", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::NotFound { .. }));
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert!(task_mgr.get_task(&conv.id).is_some());
 }
 
 #[tokio::test]
@@ -6152,6 +6800,7 @@ async fn send_message_does_not_auto_replay_after_tool_side_effect() {
                 input: None,
                 output: None,
                 description: None,
+                parent_call_id: None,
             }),
             AgentStreamEvent::Error(ErrorEventData {
                 message: "temporary provider failure".into(),
@@ -6522,6 +7171,39 @@ async fn warmup_injects_conversation_runtime_context() {
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
     assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn warmup_keeps_existing_acp_session_anchor_in_build_options() {
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-existing"));
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo,
+    );
+    let mut request = make_create_req();
+    request.extra = serde_json::json!({
+        "teamId": "team-1",
+        "slot_id": "slot-1",
+        "role": "teammate",
+    });
+    let conv = svc.create("user_1", request).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.warmup("user_1", &conv.id, &task_mgr_dyn).await.unwrap();
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    match &options[0].context.kind {
+        AgentSessionKind::Acp(context) => {
+            assert_eq!(context.session_id.as_deref(), Some("sess-existing"));
+        }
+        AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build ACP options")
+        }
+    }
 }
 
 #[tokio::test]
@@ -8518,4 +9200,153 @@ async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
     assert!(svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
     // Consumed exactly once.
     assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
+}
+
+/// The agent has declared the persisted id dead, so it MUST be dropped. Keeping
+/// it made the failure permanent: every later turn replayed the same dead id and
+/// failed at warmup with `Session not found`, before the prompt was ever sent —
+/// so the real cause (a missing provider API key, reported exactly once) became
+/// unreachable and no amount of retrying could clear it.
+#[tokio::test]
+async fn session_not_found_clears_the_persisted_session_id() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("df6f811c-dead-session"));
+    let (svc, _broadcaster, _repo, task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    let outcome = crate::stream_relay::RelayOutcome {
+        system_responses: Vec::new(),
+        terminal: crate::stream_relay::RelayTerminal::Error {
+            code: Some(AgentErrorCode::UserAgentSessionNotFound),
+            retryable: Some(true),
+        },
+        attempt: Default::default(),
+    };
+
+    let evicted = svc
+        .evict_acp_task_after_terminal_error("user-1", "conv-1", AgentType::Acp, &outcome, &task_mgr)
+        .await;
+
+    assert!(evicted, "an ACP terminal error must evict the task");
+    assert!(
+        acp_repo.session_id.lock().unwrap().is_none(),
+        "an id the agent no longer recognises must not survive"
+    );
+}
+
+/// The clear is deliberately NOT unconditional. A retryable failure triggers an
+/// auto-replay rebuild that carries the session id forward on purpose, so the
+/// replay resumes the same session rather than losing the conversation context.
+#[tokio::test]
+async fn other_terminal_errors_keep_the_session_id_for_replay() {
+    for code in [
+        AgentErrorCode::UserLlmProviderAuthFailed,
+        AgentErrorCode::UnknownUpstreamError,
+    ] {
+        let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-live"));
+        let (svc, _b, _r, task_mgr) = make_service_with_resolver_and_acp_session_repo(
+            Arc::new(RecordingSkillResolver {
+                names: Vec::new(),
+                links: Arc::new(Mutex::new(Vec::new())),
+            }),
+            acp_repo.clone(),
+        );
+
+        let outcome = crate::stream_relay::RelayOutcome {
+            system_responses: Vec::new(),
+            terminal: crate::stream_relay::RelayTerminal::Error {
+                code: Some(code),
+                retryable: Some(true),
+            },
+            attempt: Default::default(),
+        };
+        svc.evict_acp_task_after_terminal_error("user-1", "conv-1", AgentType::Acp, &outcome, &task_mgr)
+            .await;
+
+        assert_eq!(
+            acp_repo.session_id.lock().unwrap().as_deref(),
+            Some("sess-live"),
+            "session id must survive {code:?} so auto-replay can resume it"
+        );
+    }
+}
+
+/// A clean finish must not evict or touch anything.
+#[tokio::test]
+async fn a_clean_finish_leaves_the_session_id_alone() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("live-session"));
+    let (svc, _b, _r, task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    let outcome = crate::stream_relay::RelayOutcome {
+        system_responses: Vec::new(),
+        terminal: crate::stream_relay::RelayTerminal::Finish,
+        attempt: Default::default(),
+    };
+
+    let evicted = svc
+        .evict_acp_task_after_terminal_error("user-1", "conv-1", AgentType::Acp, &outcome, &task_mgr)
+        .await;
+
+    assert!(!evicted, "a clean finish must not evict");
+    assert_eq!(
+        acp_repo.session_id.lock().unwrap().as_deref(),
+        Some("live-session"),
+        "a live session must survive a clean turn"
+    );
+}
+
+/// The BUILD path is where the reported loop actually lived: warmup fails, so the
+/// terminal-error eviction never runs. This calls the shared helper directly with
+/// the code that path reports, pinning that a disowned id is dropped there too.
+#[tokio::test]
+async fn session_not_found_during_task_build_clears_the_persisted_session_id() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("deb7c49d-dead"));
+    let (svc, _b, _r, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    svc.clear_persisted_acp_session_after_disown("user-1", "conv-1", Some(AgentErrorCode::UserAgentSessionNotFound))
+        .await;
+
+    assert!(
+        acp_repo.session_id.lock().unwrap().is_none(),
+        "a build failure that disowns the session must clear the id"
+    );
+}
+
+/// A build failure for any other reason keeps the id — the session may still be
+/// resumable and dropping it would lose the conversation's context.
+#[tokio::test]
+async fn other_build_failures_keep_the_persisted_session_id() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-live"));
+    let (svc, _b, _r, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    svc.clear_persisted_acp_session_after_disown("user-1", "conv-1", Some(AgentErrorCode::UnknownUpstreamError))
+        .await;
+
+    assert_eq!(
+        acp_repo.session_id.lock().unwrap().as_deref(),
+        Some("sess-live"),
+        "an unrelated build failure must not drop a resumable session"
+    );
 }
