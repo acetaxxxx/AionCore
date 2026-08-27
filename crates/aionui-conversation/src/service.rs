@@ -16,21 +16,25 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
-    ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
-    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
+    AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
+    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
+    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
     PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
     PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
-use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
+use aionui_db::models::{
+    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
+};
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -630,6 +634,7 @@ impl ConversationService {
             persistence: self.runtime_persistence(),
             runtime_state: Arc::clone(&self.runtime_state),
             title_only,
+            pending_started_ttl: crate::background_stream::PENDING_STARTED_TTL,
         };
         let rx = agent.subscribe();
         let join = tokio::spawn(watcher.run(rx));
@@ -732,9 +737,49 @@ impl ConversationService {
         let has_task = agent.is_some();
         let task_status = agent.as_ref().and_then(|agent| agent.status());
         let pending_confirmations = agent.as_ref().map(|agent| agent.get_confirmations().len()).unwrap_or(0);
+        // `supports_midturn_delivery` is a STATIC property of the backend TYPE:
+        // a live agent reads it from its capabilities (authoritative), and
+        // without one it MUST come from the conversation's backend identity —
+        // hardcoding false here made a fresh (pre-ensure) or dormant claude
+        // conversation report false, so the frontend hydrate fetch raced the
+        // send accept and gated the whole first turn into the queue panel.
+        let supports_midturn_delivery = match agent.as_ref() {
+            Some(agent) => agent.supports_midturn_delivery(),
+            None => self.static_supports_midturn_delivery(conversation_id).await,
+        };
 
-        self.runtime_state
-            .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
+        self.runtime_state.summary_from_parts(
+            conversation_id,
+            task_status,
+            has_task,
+            pending_confirmations,
+            supports_midturn_delivery,
+        )
+    }
+
+    /// Backend-static `supports_midturn_delivery` for a conversation with no
+    /// live agent task, resolved from the persisted backend identity
+    /// (`extra.backend` — the same string create() persists from the assistant
+    /// snapshot and the session factories dispatch on) through the session
+    /// layer's static table. Any resolution failure (missing row, unparsable
+    /// extra, unknown backend) conservatively reports `false`.
+    ///
+    /// Perf note: the DB load only fires when no live agent exists, and
+    /// `runtime_summary_for` is only invoked on single-conversation paths
+    /// (detail GET, send/turn responses) — `list()` never embeds a runtime
+    /// summary — so this adds no per-row N+1.
+    async fn static_supports_midturn_delivery(&self, conversation_id: &str) -> bool {
+        let Ok(Some(user_id)) = self.conversation_repo.owner_user_id(conversation_id).await else {
+            return false;
+        };
+        let Ok(Some(row)) = self.conversation_repo.get(&user_id, conversation_id).await else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&row.extra)
+            .ok()
+            .as_ref()
+            .and_then(|extra| extra.get("backend").and_then(serde_json::Value::as_str))
+            .is_some_and(aionui_ai_agent::backend_supports_midturn_delivery)
     }
 
     pub async fn active_count_for_user(&self, user_id: &str) -> Result<usize, ConversationError> {
@@ -791,6 +836,7 @@ impl ConversationService {
         SendMessageResponse {
             msg_id,
             turn_id,
+            delivered_midturn: false,
             runtime: self.runtime_summary_for(conversation_id).await,
         }
     }
@@ -1214,110 +1260,93 @@ impl ConversationService {
             );
         }
 
+        let is_team_conversation = extra.get("teamId").is_some();
         let selected_mcp_server_ids = match extra.as_object_mut() {
             Some(obj) => {
-                let has_selection = obj.contains_key("selected_mcp_server_ids");
-                let ids = take_string_array(obj, &["selected_mcp_server_ids"]);
-                if has_selection {
-                    Some(ids)
+                if obj.contains_key("selected_mcp_server_ids") {
+                    Some(take_string_array(obj, &["selected_mcp_server_ids"]))
+                } else if is_team_conversation && obj.contains_key("mcp_server_ids") {
+                    Some(take_string_array(obj, &["mcp_server_ids"]))
                 } else {
                     assistant_snapshot
                         .as_ref()
                         .map(|snapshot| snapshot.resolved_defaults.mcp_ids.clone())
-                        .filter(|ids| !ids.is_empty())
                 }
             }
             None => None,
         };
         let selected_session_mcp_servers = match extra.as_object_mut() {
-            Some(obj) => match obj.remove("selected_session_mcp_servers") {
+            Some(obj) => match obj.remove("selected_session_mcp_servers").or_else(|| {
+                (is_team_conversation)
+                    .then(|| obj.remove("session_mcp_servers"))
+                    .flatten()
+            }) {
                 Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
                     ConversationError::BadRequest {
-                        reason: format!("Invalid selected_session_mcp_servers: {e}"),
+                        reason: format!("Invalid session MCP snapshot: {e}"),
                     }
                 })?),
                 None => None,
             },
             None => None,
         };
+        let selected_mcp_statuses = if is_team_conversation {
+            match extra.as_object_mut().and_then(|obj| obj.remove("mcp_statuses")) {
+                Some(value) => serde_json::from_value::<Vec<ConversationMcpStatus>>(value).map_err(|e| {
+                    ConversationError::BadRequest {
+                        reason: format!("Invalid MCP status snapshot: {e}"),
+                    }
+                })?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
-        let mcp_support = self
-            .resolve_mcp_support_policy(user_id, &effective_type, &extra)
+        let mcp_snapshot = self
+            .build_runtime_mcp_snapshot(
+                user_id,
+                selected_mcp_server_ids.as_deref(),
+                selected_session_mcp_servers.as_deref().unwrap_or(&[]),
+                &selected_mcp_statuses,
+                &effective_type,
+                &extra,
+            )
             .await?;
-        let mut selected_row_ids: Vec<String> = Vec::new();
-        let mut selected_mcp_names: Vec<String> = Vec::new();
-        let mut selected_mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
-        let mut seen_mcp_names = HashSet::new();
-        let mut status_index_by_name: HashMap<String, usize> = HashMap::new();
-        let repo = self
-            .mcp_server_repo
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned());
-        if let Some(repo) = repo {
-            let rows = match selected_mcp_server_ids.as_ref() {
-                Some(ids) => repo
-                    .list_by_ids_any(user_id, ids)
-                    .await
-                    .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
-                None => repo
-                    .list(user_id)
-                    .await
-                    .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
-            };
-            let selected_rows = rows
-                .into_iter()
-                .filter(|row| !row.builtin)
-                .filter(|row| match selected_mcp_server_ids.as_ref() {
-                    Some(ids) => ids.iter().any(|id| id == &row.id),
-                    None => row.enabled,
-                })
-                .collect::<Vec<_>>();
-            selected_row_ids = selected_rows.iter().map(|row| row.id.clone()).collect();
-            for row in &selected_rows {
-                if seen_mcp_names.insert(row.name.clone()) {
-                    selected_mcp_names.push(row.name.clone());
-                }
-                upsert_conversation_mcp_status(
-                    &mut selected_mcp_statuses,
-                    &mut status_index_by_name,
-                    classify_repo_mcp_status(row, mcp_support),
-                );
-            }
-        }
-
-        if let Some(session_servers) = selected_session_mcp_servers.as_ref() {
-            for server in session_servers {
-                if seen_mcp_names.insert(server.name.clone()) {
-                    selected_mcp_names.push(server.name.clone());
-                }
-                upsert_conversation_mcp_status(
-                    &mut selected_mcp_statuses,
-                    &mut status_index_by_name,
-                    classify_session_mcp_status(server, mcp_support),
-                );
-            }
-        }
 
         if let Some(obj) = extra.as_object_mut() {
             obj.insert(
                 "mcp_server_ids".to_owned(),
-                serde_json::Value::Array(selected_row_ids.into_iter().map(serde_json::Value::String).collect()),
+                serde_json::Value::Array(
+                    mcp_snapshot
+                        .mcp_server_ids
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
             );
             obj.insert(
                 "mcp_servers".to_owned(),
-                serde_json::Value::Array(selected_mcp_names.into_iter().map(serde_json::Value::String).collect()),
+                serde_json::Value::Array(
+                    mcp_snapshot
+                        .mcp_servers
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
             );
             obj.insert(
                 "mcp_statuses".to_owned(),
-                serde_json::to_value(&selected_mcp_statuses).map_err(|e| {
+                serde_json::to_value(&mcp_snapshot.mcp_statuses).map_err(|e| {
                     ConversationError::internal(format!("Failed to serialize MCP status snapshot: {e}"))
                 })?,
             );
-            if let Some(session_servers) = selected_session_mcp_servers.as_ref() {
+            if selected_session_mcp_servers.is_some() {
                 obj.insert(
                     "session_mcp_servers".to_owned(),
-                    serde_json::to_value(session_servers).map_err(|e| {
+                    serde_json::to_value(&mcp_snapshot.session_mcp_servers).map_err(|e| {
                         ConversationError::internal(format!("Failed to serialize session MCP snapshot: {e}"))
                     })?,
                 );
@@ -1771,6 +1800,16 @@ impl ConversationService {
                 .map(|row| row.last_mcp_ids.clone())
                 .unwrap_or_else(|| "[]".to_string())
         };
+        // Computed BEFORE the upsert overwrites the stored value: in `auto` mode
+        // this preference IS the assistant's effective MCP binding (see
+        // `resolve_effective_assistant_mcp_ids`), so changing it here is the same
+        // event a live team session gets from an assistant update. Only an
+        // already-seeded preference counts — first-time seeding is not a change.
+        let mcp_binding_fingerprint = changed_assistant_mcp_fingerprint(
+            &snapshot.default_modes.mcps,
+            &snapshot.resolved_defaults.mcp_ids,
+            existing_preference.as_ref().map(|row| row.last_mcp_ids.as_str()),
+        )?;
 
         preference_repo
             .upsert_for_user(
@@ -1788,7 +1827,40 @@ impl ConversationService {
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference upsert failed: {e}")))?;
 
+        if let Some(fingerprint) = mcp_binding_fingerprint {
+            self.publish_assistant_mcp_binding_changed(user_id, &snapshot.assistant_id, fingerprint);
+        }
+
         Ok(())
+    }
+
+    /// Announce that an assistant's effective MCP binding changed.
+    ///
+    /// The assistant domain publishes the same event on assistant create/update.
+    /// Preferences are the OTHER half of the same binding for `auto`-mode
+    /// assistants, and a running team session that never hears about this half
+    /// keeps its members on the previous MCP set until their next attach.
+    fn publish_assistant_mcp_binding_changed(&self, user_id: &str, assistant_id: &str, fingerprint: String) {
+        let payload = AssistantMcpBindingChanged {
+            user_id: user_id.to_owned(),
+            assistant_id: assistant_id.to_owned(),
+            fingerprint,
+        };
+        match serde_json::to_value(&payload) {
+            Ok(value) => {
+                info!(
+                    user_id,
+                    assistant_id,
+                    fingerprint = %payload.fingerprint,
+                    "assistant MCP binding changed through a conversation preference"
+                );
+                self.broadcaster
+                    .broadcast(WebSocketMessage::new(ASSISTANT_MCP_BINDING_CHANGED_EVENT, value));
+            }
+            Err(error) => {
+                warn!(user_id, assistant_id, error = %error, "failed to encode assistant MCP binding event");
+            }
+        }
     }
 
     pub(crate) async fn persist_runtime_assistant_snapshot(
@@ -2383,6 +2455,51 @@ impl ConversationService {
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to persist runtime mode: {e}")))?;
         Ok(())
+    }
+
+    /// Whether this owned conversation has the ACP session row required for
+    /// an in-place Fresh-session reset. AionRS conversations intentionally do
+    /// not create `acp_session` state and therefore return `false`.
+    pub async fn supports_acp_context_reset(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, ConversationError> {
+        let conversation = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if conversation.r#type != AgentType::Acp.serde_name() {
+            return Ok(false);
+        }
+        self.acp_session_repo
+            .get_for_user(user_id, conversation_id)
+            .await
+            .map(|row| row.is_some())
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect ACP session anchor: {error}")))
+    }
+
+    /// Drop only the persisted backend resume anchor. Runtime mode/model and
+    /// the visible conversation history are preserved, so the next rebuilt
+    /// ACP runtime opens `SessionSpec::Fresh` with the same conversation id.
+    pub async fn clear_acp_context_anchor(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        self.acp_session_repo
+            .clear_session_id_for_user(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to clear ACP session anchor: {error}")))
     }
 
     /// Delete a conversation (messages cascade via FK).
@@ -3340,7 +3457,250 @@ impl ConversationService {
 
 // ── Message Flow (send / stop / warmup) ─────────────────────────────
 
+/// A mid-turn user message's persisted `status` while the CLI holds it but has
+/// not yet consumed it into a turn (待接收). Flipped to
+/// [`MIDTURN_STATUS_RECEIVED`] on the agent's receipt signal.
+///
+/// `"pending"` because the messages table CHECK constraint only admits
+/// ('finish','pending','error','work') (002_legacy_data_normalize.sql:170),
+/// and the stale-runtime startup cleanup only touches `position='left'` rows —
+/// a pending USER (right) row is never swept.
+pub(crate) const MIDTURN_STATUS_QUEUED: &str = "pending";
+/// The terminal user-message status (已接收) — same value ordinary user
+/// messages are persisted with, so downstream consumers need no new case.
+pub(crate) const MIDTURN_STATUS_RECEIVED: &str = "finish";
+
+/// Outcome of a mid-turn delivery attempt (B5).
+enum MidturnOutcome {
+    /// The message rides the ACTIVE turn (or failed terminally and was
+    /// surfaced as a failure tip — mirroring the normal path's build-failure
+    /// contract; the tip response has `delivered_midturn=false`, so the route
+    /// returns the ordinary 202 for it, 200 only for a real delivery). The
+    /// caller returns this response.
+    Delivered(SendMessageResponse),
+    /// codex rejected the steer with "no active turn to steer" (§6甲.1): the
+    /// turn ended between our read and the write. The caller opens a NEW turn
+    /// through the normal path, reusing the already-persisted message row
+    /// (`Some`) or persisting normally (`None` when runtime persistence
+    /// disallowed the write).
+    TurnEnded { user_msg_id: Option<String> },
+}
+
+/// Is this delivery error codex's "the turn already ended" steer rejection?
+/// codex returns a bare -32600 for both steer rejections; the message text is
+/// the ONLY discriminator (verified 0.144.6, design spec §6甲.1). Locked by
+/// test so a codex wording change fails here instead of silently degrading.
+/// (The different-turn-active rejection is retried INSIDE the codex backend
+/// and never surfaces here unless the retry also failed.)
+pub(crate) fn steer_rejection_is_turn_ended(err: &AgentSendError) -> bool {
+    // `AgentSendError` classifies a BadGateway into a generic user-facing
+    // `message` and moves the raw backend text into `detail` — check both, or
+    // the classification silently degrades into a hard error (caught by
+    // `steer_rejection_classifier_matches_only_the_turn_ended_text`).
+    let stream = err.stream_error();
+    stream.message.contains("no active turn to steer")
+        || stream
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("no active turn to steer"))
+}
+
+/// Update a persisted message's `status` and broadcast the
+/// `message.statusChanged` event (B5 receipt badge). With `only_if_queued`,
+/// the flip applies ONLY to a row currently in [`MIDTURN_STATUS_QUEUED`] —
+/// the lifecycle-echo consumers use this so an unrelated echo can never touch
+/// an ordinary message.
+pub(crate) async fn apply_message_receipt(
+    repo: &Arc<dyn IConversationRepository>,
+    broadcaster: &Arc<dyn EventBroadcaster>,
+    user_id: &str,
+    conversation_id: &str,
+    msg_id: &str,
+    status: &str,
+    only_if_queued: bool,
+) {
+    if only_if_queued {
+        match repo
+            .get_message_by_msg_id(user_id, conversation_id, msg_id, "text")
+            .await
+        {
+            Ok(Some(row)) if row.status.as_deref() == Some(MIDTURN_STATUS_QUEUED) => {}
+            Ok(_) => return,
+            Err(e) => {
+                warn!(msg_id = %msg_id, error = %ErrorChain(&e), "message receipt lookup failed");
+                return;
+            }
+        }
+    }
+    if let Err(e) = repo
+        .update_message(
+            user_id,
+            conversation_id,
+            msg_id,
+            &aionui_db::MessageRowUpdate {
+                content: None,
+                status: Some(Some(status.to_owned())),
+                hidden: None,
+            },
+        )
+        .await
+    {
+        warn!(msg_id = %msg_id, error = %ErrorChain(&e), "message receipt status update failed");
+        return;
+    }
+    let payload = aionui_api_types::MessageStatusChangedPayload {
+        user_id: user_id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        msg_id: msg_id.to_owned(),
+        status: status.to_owned(),
+    };
+    match serde_json::to_value(&payload) {
+        Ok(value) => broadcaster.broadcast(WebSocketMessage::new("message.statusChanged", value)),
+        Err(e) => warn!(msg_id = %msg_id, error = %ErrorChain(&e), "statusChanged payload serialize failed"),
+    }
+}
+
 impl ConversationService {
+    /// B5: deliver a message into the RUNNING turn (no claim, no new turn id).
+    ///
+    /// Persists the user message with the pending-receipt status
+    /// ([`MIDTURN_STATUS_QUEUED`]) and broadcasts `message.userCreated`
+    /// carrying `client_msg_id` — the correlation id (== `msg_id`) that claude
+    /// echoes via `command_lifecycle` and codex round-trips as
+    /// `clientUserMessageId` — so the frontend can key the receipt badge
+    /// without text/time guessing (spec §4.5). The receipt flip to
+    /// [`MIDTURN_STATUS_RECEIVED`] arrives via `MessageLifecycle` echoes
+    /// (background watcher) for both backends.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_midturn_message(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        resolved: &ResolvedChatMessage,
+        hidden: bool,
+        agent: AgentInstance,
+        active_turn_id: String,
+        inject_skills: Vec<String>,
+    ) -> Result<MidturnOutcome, ConversationError> {
+        let user_msg_id = Self::mint_msg_id();
+        let persisted = self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::UserMessage);
+        if persisted {
+            let user_msg = aionui_db::models::MessageRow {
+                id: user_msg_id.clone(),
+                conversation_id: conversation_id.to_owned(),
+                msg_id: Some(user_msg_id.clone()),
+                r#type: "text".into(),
+                content: serde_json::json!({ "content": resolved.content }).to_string(),
+                position: Some("right".into()),
+                status: Some(MIDTURN_STATUS_QUEUED.into()),
+                hidden,
+                created_at: now_ms(),
+                backend_turn_id: None,
+            };
+            if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
+                warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert mid-turn user message");
+                return Err(e.into());
+            }
+            info!(msg_id = %user_msg_id, "Mid-turn user message persisted");
+            self.broadcaster.broadcast(WebSocketMessage::new(
+                "message.userCreated",
+                serde_json::json!({
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "msg_id": &user_msg_id,
+                    // Present ⇔ the message was delivered mid-turn; equals the
+                    // correlation id echoed on message.statusChanged.
+                    "client_msg_id": &user_msg_id,
+                    "content": &resolved.content,
+                    "position": "right",
+                    "status": MIDTURN_STATUS_QUEUED,
+                    "hidden": hidden,
+                    "created_at": user_msg.created_at,
+                }),
+            ));
+        }
+        let data = aionui_ai_agent::types::SendMessageData {
+            content: resolved.content.clone(),
+            msg_id: user_msg_id.clone(),
+            turn_id: Some(active_turn_id.clone()),
+            files: resolved.files.clone(),
+            inject_skills,
+        };
+        match agent.deliver_midturn(data).await {
+            Ok(()) => {
+                info!(
+                    conversation_id = %conversation_id,
+                    route = "midturn_delivery",
+                    active_turn_id = %active_turn_id,
+                    msg_id = %user_msg_id,
+                    "mid-turn message delivered into the active turn"
+                );
+                let mut response = self
+                    .send_message_response(conversation_id, user_msg_id, active_turn_id)
+                    .await;
+                response.delivered_midturn = true;
+                Ok(MidturnOutcome::Delivered(response))
+            }
+            Err(e) if steer_rejection_is_turn_ended(&e) => {
+                info!(
+                    conversation_id = %conversation_id,
+                    route = "new_turn",
+                    active_turn_id = %active_turn_id,
+                    msg_id = %user_msg_id,
+                    "mid-turn delivery rejected (turn ended); opening a new turn"
+                );
+                if persisted {
+                    // The message now opens its own turn — it is no longer
+                    // waiting on a mid-turn receipt.
+                    apply_message_receipt(
+                        &self.conversation_repo,
+                        &self.broadcaster,
+                        user_id,
+                        conversation_id,
+                        &user_msg_id,
+                        MIDTURN_STATUS_RECEIVED,
+                        false,
+                    )
+                    .await;
+                }
+                Ok(MidturnOutcome::TurnEnded {
+                    user_msg_id: persisted.then_some(user_msg_id),
+                })
+            }
+            Err(e) => {
+                // Terminal delivery failure: mirror the normal path's
+                // build-failure contract — surface a failure tip, mark the
+                // message errored, and return the 200-with-tip response.
+                error!(
+                    conversation_id = %conversation_id,
+                    active_turn_id = %active_turn_id,
+                    msg_id = %user_msg_id,
+                    error = %e,
+                    "mid-turn delivery failed"
+                );
+                if persisted {
+                    apply_message_receipt(
+                        &self.conversation_repo,
+                        &self.broadcaster,
+                        user_id,
+                        conversation_id,
+                        &user_msg_id,
+                        "error",
+                        false,
+                    )
+                    .await;
+                }
+                self.persist_and_broadcast_send_failure_tip(user_id, conversation_id, &active_turn_id, &e, None)
+                    .await;
+                Ok(MidturnOutcome::Delivered(
+                    self.send_message_response(conversation_id, user_msg_id, active_turn_id)
+                        .await,
+                ))
+            }
+        }
+    }
     /// Send a user message to the conversation.
     ///
     /// 1. Validates the conversation belongs to the user
@@ -3394,14 +3754,68 @@ impl ConversationService {
             .resolve_message_attachments(user_id, &req.content, &req.files)
             .await?;
 
-        let turn_id = Self::mint_turn_id();
-        let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+        // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────
+        // An ACTIVE turn + a backend that supports mid-turn delivery → the
+        // message rides the CURRENT turn: no claim, no new turn id, HTTP 200
+        // with the active turn's id. Every other case (including the 409 for
+        // non-supporting backends) is unchanged and handled by the claim below.
+        let mut fallback_user_msg: Option<String> = None;
+        if let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
+            && let Some(agent) = task_manager.get_task(conversation_id)
+            && agent.supports_midturn_delivery()
+        {
+            // §4.6: a turn blocked on a permission confirmation / question card
+            // must NOT be steered into — the card is the required answer
+            // channel, not a new instruction on the stream. Falling through to
+            // the claim below restores the exact pre-B5 contract (409) at the
+            // HTTP layer, so a direct API client cannot bypass the frontend
+            // gate. Same authoritative source the runtime summary's
+            // `pending_confirmations` reads (`get_confirmations`).
+            if !agent.get_confirmations().is_empty() {
+                info!(
+                    conversation_id = %conversation_id,
+                    route = "rejected_requires_action",
+                    active_turn_id = %active_turn_id,
+                    "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
+                );
+            } else {
+                match self
+                    .deliver_midturn_message(
+                        user_id,
+                        conversation_id,
+                        &resolved,
+                        req.hidden,
+                        agent,
+                        active_turn_id,
+                        req.inject_skills.clone(),
+                    )
+                    .await?
+                {
+                    MidturnOutcome::Delivered(response) => return Ok(response),
+                    // codex rejected the steer because the turn just ended → fall
+                    // through and open a NEW turn for the already-persisted message.
+                    MidturnOutcome::TurnEnded { user_msg_id } => fallback_user_msg = user_msg_id,
+                }
+            }
+        }
+
+        // Open a NEW turn: mint the id only on this branch. The mid-turn
+        // delivery path above instead reuses the running turn's id — a
+        // phantom turn id minted outside an actual claim must never exist.
+        let (turn_id, turn_claim) = {
+            let turn_id = Self::mint_turn_id();
+            let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+            (turn_id, turn_claim)
+        };
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
         // key. We reuse the same value for `id` (primary key) and `msg_id`
         // to preserve legacy callers that still rely on `id == msg_id`.
-        let user_msg_id = Self::mint_msg_id();
+        // A mid-turn TurnEnded fallback already persisted + broadcast the
+        // message — reuse its id instead of writing a duplicate row.
+        let was_fallback = fallback_user_msg.is_some();
+        let user_msg_id = fallback_user_msg.unwrap_or_else(Self::mint_msg_id);
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
@@ -3424,26 +3838,31 @@ impl ConversationService {
                 .await;
             return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
-        if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
-            warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
-            return Err(e.into());
+        // The TurnEnded fallback already persisted + broadcast this message
+        // (with the statusChanged flip) — doing it again would duplicate the
+        // row and the live-view bubble.
+        if !was_fallback {
+            if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
+                warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
+                return Err(e.into());
+            }
+
+            info!(msg_id = %user_msg_id, "User message persisted");
+
+            self.broadcaster.broadcast(WebSocketMessage::new(
+                "message.userCreated",
+                serde_json::json!({
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "msg_id": &user_msg_id,
+                    "content": &resolved.content,
+                    "position": "right",
+                    "status": "finish",
+                    "hidden": req.hidden,
+                    "created_at": user_msg.created_at,
+                }),
+            ));
         }
-
-        info!(msg_id = %user_msg_id, "User message persisted");
-
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "message.userCreated",
-            serde_json::json!({
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "msg_id": &user_msg_id,
-                "content": &resolved.content,
-                "position": "right",
-                "status": "finish",
-                "hidden": req.hidden,
-                "created_at": user_msg.created_at,
-            }),
-        ));
 
         // Build task options from conversation row
         let mut build_opts = match self.build_task_options(&row).await {
@@ -3958,6 +4377,86 @@ impl ConversationService {
             .await
             .map_err(ConversationError::from)?
             .config_options;
+
+        Ok(EnsureConversationRuntimeResponse {
+            recovered,
+            config_options,
+            runtime: self.runtime_summary_for(conversation_id).await,
+        })
+    }
+
+    /// Cancel any active turn, recycle the agent process, and eagerly rebuild it.
+    ///
+    /// Conversation messages, artifacts, and the persisted backend session anchor
+    /// are intentionally left untouched so the rebuilt runtime can resume the
+    /// existing backend session.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn restart_runtime(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if let Some(team_id) = team_id_from_extra(&row.extra) {
+            info!(
+                conversation_id,
+                team_id, "Rejected standalone runtime restart for team-owned conversation"
+            );
+            return Err(ConversationError::TeamRuntimeRequired {
+                conversation_id: conversation_id.to_owned(),
+                team_id,
+            });
+        }
+
+        // Checked BEFORE readiness: a restart in flight has already killed the
+        // task, so the readiness gate below would report a duplicate restart as
+        // "not ready to restart" — misleading, and a different code than the one
+        // the turn/config gates report for the very same state. `begin_restart`
+        // remains the authoritative guard for a genuine race.
+        if self.runtime_state.is_restarting(conversation_id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+
+        if task_manager.get_task(conversation_id).is_none() {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} runtime is not ready to restart"),
+            });
+        }
+
+        self.runtime_state.begin_restart(conversation_id)?;
+        let restart_result = async {
+            if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
+                self.cancel(user_id, conversation_id, &turn_id, task_manager).await?;
+            }
+
+            info!(conversation_id, "Restarting conversation runtime");
+            task_manager
+                .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))
+                .await;
+            self.runtime_state.clear_turn_state_for_restart(conversation_id);
+
+            let (agent, recovered) = self
+                .ensure_runtime_agent(user_id, conversation_id, task_manager, "runtime_restart")
+                .await?;
+            let config_options = agent
+                .get_config_options()
+                .await
+                .map_err(ConversationError::from)?
+                .config_options;
+            Ok::<_, ConversationError>((recovered, config_options))
+        }
+        .await;
+        self.runtime_state.clear_restarting(conversation_id);
+        let (recovered, config_options) = restart_result?;
 
         Ok(EnsureConversationRuntimeResponse {
             recovered,
@@ -4679,6 +5178,202 @@ async fn native_skills_dirs(
 }
 
 impl ConversationService {
+    /// Build the typed four-field runtime MCP snapshot from explicit request
+    /// selections (or the global enabled fallback when `selected_ids` is
+    /// `None`), deduped by name and classified against the agent's transport
+    /// support. Shared by `create()` and the team refresh path so both persist
+    /// the exact same snapshot shape.
+    async fn build_runtime_mcp_snapshot(
+        &self,
+        user_id: &str,
+        selected_ids: Option<&[String]>,
+        session_servers: &[SessionMcpServer],
+        additional_statuses: &[ConversationMcpStatus],
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+    ) -> Result<McpRuntimeSnapshot, ConversationError> {
+        let mcp_support = self.resolve_mcp_support_policy(user_id, agent_type, extra).await?;
+        let mut mcp_server_ids: Vec<String> = Vec::new();
+        let mut mcp_servers: Vec<String> = Vec::new();
+        let mut mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
+        let mut seen_mcp_names = HashSet::new();
+        let mut status_index_by_name: HashMap<String, usize> = HashMap::new();
+        let repo = self
+            .mcp_server_repo
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some(repo) = repo {
+            let rows = match selected_ids {
+                Some(ids) => repo
+                    .list_by_ids_any(user_id, ids)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
+                None => repo
+                    .list(user_id)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
+            };
+            let selected_rows = rows
+                .into_iter()
+                .filter(|row| !row.builtin && row.name != TEAM_MCP_SERVER_NAME)
+                .filter(|row| match selected_ids {
+                    Some(ids) => ids.iter().any(|id| id == &row.id),
+                    None => row.enabled,
+                })
+                .collect::<Vec<_>>();
+            mcp_server_ids = selected_rows.iter().map(|row| row.id.clone()).collect();
+            for row in &selected_rows {
+                if seen_mcp_names.insert(row.name.clone()) {
+                    mcp_servers.push(row.name.clone());
+                }
+                upsert_conversation_mcp_status(
+                    &mut mcp_statuses,
+                    &mut status_index_by_name,
+                    classify_repo_mcp_status(row, mcp_support),
+                );
+            }
+        }
+        let mut selected_session_servers = Vec::with_capacity(session_servers.len());
+        for server in session_servers {
+            if server.name == TEAM_MCP_SERVER_NAME {
+                continue;
+            }
+            selected_session_servers.push(server.clone());
+            if seen_mcp_names.insert(server.name.clone()) {
+                mcp_servers.push(server.name.clone());
+            }
+            upsert_conversation_mcp_status(
+                &mut mcp_statuses,
+                &mut status_index_by_name,
+                classify_session_mcp_status(server, mcp_support),
+            );
+        }
+        for status in additional_statuses {
+            if status.name == TEAM_MCP_SERVER_NAME {
+                continue;
+            }
+            if seen_mcp_names.insert(status.name.clone()) {
+                mcp_servers.push(status.name.clone());
+            }
+            upsert_conversation_mcp_status(&mut mcp_statuses, &mut status_index_by_name, status.clone());
+        }
+        Ok(McpRuntimeSnapshot {
+            mcp_server_ids,
+            session_mcp_servers: selected_session_servers,
+            mcp_servers,
+            mcp_statuses,
+        })
+    }
+
+    /// Resolve one assistant's effective MCP binding using the same fixed/auto
+    /// precedence as ordinary conversation creation. Explicit ids are loaded
+    /// regardless of the MCP row's global `enabled` flag.
+    pub async fn resolve_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<TeamMcpSelection>, ConversationError> {
+        let definition_repo = self
+            .assistant_definition_repo()
+            .ok_or_else(|| ConversationError::internal("Assistant definition repository is unavailable"))?;
+        let preference_repo = self
+            .assistant_preference_repo()
+            .ok_or_else(|| ConversationError::internal("Assistant preference repository is unavailable"))?;
+        let Some(definition) = definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant definition: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let preference = preference_repo
+            .get_for_user(user_id, &definition.id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant MCP preference: {e}")))?;
+        let selected_ids = resolve_effective_assistant_mcp_ids(
+            &definition.default_mcps_mode,
+            &definition.default_mcp_ids,
+            preference.as_ref().map(|row| row.last_mcp_ids.as_str()),
+        )?;
+
+        let repo = {
+            let guard = self
+                .mcp_server_repo
+                .read()
+                .map_err(|_| ConversationError::internal("MCP server repository lock is poisoned"))?;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?
+        };
+        let rows = repo
+            .list_by_ids_any(user_id, &selected_ids)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?;
+        let mut rows_by_id = rows
+            .into_iter()
+            .map(|row| (row.id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let mut mcp_server_ids = Vec::new();
+        let mut session_mcp_servers = Vec::new();
+        let mut mcp_statuses = Vec::new();
+        for id in &selected_ids {
+            let Some(row) = rows_by_id.remove(id) else {
+                continue;
+            };
+            if !assistant_mcp_row_is_injectable(&row) {
+                continue;
+            }
+            if row.builtin {
+                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(&row).await {
+                    Ok(server) => session_mcp_servers.push(server),
+                    Err(err) => mcp_statuses.push(ConversationMcpStatus {
+                        id: row.id,
+                        name: row.name,
+                        status: ConversationMcpStatusKind::Failed,
+                        reason: Some(err),
+                    }),
+                }
+            } else {
+                mcp_server_ids.push(row.id);
+            }
+        }
+        Ok(Some(TeamMcpSelection {
+            selected_ids,
+            mcp_server_ids,
+            session_mcp_servers,
+            mcp_statuses,
+        }))
+    }
+
+    /// Resolve and classify one assistant's current MCP binding for an existing
+    /// conversation. `None` means the assistant no longer exists; an empty
+    /// snapshot is still `Some` and therefore remains an explicit no-MCP bind.
+    pub async fn resolve_assistant_mcp_snapshot(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+    ) -> Result<Option<(McpRuntimeSnapshot, String)>, ConversationError> {
+        let Some(selection) = self.resolve_assistant_mcp_selection(user_id, assistant_id).await? else {
+            return Ok(None);
+        };
+        let fingerprint = assistant_mcp_binding_fingerprint(&selection.selected_ids);
+        let snapshot = self
+            .build_runtime_mcp_snapshot(
+                user_id,
+                Some(&selection.mcp_server_ids),
+                &selection.session_mcp_servers,
+                &selection.mcp_statuses,
+                agent_type,
+                extra,
+            )
+            .await?;
+        Ok(Some((snapshot, fingerprint)))
+    }
+
     async fn resolve_mcp_support_policy(
         &self,
         user_id: &str,
@@ -5014,6 +5709,52 @@ fn parse_json_string_list(raw: Option<&str>, field: &str) -> Result<Vec<String>,
             .map_err(|e| ConversationError::internal(format!("failed to parse assistant field {field}: {e}"))),
         _ => Ok(Vec::new()),
     }
+}
+
+/// The new binding fingerprint when writing `resolved_mcp_ids` changes an
+/// `auto`-mode assistant's effective MCP selection, else `None`.
+///
+/// `fixed` mode is excluded because its effective ids come from the definition
+/// rather than the preference — `persist_assistant_preferences_from_snapshot`
+/// does not rewrite the preference in that mode at all, so it can never be a
+/// binding change. A missing `stored_mcp_ids` is first-time seeding, not a
+/// change: announcing it would restart a member that is already starting with
+/// exactly this selection.
+fn changed_assistant_mcp_fingerprint(
+    mode: &str,
+    resolved_mcp_ids: &[String],
+    stored_mcp_ids: Option<&str>,
+) -> Result<Option<String>, ConversationError> {
+    if mode != "auto" {
+        return Ok(None);
+    }
+    let Some(stored) = stored_mcp_ids else {
+        return Ok(None);
+    };
+    let previous = parse_json_string_list(Some(stored), "last_mcp_ids")?;
+    let next = assistant_mcp_binding_fingerprint(resolved_mcp_ids);
+    // Compare fingerprints rather than raw JSON: the fingerprint sorts and
+    // dedups, so a reordered selection is correctly treated as unchanged.
+    Ok((assistant_mcp_binding_fingerprint(&previous) != next).then_some(next))
+}
+
+fn resolve_effective_assistant_mcp_ids(
+    mode: &str,
+    default_mcp_ids: &str,
+    last_mcp_ids: Option<&str>,
+) -> Result<Vec<String>, ConversationError> {
+    if mode == "fixed" {
+        parse_json_string_list(Some(default_mcp_ids), "default_mcp_ids")
+    } else {
+        last_mcp_ids
+            .map(|value| parse_json_string_list(Some(value), "last_mcp_ids"))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
+fn assistant_mcp_row_is_injectable(row: &McpServerRow) -> bool {
+    row.name != TEAM_MCP_SERVER_NAME
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -5361,6 +6102,83 @@ mod tests {
         );
 
         assert_eq!(status.status, ConversationMcpStatusKind::Failed);
+    }
+
+    #[test]
+    fn fixed_empty_mcp_binding_stays_explicitly_empty() {
+        let ids = resolve_effective_assistant_mcp_ids("fixed", "[]", Some(r#"["globally-enabled"]"#)).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn overwriting_an_auto_mcp_preference_reports_the_new_fingerprint() {
+        let fingerprint =
+            changed_assistant_mcp_fingerprint("auto", &["mcp-b".to_owned()], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint.as_deref(), Some(r#"["mcp-b"]"#));
+    }
+
+    #[test]
+    fn reordered_auto_mcp_preference_is_not_a_binding_change() {
+        let fingerprint = changed_assistant_mcp_fingerprint(
+            "auto",
+            &["mcp-b".to_owned(), "mcp-a".to_owned()],
+            Some(r#"["mcp-a","mcp-b"]"#),
+        )
+        .unwrap();
+
+        assert_eq!(fingerprint, None, "sorting/dedup must absorb pure reordering");
+    }
+
+    #[test]
+    fn clearing_an_auto_mcp_preference_reports_the_empty_fingerprint() {
+        // "no MCP" is a real selection, not a no-op: a member left running the
+        // previous set would keep tools the user just removed.
+        let fingerprint = changed_assistant_mcp_fingerprint("auto", &[], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint.as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn first_time_auto_mcp_seeding_is_not_a_binding_change() {
+        let fingerprint = changed_assistant_mcp_fingerprint("auto", &["mcp-a".to_owned()], None).unwrap();
+
+        assert_eq!(
+            fingerprint, None,
+            "seeding a brand new preference must not restart a member that is already starting with it"
+        );
+    }
+
+    #[test]
+    fn fixed_mode_never_reports_a_preference_binding_change() {
+        // In `fixed` mode the effective ids come from the definition, and the
+        // preference is copied through untouched — it can never be the change.
+        let fingerprint =
+            changed_assistant_mcp_fingerprint("fixed", &["mcp-b".to_owned()], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint, None);
+    }
+
+    #[test]
+    fn explicitly_selected_disabled_mcp_row_remains_injectable() {
+        let row = McpServerRow {
+            id: "mcp-disabled".into(),
+            user_id: "user-1".into(),
+            name: "selected-disabled".into(),
+            description: None,
+            enabled: false,
+            transport_type: "stdio".into(),
+            transport_config: r#"{"command":"node"}"#.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin: false,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(assistant_mcp_row_is_injectable(&row));
     }
 
     #[tokio::test]

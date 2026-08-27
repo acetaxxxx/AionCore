@@ -21,6 +21,7 @@ struct ConversationRuntimeState {
     active_turns: HashMap<String, String>,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
+    restarting_conversations: HashSet<String>,
     /// Cancels that arrived before the turn's agent registered, keyed by
     /// conversation and holding the turn they were meant for.
     deferred_cancels: HashMap<String, String>,
@@ -77,6 +78,16 @@ impl ConversationRuntimeStateService {
             });
         }
 
+        if state.restarting_conversations.contains(conversation_id) {
+            info!(
+                conversation_id,
+                turn_id, "conversation runtime turn claim rejected during restart"
+            );
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+
         if state.active_turns.contains_key(conversation_id) {
             info!(
                 conversation_id,
@@ -101,6 +112,17 @@ impl ConversationRuntimeStateService {
             state: Arc::downgrade(self),
             released: false,
         })
+    }
+
+    /// Claim a turn the AGENT started on its own (a CLI-initiated turn, or the
+    /// follow-up turn claude opens for a mid-turn message it could not fold into
+    /// the running one — verified in the design spec §6甲.2).
+    ///
+    /// Returns `None` when a turn is already claimed: for an agent-driven turn
+    /// that is the NORMAL case (the message folded into the running turn), not an
+    /// error, so it must not surface as 409.
+    pub fn claim_for_agent_turn(self: &Arc<Self>, conversation_id: &str, turn_id: &str) -> Option<TurnClaim> {
+        self.try_claim_turn(conversation_id, turn_id).ok()
     }
 
     pub fn is_claimed(&self, conversation_id: &str) -> bool {
@@ -240,16 +262,94 @@ impl ConversationRuntimeStateService {
             .unwrap_or(false)
     }
 
+    pub fn begin_restart(&self, conversation_id: &str) -> Result<(), ConversationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConversationError::internal("conversation runtime state lock poisoned"))?;
+        if state.shutting_down {
+            return Err(ConversationError::Busy {
+                reason: "conversation runtime is shutting down".into(),
+            });
+        }
+        if state.deleting_conversations.contains(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} is being deleted"),
+            });
+        }
+        if !state.restarting_conversations.insert(conversation_id.to_owned()) {
+            // Same condition the turn/config gates report, so it carries the same
+            // code: a caller retrying on `runtime_restarting` needs one rule, not
+            // one per entry point.
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+        info!(conversation_id, "conversation runtime marked restarting");
+        Ok(())
+    }
+
+    pub fn clear_restarting(&self, conversation_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                if state.restarting_conversations.remove(conversation_id) {
+                    info!(conversation_id, "conversation runtime restart gate released");
+                    self.release_notify.notify_waiters();
+                }
+            }
+            Err(_) => warn!(
+                conversation_id,
+                "conversation runtime state lock poisoned while clearing restart"
+            ),
+        }
+    }
+
+    pub fn is_restarting(&self, conversation_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.restarting_conversations.contains(conversation_id))
+            .unwrap_or(true)
+    }
+
+    /// Clear turn-scoped state after the old process has been terminated while
+    /// preserving the restart gate until the replacement runtime is ready.
+    pub fn clear_turn_state_for_restart(&self, conversation_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                let had_active_turn = state.active_turns.remove(conversation_id).is_some();
+                let had_cancelling = state.cancelling_conversations.remove(conversation_id);
+                state.deferred_cancels.remove(conversation_id);
+                if had_active_turn || had_cancelling {
+                    info!(
+                        conversation_id,
+                        had_active_turn, had_cancelling, "conversation turn state cleared for restart"
+                    );
+                    self.release_notify.notify_waiters();
+                }
+            }
+            Err(_) => warn!(
+                conversation_id,
+                "conversation runtime state lock poisoned while clearing restart turn"
+            ),
+        }
+    }
+
     pub fn clear_conversation(&self, conversation_id: &str) {
         match self.state.lock() {
             Ok(mut state) => {
                 let had_active_turn = state.active_turns.remove(conversation_id).is_some();
                 let had_deleting = state.deleting_conversations.remove(conversation_id);
                 let had_cancelling = state.cancelling_conversations.remove(conversation_id);
-                if had_active_turn || had_deleting || had_cancelling {
+                let had_restarting = state.restarting_conversations.remove(conversation_id);
+                state.deferred_cancels.remove(conversation_id);
+                if had_active_turn || had_deleting || had_cancelling || had_restarting {
                     info!(
                         conversation_id,
-                        had_active_turn, had_deleting, had_cancelling, "conversation runtime state cleared"
+                        had_active_turn,
+                        had_deleting,
+                        had_cancelling,
+                        had_restarting,
+                        "conversation runtime state cleared"
                     );
                     drop(state);
                     self.release_notify.notify_waiters();
@@ -312,20 +412,24 @@ impl ConversationRuntimeStateService {
         task_status: Option<ConversationStatus>,
         has_task: bool,
         pending_confirmations: usize,
+        supports_midturn_delivery: bool,
     ) -> ConversationRuntimeSummary {
-        let (active_turn_id, cancelling) = self
+        let (active_turn_id, cancelling, restarting) = self
             .state
             .lock()
             .map(|state| {
                 (
                     state.active_turns.get(conversation_id).cloned(),
                     state.cancelling_conversations.contains(conversation_id),
+                    state.restarting_conversations.contains(conversation_id),
                 )
             })
-            .unwrap_or((None, false));
+            .unwrap_or((None, false, true));
         let claimed = active_turn_id.is_some();
 
-        let state = if pending_confirmations > 0 {
+        let state = if restarting {
+            ConversationRuntimeStateKind::Restarting
+        } else if pending_confirmations > 0 {
             ConversationRuntimeStateKind::WaitingConfirmation
         } else if cancelling {
             ConversationRuntimeStateKind::Cancelling
@@ -347,6 +451,7 @@ impl ConversationRuntimeStateService {
             is_processing,
             pending_confirmations,
             turn_id: active_turn_id,
+            supports_midturn_delivery,
         }
     }
 
@@ -449,7 +554,7 @@ mod tests {
 
         assert_eq!(state.active_turn_id_for("conv-1").as_deref(), Some("turn-a"));
 
-        let summary = state.summary_from_parts("conv-1", None, false, 0);
+        let summary = state.summary_from_parts("conv-1", None, false, 0, false);
         assert_eq!(summary.turn_id.as_deref(), Some("turn-a"));
         assert_eq!(summary.state, ConversationRuntimeStateKind::Starting);
     }
@@ -467,6 +572,26 @@ mod tests {
 
         assert!(!claim.release_for_turn("turn-a"));
         assert!(!state.is_claimed("conv-1"));
+    }
+
+    #[test]
+    fn a_midturn_send_does_not_mint_a_phantom_turn_id() {
+        let svc = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = svc.try_claim_turn("conv-1", "t-1").expect("first claim");
+        // A second send while t-1 runs must NOT create a second claim, and the
+        // summary must keep reporting the REAL active turn.
+        assert!(svc.claim_for_agent_turn("conv-1", "t-2").is_none());
+        assert_eq!(svc.active_turn_id_for("conv-1").as_deref(), Some("t-1"));
+    }
+
+    #[test]
+    fn an_agent_started_turn_claims_after_the_previous_one_released() {
+        let svc = Arc::new(ConversationRuntimeStateService::default());
+        let claim = svc.try_claim_turn("conv-1", "t-1").expect("first claim");
+        drop(claim);
+        let adopted = svc.claim_for_agent_turn("conv-1", "t-2").expect("adopted");
+        assert_eq!(svc.active_turn_id_for("conv-1").as_deref(), Some("t-2"));
+        drop(adopted);
     }
 
     #[test]
@@ -613,17 +738,76 @@ mod tests {
     }
 
     #[test]
+    fn restart_gate_rejects_turns_and_duplicate_restarts_until_released() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        state.begin_restart("conv-1").expect("first restart should claim gate");
+
+        let duplicate = state
+            .begin_restart("conv-1")
+            .expect_err("duplicate restart should be rejected");
+        assert!(matches!(duplicate, ConversationError::RuntimeRestarting { .. }));
+        assert_eq!(duplicate.error_code(), "runtime_restarting");
+        let turn = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect_err("send must be rejected while restart owns the runtime");
+        // Asserted by CODE, not message text: clients gate on the code, so the
+        // wording must stay free to change without breaking them.
+        assert!(matches!(turn, ConversationError::RuntimeRestarting { .. }));
+        assert_eq!(turn.error_code(), "runtime_restarting");
+
+        let summary = state.summary_from_parts("conv-1", None, false, 0, false);
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Restarting);
+        assert!(summary.is_processing);
+        assert!(!summary.can_send_message);
+
+        state.clear_restarting("conv-1");
+        assert!(state.try_claim_turn("conv-1", "turn-2").is_ok());
+    }
+
+    #[test]
+    fn clearing_old_turn_for_restart_preserves_restart_gate() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-before-restart")
+            .expect("turn should be active before restart");
+        state.mark_cancelling("conv-1");
+        state.begin_restart("conv-1").expect("restart should claim gate");
+
+        state.clear_turn_state_for_restart("conv-1");
+
+        assert!(!state.is_claimed("conv-1"));
+        assert!(!state.is_cancelling("conv-1"));
+        assert!(state.is_restarting("conv-1"));
+        assert!(state.try_claim_turn("conv-1", "turn-during-restart").is_err());
+    }
+
+    #[test]
     fn summary_uses_claim_as_starting_state() {
         let state = Arc::new(ConversationRuntimeStateService::default());
         let _claim = state
             .try_claim_turn("conv-1", "turn-1")
             .expect("claim should be created");
 
-        let summary = state.summary_from_parts("conv-1", None, false, 0);
+        let summary = state.summary_from_parts("conv-1", None, false, 0, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::Starting);
         assert!(summary.is_processing);
         assert!(!summary.can_send_message);
+    }
+
+    /// Task-1 brief: `summary_from_parts` must pass the caller-supplied
+    /// `supports_midturn_delivery` straight through, unmodified by any other
+    /// runtime-state derivation.
+    #[test]
+    fn summary_from_parts_carries_supports_midturn_delivery_through() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        let summary_true = state.summary_from_parts("conv-1", None, false, 0, true);
+        assert!(summary_true.supports_midturn_delivery);
+
+        let summary_false = state.summary_from_parts("conv-1", None, false, 0, false);
+        assert!(!summary_false.supports_midturn_delivery);
     }
 
     #[test]
@@ -633,7 +817,7 @@ mod tests {
             .try_claim_turn("conv-1", "turn-1")
             .expect("claim should be created");
 
-        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 1);
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 1, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::WaitingConfirmation);
         assert!(summary.is_processing);
@@ -648,7 +832,7 @@ mod tests {
             .expect("claim should be created");
         state.mark_cancelling("conv-1");
 
-        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0);
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::Cancelling);
         assert_eq!(summary.turn_id.as_deref(), Some("turn-a"));
@@ -660,7 +844,7 @@ mod tests {
     fn summary_uses_running_task_without_claim() {
         let state = Arc::new(ConversationRuntimeStateService::default());
 
-        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0);
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::Running);
         assert!(summary.is_processing);
@@ -671,7 +855,7 @@ mod tests {
     fn summary_idle_when_no_claim_running_task_or_confirmation() {
         let state = Arc::new(ConversationRuntimeStateService::default());
 
-        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Finished), true, 0);
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Finished), true, 0, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::Idle);
         assert!(!summary.is_processing);

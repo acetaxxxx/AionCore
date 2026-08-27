@@ -2,8 +2,9 @@
 //!
 //! Uses the `rmcp` crate (Rust MCP SDK) for protocol handling. Tool calls are
 //! forwarded to the TeamMcpServer TCP listener via 4-byte big-endian
-//! length-prefixed JSON frames — the same wire protocol used by `mcp-bridge`,
-//! but with proper tool registration via rmcp instead of transparent proxying.
+//! length-prefixed JSON frames. Tools are registered properly through rmcp
+//! rather than proxied transparently, so the agent always sees a spec-shaped
+//! `tools/list` regardless of the internal TCP representation.
 //!
 //! Each tool call opens a fresh TCP connection, sends an `initialize` frame
 //! (injecting auth_token + slot_id), then sends the `tools/call` frame, reads
@@ -124,6 +125,14 @@ struct TeamStdioServer {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadMessagesParams {
+    /// Resume after this message_id; use the next_since_message_id from the previous page.
+    #[serde(default)]
+    since_message_id: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct SendMessageParams {
     /// Target agent slot_id or "*" for broadcast.
     to: String,
@@ -132,6 +141,21 @@ struct SendMessageParams {
     /// Absolute attachment paths to forward to the target agent.
     #[serde(default)]
     files: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct InterruptAgentParams {
+    /// Exact teammate slot_id; wildcard is not supported.
+    slot_id: String,
+    /// Replacement instruction delivered after interruption.
+    message: String,
+    /// Absolute attachment paths to forward to the target agent.
+    #[serde(default)]
+    files: Vec<String>,
+    /// Optional interruption reason.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -230,6 +254,13 @@ struct RenameAgentParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ClearAgentContextParams {
+    /// Agent slot_id whose context should be cleared.
+    slot_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct ShutdownAgentParams {
     /// Agent slot_id to shut down.
     slot_id: String,
@@ -255,6 +286,19 @@ struct DescribeAssistantParams {
 #[tool_router]
 impl TeamStdioServer {
     #[tool(
+        name = "team_read_messages",
+        description = "Peek at your own unread team mailbox messages. Returns at most the oldest 50 unread messages in FIFO order, each with a message_id. When has_more is true, call again with since_message_id set to the returned next_since_message_id to read the following page. Messages returned in full are marked read only if the current turn completes successfully; failed or cancelled turns preserve them for retry. A message with content_truncated=true is a preview only: it stays unread and is redelivered in full on a later turn, so do not act on it yet."
+    )]
+    async fn read_messages(&self, Parameters(params): Parameters<ReadMessagesParams>) -> CallToolResult {
+        let mut arguments = serde_json::Map::new();
+        if let Some(since_message_id) = params.since_message_id {
+            arguments.insert("since_message_id".into(), serde_json::Value::String(since_message_id));
+        }
+        self.forward_to_tcp("team_read_messages", &serde_json::Value::Object(arguments))
+            .await
+    }
+
+    #[tool(
         name = "team_send_message",
         description = "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
     )]
@@ -265,6 +309,23 @@ impl TeamStdioServer {
                 "to": params.to,
                 "message": params.message,
                 "files": params.files,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_interrupt_agent",
+        description = "Immediately stop a teammate's active turn and durably deliver a replacement instruction as its next highest-priority message."
+    )]
+    async fn interrupt_agent(&self, Parameters(params): Parameters<InterruptAgentParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_interrupt_agent",
+            &serde_json::json!({
+                "slot_id": params.slot_id,
+                "message": params.message,
+                "files": params.files,
+                "reason": params.reason,
             }),
         )
         .await
@@ -338,6 +399,18 @@ impl TeamStdioServer {
         self.forward_to_tcp(
             "team_rename_agent",
             &serde_json::json!({ "slot_id": params.slot_id, "new_name": params.new_name }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_clear_agent_context",
+        description = "Start a fresh backend context for a teammate while preserving team membership, settings, visible chat history, tasks, files, and unread mailbox messages. Lead only."
+    )]
+    async fn clear_agent_context(&self, Parameters(params): Parameters<ClearAgentContextParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_clear_agent_context",
+            &serde_json::json!({ "slot_id": params.slot_id }),
         )
         .await
     }
@@ -798,6 +871,7 @@ mod tests {
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
+        assert_eq!(tools.len(), 13, "stdio must expose the complete shared registry");
         let mut actual_names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         actual_names.sort_unstable();
         let mut expected_names: Vec<_> = aionui_team_prompts::tools::team_tool_specs()
@@ -823,6 +897,30 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn team_stdio_interrupt_and_clear_context_schemas_match_registry_shape() {
+        let router = TeamStdioServer::tool_router();
+        let tools = router.list_all();
+        let interrupt = tools
+            .iter()
+            .find(|tool| tool.name == "team_interrupt_agent")
+            .expect("team_interrupt_agent tool missing");
+        let interrupt_properties = interrupt.input_schema["properties"].as_object().unwrap();
+        assert_eq!(interrupt_properties.len(), 4);
+        assert!(interrupt_properties.contains_key("slot_id"));
+        assert!(interrupt_properties.contains_key("message"));
+        assert!(interrupt_properties.contains_key("files"));
+        assert!(interrupt_properties.contains_key("reason"));
+
+        let clear = tools
+            .iter()
+            .find(|tool| tool.name == "team_clear_agent_context")
+            .expect("team_clear_agent_context tool missing");
+        let clear_properties = clear.input_schema["properties"].as_object().unwrap();
+        assert_eq!(clear_properties.len(), 1);
+        assert!(clear_properties.contains_key("slot_id"));
     }
 
     #[tokio::test]

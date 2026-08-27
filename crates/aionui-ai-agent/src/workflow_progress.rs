@@ -138,7 +138,10 @@ pub(crate) struct Rendered {
 /// - `local_workflow` → [`CardKind::Workflow`]: has a per-agent roster
 ///   (`workflow_progress[]`) to render.
 /// - `local_bash` / `local_agent` → [`CardKind::BackgroundTask`]: no roster ever
-///   arrives — the card is a single live row on the launching tool call.
+///   arrives — the card is a single live row on the launching tool call. The
+///   two differ only in the headline word ([`WorkflowCard::new_background`] says
+///   "bg task", [`WorkflowCard::new_subagent`] says "subagent") so a Task
+///   subagent is distinguishable from a background bash in the step list.
 ///
 /// (verified: local_agent + linkage in
 /// `claude_2.1.169_single_tool_turn.ndjson`; local_bash + linkage in
@@ -203,9 +206,18 @@ impl WorkflowCard {
         }
     }
 
-    /// A rosterless background task (`local_bash` / `local_agent`). `desc` is the
-    /// launching call's own description of the work; `task_id` rides in the
-    /// headline so the user can name the task when asking to stop it.
+    /// A rosterless background task (`local_bash`). `desc` is the launching
+    /// call's own description of the work; `task_id` rides in the headline so
+    /// the user can name the task when asking to stop it.
+    ///
+    /// `desc` is DROPPED when it merely repeats `tool_name`. The step row draws
+    /// the name and the description side by side and dedupes only on exact
+    /// equality, so once a backend derives its step label from the same argument
+    /// the headline quotes — since #870 a claude Bash label IS that call's own
+    /// `description` — keeping both printed the text twice: "Wait for instance
+    /// readiness" + "Wait for instance readiness · bg task bdyspm202 · 00:09".
+    /// Where the label is still a bare tool name, `desc` is the only thing
+    /// saying what the task does, so it is kept.
     pub fn new_background(
         call_id: String,
         tool_name: String,
@@ -214,11 +226,40 @@ impl WorkflowCard {
         desc: Option<String>,
         now_ms: i64,
     ) -> Self {
+        Self::new_task(call_id, tool_name, args, task_id, desc, now_ms, "bg task")
+    }
+
+    /// A Task subagent's card (`local_agent`, foreground or background — the
+    /// wire declares both the same way). Identical to [`Self::new_background`]
+    /// except the headline word: a subagent is delegated agent work, and
+    /// labelling it "bg task" made it indistinguishable from a background bash
+    /// in the step list (live 2026-08-19).
+    pub fn new_subagent(
+        call_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        task_id: &str,
+        desc: Option<String>,
+        now_ms: i64,
+    ) -> Self {
+        Self::new_task(call_id, tool_name, args, task_id, desc, now_ms, "subagent")
+    }
+
+    fn new_task(
+        call_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        task_id: &str,
+        desc: Option<String>,
+        now_ms: i64,
+        word: &str,
+    ) -> Self {
         let mut card = Self::new(call_id, tool_name, args, now_ms);
         card.kind = CardKind::BackgroundTask;
         card.bg_headline = match desc {
-            Some(d) => format!("{} · bg task {task_id}", elide_middle(&d, SUMMARY_MAX)),
-            None => format!("bg task {task_id}"),
+            Some(d) if d.trim() == card.tool_name.trim() => format!("{word} {task_id}"),
+            Some(d) => format!("{} · {word} {task_id}", elide_middle(&d, SUMMARY_MAX)),
+            None => format!("{word} {task_id}"),
         };
         card
     }
@@ -315,6 +356,9 @@ impl WorkflowCard {
                 CardKind::BackgroundTask => None,
             },
             description: Some(rendered.description.clone()),
+            // Cards ride a MAIN-STREAM launching call; absent (not null) so the
+            // merge-patch never touches attribution persisted by the call itself.
+            parent_call_id: None,
         };
         let entries = rendered.entries.clone();
         self.last_render = Some(rendered);
@@ -622,6 +666,87 @@ mod tests {
         assert_ne!(
             ea[0].call_id, eb[0].call_id,
             "two workflows must not claim the same messages.id"
+        );
+    }
+
+    #[test]
+    fn background_headline_does_not_repeat_the_step_label() {
+        // The step row draws `name` then `description`, deduping only on EXACT
+        // equality. Since #870 a claude Bash step's label IS that call's own
+        // `description`, so a headline that also quoted it printed the text
+        // twice: "Wait for instance readiness" + "Wait for instance readiness ·
+        // bg task bdyspm202 · 00:09".
+        let label = "Wait for instance readiness";
+        let mut c = WorkflowCard::new_background(
+            "toolu_bg".into(),
+            label.into(),
+            serde_json::json!({"command": "until grep -q READY log; do sleep 1; done", "description": label}),
+            "bdyspm202",
+            Some(label.to_string()),
+            0,
+        );
+        let (f, _) = c.take_emission(9_000, true).expect("background cards open immediately");
+        let description = f.description.as_deref().unwrap();
+
+        assert!(
+            !description.contains(label),
+            "headline must not repeat the label the row already shows: {description:?}"
+        );
+        // It still has to say WHICH task, so the user can ask to stop it.
+        assert!(
+            description.contains("bg task bdyspm202"),
+            "lost the task id: {description:?}"
+        );
+        assert!(description.ends_with("00:09"), "lost the clock: {description:?}");
+    }
+
+    /// A Task subagent's card must say "subagent", not "bg task" — with both
+    /// labelled identically the step list could not distinguish delegated agent
+    /// work from a background shell (live 2026-08-19: a foreground Task and a
+    /// background bash rendered as the same "bg task <id> · clock" row).
+    #[test]
+    fn subagent_card_says_subagent_not_bg_task() {
+        // Post-#870 shape: the Task call's step label IS its own description,
+        // so the dedupe drops it from the headline and only the word + id stay.
+        let label = "修复 AIONUI-151 桌面 401 恢复";
+        let mut c = WorkflowCard::new_subagent(
+            "toolu_task".into(),
+            label.into(),
+            serde_json::json!({"description": label, "subagent_type": "claude"}),
+            "ae859b22dc5afbdca",
+            Some(label.to_string()),
+            0,
+        );
+        let (f, _) = c.take_emission(9_000, true).expect("task cards open immediately");
+        let description = f.description.as_deref().unwrap();
+        assert!(
+            description.contains("subagent ae859b22dc5afbdca"),
+            "headline must name the subagent and its id: {description:?}"
+        );
+        assert!(
+            !description.contains("bg task"),
+            "a subagent is not a bg task: {description:?}"
+        );
+        assert!(description.ends_with("00:09"), "lost the clock: {description:?}");
+    }
+
+    /// The other direction: where the label is still a BARE tool name, the desc
+    /// is the only thing saying what the task does, so it must be kept.
+    #[test]
+    fn background_headline_keeps_a_desc_that_adds_information() {
+        let mut c = WorkflowCard::new_background(
+            "toolu_bg".into(),
+            "Bash".into(),
+            serde_json::Value::Null,
+            "b7",
+            Some("Sleep 15 seconds".into()),
+            0,
+        );
+        let (f, _) = c.take_emission(0, true).unwrap();
+        let description = f.description.as_deref().unwrap();
+        assert!(
+            description.contains("Sleep 15 seconds") && description.contains("bg task b7"),
+            "a desc distinct from the label carries the only description of the work: {description:?}"
         );
     }
 

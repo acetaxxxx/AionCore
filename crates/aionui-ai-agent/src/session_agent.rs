@@ -32,7 +32,7 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
 use crate::types::{PromptMediaCaps, SendMessageData};
-use aionui_api_types::AcpBuildExtra;
+use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME};
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
@@ -523,6 +523,119 @@ impl SessionAgentTask {
 
     fn next_command_id(&self) -> u64 {
         self.command_seq.fetch_add(1, Ordering::Relaxed) as u64
+    }
+
+    /// Build the multimodal `ContentBlock` vector for a prompt: partition
+    /// attachments by the backend's declared prompt blocks — capable media
+    /// becomes native Image/Audio blocks; everything else keeps the
+    /// pre-multimodal form (path in the [[AION_FILES]] text + resource link).
+    ///
+    /// A native media block carries ONLY bytes: `ContentBlock::Image` is
+    /// `{data, media_type}` with no path field, and `partition_media` has
+    /// already stripped that path out of the [[AION_FILES]] text. So each
+    /// natively-delivered attachment is PAIRED with a resource link to the very
+    /// same file — the adapters render a link as an `[Attached file: <uri>]`
+    /// text element (see `adapter/claude.rs` / `backend/codex_conn.rs`), which
+    /// is how every non-media attachment already travels and how images
+    /// travelled before the multimodal split. Without the pair, an agent that
+    /// can both see and read files gets pixels it cannot open (Sentry
+    /// 7677917218). The pair is gated on the backend advertising `resource`:
+    /// an un-advertised block is rejected at dispatch and would kill the whole
+    /// Send (`BlockSet::allows`).
+    ///
+    /// A read failure degrades that attachment back to a resource link alone —
+    /// the path also remains in the original text because partition already ran,
+    /// which the adapters tolerate (they resolve links independently of the
+    /// text). Shared by `send_message` and `deliver_midturn`.
+    async fn build_prompt_blocks(&self, data: &SendMessageData) -> Vec<ContentBlock> {
+        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
+        let link_media_paths = self.backend.capabilities().prompt_blocks.resource;
+        let mut content: Vec<ContentBlock> = Vec::new();
+        if !partition.content.is_empty() {
+            content.push(ContentBlock::Text(partition.content));
+        }
+        for path in partition.path_files {
+            // File paths ride as resource links; the claude/codex adapters resolve
+            // them (Read tool / base64) at dispatch time.
+            content.push(ContentBlock::ResourceLink {
+                uri: path,
+                mime_type: None,
+            });
+        }
+        let mut media_links = 0usize;
+        for attachment in &partition.media {
+            match crate::media::read_media_bytes(attachment).await {
+                Some(bytes) => {
+                    content.push(match attachment.kind {
+                        crate::media::MediaKind::Image => ContentBlock::Image {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                        crate::media::MediaKind::Audio => ContentBlock::Audio {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                    });
+                    // Pair the bytes with the path (see the fn doc): the block
+                    // itself has no uri field and the text no longer lists it.
+                    if link_media_paths {
+                        content.push(ContentBlock::ResourceLink {
+                            uri: attachment.path.clone(),
+                            mime_type: Some(attachment.mime.clone()),
+                        });
+                        media_links += 1;
+                    }
+                }
+                None => content.push(ContentBlock::ResourceLink {
+                    uri: attachment.path.clone(),
+                    mime_type: Some(attachment.mime.clone()),
+                }),
+            }
+        }
+        if !partition.media.is_empty() {
+            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
+                ContentBlock::Image { .. } => (i + 1, a),
+                ContentBlock::Audio { .. } => (i, a + 1),
+                _ => (i, a),
+            });
+            tracing::info!(
+                conversation_id = %self.conversation_id,
+                msg_id = %data.msg_id,
+                images,
+                audios,
+                media_links,
+                "session prompt carries native media content blocks"
+            );
+        }
+        content
+    }
+
+    /// B5 mid-turn delivery: hand a message to the RUNNING turn instead of
+    /// opening a new one. Dispatches `Command::Steer` (codex `turn/steer`;
+    /// claude direct stdin user-frame write) with `data.msg_id` as the
+    /// correlation id both CLIs round-trip (claude user-frame `uuid` echoed via
+    /// `command_lifecycle`; codex `clientUserMessageId`).
+    ///
+    /// Deliberately NOT `send_message`: no `AgentStreamEvent::Start` emit and
+    /// no status flip — the message folds into the ACTIVE turn, whose relay and
+    /// status are already live (a stray Start would open a phantom turn
+    /// boundary mid-stream).
+    pub async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.runtime.touch();
+        let content = self.build_prompt_blocks(&data).await;
+        self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
+        let cmd = Command::Steer {
+            content,
+            client_msg_id: Some(data.msg_id),
+        };
+        self.backend
+            .dispatch(cmd)
+            .await
+            .map(|_| ())
+            // Preserve the backend's message text: the conversation layer
+            // classifies codex's "no active turn to steer" rejection to fall
+            // back to the normal new-turn path.
+            .map_err(|e| AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string())))
     }
 
     /// DEV (`--dump-prompts`): dump this turn's final input blocks as a
@@ -1204,6 +1317,10 @@ impl IAgentTask for SessionAgentTask {
         self.runtime.tx.subscribe()
     }
 
+    fn supports_midturn_delivery(&self) -> bool {
+        self.backend.capabilities().supports_midturn_delivery
+    }
+
     fn prompt_media_caps(&self) -> PromptMediaCaps {
         let blocks = self.backend.capabilities().prompt_blocks;
         PromptMediaCaps {
@@ -1214,58 +1331,7 @@ impl IAgentTask for SessionAgentTask {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.touch();
-        // Partition attachments by the backend's declared prompt blocks:
-        // capable media becomes native Image/Audio blocks; everything else
-        // keeps the pre-multimodal form (path in the [[AION_FILES]] text +
-        // resource link). A read failure degrades that attachment back to a
-        // resource link — the path also remains in the original text because
-        // partition already ran, which the adapters tolerate (they resolve
-        // links independently of the text).
-        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
-        let mut content: Vec<ContentBlock> = Vec::new();
-        if !partition.content.is_empty() {
-            content.push(ContentBlock::Text(partition.content));
-        }
-        for path in partition.path_files {
-            // File paths ride as resource links; the claude/codex adapters resolve
-            // them (Read tool / base64) at dispatch time.
-            content.push(ContentBlock::ResourceLink {
-                uri: path,
-                mime_type: None,
-            });
-        }
-        for attachment in &partition.media {
-            match crate::media::read_media_bytes(attachment).await {
-                Some(bytes) => content.push(match attachment.kind {
-                    crate::media::MediaKind::Image => ContentBlock::Image {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                    crate::media::MediaKind::Audio => ContentBlock::Audio {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                }),
-                None => content.push(ContentBlock::ResourceLink {
-                    uri: attachment.path.clone(),
-                    mime_type: Some(attachment.mime.clone()),
-                }),
-            }
-        }
-        if !partition.media.is_empty() {
-            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
-                ContentBlock::Image { .. } => (i + 1, a),
-                ContentBlock::Audio { .. } => (i, a + 1),
-                _ => (i, a),
-            });
-            tracing::info!(
-                conversation_id = %self.conversation_id,
-                msg_id = %data.msg_id,
-                images,
-                audios,
-                "session prompt carries native media content blocks"
-            );
-        }
+        let content = self.build_prompt_blocks(&data).await;
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
         self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
@@ -1347,10 +1413,14 @@ impl IAgentTask for SessionAgentTask {
         // turn (gate recovers in seconds, no crash card), then (2) delegate real
         // process teardown to the backend, which kills the process tree WITHOUT
         // waiting for the last Arc to drop.
-        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+        if matches!(
+            reason,
+            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
+        ) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
-                "session kill(UserCancelTimeout): emitted clean Finish + delegating backend terminate (was Drop-only no-op)"
+                ?reason,
+                "session kill: emitted clean Finish and delegated backend termination"
             );
             // 1) clean converge FIRST: relay breaks → orchestrator releases the turn
             //    claim → `cancelling` cleared → gate recovers (no red crash card).
@@ -1386,10 +1456,14 @@ impl SessionAgentTask {
         &self,
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+        if matches!(
+            reason,
+            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
+        ) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
-                "session kill_and_wait(UserCancelTimeout): emitted clean Finish + awaiting backend terminate"
+                ?reason,
+                "session kill_and_wait: emitted clean Finish and awaiting backend termination"
             );
             self.runtime.emit_finish_once(); // clean converge FIRST (sync)
             let backend = self.backend.clone();
@@ -1743,7 +1817,9 @@ pub async fn build_session_instance(
 
     // GAP #3 — MCP init surface: resolve user-configured servers to the neutral
     // spec (clean-slate resolve_session_init), fold in the inline snapshot, then
-    // prepend the team coordination MCP. Same order as the app boundary.
+    // prepend the team coordination MCP. Same order as the app boundary. The
+    // reserved name `aionui-team` is filtered from BOTH sources so the team
+    // coordination MCP (prepended last, below) always wins.
     let mut neutral = match mcp_server_repo {
         Some(repo) => {
             crate::mcp_resolve::resolve_session_mcp_servers(
@@ -1757,7 +1833,14 @@ pub async fn build_session_instance(
         }
         None => Vec::new(),
     };
-    neutral.extend(config.session_mcp_servers.iter().cloned());
+    neutral.retain(|server| server.name != TEAM_MCP_SERVER_NAME);
+    neutral.extend(
+        config
+            .session_mcp_servers
+            .iter()
+            .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
+            .cloned(),
+    );
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         // Team-MCP is PREPENDED before the user's servers (clean-slate + legacy
@@ -2763,6 +2846,7 @@ fn spawn_event_pump(
                     input: None,
                     output: Some(acc.clone()),
                     description: None,
+                    parent_call_id: None,
                 }));
                 continue;
             }
@@ -2971,6 +3055,7 @@ fn spawn_event_pump(
                                     input: None,
                                     output: None,
                                     description: None,
+                                    parent_call_id: None,
                                 }));
                             }
                             tool_output.clear();
@@ -3103,6 +3188,7 @@ fn spawn_event_pump(
                             input: None,
                             output: None,
                             description: None,
+                            parent_call_id: None,
                         }));
                     }
                     for (call_id, name) in kept_open {
@@ -3731,11 +3817,19 @@ fn update_workflow_cards(
                         .and_then(|v| v.as_str())
                         .or_else(|| args.get("command").and_then(|v| v.as_str()))
                         .map(str::to_string);
-                    let mut card = WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms);
+                    // A Task subagent (`local_agent`) gets the "subagent" headline;
+                    // everything else (`local_bash`, unknown) stays "bg task".
+                    let is_agent = matches!(kind, Some(SubagentTaskKind::AgentContainer));
+                    let mut card = if is_agent {
+                        WorkflowCard::new_subagent(call_id.clone(), name, args, r#ref, desc, now_ms)
+                    } else {
+                        WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms)
+                    };
                     tracing::info!(
                         conv_id = %conversation_id,
                         task_id = %r#ref,
                         %call_id,
+                        subagent = is_agent,
                         "session-pump: background task card opened"
                     );
                     // No roster will ever arrive to trigger a first emission, so
@@ -3788,6 +3882,7 @@ fn update_workflow_cards(
                                 input: None,
                                 output: None,
                                 description: None,
+                                parent_call_id: None,
                             },
                             agents: Vec::new(),
                             settle_only: true,
@@ -4057,6 +4152,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             tool_use_id,
             name,
             input,
+            parent_tool_use_id,
             ..
         } => {
             vec![AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -4067,12 +4163,16 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 input: Some(input),
                 output: None,
                 description: None,
+                // Subagent attribution (009 H5): persisted onto the row so the
+                // frontend can group a subagent's steps under its Task call.
+                parent_call_id: parent_tool_use_id,
             })]
         }
         SessionEvent::ToolResult {
             tool_use_id,
             is_error,
             content,
+            parent_tool_use_id,
             ..
         } => {
             let output = tool_result_text(&content);
@@ -4088,6 +4188,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 input: None,
                 output,
                 description: None,
+                parent_call_id: parent_tool_use_id,
             })]
         }
         SessionEvent::TurnResult {
@@ -4367,6 +4468,17 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         SessionEvent::SessionTitle { title } => {
             vec![AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": title }))]
         }
+        // Mid-turn interjection (Task 3): lower the claude command_lifecycle echo
+        // to an internal-only stream frame so the conversation layer's
+        // BackgroundStreamWatcher can tell an agent-started turn that SERVES a
+        // user message (claim it) from a pure background continuation (leave it
+        // unclaimed). Consumed inside the relay/watcher, never forwarded to the
+        // WebSocket.
+        SessionEvent::MessageLifecycle { client_msg_id, phase } => {
+            vec![AgentStreamEvent::MessageLifecycle(
+                crate::protocol::events::MessageLifecycleData { client_msg_id, phase },
+            )]
+        }
         // Events with no origin-side counterpart (or purely internal) are dropped.
         // Cancel folds into the Finish emitted by the resulting terminal; Heartbeat,
         // PromptAccepted, Snapshot, Lagged, item lifecycle, subagent/rewound/etc. are
@@ -4623,6 +4735,233 @@ mod build_mapping_tests {
             has_command_override: false,
             env_override_key_count: 0,
         }
+    }
+
+    struct DirectMcpRepo {
+        rows: Vec<aionui_db::models::McpServerRow>,
+    }
+
+    #[derive(Default)]
+    struct RecordingFailSpawner {
+        last_command: std::sync::Mutex<Option<aionui_common::CommandSpec>>,
+    }
+
+    impl RecordingFailSpawner {
+        fn last_command(&self) -> Option<aionui_common::CommandSpec> {
+            self.last_command.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl aionui_process::Spawner for RecordingFailSpawner {
+        async fn spawn(
+            &self,
+            spec: aionui_common::CommandSpec,
+            _extra_env: &[(String, String)],
+            _opaque_owner_tag: &str,
+        ) -> Result<Arc<aionui_process::ManagedProcess>, aionui_process::ProcessError> {
+            *self.last_command.lock().unwrap() = Some(spec);
+            Err(aionui_process::ProcessError::internal(
+                "recording spawner deliberately stops after assembly",
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IMcpServerRepository for DirectMcpRepo {
+        async fn list(&self, user_id: &str) -> Result<Vec<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
+        }
+
+        async fn find_by_id(
+            &self,
+            user_id: &str,
+            id: &str,
+        ) -> Result<Option<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.id == id)
+                .cloned())
+        }
+
+        async fn find_by_name(
+            &self,
+            user_id: &str,
+            name: &str,
+        ) -> Result<Option<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.name == name)
+                .cloned())
+        }
+
+        async fn create(
+            &self,
+            _params: aionui_db::CreateMcpServerParams<'_>,
+        ) -> Result<aionui_db::models::McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _params: aionui_db::UpdateMcpServerParams<'_>,
+        ) -> Result<aionui_db::models::McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn batch_upsert(
+            &self,
+            _user_id: &str,
+            _servers: &[aionui_db::CreateMcpServerParams<'_>],
+        ) -> Result<Vec<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update_status(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _status: &str,
+            _last_connected: Option<aionui_common::TimestampMs>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+    }
+
+    fn direct_mcp_row(id: &str, name: &str) -> aionui_db::models::McpServerRow {
+        aionui_db::models::McpServerRow {
+            id: id.into(),
+            user_id: "user-1".into(),
+            name: name.into(),
+            description: None,
+            enabled: true,
+            transport_type: "http".into(),
+            transport_config: r#"{"url":"http://127.0.0.1:9999/mcp"}"#.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin: false,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_claude_spawn_contains_team_nonbuiltin_and_builtin_without_reserved_override() {
+        use aionui_api_types::{SessionMcpServer, SessionMcpTransport, TeamMcpStdioConfig};
+
+        let executable = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            mcp_server_ids: Some(vec!["mcp-docs".into(), "mcp-reserved".into()]),
+            session_mcp_servers: vec![
+                SessionMcpServer {
+                    id: "mcp-chrome".into(),
+                    name: "chrome-devtools".into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: executable.clone(),
+                        args: vec!["chrome-devtools-mcp".into()],
+                        env: Default::default(),
+                    },
+                },
+                SessionMcpServer {
+                    id: "mcp-inline-collision".into(),
+                    name: TEAM_MCP_SERVER_NAME.into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: executable,
+                        args: vec!["malicious".into()],
+                        env: Default::default(),
+                    },
+                },
+            ],
+            team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                team_id: "team-1".into(),
+                port: 9000,
+                token: "tok".into(),
+                slot_id: "slot-1".into(),
+                binary_path: "/usr/bin/team-coordinator".into(),
+            }),
+            ..Default::default()
+        };
+        let repo: Arc<dyn IMcpServerRepository> = Arc::new(DirectMcpRepo {
+            rows: vec![
+                direct_mcp_row("mcp-docs", "mcp-docs"),
+                direct_mcp_row("mcp-reserved", TEAM_MCP_SERVER_NAME),
+            ],
+        });
+        let metadata = test_metadata(Some("claude"), None);
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
+        let spawner = Arc::new(RecordingFailSpawner::default());
+
+        let result = build_session_instance(
+            "claude",
+            SessionBuildInputs {
+                conversation_id: "conv-direct-mcp".into(),
+                user_id: "user-1".into(),
+                workspace: std::env::current_dir()
+                    .expect("current directory")
+                    .to_string_lossy()
+                    .into_owned(),
+                config: &config,
+                metadata: &metadata,
+                session_snapshot: None,
+                backend_session_id: None,
+                mcp_server_repo: Some(&repo),
+                runtime_env: &[],
+                broadcaster,
+                catalog_writeback: None,
+                acp_session_repo: None,
+                prompt_dump_dir: None,
+                permission_hook_body: None,
+            },
+            spawner.clone(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "FakeSpawner deliberately fails after recording the spawn"
+        );
+
+        let command = spawner.last_command().expect("direct backend must reach spawn");
+        let mcp_flag = command
+            .args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .expect("direct claude spawn must carry --mcp-config");
+        let config_json: serde_json::Value =
+            serde_json::from_str(&command.args[mcp_flag + 1]).expect("valid inline MCP config");
+        let servers = config_json["mcpServers"].as_object().expect("MCP server map");
+
+        assert_eq!(servers.len(), 3);
+        assert!(servers.contains_key("mcp-docs"));
+        assert!(servers.contains_key("chrome-devtools"));
+        assert_eq!(
+            servers[TEAM_MCP_SERVER_NAME]["command"],
+            serde_json::json!("/usr/bin/team-coordinator"),
+            "the coordination MCP must survive both repo and inline reserved-name collisions"
+        );
     }
 
     #[test]
@@ -5029,6 +5368,7 @@ mod translate_tests {
             input: None,
             output: None,
             description: None,
+            parent_call_id: None,
         })
     }
 
@@ -6388,8 +6728,8 @@ mod pump_tests {
     }
 
     // Image-capable backend: an image attachment leaves the [[AION_FILES]]
-    // text and rides as a native Image block; non-media files keep the
-    // path-text + resource-link form.
+    // text and rides as a native Image block PAIRED with a link to the same
+    // file; non-media files keep the path-text + resource-link form.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_message_partitions_image_into_native_block() {
         let dir = std::env::temp_dir().join("aionui-session-media-tests");
@@ -6437,7 +6777,11 @@ mod pump_tests {
         let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
             panic!("expected a Send command");
         };
-        assert_eq!(content.len(), 3, "text + pdf link + image block: {content:?}");
+        assert_eq!(
+            content.len(),
+            4,
+            "text + pdf link + image block + the image's own link: {content:?}"
+        );
         let ContentBlock::Text(text) = &content[0] else {
             panic!("expected text first: {content:?}");
         };
@@ -6451,6 +6795,132 @@ mod pump_tests {
         };
         assert_eq!(data, b"catbytes");
         assert_eq!(media_type, "image/png");
+        let ContentBlock::ResourceLink { uri, mime_type } = &content[3] else {
+            panic!("expected the image's paired resource link fourth: {content:?}");
+        };
+        assert_eq!(uri, &img);
+        assert_eq!(mime_type.as_deref(), Some("image/png"));
+    }
+
+    // Regression guard (Sentry 7677917218): a natively-delivered image must ALSO
+    // carry its disk path. Without the paired link the agent sees pixels but has
+    // no path for its Read tool — it can look at the image but not open the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_pairs_image_block_with_resource_link() {
+        let dir = std::env::temp_dir().join("aionui-session-media-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("qr.png");
+        std::fs::write(&img, b"qrbytes").unwrap();
+        let img = img.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: true,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-link".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        let marker = aionui_common::constants::AIONUI_FILES_MARKER;
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: format!("replace the qr code\n\n{marker}\n{img}"),
+                msg_id: "m-link".into(),
+                turn_id: None,
+                files: vec![img.clone()],
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert!(
+            content.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+            "image block missing: {content:?}"
+        );
+        let linked: Vec<&str> = content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ResourceLink { uri, .. } => Some(uri.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            linked,
+            vec![img.as_str()],
+            "the image's path must ride along as a resource link: {content:?}"
+        );
+    }
+
+    // Capability gate: a backend that takes images but NOT resource links must not
+    // receive the paired link — `BlockSet::allows` rejects an un-advertised block
+    // and that rejection kills the WHOLE Send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_omits_media_link_when_resource_block_unsupported() {
+        let dir = std::env::temp_dir().join("aionui-session-media-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("no-link.png");
+        std::fs::write(&img, b"pngbytes").unwrap();
+        let img = img.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: false,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-nolink".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: "look".into(),
+                msg_id: "m-nolink".into(),
+                turn_id: None,
+                files: vec![img.clone()],
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert!(
+            content.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+            "image block missing: {content:?}"
+        );
+        assert!(
+            !content.iter().any(|b| matches!(b, ContentBlock::ResourceLink { .. })),
+            "must not emit a resource link to a backend that does not advertise it: {content:?}"
+        );
     }
 
     /// A codex detached exec (`source: unifiedExecStartup`) is still RUNNING when
@@ -7635,6 +8105,85 @@ mod pump_tests {
         assert!(
             settle > finish,
             "the card settles AFTER the turn's Finish — it survived the turn end"
+        );
+    }
+
+    /// A Task subagent (`task_type: local_agent`, kind `AgentContainer`) rides
+    /// the same card machinery as a background bash but must be LABELLED as a
+    /// subagent — with both saying "bg task" the step list could not tell
+    /// delegated agent work from a background shell (live 2026-08-19). Its
+    /// internal tool calls also carry the launching call's id so the frontend
+    /// can group them under the Task row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_subagent_card_is_labelled_subagent_and_children_carry_parent() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            // Shape mirrors claude_2.1.169_single_tool_turn.ndjson: Agent
+            // tool_use → task_started{local_agent} → the subagent's own tool_use
+            // frame carrying parent_tool_use_id.
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_task".into(),
+                name: "修复 AIONUI-151 桌面 401 恢复".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({
+                    "description": "修复 AIONUI-151 桌面 401 恢复",
+                    "subagent_type": "claude",
+                    "run_in_background": false
+                }),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "ae859b22dc5afbdca".into(),
+                label: Some("claude".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_task".into()),
+                kind: Some(SubagentTaskKind::AgentContainer),
+            }),
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_inner".into(),
+                name: "Read httpBridge.ts".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"file_path": "/tmp/httpBridge.ts"}),
+                parent_tool_use_id: Some("toolu_task".into()),
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "ae859b22dc5afbdca".into(),
+                label: None,
+                status: SubagentStatus::Completed,
+                parent_ref: Some("toolu_task".into()),
+                kind: None,
+            }),
+        ];
+        let frames = drain_script(script).await;
+
+        let progress = wf_frames(&frames);
+        assert!(!progress.is_empty(), "the subagent card must emit on open");
+        let desc = progress[0].card.description.as_deref().unwrap_or_default();
+        assert!(
+            desc.contains("subagent ae859b22dc5afbdca"),
+            "a Task subagent's card says 'subagent', not 'bg task': {desc}"
+        );
+        assert!(!desc.contains("bg task"), "not a bg task: {desc}");
+
+        // Attribution: the subagent's INTERNAL call carries the Task call's id;
+        // the Task launch itself (a main-agent call) carries none.
+        let parent_of = |id: &str| {
+            frames.iter().find_map(|f| match f {
+                AgentStreamEvent::ToolCall(d) if d.call_id == id && d.status == ToolCallStatus::Running => {
+                    Some(d.parent_call_id.clone())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            parent_of("toolu_inner"),
+            Some(Some("toolu_task".into())),
+            "a subagent-internal call must carry its Task call's id"
+        );
+        assert_eq!(
+            parent_of("toolu_task"),
+            Some(None),
+            "the main-agent launching call carries no parent"
         );
     }
 
@@ -9394,6 +9943,52 @@ mod force_kill_tests {
         }
     }
 
+    /// Task-1 brief: `SessionAgentTask::supports_midturn_delivery` must read
+    /// straight through to the backend's declared capability bit — no
+    /// reinterpretation, no default override.
+    struct MidturnCapableBackend {
+        supports_midturn_delivery: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for MidturnCapableBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_midturn_delivery: self.supports_midturn_delivery,
+                ..Capabilities::default()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supports_midturn_delivery_reads_through_backend_capabilities() {
+        for expected in [true, false] {
+            let backend: Arc<dyn SessionBackend> = Arc::new(MidturnCapableBackend {
+                supports_midturn_delivery: expected,
+            });
+            let task = SessionAgentTask::new(
+                AgentType::Acp,
+                "conv-1".into(),
+                "user-1".into(),
+                "/w".into(),
+                backend,
+                None,
+            );
+            assert_eq!(IAgentTask::supports_midturn_delivery(task.as_ref()), expected);
+        }
+    }
+
     fn build_task_with_counter() -> (Arc<SessionAgentTask>, Arc<AtomicUsize>) {
         let counter = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn SessionBackend> = Arc::new(TerminateCountingBackend {
@@ -9502,6 +10097,24 @@ mod force_kill_tests {
         let again = next_terminal(&mut rx).await;
         assert!(again.is_none(), "no second Finish broadcast, got {again:?}");
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+    }
+
+    #[tokio::test]
+    async fn runtime_restart_forces_clean_finish_and_terminates_backend() {
+        let (task, counter) = build_task_with_counter();
+        let mut rx = IAgentTask::subscribe(task.as_ref());
+        start_turn(task.as_ref()).await;
+
+        let inst = AgentInstance::Session(Arc::clone(&task));
+        inst.kill_and_wait(Some(AgentKillReason::RuntimeRestart)).await;
+
+        let terminal = next_terminal(&mut rx).await.expect("a terminal frame after restart");
+        assert!(
+            matches!(terminal, AgentStreamEvent::Finish(_)),
+            "runtime restart must finish the turn without an Error frame, got {terminal:?}"
+        );
+        assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     /// T6: isolation — non-`UserCancelTimeout` reasons keep the original
