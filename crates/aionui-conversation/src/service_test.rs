@@ -29,7 +29,7 @@ use aionui_api_types::{
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
-    ProviderWithModel, TimestampMs, now_ms,
+    ProviderWithModel, TimestampMs,
 };
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow,
@@ -9840,11 +9840,12 @@ mod session_mentions_integration {
 
     #[tokio::test]
     async fn test_deferred_cancel_single_terminal_outcome() {
-        let (svc, _broadcaster, _repo, task_mgr) = make_service();
+        let (svc, _broadcaster, repo, task_mgr) = make_service();
         let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
         let svc = svc.with_turn_journal(journal.clone());
 
         let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        let conversation_row = get_row(&repo, "user_1", &conv.id).await;
         let turn_id = "turn_deferred_cancel_1";
 
         // 1. Capture PreExecution in journal
@@ -9855,7 +9856,7 @@ mod session_mentions_integration {
             parent_turn_id: None,
             user_message: "Prompt before deferred cancel",
             workspace: None,
-            created_at_ms: now_ms(),
+            created_at_ms: crate::service::journal_now_ms(),
         };
         journal.capture_pre_turn(&pre_record).await.unwrap();
 
@@ -9871,12 +9872,12 @@ mod session_mentions_integration {
 
         let result = orchestrator
             .run_user_turn(crate::turn_orchestrator::TurnStartInput {
-                conversation: conv.clone(),
+                conversation: conversation_row.clone(),
                 turn_id: turn_id.to_string(),
                 content: "Prompt before deferred cancel".to_string(),
                 files: vec![],
                 inject_skills: vec![],
-                build_options: svc.build_task_options(&conv, None).await.unwrap(),
+                build_options: svc.build_task_options(&conversation_row).await.unwrap(),
                 stored_workspace: String::new(),
                 turn_claim,
                 user_id: "user_1".to_string(),
