@@ -163,6 +163,7 @@ pub struct StreamRelay {
     msg_id: String,
     turn_id: String,
     user_id: String,
+    repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Option<Arc<dyn SkillResolver>>,
     allowed_skill_names: Vec<String>,
@@ -183,13 +184,19 @@ impl StreamRelay {
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
-        let adapter =
-            StreamPersistenceAdapter::new(user_id.clone(), conversation_id.clone(), msg_id.clone(), repo, None);
+        let adapter = StreamPersistenceAdapter::new(
+            user_id.clone(),
+            conversation_id.clone(),
+            msg_id.clone(),
+            repo.clone(),
+            None,
+        );
         Self {
             conversation_id,
             msg_id,
             turn_id,
             user_id,
+            repo,
             broadcaster,
             skill_resolver: None,
             allowed_skill_names: Vec::new(),
@@ -663,12 +670,51 @@ impl StreamRelay {
                             // turns; inside a turn it is pure bookkeeping. Never
                             // forwarded to the WebSocket.
                         }
-                        // NOTE: AcpSessionInfo (agent session titles) is deliberately
-                        // NOT consumed here. Titles arrive at session-open and at the
-                        // turn's final instant (pi/omp race the relay's exit by ~1ms;
-                        // claude replies seconds after Finish), so the per-instance
-                        // BackgroundStreamWatcher is the single gate-free consumer.
-                        // The frame still reaches the frontend via the catch-all.
+                        // Agent session titles. The BackgroundStreamWatcher is the
+                        // between-turns consumer, but while it lends its receiver to
+                        // an orphan-turn relay THIS relay is the only consumer — live
+                        // 2026-08-19 (conv a7f2838a): claude's generate_session_title
+                        // reply landed 0.6s after a CLI-initiated turn opened, the
+                        // frame was dropped here, and the one-shot latch was already
+                        // completed (no retry) — the placeholder name stuck forever.
+                        // apply_agent_title is idempotent (same-title no-op) and
+                        // name_source-guarded, so watcher+relay double-apply is safe.
+                        AgentStreamEvent::AcpSessionInfo(payload) => {
+                            if let Some(title) = payload
+                                .get("title")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::trim)
+                                .filter(|t| !t.is_empty())
+                                && let Err(e) = crate::service::apply_agent_title(
+                                    &self.repo,
+                                    &self.broadcaster,
+                                    &self.user_id,
+                                    &self.conversation_id,
+                                    title,
+                                    "relay",
+                                )
+                                .await
+                            {
+                                warn!(
+                                    conversation_id = %self.conversation_id,
+                                    error = %e,
+                                    "agent session title apply failed (relay)"
+                                );
+                            }
+                            // The raw frame still reaches the frontend via message.stream.
+                            self.forward_to_websocket(&event);
+                        }
+                        AgentStreamEvent::Plan(data) => {
+                            // A plan is a side-channel SNAPSHOT, not turn work. It
+                            // deliberately does NOT set `saw_tool_or_side_effect` (that
+                            // would make an otherwise-replayable turn look unsafe to
+                            // retry) and does NOT close the active text segment — a plan
+                            // refresh lands mid-reply and would otherwise shatter that
+                            // reply into a fresh bubble, the same reasoning as the
+                            // WorkflowProgress arm above.
+                            self.forward_to_websocket(&event);
+                            self.adapter.persist_plan(data, &self.turn_id).await;
+                        }
                         _ => {
                             self.forward_to_websocket(&event);
                         }
@@ -1197,8 +1243,15 @@ mod tests {
         }
     }
 
+    /// Live 2026-08-19 (conv a7f2838a): claude's `generate_session_title` reply
+    /// landed 0.6s after the BackgroundStreamWatcher lent its receiver to a
+    /// CLI-initiated orphan turn — the relay was the ONLY consumer of the title
+    /// frame and dropped it, and the one-shot latch was already completed, so
+    /// the conversation kept its placeholder name forever. The relay must apply
+    /// titles itself (apply_agent_title is idempotent and name_source-guarded,
+    /// so watcher+relay double-apply is a harmless no-op).
     #[tokio::test]
-    async fn acp_session_info_is_forwarded_but_never_renames_at_relay_level() {
+    async fn acp_session_info_applies_agent_title_at_relay_level() {
         let repo = Arc::new(RecordingRepo::new());
         *repo.conversation.lock().unwrap() = Some(agent_title_test_row("first message placeholder", None));
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
@@ -1222,15 +1275,12 @@ mod tests {
         let outcome = relay.consume(rx).await;
         assert_eq!(outcome.terminal, RelayTerminal::Finish);
 
-        // The relay must NOT rename (the BackgroundStreamWatcher is the single
-        // title consumer — relay-side apply raced its own exit and double-applied).
+        let renamed = repo.conversation_updates.lock().unwrap().iter().any(|(id, u)| {
+            id == "conv-1" && u.name.as_deref() == Some("Fix login bug") && u.name_source.as_deref() == Some("agent")
+        });
         assert!(
-            repo.conversation_updates
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|(_, u)| u.name.is_none()),
-            "relay must not rename"
+            renamed,
+            "relay must apply the agent title (rename + name_source='agent')"
         );
         // The raw frame still reaches the frontend via message.stream.
         let mut saw_forward = false;
@@ -1240,6 +1290,39 @@ mod tests {
             }
         }
         assert!(saw_forward, "AcpSessionInfo frame must still be forwarded");
+    }
+
+    #[tokio::test]
+    async fn acp_session_info_never_renames_user_owned_name() {
+        let repo = Arc::new(RecordingRepo::new());
+        *repo.conversation.lock().unwrap() = Some(agent_title_test_row("my name", Some("user")));
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
+            "title": "Fix login bug"
+        })))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        relay.consume(rx).await;
+
+        assert!(
+            repo.conversation_updates
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, u)| u.name.is_none()),
+            "a user-owned name must never be overwritten by an agent title"
+        );
     }
 
     #[tokio::test]
@@ -2460,6 +2543,68 @@ mod tests {
     }
 
     // ── Tool persistence tests ────────────────────────────────────
+
+    /// A plan snapshot must reach the DB, not just the WebSocket: a turn that
+    /// keeps running in the background has to rehydrate its plan bar when the
+    /// user comes back to the conversation.
+    ///
+    /// One row per turn, upserted — a plan is a FULL-REPLACEMENT snapshot, so a
+    /// second frame overwrites the first rather than stacking a second card.
+    #[tokio::test]
+    async fn run_plan_persists_message() {
+        use aionui_ai_agent::protocol::events::session_updates::PlanEventData;
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Plan(PlanEventData {
+            session_id: None,
+            entries: vec![json!({"content": "step one", "status": "pending"})],
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Plan(PlanEventData {
+            session_id: None,
+            entries: vec![json!({"content": "step one", "status": "completed"})],
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let plans: Vec<_> = inserts.iter().filter(|m| m.r#type == "plan").collect();
+        assert_eq!(plans.len(), 1, "one row per turn, not one per frame: {inserts:?}");
+
+        let row = plans[0];
+        assert_eq!(row.id, "plan:asst-1");
+        // BARE msg_id: the live WS frame carries the turn msg_id, and the
+        // renderer dedupes history against live frames on `${type}:${msg_id}`.
+        assert_eq!(row.msg_id.as_deref(), Some("asst-1"));
+
+        let updates = repo.take_updates();
+        let (_, upd) = updates
+            .iter()
+            .find(|(id, _)| id == "plan:asst-1")
+            .expect("the second frame must upsert the same row");
+
+        let content: serde_json::Value = serde_json::from_str(upd.content.as_deref().unwrap()).unwrap();
+        assert_eq!(content["entries"][0]["status"], "completed");
+        // turn_id rides inside content (the column set is fixed); the plan bar
+        // gates on it matching the running turn.
+        assert_eq!(content["turn_id"], "turn-1");
+    }
 
     #[tokio::test]
     async fn run_tool_call_persists_message() {

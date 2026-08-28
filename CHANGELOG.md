@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.1.72](https://github.com/iOfficeAI/AionCore/compare/v0.1.71...v0.1.72) (2026-08-24)
+
+
+### Features
+
+* **auth:** account/secret CLI and decoupled encryption root ([#917](https://github.com/iOfficeAI/AionCore/issues/917)) ([0251be7](https://github.com/iOfficeAI/AionCore/commit/0251be76481c56283edbe067bfac548d7d45d534))
+* **conversation:** persist plan snapshots and expose them for rehydration ([#916](https://github.com/iOfficeAI/AionCore/issues/916)) ([b2f12e9](https://github.com/iOfficeAI/AionCore/commit/b2f12e952ec8e71ed37f6240108998c9d7b016a1))
+* **sidebar:** tear down agent processes on archive ([#925](https://github.com/iOfficeAI/AionCore/issues/925)) ([7ac84f9](https://github.com/iOfficeAI/AionCore/commit/7ac84f93c5f81e1b1cc41f8119c089df72d63afc))
+
+
+### Bug Fixes
+
+* **auth:** extend JWT TTL to 30d to match cookie ([#918](https://github.com/iOfficeAI/AionCore/issues/918)) ([ecbedfa](https://github.com/iOfficeAI/AionCore/commit/ecbedfa622e80b7141cf1f0ab7dd007b23d1714d))
+* **claude:** apply model selection in-band so it matches the claude CLI ([#928](https://github.com/iOfficeAI/AionCore/issues/928)) ([706a2eb](https://github.com/iOfficeAI/AionCore/commit/706a2ebec8bb33f48e6d2a5fd93a72d91c982d01))
+* **cli:** register unindexed top-level subcommands in the capability index ([#929](https://github.com/iOfficeAI/AionCore/issues/929)) ([c490161](https://github.com/iOfficeAI/AionCore/commit/c490161df4ee7ab34830e81a67473d416ca78f03))
+
+
+### Performance Improvements
+
+* slim auto-inject skill descriptions to the injection budget ([#930](https://github.com/iOfficeAI/AionCore/issues/930)) ([9b7e4ce](https://github.com/iOfficeAI/AionCore/commit/9b7e4cee9c14faabb4965bc364e3a093c1813e61))
+
+## [0.1.71](https://github.com/iOfficeAI/AionCore/compare/v0.1.70...v0.1.71) (2026-08-21)
+
+
+### Features
+
+* **project:** add fs/remount to rebuild stale mounts ([#910](https://github.com/iOfficeAI/AionCore/issues/910)) ([345f70b](https://github.com/iOfficeAI/AionCore/commit/345f70b3d4cee250ef12a7efa425e78f5f11960e))
+* **session-message:** deliver messages across a user's conversations ([#914](https://github.com/iOfficeAI/AionCore/issues/914)) ([f2b490f](https://github.com/iOfficeAI/AionCore/commit/f2b490f821fbc781b248d497e2955a9869213b02))
+* **sidebar:** archive foundation and aggregated read model ([#911](https://github.com/iOfficeAI/AionCore/issues/911)) ([8d6f6cc](https://github.com/iOfficeAI/AionCore/commit/8d6f6ccdbbadd69fb45a60b5cc135f256bd7359b))
+
+
+### Bug Fixes
+
+* **app:** fall back to default log dir when custom log dir is unusable (AIONUI-231) ([#898](https://github.com/iOfficeAI/AionCore/issues/898)) ([a2391ae](https://github.com/iOfficeAI/AionCore/commit/a2391ae68fe3f0408b1ade052031ba458bfcba63))
+* **claude:** append the assistant preset instead of replacing the system prompt ([#900](https://github.com/iOfficeAI/AionCore/issues/900)) ([b4543b4](https://github.com/iOfficeAI/AionCore/commit/b4543b471b06e3aa1159339dc15e137773a86c27))
+* **codex:** send the assistant preset as developerInstructions, not baseInstructions ([#897](https://github.com/iOfficeAI/AionCore/issues/897)) ([a3d47a9](https://github.com/iOfficeAI/AionCore/commit/a3d47a91de714f6d5b6f2b5339d14b1d84ebfbbd))
+* **conversation:** apply agent session titles at the relay level ([#896](https://github.com/iOfficeAI/AionCore/issues/896)) ([1a2c86a](https://github.com/iOfficeAI/AionCore/commit/1a2c86a8a702aa1d7aa081114da93ac3c734adfc))
+* **extension:** bound the builtin-skills materialize lock acquisition (AIONUI-168) ([#903](https://github.com/iOfficeAI/AionCore/issues/903)) ([b584da0](https://github.com/iOfficeAI/AionCore/commit/b584da01e1608da15438264e34ea506b4d947d95))
+* **project:** keep mounted targets when one fs/subscribe target fails (AIONUI-236) ([#902](https://github.com/iOfficeAI/AionCore/issues/902)) ([2f5edd4](https://github.com/iOfficeAI/AionCore/commit/2f5edd4151ed0d6ce59e8491068c95b0578f5c58))
+* **runtime:** log npm/npx probe stderr and missing-executable snapshot (AIONUI-62) ([#904](https://github.com/iOfficeAI/AionCore/issues/904)) ([9124b20](https://github.com/iOfficeAI/AionCore/commit/9124b2078cdd3f5029553a0a3ee3d177b1b998d9))
+
 ## [0.1.70](https://github.com/iOfficeAI/AionCore/compare/v0.1.69...v0.1.70) (2026-08-19)
 
 

@@ -9,6 +9,7 @@ members = [
     "crates/aionui-runtime",
     "crates/aionui-process",
     "crates/aionui-session",
+    "crates/aionui-session-message",
     "crates/aionui-auth",
     "crates/aionui-system",
     "crates/aionui-file",
@@ -22,13 +23,14 @@ members = [
     "crates/aionui-team-prompts",
     "crates/aionui-team",
     "crates/aionui-project",
+    "crates/aionui-sidebar",
     "crates/aionui-cron",
     "crates/aionui-assistant",
     "crates/aionui-app",
 ]
 
 [workspace.package]
-version = "0.1.70"
+version = "0.1.72"
 edition = "2024"
 license = "MIT"
 
@@ -42,6 +44,7 @@ aionui-realtime = { path = "crates/aionui-realtime" }
 aionui-runtime = { path = "crates/aionui-runtime" }
 aionui-process = { path = "crates/aionui-process" }
 aionui-session = { path = "crates/aionui-session" }
+aionui-session-message = { path = "crates/aionui-session-message" }
 aionui-auth = { path = "crates/aionui-auth" }
 aionui-system = { path = "crates/aionui-system" }
 aionui-file = { path = "crates/aionui-file" }
@@ -55,6 +58,7 @@ aionui-channel = { path = "crates/aionui-channel" }
 aionui-team-prompts = { path = "crates/aionui-team-prompts" }
 aionui-team = { path = "crates/aionui-team" }
 aionui-project = { path = "crates/aionui-project" }
+aionui-sidebar = { path = "crates/aionui-sidebar" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
@@ -95,6 +99,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "regis
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+# No-echo password prompt for the `user set-password` bootstrap CLI (win/mac/linux).
+rpassword = "7"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
