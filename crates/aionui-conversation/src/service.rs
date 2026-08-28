@@ -4163,7 +4163,28 @@ impl ConversationService {
             }
 
             info!(msg_id = %user_msg_id, "User message persisted");
+        }
 
+        // Capture pre-turn in TurnJournal before WebSocket broadcast and worker launch.
+        let normalized_ws = crate::turn_journal::normalize_workspace_label(row.workspace.as_deref());
+        let pre_record = crate::turn_journal::PreTurnRecord {
+            user_id,
+            conversation_id,
+            turn_id: &turn_id,
+            parent_turn_id: None,
+            user_message: &resolved.content,
+            workspace: normalized_ws.as_deref(),
+            created_at_ms: user_msg.created_at,
+        };
+        if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
+            warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal; failing closed");
+            let mut turn_claim = turn_claim;
+            let was_deleting = turn_claim.release();
+            self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting).await;
+            return Err(ConversationError::internal(format!("Failed to capture pre-turn in turn journal: {e}")));
+        }
+
+        if !was_fallback {
             self.broadcaster.broadcast(WebSocketMessage::new(
                 "message.userCreated",
                 serde_json::json!({
@@ -4178,7 +4199,6 @@ impl ConversationService {
                 }),
             ));
         }
-
         // Build task options from conversation row
         let mut build_opts = match self.build_task_options(&row).await {
             Ok(opts) => opts,
@@ -4190,6 +4210,25 @@ impl ConversationService {
                 );
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
+                let failure_outcome = crate::turn_journal::TerminalOutcomeRecord {
+                    status: crate::turn_journal::TurnTerminalStatus::Failed,
+                    assistant_message: None,
+                    token_usage: None,
+                    attempts: 0,
+                    last_attempt_id: None,
+                    retry_summaries: None,
+                    error_metadata: Some(serde_json::json!({
+                        "stage": "worker_build",
+                        "error": err.to_string(),
+                        "error_code": top_level_code,
+                        "assistant_message": "unavailable",
+                        "token_usage": "unavailable"
+                    })),
+                    finished_at_ms: now_ms(),
+                };
+                if let Err(je) = self.turn_journal.reconcile_terminal(user_id, conversation_id, &turn_id, &failure_outcome).await {
+                    error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on build failure; turn remains open for startup recovery reconciliation");
+                }
                 self.persist_and_broadcast_send_failure_tip(
                     user_id,
                     conversation_id,
@@ -4292,6 +4331,27 @@ impl ConversationService {
                 return Err(e.into());
             }
         }
+
+        // 1. Capture pre-turn in TurnJournal BEFORE emitting on_started or launching worker (fail-closed)
+        let normalized_ws = crate::turn_journal::normalize_workspace_label(row.workspace.as_deref());
+        let pre_record = crate::turn_journal::PreTurnRecord {
+            user_id: &request.user_id,
+            conversation_id: &request.conversation_id,
+            turn_id: &turn_id,
+            parent_turn_id: None,
+            user_message: &request.content,
+            workspace: normalized_ws.as_deref(),
+            created_at_ms: now_ms(),
+        };
+        if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
+            warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal for agent turn; failing closed without invoking on_started");
+            let mut turn_claim = turn_claim;
+            let was_deleting = turn_claim.release();
+            self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting).await;
+            return Err(ConversationError::internal(format!("Failed to capture pre-turn in turn journal: {e}")));
+        }
+
+        // 2. Invoke on_started callback ONLY after pre-turn event is safely captured
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(ConversationAgentTurnStarted {
                 conversation_id: request.conversation_id.clone(),
@@ -4305,6 +4365,25 @@ impl ConversationService {
             Err(err) => {
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
+                let failure_outcome = crate::turn_journal::TerminalOutcomeRecord {
+                    status: crate::turn_journal::TurnTerminalStatus::Failed,
+                    assistant_message: None,
+                    token_usage: None,
+                    attempts: 0,
+                    last_attempt_id: None,
+                    retry_summaries: None,
+                    error_metadata: Some(serde_json::json!({
+                        "stage": "worker_build",
+                        "error": err.to_string(),
+                        "error_code": top_level_code,
+                        "assistant_message": "unavailable",
+                        "token_usage": "unavailable"
+                    })),
+                    finished_at_ms: now_ms(),
+                };
+                if let Err(je) = self.turn_journal.reconcile_terminal(&request.user_id, &request.conversation_id, &turn_id, &failure_outcome).await {
+                    error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on agent turn build failure; turn remains open for startup recovery reconciliation");
+                }
                 self.persist_and_broadcast_send_failure_tip(
                     &request.user_id,
                     &request.conversation_id,
