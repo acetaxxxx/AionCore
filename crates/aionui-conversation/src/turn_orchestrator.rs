@@ -441,7 +441,6 @@ impl ConversationTurnOrchestrator {
         };
         let mut replayed = false;
         let superseding_tips = SupersedingTipTotals::default();
-        let mut replay_started_at = None;
         let mut final_error_message = None;
         let mut auth_failure = false;
         let mut last_attempt_terminal = None;
@@ -522,7 +521,10 @@ impl ConversationTurnOrchestrator {
             {
                 Ok(result) => result,
                 Err(result) => {
-                    let attempt_duration = now_ms().saturating_sub(attempt_started_at);
+                    let attempt_duration: u64 = now_ms()
+                        .saturating_sub(attempt_started_at)
+                        .try_into()
+                        .unwrap_or_default();
                     final_error_message = result.error_message.clone();
                     recorded_attempt_summaries.push(crate::turn_journal::AttemptSummary {
                         attempt_id,
@@ -533,7 +535,10 @@ impl ConversationTurnOrchestrator {
                 }
             };
 
-            let attempt_duration = now_ms().saturating_sub(attempt_started_at);
+            let attempt_duration: u64 = now_ms()
+                .saturating_sub(attempt_started_at)
+                .try_into()
+                .unwrap_or_default();
             last_attempt_terminal = Some(attempt_result.outcome.terminal.clone());
 
             // Track the final attempt's auth signal so the post-loop availability
@@ -599,7 +604,6 @@ impl ConversationTurnOrchestrator {
                         error: replay_error,
                         duration_ms: Some(attempt_duration),
                     });
-                    replay_started_at = Some(now_ms());
                     info!(
                         conversation_id = %conv_id,
                         turn_id = %turn_id,
