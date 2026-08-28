@@ -29,7 +29,7 @@ use aionui_api_types::{
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
-    ProviderWithModel, TimestampMs,
+    ProviderWithModel, TimestampMs, now_ms,
 };
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow,
@@ -52,6 +52,8 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
+use crate::turn_journal::TurnJournal;
+use crate::turn_orchestrator::ConversationTurnStatus;
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
@@ -9788,7 +9790,7 @@ mod session_mentions_integration {
         {
             assert_eq!(turn_id, &send.turn_id);
             assert_eq!(user_message, "hello");
-            if let Some(ref ws) = workspace {
+            if let Some(ws) = workspace {
                 assert!(!ws.contains("/root"), "workspace must be normalized opaque metadata");
             }
         } else {
@@ -9859,7 +9861,8 @@ mod session_mentions_integration {
 
         // 2. Set deferred cancel on runtime state and claim turn
         svc.runtime_state().defer_cancel(&conv.id, turn_id);
-        assert!(svc.runtime_state().is_turn_cancelling(&conv.id, turn_id));
+        assert!(svc.runtime_state().take_deferred_cancel(&conv.id, turn_id));
+        svc.runtime_state().defer_cancel(&conv.id, turn_id);
 
         let turn_claim = svc.runtime_state().try_claim_turn(&conv.id, turn_id).unwrap();
 
@@ -9873,7 +9876,7 @@ mod session_mentions_integration {
                 content: "Prompt before deferred cancel".to_string(),
                 files: vec![],
                 inject_skills: vec![],
-                build_options: BuildTaskOptions::default(),
+                build_options: svc.build_task_options(&conv, None).await.unwrap(),
                 stored_workspace: String::new(),
                 turn_claim,
                 user_id: "user_1".to_string(),
