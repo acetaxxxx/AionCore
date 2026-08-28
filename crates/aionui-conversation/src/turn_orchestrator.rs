@@ -230,44 +230,11 @@ impl ConversationTurnOrchestrator {
         let persistence = self.service.runtime_persistence();
         let runtime_state = self.service.runtime_state();
 
-        // A cancel may have arrived while the task was still being built, when
-        // there was no agent to hand it to (see `ConversationService::cancel`).
-        // Honour it here, BEFORE the prompt goes out: the user withdrew this
-        // turn, so the cleanest outcome is that the CLI never runs at all.
-        //
-        // Ends as Completed, not Failed — a turn the user cancelled is not an
-        // error, and reporting one would surface a red bubble for something
-        // they asked for.
-        if runtime_state.take_deferred_cancel(&input.conv_id, &input.turn_id) {
-            info!(
-                conversation_id = %input.conv_id,
-                turn_id = %input.turn_id,
-                "Applying a cancel that arrived while the agent was still being built"
-            );
-            // Tell the UI the turn is over. Every OTHER terminal on this path is
-            // emitted by the `StreamRelay`, which is built further down — so
-            // returning here without a frame settles the turn on the server and
-            // leaves the client's spinner running until the 15s watchdog.
-            //
-            // Live symptom (agy, 2026-08-12): the conversation produced NO
-            // stream frames at all, not even `start`, and
-            // `live_antigravity_cancel_settles_and_recovers` failed 4/4. agy is
-            // where it shows up because its build is the slowest — probing
-            // models, checking the CLI version, installing the permission hook
-            // and writing the MCP config — so a cancel lands inside it rather
-            // than after it. Nothing about the bug is agy-specific.
-            self.service.broadcast_turn_settled_without_relay(
-                &input.user_id,
-                &input.conv_id,
-                &input.turn_id,
-                &input.msg_id,
-            );
-            return Err(ConversationTurnResult {
-                status: ConversationTurnStatus::Completed,
-                error_message: None,
-            });
-        }
-
+        // Note on Turn Continuation Distinction:
+        // - System Continuation (TurnContinuationPolicy below): internal multi-step tool/agent continuation
+        //   within the SAME logical turn (`turn_id`).
+        // - User Continuation (Follow-up prompts): requires a distinct NEW `turn_id` with `parent_turn_id`
+        //   in PreTurnRecord. (User continuation ingress is handled at the API route layer, not here).
         let mut pending_send = Some((input.send, input.msg_id));
         let mut continuation_count = input.continuation_count;
         let continuation_policy = TurnContinuationPolicy::new(MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN);
@@ -475,13 +442,67 @@ impl ConversationTurnOrchestrator {
         let mut replayed = false;
         let superseding_tips = SupersedingTipTotals::default();
         let mut replay_started_at = None;
-        let mut final_error_message;
+        let mut final_error_message = None;
         let mut auth_failure = false;
+        let mut last_attempt_terminal = None;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
+        // A cancel may have arrived while the task was still being built, when
+        // there was no agent to hand it to (see `ConversationService::cancel`).
+        // Honour it here, BEFORE the prompt goes out: the user withdrew this
+        // turn, so the cleanest outcome is that the CLI never runs at all.
+        //
+        // Ends as Completed, not Failed — a turn the user cancelled is not an
+        // error, and reporting one would surface a red bubble for something
+        // they asked for.
+        if runtime_state.take_deferred_cancel(&conv_id, &turn_id) {
+            info!(
+                conversation_id = %conv_id,
+                turn_id = %turn_id,
+                "Applying a cancel that arrived while the agent was still being built"
+            );
+            let cancel_outcome = crate::turn_journal::TerminalOutcomeRecord {
+                status: crate::turn_journal::TurnTerminalStatus::Cancelled,
+                assistant_message: None,
+                token_usage: None,
+                attempts: 0,
+                last_attempt_id: None,
+                retry_summaries: None,
+                error_metadata: Some(serde_json::json!({
+                    "stage": "pre_stream_cancelled",
+                    "reason": "deferred_cancel",
+                    "assistant_message": "unavailable",
+                    "token_usage": "unavailable"
+                })),
+                finished_at_ms: now_ms(),
+            };
+            if let Err(je) = self.service.turn_journal().reconcile_terminal(&input.user_id, &conv_id, &turn_id, &cancel_outcome).await {
+                error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on deferred cancel; turn remains open for startup recovery reconciliation");
+            }
+            self.service.broadcast_turn_settled_without_relay(
+                &input.user_id,
+                &conv_id,
+                &turn_id,
+                &first_turn_msg_id,
+            );
+            let was_deleting = turn_claim.release_for_turn(&turn_id);
+            self.service
+                .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
+                .await;
+            return ConversationTurnResult {
+                status: ConversationTurnStatus::Completed,
+                error_message: None,
+            };
+        }
+
+        let mut recorded_attempt_summaries: Vec<crate::turn_journal::AttemptSummary> = Vec::new();
+
         let final_failed = loop {
-            let attempt_number = if replayed { 2 } else { 1 };
+            let attempt_number = recorded_attempt_summaries.len() + 1;
+            let attempt_id = format!("{turn_id}-att-{attempt_number}");
+            let attempt_started_at = now_ms();
+
             let attempt_result = match self
                 .run_attempt(TurnAttemptInput {
                     conv_id: conv_id.clone(),
@@ -501,32 +522,54 @@ impl ConversationTurnOrchestrator {
             {
                 Ok(result) => result,
                 Err(result) => {
-                    final_error_message = result.error_message;
-                    break result.status == ConversationTurnStatus::Failed;
+                    let attempt_duration = now_ms().saturating_sub(attempt_started_at);
+                    final_error_message = result.error_message.clone();
+                    recorded_attempt_summaries.push(crate::turn_journal::AttemptSummary {
+                        attempt_id,
+                        error: result.error_message,
+                        duration_ms: Some(attempt_duration),
+                    });
+                    break true;
                 }
             };
+
+            let attempt_duration = now_ms().saturating_sub(attempt_started_at);
+            last_attempt_terminal = Some(attempt_result.outcome.terminal.clone());
 
             // Track the final attempt's auth signal so the post-loop availability
             // write-back can reflect "needs sign-in" (last iteration wins).
             auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
-            if !attempt_result.outcome.terminal.is_error() {
+            if matches!(attempt_result.outcome.terminal, RelayTerminal::Finish) {
                 final_error_message = None;
+                recorded_attempt_summaries.push(crate::turn_journal::AttemptSummary {
+                    attempt_id,
+                    error: None,
+                    duration_ms: Some(attempt_duration),
+                });
                 if replayed {
                     info!(
                         conversation_id = %conv_id,
                         turn_id = %turn_id,
                         attempt = attempt_number,
-                        elapsed_ms = replay_started_at
-                            .map(|started_at| now_ms().saturating_sub(started_at))
-                            .unwrap_or_default(),
+                        elapsed_ms = attempt_duration,
                         "conversation turn auto replay completed"
                     );
                 }
                 break false;
             }
-            final_error_message = turn_attempt_error_message(&attempt_result.summary);
+
+            let attempt_err = turn_attempt_error_message(&attempt_result.summary)
+                .or_else(|| match &attempt_result.outcome.terminal {
+                    RelayTerminal::ChannelClosed => Some("channel_closed_unexpectedly".to_string()),
+                    RelayTerminal::Error { code, .. } => {
+                        code.map(|c| format!("{:?}", c)).or_else(|| Some("relay_error".to_string()))
+                    }
+                    _ => None,
+                });
+            final_error_message = attempt_err.clone();
+
             if replayed {
                 warn!(
                     conversation_id = %conv_id,
@@ -550,6 +593,12 @@ impl ConversationTurnOrchestrator {
 
             match decision {
                 TurnRecoveryDecision::AutoReplayOnce { reason, .. } => {
+                    let replay_error = attempt_err.or_else(|| Some(format!("{:?}", reason)));
+                    recorded_attempt_summaries.push(crate::turn_journal::AttemptSummary {
+                        attempt_id,
+                        error: replay_error,
+                        duration_ms: Some(attempt_duration),
+                    });
                     replay_started_at = Some(now_ms());
                     info!(
                         conversation_id = %conv_id,
@@ -584,6 +633,11 @@ impl ConversationTurnOrchestrator {
                     continue;
                 }
                 TurnRecoveryDecision::None => {
+                    recorded_attempt_summaries.push(crate::turn_journal::AttemptSummary {
+                        attempt_id,
+                        error: attempt_err,
+                        duration_ms: Some(attempt_duration),
+                    });
                     if attempt_result.outcome.attempt.terminal_error_deferred
                         && let Some(data) = attempt_result.outcome.attempt.terminal_error.clone()
                     {
@@ -632,13 +686,63 @@ impl ConversationTurnOrchestrator {
                     .unwrap_or("Agent requires sign-in to run."),
             )
             .await;
-        } else if !final_failed {
+        } else if !final_failed && matches!(last_attempt_terminal, Some(RelayTerminal::Finish)) {
             record_agent_session_success(
                 &self.service,
                 &input.user_id,
                 availability_agent_id(&input.build_options).as_deref(),
             )
             .await;
+        }
+
+        let terminal_status = if final_failed {
+            crate::turn_journal::TurnTerminalStatus::Failed
+        } else {
+            match last_attempt_terminal {
+                Some(RelayTerminal::Finish) => crate::turn_journal::TurnTerminalStatus::Success,
+                Some(RelayTerminal::ChannelClosed) => {
+                    // Unknown/unexpected channel close is mapped to Failed with error metadata
+                    crate::turn_journal::TurnTerminalStatus::Failed
+                }
+                Some(RelayTerminal::Error { .. }) => crate::turn_journal::TurnTerminalStatus::Failed,
+                None => crate::turn_journal::TurnTerminalStatus::Success,
+            }
+        };
+        let attempt_count = recorded_attempt_summaries.len() as u32;
+        let attempt_count = if attempt_count == 0 { 1 } else { attempt_count };
+        let last_attempt_id_str = format!("{turn_id}-att-{attempt_count}");
+
+        let retry_summaries = if recorded_attempt_summaries.len() > 1 {
+            Some(recorded_attempt_summaries)
+        } else {
+            None
+        };
+
+        let mut error_meta = serde_json::Map::new();
+        if let Some(ref err) = final_error_message {
+            error_meta.insert("error".to_string(), serde_json::Value::String(err.clone()));
+        }
+        if matches!(last_attempt_terminal, Some(RelayTerminal::ChannelClosed)) {
+            error_meta.insert("reason".to_string(), serde_json::Value::String("channel_closed_unexpectedly".to_string()));
+            if final_error_message.is_none() {
+                final_error_message = Some("stream_channel_closed_unexpectedly".to_string());
+            }
+        }
+        error_meta.insert("assistant_message".to_string(), serde_json::Value::String("unavailable".to_string()));
+        error_meta.insert("token_usage".to_string(), serde_json::Value::String("unavailable".to_string()));
+
+        let final_outcome = crate::turn_journal::TerminalOutcomeRecord {
+            status: terminal_status,
+            assistant_message: None,
+            token_usage: None,
+            attempts: attempt_count,
+            last_attempt_id: Some(&last_attempt_id_str),
+            retry_summaries,
+            error_metadata: Some(serde_json::Value::Object(error_meta)),
+            finished_at_ms: now_ms(),
+        };
+        if let Err(je) = self.service.turn_journal().reconcile_terminal(&input.user_id, &conv_id, &turn_id, &final_outcome).await {
+            error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome in turn journal; turn remains open for startup recovery reconciliation");
         }
 
         let was_deleting = turn_claim.release_for_turn(&turn_id);
