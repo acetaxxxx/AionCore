@@ -71,6 +71,12 @@ const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 
+/// Journal records use unsigned millisecond timestamps while the existing
+/// database/common timestamp API is signed. Clamp defensively at this boundary.
+pub(crate) fn journal_now_ms() -> u64 {
+    now_ms().try_into().unwrap_or_default()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
     #[serde(default)]
@@ -3760,7 +3766,7 @@ impl ConversationService {
             &resolved.content,
             crate::turn_journal::MidTurnEventKind::Rejected,
             Some(reason),
-            created_at,
+            journal_now_ms(),
         );
         self.record_mid_turn_event(&rejected_event).await?;
 
@@ -3807,6 +3813,7 @@ impl ConversationService {
         let persisted = self
             .runtime_persistence()
             .allows(conversation_id, RuntimeWriteKind::UserMessage);
+        let created_at = now_ms();
         if persisted {
             let user_msg = aionui_db::models::MessageRow {
                 id: user_msg_id.clone(),
@@ -3817,7 +3824,7 @@ impl ConversationService {
                 position: Some("right".into()),
                 status: Some(MIDTURN_STATUS_QUEUED.into()),
                 hidden,
-                created_at: now_ms(),
+                created_at,
                 backend_turn_id: None,
             };
             if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
@@ -3839,7 +3846,7 @@ impl ConversationService {
             &resolved.content,
             crate::turn_journal::MidTurnEventKind::Accepted,
             None,
-            now_ms(),
+            journal_now_ms(),
         );
         if let Err(error) = self.record_mid_turn_event(&accepted_event).await {
             if persisted {
@@ -3875,7 +3882,7 @@ impl ConversationService {
                     "position": "right",
                     "status": MIDTURN_STATUS_QUEUED,
                     "hidden": hidden,
-                    "created_at": user_msg.created_at,
+                    "created_at": created_at,
                 }),
             ));
         }
@@ -4166,7 +4173,9 @@ impl ConversationService {
         }
 
         // Capture pre-turn in TurnJournal before WebSocket broadcast and worker launch.
-        let normalized_ws = crate::turn_journal::normalize_workspace_label(row.workspace.as_deref());
+        let normalized_ws = crate::turn_journal::normalize_workspace_label(
+            crate::session_mentions::workspace_from_extra(&row.extra).as_deref(),
+        );
         let pre_record = crate::turn_journal::PreTurnRecord {
             user_id,
             conversation_id,
@@ -4174,7 +4183,7 @@ impl ConversationService {
             parent_turn_id: None,
             user_message: &resolved.content,
             workspace: normalized_ws.as_deref(),
-            created_at_ms: user_msg.created_at,
+            created_at_ms: journal_now_ms(),
         };
         if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
             warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal; failing closed");
@@ -4182,6 +4191,37 @@ impl ConversationService {
             let was_deleting = turn_claim.release();
             self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting).await;
             return Err(ConversationError::internal(format!("Failed to capture pre-turn in turn journal: {e}")));
+        }
+
+        // A steer rejection is known only after the original active-turn
+        // delivery attempt. When that source turn has ended, this new turn
+        // carries the relationship metadata before any worker launch. The
+        // source turn id is never reused after its claim ended.
+        if let Some(source_turn_id) = fallback_source_turn.as_deref() {
+            for event_kind in [
+                crate::turn_journal::MidTurnEventKind::SteerRejected,
+                crate::turn_journal::MidTurnEventKind::Fallback,
+            ] {
+                let event = crate::turn_journal::MidTurnRecord::new(
+                    user_id,
+                    conversation_id,
+                    &turn_id,
+                    Some(source_turn_id),
+                    None,
+                    Some(&user_msg_id),
+                    &resolved.content,
+                    event_kind,
+                    Some("source_turn_ended"),
+                    journal_now_ms(),
+                );
+                if let Err(error) = self.record_mid_turn_event(&event).await {
+                    let mut turn_claim = turn_claim;
+                    let was_deleting = turn_claim.release();
+                    self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
+                        .await;
+                    return Err(error);
+                }
+            }
         }
 
         if !was_fallback {
@@ -4224,7 +4264,7 @@ impl ConversationService {
                         "assistant_message": "unavailable",
                         "token_usage": "unavailable"
                     })),
-                    finished_at_ms: now_ms(),
+                    finished_at_ms: journal_now_ms(),
                 };
                 if let Err(je) = self.turn_journal.reconcile_terminal(user_id, conversation_id, &turn_id, &failure_outcome).await {
                     error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on build failure; turn remains open for startup recovery reconciliation");
@@ -4333,7 +4373,9 @@ impl ConversationService {
         }
 
         // 1. Capture pre-turn in TurnJournal BEFORE emitting on_started or launching worker (fail-closed)
-        let normalized_ws = crate::turn_journal::normalize_workspace_label(row.workspace.as_deref());
+        let normalized_ws = crate::turn_journal::normalize_workspace_label(
+            crate::session_mentions::workspace_from_extra(&row.extra).as_deref(),
+        );
         let pre_record = crate::turn_journal::PreTurnRecord {
             user_id: &request.user_id,
             conversation_id: &request.conversation_id,
@@ -4341,7 +4383,7 @@ impl ConversationService {
             parent_turn_id: None,
             user_message: &request.content,
             workspace: normalized_ws.as_deref(),
-            created_at_ms: now_ms(),
+            created_at_ms: journal_now_ms(),
         };
         if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
             warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal for agent turn; failing closed without invoking on_started");
@@ -4379,7 +4421,7 @@ impl ConversationService {
                         "assistant_message": "unavailable",
                         "token_usage": "unavailable"
                     })),
-                    finished_at_ms: now_ms(),
+                    finished_at_ms: journal_now_ms(),
                 };
                 if let Err(je) = self.turn_journal.reconcile_terminal(&request.user_id, &request.conversation_id, &turn_id, &failure_outcome).await {
                     error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on agent turn build failure; turn remains open for startup recovery reconciliation");

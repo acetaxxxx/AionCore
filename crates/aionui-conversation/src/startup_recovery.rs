@@ -94,7 +94,7 @@ impl ConversationService {
         };
         let options = crate::turn_journal::StartupRecoveryOptions {
             grace_window_ms,
-            now_ms: aionui_common::now_ms(),
+            now_ms: crate::service::journal_now_ms(),
         };
         match crate::turn_journal::internal_startup_recovery(self.turn_journal.as_ref(), data_dir, &options).await {
             Ok(count) => {
