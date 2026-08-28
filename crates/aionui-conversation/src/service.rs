@@ -4062,6 +4062,15 @@ impl ConversationService {
             // gate. Same authoritative source the runtime summary's
             // `pending_confirmations` reads (`get_confirmations`).
             if !agent.get_confirmations().is_empty() {
+                // Preserve the pre-B5 running-conversation conflict while the
+                // claim is still active. A rejected receipt is only meaningful
+                // after that claim has ended; persisting one here would turn a
+                // direct 409 into a user message/broadcast side effect.
+                if self.runtime_state.is_claimed(conversation_id) {
+                    return Err(ConversationError::Busy {
+                        reason: format!("conversation {conversation_id} is already running"),
+                    });
+                }
                 // Once per turn, not once per attempt: the cross-session
                 // drainer retries a queued delivery every second and each
                 // retry is refused identically, which turned one unanswered
