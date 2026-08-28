@@ -1,13 +1,17 @@
 # Compile the Linux AionCore binary once in the public source repository.
-FROM node:22-slim AS builder
+FROM node:22-slim AS build-base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_PROFILE_RELEASE_OPT_LEVEL="s" \
     CARGO_PROFILE_RELEASE_STRIP="true"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl python3 build-essential \
+    && apt-get install -y --no-install-recommends ca-certificates git curl python3 build-essential \
     && rm -rf /var/lib/apt/lists/*
+
+RUN git --version
+
+FROM build-base AS builder
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -20,4 +24,3 @@ RUN cargo build --release --locked -p aionui-app
 FROM scratch AS artifact
 COPY --from=builder /app/AionCore/target/release/aioncore /aioncore
 COPY LICENSE /licenses/AionCore/LICENSE
-
