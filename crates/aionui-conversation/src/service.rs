@@ -351,6 +351,12 @@ pub struct ConversationService {
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
+
+    turn_journal: Arc<dyn crate::turn_journal::TurnJournal>,
+    /// Private mid-turn event coordinator sharing the production journal
+    /// instance (and therefore its lock/root) with the public seam.
+    mid_turn_coordinator: Option<Arc<crate::turn_journal::MidTurnCoordinator>>,
+    journal_data_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -426,7 +432,57 @@ impl ConversationService {
             conversation_repo,
             agent_metadata_repo,
             acp_session_repo,
+            turn_journal: Arc::new(crate::turn_journal::InMemoryTurnJournal::new()),
+            mid_turn_coordinator: None,
+            journal_data_dir: None,
         }
+    }
+
+    pub fn with_turn_journal(mut self, turn_journal: Arc<dyn crate::turn_journal::TurnJournal>) -> Self {
+        self.turn_journal = turn_journal;
+        self.mid_turn_coordinator = None;
+        self
+    }
+
+    /// Installs the production filesystem journal for both public lifecycle
+    /// methods and the private mid-turn coordinator. Keeping one Arc here is
+    /// essential: startup recovery and live delivery must share locks and root.
+    pub fn with_filesystem_turn_journal(
+        mut self,
+        journal: Arc<crate::turn_journal::FilesystemTurnJournal>,
+    ) -> Self {
+        self.turn_journal = journal.clone();
+        self.mid_turn_coordinator = Some(Arc::new(crate::turn_journal::MidTurnCoordinator::filesystem(journal)));
+        self
+    }
+
+    pub fn with_journal_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.journal_data_dir = Some(data_dir.into());
+        self
+    }
+
+    pub fn turn_journal(&self) -> Arc<dyn crate::turn_journal::TurnJournal> {
+        Arc::clone(&self.turn_journal)
+    }
+
+    async fn record_mid_turn_event(
+        &self,
+        record: &crate::turn_journal::MidTurnRecord,
+    ) -> Result<(), ConversationError> {
+        let Some(coordinator) = &self.mid_turn_coordinator else {
+            // Test/custom TurnJournal implementations predate the private
+            // mid-turn operation. Production composition always installs the
+            // filesystem coordinator; preserve those adapters' API behavior.
+            return Ok(());
+        };
+        coordinator
+            .record(record)
+            .await
+            .map_err(|error| ConversationError::internal(format!("mid-turn journal write failed: {error}")))
+    }
+
+    pub fn journal_data_dir(&self) -> Option<&Path> {
+        self.journal_data_dir.as_deref()
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -3580,7 +3636,10 @@ enum MidturnOutcome {
     /// through the normal path, reusing the already-persisted message row
     /// (`Some`) or persisting normally (`None` when runtime persistence
     /// disallowed the write).
-    TurnEnded { user_msg_id: Option<String> },
+    TurnEnded {
+        user_msg_id: Option<String>,
+        source_turn_id: String,
+    },
 }
 
 /// Is this delivery error codex's "the turn already ended" steer rejection?
@@ -3658,6 +3717,71 @@ pub(crate) async fn apply_message_receipt(
 }
 
 impl ConversationService {
+    /// Persist and surface a rejected mid-turn receipt without sending the
+    /// request to the agent/memory. The journal is durable before the UI sees
+    /// the receipt, matching accepted mid-turn ordering.
+    async fn persist_rejected_mid_turn_receipt(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        resolved: &ResolvedChatMessage,
+        hidden: bool,
+        active_turn_id: &str,
+        reason: &str,
+    ) -> Result<(), ConversationError> {
+        let msg_id = Self::mint_msg_id();
+        let persisted = self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::UserMessage);
+        let created_at = now_ms();
+        if persisted {
+            let user_msg = aionui_db::models::MessageRow {
+                id: msg_id.clone(),
+                conversation_id: conversation_id.to_owned(),
+                msg_id: Some(msg_id.clone()),
+                r#type: "text".into(),
+                content: serde_json::json!({ "content": resolved.content }).to_string(),
+                position: Some("right".into()),
+                status: Some("error".into()),
+                hidden,
+                created_at,
+                backend_turn_id: None,
+            };
+            self.conversation_repo.insert_message(user_id, &user_msg).await?;
+        }
+
+        let rejected_event = crate::turn_journal::MidTurnRecord::new(
+            user_id,
+            conversation_id,
+            active_turn_id,
+            None,
+            None,
+            Some(&msg_id),
+            &resolved.content,
+            crate::turn_journal::MidTurnEventKind::Rejected,
+            Some(reason),
+            created_at,
+        );
+        self.record_mid_turn_event(&rejected_event).await?;
+
+        if persisted {
+            self.broadcaster.broadcast(WebSocketMessage::new(
+                "message.userCreated",
+                serde_json::json!({
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "msg_id": &msg_id,
+                    "content": &resolved.content,
+                    "position": "right",
+                    "status": "error",
+                    "hidden": hidden,
+                    "created_at": created_at,
+                }),
+            ));
+        }
+        Ok(())
+    }
+
     /// B5: deliver a message into the RUNNING turn (no claim, no new turn id).
     ///
     /// Persists the user message with the pending-receipt status
@@ -3701,6 +3825,43 @@ impl ConversationService {
                 return Err(e.into());
             }
             info!(msg_id = %user_msg_id, "Mid-turn user message persisted");
+        }
+
+        // Journal the acceptance before any UI broadcast or agent delivery.
+        // The compact event stores only a message reference and content hash.
+        let accepted_event = crate::turn_journal::MidTurnRecord::new(
+            user_id,
+            conversation_id,
+            &active_turn_id,
+            None,
+            None,
+            Some(&user_msg_id),
+            &resolved.content,
+            crate::turn_journal::MidTurnEventKind::Accepted,
+            None,
+            now_ms(),
+        );
+        if let Err(error) = self.record_mid_turn_event(&accepted_event).await {
+            if persisted {
+                // Keep the persisted receipt deterministic without emitting a
+                // user-created event that would imply worker delivery.
+                let _ = self
+                    .conversation_repo
+                    .update_message(
+                        user_id,
+                        conversation_id,
+                        &user_msg_id,
+                        &aionui_db::MessageRowUpdate {
+                            content: None,
+                            status: Some(Some("error".to_owned())),
+                            hidden: None,
+                        },
+                    )
+                    .await;
+            }
+            return Err(error);
+        }
+        if persisted {
             self.broadcaster.broadcast(WebSocketMessage::new(
                 "message.userCreated",
                 serde_json::json!({
@@ -3764,6 +3925,7 @@ impl ConversationService {
                 }
                 Ok(MidturnOutcome::TurnEnded {
                     user_msg_id: persisted.then_some(user_msg_id),
+                    source_turn_id: active_turn_id,
                 })
             }
             Err(e) => {
@@ -3883,6 +4045,7 @@ impl ConversationService {
         // with the active turn's id. Every other case (including the 409 for
         // non-supporting backends) is unchanged and handled by the claim below.
         let mut fallback_user_msg: Option<String> = None;
+        let mut fallback_source_turn: Option<String> = None;
         if let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
             && let Some(agent) = task_manager.get_task(conversation_id)
             && agent.supports_midturn_delivery()
@@ -3911,6 +4074,19 @@ impl ConversationService {
                         "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
                     );
                 }
+                self
+                    .persist_rejected_mid_turn_receipt(
+                        user_id,
+                        conversation_id,
+                        &resolved,
+                        req.hidden,
+                        &active_turn_id,
+                        "confirmation_required",
+                    )
+                    .await?;
+                return Err(ConversationError::Busy {
+                    reason: "conversation requires confirmation before accepting a mid-turn message".into(),
+                });
             } else {
                 match self
                     .deliver_midturn_message(
@@ -3927,7 +4103,13 @@ impl ConversationService {
                     MidturnOutcome::Delivered(response) => return Ok(response),
                     // codex rejected the steer because the turn just ended → fall
                     // through and open a NEW turn for the already-persisted message.
-                    MidturnOutcome::TurnEnded { user_msg_id } => fallback_user_msg = user_msg_id,
+                    MidturnOutcome::TurnEnded {
+                        user_msg_id,
+                        source_turn_id,
+                    } => {
+                        fallback_user_msg = user_msg_id;
+                        fallback_source_turn = Some(source_turn_id);
+                    }
                 }
             }
         }
