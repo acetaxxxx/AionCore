@@ -4,12 +4,12 @@
 //! and reconciling final terminal outcomes, while maintaining strict user and conversation
 //! isolation, complete-payload idempotency, concurrency safety, durability, and recovery invariants.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
@@ -161,22 +161,20 @@ pub enum JournalError {
     #[error("Invalid identifier: {reason}")]
     InvalidIdentifier { reason: String },
 
-    #[error("Missing pre-execution record for turn '{turn_id}': cannot reconcile terminal outcome before pre-execution is captured")]
+    #[error(
+        "Missing pre-execution record for turn '{turn_id}': cannot reconcile terminal outcome before pre-execution is captured"
+    )]
     MissingPreExecution { turn_id: String },
 
     #[error("Corrupted journal log at line {line_number}: {reason}")]
-    CorruptedLog {
-        line_number: usize,
-        reason: String,
-    },
+    CorruptedLog { line_number: usize, reason: String },
 
     #[error("Conflicting pre-execution record for turn '{turn_id}': {reason}")]
-    ConflictingPreExecution {
-        turn_id: String,
-        reason: String,
-    },
+    ConflictingPreExecution { turn_id: String, reason: String },
 
-    #[error("Conflicting terminal outcome for turn '{turn_id}': existing {existing:?}, attempted {attempted:?}, reason: {reason}")]
+    #[error(
+        "Conflicting terminal outcome for turn '{turn_id}': existing {existing:?}, attempted {attempted:?}, reason: {reason}"
+    )]
     ConflictingOutcome {
         turn_id: String,
         existing: TurnTerminalStatus,
@@ -223,7 +221,9 @@ pub enum RawJournalEvent {
         error_metadata: Option<serde_json::Value>,
         finished_at_ms: u64,
     },
-    MidTurn { record: MidTurnRecord },
+    MidTurn {
+        record: MidTurnRecord,
+    },
 }
 
 impl RawJournalEvent {
@@ -379,12 +379,7 @@ impl FilesystemTurnJournal {
     }
 
     /// Resolves the absolute path for a specific turn log file.
-    fn get_turn_file_path(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        turn_id: &str,
-    ) -> Result<PathBuf, JournalError> {
+    fn get_turn_file_path(&self, user_id: &str, conversation_id: &str, turn_id: &str) -> Result<PathBuf, JournalError> {
         validate_identifier(turn_id, "turn_id")?;
         let raw_dir = self.get_conversation_raw_dir(user_id, conversation_id)?;
         Ok(raw_dir.join(format!("{turn_id}.jsonl")))
@@ -472,10 +467,7 @@ impl FilesystemTurnJournal {
             let mut attempts = 0;
             loop {
                 let res = async {
-                    let mut file = tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .open(file_path)
-                        .await?;
+                    let mut file = tokio::fs::OpenOptions::new().write(true).open(file_path).await?;
                     file.set_len(valid_byte_offset as u64).await?;
                     file.flush().await?;
                     file.sync_all().await?;
@@ -558,11 +550,16 @@ impl FilesystemTurnJournal {
     /// lifecycle coordinator; it is not a third [`TurnJournal`] method.
     pub(crate) async fn append_mid_turn_event(&self, record: &MidTurnRecord) -> Result<(), JournalError> {
         validate_mid_turn_record(record)?;
-        let turn_lock = self.get_turn_lock(&record.user_id, &record.conversation_id, &record.turn_id).await;
+        let turn_lock = self
+            .get_turn_lock(&record.user_id, &record.conversation_id, &record.turn_id)
+            .await;
         let _guard = turn_lock.lock().await;
         let file_path = self.get_turn_file_path(&record.user_id, &record.conversation_id, &record.turn_id)?;
         let existing_events = Self::read_and_sanitize_turn_events(&file_path).await?;
-        if !existing_events.iter().any(|event| matches!(event, RawJournalEvent::PreExecution { .. })) {
+        if !existing_events
+            .iter()
+            .any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
+        {
             return Err(JournalError::MissingPreExecution {
                 turn_id: record.turn_id.clone(),
             });
@@ -602,7 +599,9 @@ impl TurnJournal for FilesystemTurnJournal {
         // Enforce opaque workspace normalization at adapter boundary
         let normalized_workspace = normalize_workspace_label(record.workspace);
 
-        let turn_lock = self.get_turn_lock(record.user_id, record.conversation_id, record.turn_id).await;
+        let turn_lock = self
+            .get_turn_lock(record.user_id, record.conversation_id, record.turn_id)
+            .await;
         let _guard = turn_lock.lock().await;
 
         let file_path = self.get_turn_file_path(record.user_id, record.conversation_id, record.turn_id)?;
@@ -635,8 +634,14 @@ impl TurnJournal for FilesystemTurnJournal {
                         reason: format!(
                             "PreExecution payload mismatch for turn {}: existing user/conv/msg/parent ({}/{}/{:?}/{:?}), attempted ({}/{}/{:?}/{:?})",
                             record.turn_id,
-                            user_id, conversation_id, user_message, parent_turn_id,
-                            record.user_id, record.conversation_id, record.user_message, record.parent_turn_id
+                            user_id,
+                            conversation_id,
+                            user_message,
+                            parent_turn_id,
+                            record.user_id,
+                            record.conversation_id,
+                            record.user_message,
+                            record.parent_turn_id
                         ),
                     });
                 }
@@ -677,7 +682,9 @@ impl TurnJournal for FilesystemTurnJournal {
         let existing_events = Self::read_and_sanitize_turn_events(&file_path).await?;
 
         // Invariant: Must reject turns without an existing PreExecution event
-        let has_pre_execution = existing_events.iter().any(|e| matches!(e, RawJournalEvent::PreExecution { .. }));
+        let has_pre_execution = existing_events
+            .iter()
+            .any(|e| matches!(e, RawJournalEvent::PreExecution { .. }));
         if !has_pre_execution {
             return Err(JournalError::MissingPreExecution {
                 turn_id: turn_id.to_string(),
@@ -719,8 +726,16 @@ impl TurnJournal for FilesystemTurnJournal {
                         reason: format!(
                             "Terminal payload mismatch for turn {}: existing status/msg/usage/att/meta ({:?}/{:?}/{:?}/{:?}/{:?}), attempted ({:?}/{:?}/{:?}/{:?}/{:?})",
                             turn_id,
-                            status, assistant_message, token_usage, attempts, error_metadata,
-                            outcome.status, outcome.assistant_message, outcome.token_usage, outcome.attempts, outcome.error_metadata
+                            status,
+                            assistant_message,
+                            token_usage,
+                            attempts,
+                            error_metadata,
+                            outcome.status,
+                            outcome.assistant_message,
+                            outcome.token_usage,
+                            outcome.attempts,
+                            outcome.error_metadata
                         ),
                     });
                 }
@@ -780,7 +795,10 @@ impl InMemoryTurnJournal {
         );
         let mut guard = self.events.write().await;
         let entry = guard.entry(canonical_key).or_default();
-        if !entry.iter().any(|event| matches!(event, RawJournalEvent::PreExecution { .. })) {
+        if !entry
+            .iter()
+            .any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
+        {
             return Err(JournalError::MissingPreExecution {
                 turn_id: record.turn_id.clone(),
             });
@@ -889,8 +907,14 @@ impl TurnJournal for InMemoryTurnJournal {
                         reason: format!(
                             "PreExecution payload mismatch for turn {}: existing user/conv/msg/parent ({}/{}/{:?}/{:?}), attempted ({}/{}/{:?}/{:?})",
                             record.turn_id,
-                            user_id, conversation_id, user_message, parent_turn_id,
-                            record.user_id, record.conversation_id, record.user_message, record.parent_turn_id
+                            user_id,
+                            conversation_id,
+                            user_message,
+                            parent_turn_id,
+                            record.user_id,
+                            record.conversation_id,
+                            record.user_message,
+                            record.parent_turn_id
                         ),
                     });
                 }
@@ -925,11 +949,7 @@ impl TurnJournal for InMemoryTurnJournal {
             validate_identifier(attempt_id, "last_attempt_id")?;
         }
 
-        let canonical_key = (
-            user_id.to_string(),
-            conversation_id.to_string(),
-            turn_id.to_string(),
-        );
+        let canonical_key = (user_id.to_string(), conversation_id.to_string(), turn_id.to_string());
 
         let mut guard = self.events.write().await;
         let entry = guard.entry(canonical_key).or_default();
@@ -974,8 +994,16 @@ impl TurnJournal for InMemoryTurnJournal {
                         reason: format!(
                             "Terminal payload mismatch for turn {}: existing status/msg/usage/att/meta ({:?}/{:?}/{:?}/{:?}/{:?}), attempted ({:?}/{:?}/{:?}/{:?}/{:?})",
                             turn_id,
-                            status, assistant_message, token_usage, attempts, error_metadata,
-                            outcome.status, outcome.assistant_message, outcome.token_usage, outcome.attempts, outcome.error_metadata
+                            status,
+                            assistant_message,
+                            token_usage,
+                            attempts,
+                            error_metadata,
+                            outcome.status,
+                            outcome.assistant_message,
+                            outcome.token_usage,
+                            outcome.attempts,
+                            outcome.error_metadata
                         ),
                     });
                 }
@@ -1132,7 +1160,9 @@ pub(crate) async fn internal_startup_recovery(
                             };
 
                             // Use shared reconcile_terminal with per-turn lock, PreExecution verification, and sync_all
-                            journal.reconcile_terminal(&user_id, &conv_id, &turn_id, &timeout_outcome).await?;
+                            journal
+                                .reconcile_terminal(&user_id, &conv_id, &turn_id, &timeout_outcome)
+                                .await?;
                             reconciled_count += 1;
                         }
                     }
@@ -1200,7 +1230,10 @@ mod tests {
         assert_eq!(events.len(), 2, "duplicate mid-turn append must be a no-op");
         assert!(matches!(events[1], RawJournalEvent::MidTurn { .. }));
         let serialized = serde_json::to_string(&events[1]).unwrap();
-        assert!(!serialized.contains("steer body"), "mid-turn journal must not copy message text");
+        assert!(
+            !serialized.contains("steer body"),
+            "mid-turn journal must not copy message text"
+        );
         assert!(serialized.contains("content_hash"));
     }
 
@@ -1224,7 +1257,9 @@ mod tests {
         let raw_file = temp.path().join("users/user_alice/events/raw/conv_123/turn_001.jsonl");
         assert!(raw_file.exists());
 
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             RawJournalEvent::PreExecution {
@@ -1266,8 +1301,12 @@ mod tests {
         journal.capture_pre_turn(&pre_record).await.unwrap();
         journal.capture_pre_turn(&pre_record).await.unwrap();
 
-        let raw_file = temp.path().join("users/user_alice/events/raw/conv_123/turn_001_dup.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let raw_file = temp
+            .path()
+            .join("users/user_alice/events/raw/conv_123/turn_001_dup.jsonl");
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
     }
 
@@ -1380,7 +1419,9 @@ mod tests {
             .unwrap();
 
         let raw_file = temp.path().join("users/user_bob/events/raw/conv_456/turn_002.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2);
         match &events[1] {
             RawJournalEvent::FinalOutcome {
@@ -1443,7 +1484,9 @@ mod tests {
             .unwrap();
 
         let raw_file = temp.path().join("users/user_bob/events/raw/conv_456/turn_003.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2);
     }
 
@@ -1496,7 +1539,12 @@ mod tests {
             .unwrap_err();
 
         match err {
-            JournalError::ConflictingOutcome { existing, attempted, reason, .. } => {
+            JournalError::ConflictingOutcome {
+                existing,
+                attempted,
+                reason,
+                ..
+            } => {
                 assert_eq!(existing, TurnTerminalStatus::Success);
                 assert_eq!(attempted, TurnTerminalStatus::Success);
                 assert!(reason.contains("payload mismatch"));
@@ -1554,7 +1602,9 @@ mod tests {
             .unwrap_err();
 
         match err {
-            JournalError::ConflictingOutcome { existing, attempted, .. } => {
+            JournalError::ConflictingOutcome {
+                existing, attempted, ..
+            } => {
                 assert_eq!(existing, TurnTerminalStatus::Success);
                 assert_eq!(attempted, TurnTerminalStatus::Failed);
             }
@@ -1592,7 +1642,8 @@ mod tests {
                     error_metadata: None,
                     finished_at_ms: 2000,
                 };
-                j.reconcile_terminal("user_concur", "conv_concur", "turn_concur_1", &outcome).await
+                j.reconcile_terminal("user_concur", "conv_concur", "turn_concur_1", &outcome)
+                    .await
             }));
         }
 
@@ -1601,8 +1652,12 @@ mod tests {
             assert!(res.is_ok());
         }
 
-        let raw_file = temp.path().join("users/user_concur/events/raw/conv_concur/turn_concur_1.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let raw_file = temp
+            .path()
+            .join("users/user_concur/events/raw/conv_concur/turn_concur_1.jsonl");
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2);
     }
 
@@ -1639,20 +1694,29 @@ mod tests {
                 error_metadata: None,
                 finished_at_ms: 2000,
             };
-            j_live.reconcile_terminal("user_race", "conv_race", "turn_race_1", &outcome).await
+            j_live
+                .reconcile_terminal("user_race", "conv_race", "turn_race_1", &outcome)
+                .await
         });
 
         let j_rec = Arc::clone(&journal);
-        let rec_handle = tokio::spawn(async move {
-            internal_startup_recovery(j_rec.as_ref(), &j_rec.base_dir, &options).await
-        });
+        let rec_handle =
+            tokio::spawn(async move { internal_startup_recovery(j_rec.as_ref(), &j_rec.base_dir, &options).await });
 
         let (live_res, rec_res) = tokio::join!(live_handle, rec_handle);
         assert!(live_res.unwrap().is_ok() || rec_res.unwrap().is_ok());
 
-        let raw_file = temp.path().join("users/user_race/events/raw/conv_race/turn_race_1.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
-        assert_eq!(events.len(), 2, "Must contain exactly 1 PreExecution and 1 FinalOutcome under race");
+        let raw_file = temp
+            .path()
+            .join("users/user_race/events/raw/conv_race/turn_race_1.jsonl");
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "Must contain exactly 1 PreExecution and 1 FinalOutcome under race"
+        );
     }
 
     #[tokio::test]
@@ -1686,14 +1750,22 @@ mod tests {
             .await
             .unwrap();
 
-        let file_alpha = temp.path().join("users/user_multi/events/raw/conv_alpha/turn_shared_name.jsonl");
-        let file_beta = temp.path().join("users/user_multi/events/raw/conv_beta/turn_shared_name.jsonl");
+        let file_alpha = temp
+            .path()
+            .join("users/user_multi/events/raw/conv_alpha/turn_shared_name.jsonl");
+        let file_beta = temp
+            .path()
+            .join("users/user_multi/events/raw/conv_beta/turn_shared_name.jsonl");
 
         assert!(file_alpha.exists());
         assert!(file_beta.exists());
 
-        let events_alpha = FilesystemTurnJournal::read_and_sanitize_turn_events(&file_alpha).await.unwrap();
-        let events_beta = FilesystemTurnJournal::read_and_sanitize_turn_events(&file_beta).await.unwrap();
+        let events_alpha = FilesystemTurnJournal::read_and_sanitize_turn_events(&file_alpha)
+            .await
+            .unwrap();
+        let events_beta = FilesystemTurnJournal::read_and_sanitize_turn_events(&file_beta)
+            .await
+            .unwrap();
 
         assert_eq!(events_alpha.len(), 1);
         assert_eq!(events_beta.len(), 1);
@@ -1738,15 +1810,16 @@ mod tests {
             .unwrap();
 
         let raw_file = temp.path().join("users/user_carol/events/raw/conv_789/turn_005.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2);
         match &events[1] {
-            RawJournalEvent::FinalOutcome { status, error_metadata, .. } => {
+            RawJournalEvent::FinalOutcome {
+                status, error_metadata, ..
+            } => {
                 assert_eq!(*status, TurnTerminalStatus::Failed);
-                assert_eq!(
-                    error_metadata.as_ref().unwrap().get("stage").unwrap(),
-                    "worker_build"
-                );
+                assert_eq!(error_metadata.as_ref().unwrap().get("stage").unwrap(), "worker_build");
             }
             _ => panic!("Expected FinalOutcome event"),
         }
@@ -1819,7 +1892,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(events_6.len(), 2);
-        assert!(matches!(events_6[1], RawJournalEvent::FinalOutcome { status: TurnTerminalStatus::Cancelled, .. }));
+        assert!(matches!(
+            events_6[1],
+            RawJournalEvent::FinalOutcome {
+                status: TurnTerminalStatus::Cancelled,
+                ..
+            }
+        ));
 
         let events_7 = FilesystemTurnJournal::read_and_sanitize_turn_events(
             &temp.path().join("users/user_dave/events/raw/conv_111/turn_007.jsonl"),
@@ -1827,7 +1906,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(events_7.len(), 2);
-        assert!(matches!(events_7[1], RawJournalEvent::FinalOutcome { status: TurnTerminalStatus::Timeout, .. }));
+        assert!(matches!(
+            events_7[1],
+            RawJournalEvent::FinalOutcome {
+                status: TurnTerminalStatus::Timeout,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1851,14 +1936,20 @@ mod tests {
             now_ms: 25_000,
         };
 
-        let reconciled = internal_startup_recovery(&journal, temp.path(), &options).await.unwrap();
+        let reconciled = internal_startup_recovery(&journal, temp.path(), &options)
+            .await
+            .unwrap();
         assert_eq!(reconciled, 1);
 
         let raw_file = temp.path().join("users/user_eve/events/raw/conv_222/turn_008.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2);
         match &events[1] {
-            RawJournalEvent::FinalOutcome { status, error_metadata, .. } => {
+            RawJournalEvent::FinalOutcome {
+                status, error_metadata, ..
+            } => {
                 assert_eq!(*status, TurnTerminalStatus::Timeout);
                 let meta = error_metadata.as_ref().unwrap();
                 assert_eq!(meta.get("recovered").unwrap(), true);
@@ -1867,7 +1958,9 @@ mod tests {
             _ => panic!("Expected FinalOutcome event"),
         }
 
-        let second_run = internal_startup_recovery(&journal, temp.path(), &options).await.unwrap();
+        let second_run = internal_startup_recovery(&journal, temp.path(), &options)
+            .await
+            .unwrap();
         assert_eq!(second_run, 0);
     }
 
@@ -1892,11 +1985,15 @@ mod tests {
             now_ms: 22_000,
         };
 
-        let reconciled = internal_startup_recovery(&journal, temp.path(), &options).await.unwrap();
+        let reconciled = internal_startup_recovery(&journal, temp.path(), &options)
+            .await
+            .unwrap();
         assert_eq!(reconciled, 0);
 
         let raw_file = temp.path().join("users/user_eve/events/raw/conv_222/turn_009.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
     }
 
@@ -1921,7 +2018,9 @@ mod tests {
         let corrupted_content = format!("{valid_pre}\n{{\"event_type\":\"final_outcome\",\"broken_json_half_written");
         tokio::fs::write(&raw_file, corrupted_content).await.unwrap();
 
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], RawJournalEvent::PreExecution { .. }));
 
@@ -1943,14 +2042,18 @@ mod tests {
             .await
             .unwrap();
 
-        let updated_events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let updated_events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(updated_events.len(), 2);
     }
 
     #[tokio::test]
     async fn test_partial_tail_with_trailing_newline_sanitized_and_appended() {
         let temp = tempdir().unwrap();
-        let raw_file = temp.path().join("users/user_newline/events/raw/conv_nl/turn_nl_1.jsonl");
+        let raw_file = temp
+            .path()
+            .join("users/user_newline/events/raw/conv_nl/turn_nl_1.jsonl");
         tokio::fs::create_dir_all(raw_file.parent().unwrap()).await.unwrap();
 
         let valid_pre = serde_json::to_string(&RawJournalEvent::PreExecution {
@@ -1968,7 +2071,9 @@ mod tests {
         let corrupted_content = format!("{valid_pre}\n{{\"event_type\":\"corrupted_tail\"}}\n");
         tokio::fs::write(&raw_file, corrupted_content).await.unwrap();
 
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
 
         let journal = FilesystemTurnJournal::new(temp.path());
@@ -1988,7 +2093,9 @@ mod tests {
             .await
             .unwrap();
 
-        let updated_events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let updated_events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(updated_events.len(), 2);
         assert!(matches!(updated_events[1], RawJournalEvent::FinalOutcome { .. }));
     }
@@ -2032,9 +2139,17 @@ mod tests {
             .await
             .unwrap();
 
-        let raw_file = temp.path().join("users/user_idemp/events/raw/conv_idemp/turn_idemp_1.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
-        assert_eq!(events.len(), 2, "Duplicate reconciliation must not produce duplicate lines");
+        let raw_file = temp
+            .path()
+            .join("users/user_idemp/events/raw/conv_idemp/turn_idemp_1.jsonl");
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "Duplicate reconciliation must not produce duplicate lines"
+        );
     }
 
     #[tokio::test]
@@ -2117,10 +2232,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(events.len(), 2, "Must contain exactly 1 PreExecution and 1 FinalOutcome");
+        assert_eq!(
+            events.len(),
+            2,
+            "Must contain exactly 1 PreExecution and 1 FinalOutcome"
+        );
         assert!(matches!(events[0], RawJournalEvent::PreExecution { .. }));
         match &events[1] {
-            RawJournalEvent::FinalOutcome { status, assistant_message, .. } => {
+            RawJournalEvent::FinalOutcome {
+                status,
+                assistant_message,
+                ..
+            } => {
                 assert_eq!(*status, TurnTerminalStatus::Success);
                 assert_eq!(assistant_message.as_deref(), Some("Completed response"));
             }
@@ -2179,7 +2302,9 @@ mod tests {
         let corrupted_content = format!("{valid_pre}\n{{broken_middle_line}}\n{valid_term}\n");
         tokio::fs::write(&raw_file, corrupted_content).await.unwrap();
 
-        let err = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap_err();
+        let err = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap_err();
         assert!(matches!(err, JournalError::CorruptedLog { line_number: 2, .. }));
     }
 
@@ -2199,7 +2324,12 @@ mod tests {
             workspace: None,
             created_at_ms: 10_000,
         };
-        tokio::fs::write(&raw_file, format!("{}\n", serde_json::to_string(&mismatched_event).unwrap())).await.unwrap();
+        tokio::fs::write(
+            &raw_file,
+            format!("{}\n", serde_json::to_string(&mismatched_event).unwrap()),
+        )
+        .await
+        .unwrap();
 
         let options = StartupRecoveryOptions {
             grace_window_ms: 5_000,
@@ -2209,7 +2339,9 @@ mod tests {
         let journal = FilesystemTurnJournal::new(temp.path());
 
         // Recovery scanner skips mismatched file
-        let count = internal_startup_recovery(&journal, temp.path(), &options).await.unwrap();
+        let count = internal_startup_recovery(&journal, temp.path(), &options)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -2302,10 +2434,14 @@ mod tests {
 
         journal.capture_pre_turn(&pre_record).await.unwrap();
 
-        let raw_file = temp.path().join("users/user_normal/events/raw/conv_normal/turn_normal.jsonl");
+        let raw_file = temp
+            .path()
+            .join("users/user_normal/events/raw/conv_normal/turn_normal.jsonl");
         assert!(raw_file.exists());
 
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         if let RawJournalEvent::PreExecution { workspace, .. } = &events[0] {
             assert_eq!(workspace.as_deref(), Some("bound_workspace"));
@@ -2321,7 +2457,9 @@ mod tests {
         let vault_dir = temp.path().join("users/user_human/vault");
         let human_note = vault_dir.join("knowledge/notes/my_daily_journal.md");
         tokio::fs::create_dir_all(human_note.parent().unwrap()).await.unwrap();
-        tokio::fs::write(&human_note, "# My Journal\nHuman content").await.unwrap();
+        tokio::fs::write(&human_note, "# My Journal\nHuman content")
+            .await
+            .unwrap();
 
         let journal = FilesystemTurnJournal::new(temp.path());
         let pre_record = PreTurnRecord {
@@ -2478,10 +2616,16 @@ mod tests {
         assert!(file1.exists());
         assert!(file2.exists());
 
-        let events2 = FilesystemTurnJournal::read_and_sanitize_turn_events(&file2).await.unwrap();
+        let events2 = FilesystemTurnJournal::read_and_sanitize_turn_events(&file2)
+            .await
+            .unwrap();
         assert_eq!(events2.len(), 1);
         match &events2[0] {
-            RawJournalEvent::PreExecution { turn_id, parent_turn_id, .. } => {
+            RawJournalEvent::PreExecution {
+                turn_id,
+                parent_turn_id,
+                ..
+            } => {
                 assert_eq!(turn_id, "turn_102");
                 assert_eq!(parent_turn_id.as_deref(), Some("turn_101"));
             }
@@ -2536,8 +2680,12 @@ mod tests {
             .await
             .unwrap();
 
-        let file = temp.path().join("users/user_replay/events/raw/conv_replay/turn_replay_1.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&file).await.unwrap();
+        let file = temp
+            .path()
+            .join("users/user_replay/events/raw/conv_replay/turn_replay_1.jsonl");
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&file)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2);
         match &events[1] {
             RawJournalEvent::FinalOutcome {
@@ -2639,15 +2787,35 @@ mod tests {
             .await
             .unwrap();
 
-        let file_build = temp.path().join("users/user_fail/events/raw/conv_build/turn_build_1.jsonl");
-        let file_cancel = temp.path().join("users/user_fail/events/raw/conv_cancel/turn_cancel_1.jsonl");
+        let file_build = temp
+            .path()
+            .join("users/user_fail/events/raw/conv_build/turn_build_1.jsonl");
+        let file_cancel = temp
+            .path()
+            .join("users/user_fail/events/raw/conv_cancel/turn_cancel_1.jsonl");
 
-        let events_build = FilesystemTurnJournal::read_and_sanitize_turn_events(&file_build).await.unwrap();
-        let events_cancel = FilesystemTurnJournal::read_and_sanitize_turn_events(&file_cancel).await.unwrap();
+        let events_build = FilesystemTurnJournal::read_and_sanitize_turn_events(&file_build)
+            .await
+            .unwrap();
+        let events_cancel = FilesystemTurnJournal::read_and_sanitize_turn_events(&file_cancel)
+            .await
+            .unwrap();
 
         assert_eq!(events_build.len(), 2);
         assert_eq!(events_cancel.len(), 2);
-        assert!(matches!(events_build[1], RawJournalEvent::FinalOutcome { status: TurnTerminalStatus::Failed, .. }));
-        assert!(matches!(events_cancel[1], RawJournalEvent::FinalOutcome { status: TurnTerminalStatus::Cancelled, .. }));
+        assert!(matches!(
+            events_build[1],
+            RawJournalEvent::FinalOutcome {
+                status: TurnTerminalStatus::Failed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events_cancel[1],
+            RawJournalEvent::FinalOutcome {
+                status: TurnTerminalStatus::Cancelled,
+                ..
+            }
+        ));
     }
 }
