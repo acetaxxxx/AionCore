@@ -441,7 +441,7 @@ impl ConversationTurnOrchestrator {
         };
         let mut replayed = false;
         let superseding_tips = SupersedingTipTotals::default();
-        let mut final_error_message = None;
+        let mut final_error_message: Option<String>;
         let mut auth_failure = false;
         let mut last_attempt_terminal = None;
 

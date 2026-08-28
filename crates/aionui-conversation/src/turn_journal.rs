@@ -485,7 +485,7 @@ impl FilesystemTurnJournal {
 
                 match res {
                     Ok(()) => break,
-                    Err(e) if attempts < 3 => {
+                    Err(_e) if attempts < 3 => {
                         attempts += 1;
                         tokio::time::sleep(tokio::time::Duration::from_millis(25 * attempts as u64)).await;
                     }
@@ -542,7 +542,7 @@ impl FilesystemTurnJournal {
 
             match res {
                 Ok(()) => return Ok(()),
-                Err(e) if attempts < 3 => {
+                Err(_e) if attempts < 3 => {
                     attempts += 1;
                     tokio::time::sleep(tokio::time::Duration::from_millis(25 * attempts as u64)).await;
                 }
@@ -770,6 +770,7 @@ impl InMemoryTurnJournal {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn append_mid_turn_event(&self, record: &MidTurnRecord) -> Result<(), JournalError> {
         validate_mid_turn_record(record)?;
         let canonical_key = (
