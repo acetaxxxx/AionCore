@@ -222,6 +222,80 @@ async fn subscribe_parent_escape_is_invalid_relative_path() {
     assert_eq!(reply["error"]["message"], "invalid_relative_path");
 }
 
+/// A target that resolves (phase 1) but cannot mount (phase 2) must not take the
+/// whole batch down. Mount = arm watch + read the baseline listing, so it can
+/// fail per-target for reasons that say nothing about the siblings — on a large
+/// tree, an exhausted OS watch-descriptor limit (AIONUI-236). A regular file
+/// stands in for that here: it passes lexical resolution, then fails the mount.
+#[tokio::test]
+async fn subscribe_keeps_mounted_targets_when_one_target_fails() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("main.ts"), b"x").unwrap();
+    // Resolves fine, but is not a directory → mount fails for this target only.
+    std::fs::write(dir.path().join("notadir"), b"x").unwrap();
+
+    // Failing target first, so a leading failure cannot short-circuit the batch.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                4,
+                "fs/subscribe",
+                json!({"targets":[dir_ref(&pe, "notadir"), dir_ref(&pe, ""), dir_ref(&pe, "src")]}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(
+        reply.get("error").is_none(),
+        "a partially mountable batch must not fail the request: {reply}"
+    );
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 2, "both mountable targets keep their snapshot: {reply}");
+    assert_eq!(snaps[0]["target"], dir_ref(&pe, ""));
+    assert_eq!(snaps[1]["target"], dir_ref(&pe, "src"));
+    let src_names: Vec<&str> = snaps[1]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(src_names, vec!["main.ts"]);
+}
+
+/// The degrade is only for partial success: when nothing mounts, the request
+/// still fails with the first target's error rather than replying with a
+/// silently empty snapshot list.
+#[tokio::test]
+async fn subscribe_all_targets_failing_to_mount_still_errors() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"x").unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                5,
+                "fs/subscribe",
+                json!({"targets":[dir_ref(&pe, "a.txt"), dir_ref(&pe, "b.txt")]}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(reply.get("result").is_none(), "no snapshots mounted: {reply}");
+    assert_eq!(reply["error"]["code"], -32006);
+    assert_eq!(reply["error"]["message"], "provider_unavailable");
+    // The first failure identifies the batch, as it did before the degrade.
+    assert_eq!(reply["error"]["data"]["pe_id"], pe);
+    assert_eq!(reply["error"]["data"]["relative_path"], "a.txt");
+}
+
 #[tokio::test]
 async fn mkdir_then_remove_roundtrip() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
@@ -1283,4 +1357,119 @@ async fn completion_signals_done_actor_clears_and_later_cancel_is_noop() {
         !actor.cancel_search("1", &json!(5)),
         "a completed search must not be treated as in-flight by fs/searchCancel"
     );
+}
+
+// ══ remount (force-refresh a stale backend mount) ════════════════════════════
+
+/// Entry names on a wire snapshot object (`{ target, entries }`).
+fn entry_names(snapshot: &Value) -> Vec<String> {
+    snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The behavioral contract that motivates the feature: a re-subscribe of a
+/// still-live root serves the cached listing (so a change the watcher never
+/// delivered stays invisible), whereas `fs/remount` tears the node down and
+/// re-reads the baseline from disk.
+#[tokio::test]
+async fn remount_rereads_baseline_where_resubscribe_serves_stale_cache() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    // Subscribe → mounts, baseline = [a.txt].
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+
+    // Change the directory without letting the watcher event reach the shard
+    // (raw_rx is never drained in these dispatch-level tests) → the backend's
+    // cached listing now lags the disk, the "mount went stale" the refresh fixes.
+    std::fs::write(dir.path().join("b.txt"), b"y").unwrap();
+
+    // A re-subscribe (AlreadyLive) serves the stale cached listing → no b.txt.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(2, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+    let resub = push.last_for("1").unwrap();
+    assert_eq!(
+        entry_names(&resub["result"]["snapshots"][0]),
+        vec!["a.txt"],
+        "re-subscribe serves the stale cached listing: {resub}"
+    );
+
+    // Remount re-reads the baseline → b.txt now present in a normal snapshot.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(3, "fs/remount", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["id"], 3);
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 1);
+    assert_eq!(snaps[0]["target"], dir_ref(&pe, ""));
+    let mut names = entry_names(&snaps[0]);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["a.txt", "b.txt"],
+        "remount re-read the baseline from disk: {reply}"
+    );
+    // canonical / absolute path must never leak on the wire.
+    assert!(reply.to_string().find("file://").is_none(), "no canonical uri: {reply}");
+}
+
+/// A remount of a root that is not currently watched (never subscribed, or a
+/// collapsed root) is a no-op: an empty—but successful—snapshot batch, never an
+/// error, and it must not mount the cold canonical.
+#[tokio::test]
+async fn remount_unwatched_root_returns_empty_success() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    // No prior subscribe → the root is cold.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(1, "fs/remount", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(reply.get("error").is_none(), "a no-op remount is not an error: {reply}");
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert!(snaps.is_empty(), "an unwatched target contributes no snapshot: {reply}");
+}
+
+/// Phase 1 resolves atomically (like subscribe): an unresolvable pe fails the
+/// whole request rather than silently dropping the target.
+#[tokio::test]
+async fn remount_unknown_pe_is_out_of_scope() {
+    let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(2, "fs/remount", json!({"targets":[dir_ref("pe-nope", "")]})),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32000);
+    assert_eq!(reply["error"]["message"], "out_of_scope");
+    assert_eq!(reply["error"]["data"]["pe_id"], "pe-nope");
 }
