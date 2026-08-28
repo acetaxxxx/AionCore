@@ -104,6 +104,11 @@ pub struct MidTurnRecord {
 
 impl MidTurnRecord {
     /// Derive stable identity from the complete event identity and payload.
+    ///
+    /// This compatibility constructor intentionally retains its established
+    /// argument list for existing lifecycle callers; use the record fields or
+    /// a higher-level coordinator when constructing new integrations.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         user_id: &str,
         conversation_id: &str,
@@ -317,13 +322,17 @@ pub trait TurnJournal: Send + Sync {
 #[cfg(test)]
 pub type FaultInjector = Arc<dyn Fn(&Path, usize, &str, &RawJournalEvent) -> Option<std::io::Error> + Send + Sync>;
 
+type CanonicalTurnKey = (String, String, String);
+type TurnLocks = Arc<RwLock<HashMap<CanonicalTurnKey, Arc<Mutex<()>>>>>;
+type TurnEvents = Arc<RwLock<HashMap<CanonicalTurnKey, Vec<RawJournalEvent>>>>;
+
 /// Production filesystem-backed implementation of [`TurnJournal`].
 ///
 /// Stores raw append-only JSONL files under `<base_dir>/users/<user_id>/events/raw/<conversation_id>/<turn_id>.jsonl`.
 #[derive(Clone)]
 pub struct FilesystemTurnJournal {
     base_dir: PathBuf,
-    locks: Arc<RwLock<HashMap<(String, String, String), Arc<Mutex<()>>>>>,
+    locks: TurnLocks,
     #[cfg(test)]
     fault_injector: Option<FaultInjector>,
 }
@@ -507,10 +516,8 @@ impl FilesystemTurnJournal {
         loop {
             // Check if the event is already committed on disk (e.g. from prior attempt whose flush/sync timed out)
             let existing_events = Self::read_and_sanitize_turn_events(file_path).await?;
-            if let Some(last_event) = existing_events.last() {
-                if last_event == event {
-                    return Ok(());
-                }
+            if existing_events.last().is_some_and(|last_event| last_event == event) {
+                return Ok(());
             }
 
             let res = async {
@@ -769,7 +776,7 @@ impl TurnJournal for FilesystemTurnJournal {
 /// Uses canonical key `(user_id, conversation_id, turn_id)` to ensure complete cross-conversation isolation.
 #[derive(Default, Clone)]
 pub struct InMemoryTurnJournal {
-    events: Arc<RwLock<HashMap<(String, String, String), Vec<RawJournalEvent>>>>,
+    events: TurnEvents,
 }
 
 impl InMemoryTurnJournal {
@@ -1137,34 +1144,32 @@ pub(crate) async fn internal_startup_recovery(
                     }
                 }
 
-                if !has_terminal {
-                    if let Some(created_at_ms) = pre_turn {
-                        let elapsed = options.now_ms.saturating_sub(created_at_ms);
-                        if elapsed >= options.grace_window_ms {
-                            let timeout_outcome = TerminalOutcomeRecord {
-                                status: TurnTerminalStatus::Timeout,
-                                assistant_message: None,
-                                token_usage: None,
-                                attempts: 1,
-                                last_attempt_id: None,
-                                retry_summaries: None,
-                                error_metadata: Some(serde_json::json!({
-                                    "recovered": true,
-                                    "reason": "server_restart_timeout",
-                                    "grace_window_ms": options.grace_window_ms,
-                                    "elapsed_ms": elapsed,
-                                    "assistant_message": "unavailable",
-                                    "token_usage": "unavailable"
-                                })),
-                                finished_at_ms: options.now_ms,
-                            };
+                if !has_terminal && let Some(created_at_ms) = pre_turn {
+                    let elapsed = options.now_ms.saturating_sub(created_at_ms);
+                    if elapsed >= options.grace_window_ms {
+                        let timeout_outcome = TerminalOutcomeRecord {
+                            status: TurnTerminalStatus::Timeout,
+                            assistant_message: None,
+                            token_usage: None,
+                            attempts: 1,
+                            last_attempt_id: None,
+                            retry_summaries: None,
+                            error_metadata: Some(serde_json::json!({
+                                "recovered": true,
+                                "reason": "server_restart_timeout",
+                                "grace_window_ms": options.grace_window_ms,
+                                "elapsed_ms": elapsed,
+                                "assistant_message": "unavailable",
+                                "token_usage": "unavailable"
+                            })),
+                            finished_at_ms: options.now_ms,
+                        };
 
-                            // Use shared reconcile_terminal with per-turn lock, PreExecution verification, and sync_all
-                            journal
-                                .reconcile_terminal(&user_id, &conv_id, &turn_id, &timeout_outcome)
-                                .await?;
-                            reconciled_count += 1;
-                        }
+                        // Use shared reconcile_terminal with per-turn lock, PreExecution verification, and sync_all
+                        journal
+                            .reconcile_terminal(&user_id, &conv_id, &turn_id, &timeout_outcome)
+                            .await?;
+                        reconciled_count += 1;
                     }
                 }
             }
