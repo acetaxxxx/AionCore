@@ -15,7 +15,7 @@ use crate::runtime_state::TurnClaim;
 use crate::service::{
     ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
-use crate::stream_relay::{RelayOutcome, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
+use crate::stream_relay::{RelayOutcome, RelayTerminal, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
 use aionui_api_types::AgentErrorCode;
@@ -475,7 +475,7 @@ impl ConversationTurnOrchestrator {
                     "assistant_message": "unavailable",
                     "token_usage": "unavailable"
                 })),
-                finished_at_ms: now_ms(),
+                finished_at_ms: crate::service::journal_now_ms(),
             };
             if let Err(je) = self.service.turn_journal().reconcile_terminal(&input.user_id, &conv_id, &turn_id, &cancel_outcome).await {
                 error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on deferred cancel; turn remains open for startup recovery reconciliation");
@@ -541,7 +541,7 @@ impl ConversationTurnOrchestrator {
             auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
-            if matches!(attempt_result.outcome.terminal, RelayTerminal::Finish) {
+            if matches!(&attempt_result.outcome.terminal, RelayTerminal::Finish) {
                 final_error_message = None;
                 recorded_attempt_summaries.push(crate::turn_journal::AttemptSummary {
                     attempt_id,
@@ -686,7 +686,7 @@ impl ConversationTurnOrchestrator {
                     .unwrap_or("Agent requires sign-in to run."),
             )
             .await;
-        } else if !final_failed && matches!(last_attempt_terminal, Some(RelayTerminal::Finish)) {
+        } else if !final_failed && matches!(&last_attempt_terminal, Some(RelayTerminal::Finish)) {
             record_agent_session_success(
                 &self.service,
                 &input.user_id,
@@ -698,7 +698,7 @@ impl ConversationTurnOrchestrator {
         let terminal_status = if final_failed {
             crate::turn_journal::TurnTerminalStatus::Failed
         } else {
-            match last_attempt_terminal {
+            match last_attempt_terminal.as_ref() {
                 Some(RelayTerminal::Finish) => crate::turn_journal::TurnTerminalStatus::Success,
                 Some(RelayTerminal::ChannelClosed) => {
                     // Unknown/unexpected channel close is mapped to Failed with error metadata
@@ -722,7 +722,7 @@ impl ConversationTurnOrchestrator {
         if let Some(ref err) = final_error_message {
             error_meta.insert("error".to_string(), serde_json::Value::String(err.clone()));
         }
-        if matches!(last_attempt_terminal, Some(RelayTerminal::ChannelClosed)) {
+        if matches!(&last_attempt_terminal, Some(RelayTerminal::ChannelClosed)) {
             error_meta.insert("reason".to_string(), serde_json::Value::String("channel_closed_unexpectedly".to_string()));
             if final_error_message.is_none() {
                 final_error_message = Some("stream_channel_closed_unexpectedly".to_string());
@@ -739,7 +739,7 @@ impl ConversationTurnOrchestrator {
             last_attempt_id: Some(&last_attempt_id_str),
             retry_summaries,
             error_metadata: Some(serde_json::Value::Object(error_meta)),
-            finished_at_ms: now_ms(),
+            finished_at_ms: crate::service::journal_now_ms(),
         };
         if let Err(je) = self.service.turn_journal().reconcile_terminal(&input.user_id, &conv_id, &turn_id, &final_outcome).await {
             error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome in turn journal; turn remains open for startup recovery reconciliation");
