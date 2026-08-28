@@ -1,0 +1,100 @@
+name: Branch CI
+
+on:
+  push:
+    branches:
+      - "feat/**"
+      - "sync/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: branch-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_TIMEOUT: "600"
+  CARGO_NET_RETRY: "10"
+  RUST_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  linux-x64:
+    name: Linux x64 check and build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Validate branch allowlist and commit
+        shell: bash
+        run: |
+          case "$GITHUB_REF" in
+            refs/heads/feat/*|refs/heads/sync/*) ;;
+            *)
+              echo "Unexpected ref for Branch CI: $GITHUB_REF" >&2
+              exit 1
+              ;;
+          esac
+          test -n "$GITHUB_SHA"
+          echo "Branch CI commit: $GITHUB_SHA"
+
+      - name: Check out pushed commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Record commit identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "Checked out commit: $(git rev-parse HEAD)"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ env.RUST_TARGET }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: branch-ci-${{ env.RUST_TARGET }}-ubuntu-22.04
+
+      - name: Cargo check aionui-app (Linux x64)
+        run: cargo check --locked --target "${RUST_TARGET}" -p aionui-app
+
+      - name: Cargo build aionui-app (Linux x64)
+        run: cargo build --locked --release --target "${RUST_TARGET}" -p aionui-app
+
+      - name: Write commit and status summary
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p ci-artifacts
+          cat > ci-artifacts/branch-ci-status.txt <<EOF
+          workflow=branch-ci
+          ref=${GITHUB_REF}
+          commit=${GITHUB_SHA}
+          target=${RUST_TARGET}
+          status=${{ job.status }}
+          EOF
+
+          {
+            echo "## AionCore Branch CI"
+            echo ""
+            echo "- Ref: \`${GITHUB_REF}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Target: \`${RUST_TARGET}\`"
+            echo "- Status: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload commit and status artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: aioncore-branch-ci-${{ github.sha }}
+          path: ci-artifacts/branch-ci-status.txt
+          if-no-files-found: error
+          retention-days: 7
