@@ -1693,9 +1693,10 @@ async fn agent_title_applies_to_default_named_conversation() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Fix login bug")
-        .await
-        .unwrap();
+    let applied =
+        crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Fix login bug", "test")
+            .await
+            .unwrap();
 
     assert!(applied);
     let row = get_row(&repo, "user_1", &id).await;
@@ -1720,9 +1721,10 @@ async fn agent_title_overwrites_previous_agent_title() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Newer agent title")
-        .await
-        .unwrap();
+    let applied =
+        crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Newer agent title", "test")
+            .await
+            .unwrap();
 
     assert!(applied);
     assert_eq!(get_row(&repo, "user_1", &id).await.name, "Newer agent title");
@@ -1736,7 +1738,7 @@ async fn agent_title_never_overwrites_user_rename() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Agent title")
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Agent title", "test")
         .await
         .unwrap();
 
@@ -1761,7 +1763,7 @@ async fn agent_title_unchanged_is_noop() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Same title")
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Same title", "test")
         .await
         .unwrap();
 
@@ -1781,7 +1783,7 @@ async fn agent_title_ignores_unknown_conversation() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", "missing", "Title")
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", "missing", "Title", "test")
         .await
         .unwrap();
 
@@ -6035,6 +6037,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
                 content: "hello".into(),
                 hidden: false,
                 files: vec![],
+                sessions: vec![],
                 inject_skills: vec![],
             },
             &task_mgr,
@@ -9349,4 +9352,688 @@ async fn other_build_failures_keep_the_persisted_session_id() {
         Some("sess-live"),
         "an unrelated build failure must not drop a resumable session"
     );
+}
+
+// ── `@@` session mentions at the send boundary ──────────────────────
+//
+// Lives here rather than beside `session_mentions.rs` because `MockRepo` and
+// the service builders are private to this module. The nested module name
+// keeps `cargo test session_mentions` matching.
+mod session_mentions_integration {
+    use super::*;
+    use aionui_api_types::SessionRef;
+
+    /// Insert a conversation row directly so the test controls name, workspace
+    /// and `extra` (team marker) exactly.
+    async fn insert_conv(repo: &Arc<MockRepo>, user_id: &str, id: &str, name: &str, extra: serde_json::Value) {
+        let row = ConversationRow {
+            id: id.to_owned(),
+            user_id: user_id.to_owned(),
+            name: name.to_owned(),
+            r#type: AgentType::Acp.serde_name().to_owned(),
+            extra: extra.to_string(),
+            model: None,
+            status: Some("finished".into()),
+            source: Some("aionui".into()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: 1,
+            updated_at: 1,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
+        };
+        repo.create(&row).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_reference_appends_the_block_with_the_name_from_the_row() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_target",
+            "重构-鉴权模块",
+            json!({"workspace": "/w/a"}),
+        )
+        .await;
+
+        let resolved = svc
+            .resolve_session_mentions(
+                "user_1",
+                "问下他那边接口定完了没",
+                &[SessionRef {
+                    id: "conv_target".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .expect("resolution succeeds");
+
+        assert!(resolved.starts_with("问下他那边接口定完了没"), "{resolved}");
+        assert!(
+            resolved.contains("重构-鉴权模块\tconv_target\tworkspace: same"),
+            "the name must come from the row, not the client: {resolved}"
+        );
+        assert!(resolved.trim_end().ends_with("[[/AION_SESSIONS]]"), "{resolved}");
+    }
+
+    #[tokio::test]
+    async fn a_cross_workspace_reference_states_the_target_path_and_the_warning() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_docs",
+            "文档站改版",
+            json!({"workspace": "/w/docs"}),
+        )
+        .await;
+
+        let resolved = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[SessionRef {
+                    id: "conv_docs".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            resolved.contains("文档站改版\tconv_docs\tworkspace: /w/docs（与你不同）"),
+            "{resolved}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_session_list_leaves_content_byte_identical() {
+        let (svc, _b, _repo, _t) = make_service();
+        let resolved = svc
+            .resolve_session_mentions("user_1", "no mentions here", &[], Some("/w/a"))
+            .await
+            .unwrap();
+        assert_eq!(resolved, "no mentions here");
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_another_users_conversation_fails_the_whole_message() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(&repo, "user_2", "conv_theirs", "theirs", json!({"workspace": "/w/b"})).await;
+
+        let err = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[SessionRef {
+                    id: "conv_theirs".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .expect_err("must fail atomically");
+
+        // 404, not 403 — do not leak that the id exists (spec §9.1).
+        assert!(matches!(err, ConversationError::NotFound { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_a_missing_conversation_fails_the_whole_message() {
+        let (svc, _b, _repo, _t) = make_service();
+        let err = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[SessionRef {
+                    id: "conv_does_not_exist".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .expect_err("must fail atomically");
+        assert!(matches!(err, ConversationError::NotFound { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_a_team_conversation_is_rejected() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(&repo, "user_1", "conv_team", "team chat", json!({"teamId": "team_1"})).await;
+
+        let err = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[SessionRef {
+                    id: "conv_team".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .expect_err("team conversations are not valid @@ targets");
+        assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn one_bad_reference_fails_the_send_even_when_another_is_valid() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(&repo, "user_1", "conv_ok", "ok", json!({"workspace": "/w/a"})).await;
+
+        let err = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[
+                    SessionRef {
+                        id: "conv_ok".to_owned(),
+                    },
+                    SessionRef {
+                        id: "conv_missing".to_owned(),
+                    },
+                ],
+                Some("/w/a"),
+            )
+            .await
+            .expect_err("atomicity: one bad reference fails the whole message");
+        assert!(matches!(err, ConversationError::NotFound { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn send_message_persists_and_broadcasts_the_block_inline() {
+        let (svc, broadcaster, repo, task_mgr) = make_service();
+        let sender = svc.create("user_1", make_create_req()).await.unwrap();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_target",
+            "重构-鉴权模块",
+            json!({"workspace": "/w/a"}),
+        )
+        .await;
+        broadcaster.take_events();
+
+        let request: SendMessageRequest = serde_json::from_value(json!({
+            "content": "问下他",
+            "sessions": [{ "id": "conv_target" }]
+        }))
+        .unwrap();
+
+        let response = svc
+            .send_message("user_1", &sender.id, request, &task_mgr)
+            .await
+            .expect("send succeeds");
+
+        let rows: Vec<_> = repo
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.msg_id.as_deref() == Some(response.msg_id.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(rows.len(), 1, "persisted exactly once");
+        // The `content` column stores a JSON envelope, so read the text back
+        // out rather than matching against escaped tabs.
+        let envelope: serde_json::Value = serde_json::from_str(&rows[0].content).expect("content is a JSON envelope");
+        let persisted = envelope["content"].as_str().expect("content text").to_owned();
+        assert!(
+            persisted.contains("重构-鉴权模块\tconv_target\tworkspace:"),
+            "the block must be persisted verbatim: {persisted}"
+        );
+        assert!(persisted.starts_with("问下他\n\n[[AION_SESSIONS]]"), "{persisted}");
+    }
+
+    /// The ordering constraint the plan calls a hard requirement: the block is
+    /// appended BEFORE the mid-turn branch consumes `resolved`. Hooking it
+    /// after would leave every other test green while silently dropping `@@`
+    /// context on the mid-turn path.
+    #[tokio::test]
+    async fn a_midturn_delivery_still_carries_the_sessions_block() {
+        let (svc, _b, repo, _t) = make_service();
+        let sender = svc.create("user_1", make_create_req()).await.unwrap();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_target",
+            "重构-鉴权模块",
+            json!({"workspace": "/w/a"}),
+        )
+        .await;
+        let _claim = svc
+            .runtime_state()
+            .try_claim_turn(&sender.id, "turn_active")
+            .expect("claim the active turn");
+        let agent = Arc::new(MidturnMockAgent::new(&sender.id));
+        let task_mgr = Arc::new(MockTaskManager::new());
+        task_mgr.insert_agent(&sender.id, AgentInstance::Mock(agent.clone()));
+        let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+
+        let request: SendMessageRequest = serde_json::from_value(json!({
+            "content": "问下他",
+            "sessions": [{ "id": "conv_target" }]
+        }))
+        .unwrap();
+
+        let response = svc
+            .send_message("user_1", &sender.id, request, &task_mgr_dyn)
+            .await
+            .expect("mid-turn send must not 409");
+        assert!(response.delivered_midturn, "this test must exercise the mid-turn path");
+
+        let delivered = agent.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            delivered[0].content.contains("[[AION_SESSIONS]]"),
+            "mid-turn delivery must not drop the @@ block: {}",
+            delivered[0].content
+        );
+        assert!(
+            delivered[0].content.contains("重构-鉴权模块\tconv_target\tworkspace:"),
+            "{}",
+            delivered[0].content
+        );
+    }
+
+    /// `[[AION_FILES]]` MUST remain the last block in the content.
+    ///
+    /// The front-end's file-chip parser reads every non-empty line after the
+    /// `[[AION_FILES]]` marker as a path and abandons the whole parse if any of
+    /// them is not one (`MessageText.tsx`, `parseFileMarker`). While the
+    /// sessions block was appended after the files block, a message carrying
+    /// BOTH `@` and `@@` lost its file chips and rendered the raw marker plus
+    /// the absolute path as plain text. Only a message with both kinds of
+    /// reference reproduces it, which is why no earlier test caught it.
+    #[tokio::test]
+    async fn the_files_block_stays_last_when_a_message_carries_both_a_file_and_a_session() {
+        let work_root = tempfile::tempdir().unwrap();
+        let (svc, _bc, repo, task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+        svc.with_project_service(make_injected_project_service(work_root.path()).await);
+
+        let sender = svc.create("user_1", make_create_req()).await.unwrap();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_target",
+            "重构-鉴权模块",
+            json!({"workspace": "/w/a"}),
+        )
+        .await;
+
+        // A `Local` ref only has to be an existing regular file, so it needs no
+        // upload root and no project binding.
+        let attachment = work_root.path().join("auth.rs");
+        std::fs::write(&attachment, "fn main() {}").unwrap();
+
+        let request: SendMessageRequest = serde_json::from_value(json!({
+            "content": "看下这个文件，然后问下他",
+            "files": [{ "kind": "local", "path": attachment.to_string_lossy() }],
+            "sessions": [{ "id": "conv_target" }]
+        }))
+        .unwrap();
+
+        let response = svc
+            .send_message("user_1", &sender.id, request, &task_mgr)
+            .await
+            .expect("send succeeds");
+
+        let rows: Vec<_> = repo
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.msg_id.as_deref() == Some(response.msg_id.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let envelope: serde_json::Value = serde_json::from_str(&rows[0].content).expect("content is a JSON envelope");
+        let persisted = envelope["content"].as_str().expect("content text");
+
+        let sessions_at = persisted
+            .find("[[AION_SESSIONS]]")
+            .unwrap_or_else(|| panic!("sessions block missing: {persisted}"));
+        let files_at = persisted
+            .find("[[AION_FILES]]")
+            .unwrap_or_else(|| panic!("files block missing: {persisted}"));
+        assert!(
+            sessions_at < files_at,
+            "the files block must come last so every line after its marker is a path: {persisted}"
+        );
+
+        // The concrete property the front-end depends on: nothing but paths
+        // follows the marker.
+        let after_marker = &persisted[files_at + "[[AION_FILES]]".len()..];
+        for line in after_marker.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            assert!(
+                line.starts_with('/') || line.starts_with('\\') || line.contains(":\\"),
+                "only absolute paths may follow the files marker, found {line:?} in {persisted}"
+            );
+        }
+    }
+struct FailingPreTurnJournal;
+
+#[async_trait::async_trait]
+impl crate::turn_journal::TurnJournal for FailingPreTurnJournal {
+    async fn capture_pre_turn(&self, _record: &crate::turn_journal::PreTurnRecord<'_>) -> Result<(), crate::turn_journal::JournalError> {
+        Err(crate::turn_journal::JournalError::Internal("Simulated journal write failure".to_string()))
+    }
+
+    async fn reconcile_terminal(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _turn_id: &str,
+        _outcome: &crate::turn_journal::TerminalOutcomeRecord<'_>,
+    ) -> Result<(), crate::turn_journal::JournalError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_send_message_pre_capture_fail_closed_releases_claim_and_does_not_broadcast() {
+    let (svc, broadcaster, _repo, task_mgr) = make_service();
+    let svc = svc.with_turn_journal(Arc::new(FailingPreTurnJournal));
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let res = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await;
+
+    assert!(res.is_err(), "send_message must fail closed when turn journal capture fails");
+
+    // Verify turn claim was released (not stuck)
+    let claim_res = svc.runtime_state().try_claim_turn(&conv.id, "turn_next");
+    assert!(claim_res.is_ok(), "turn claim must be released on fail-closed compensation");
+
+    // Verify NO userCreated broadcast was emitted
+    let events = broadcaster.take_events();
+    let has_user_created = events.iter().any(|e| e.name == "message.userCreated");
+    assert!(!has_user_created, "message.userCreated must NOT be broadcast when pre-turn capture fails");
+}
+
+#[tokio::test]
+async fn test_send_message_captures_pre_turn_in_journal_with_normalized_workspace() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+    let svc = svc.with_turn_journal(journal.clone());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let send = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await.unwrap();
+
+    let events = journal.get_turn_events("user_1", &conv.id, &send.turn_id).await;
+    assert!(!events.is_empty(), "PreTurn event must be recorded in journal");
+
+    if let crate::turn_journal::RawJournalEvent::PreExecution { turn_id, user_message, workspace, .. } = &events[0] {
+        assert_eq!(turn_id, &send.turn_id);
+        assert_eq!(user_message, "hello");
+        if let Some(ref ws) = workspace {
+            assert!(!ws.contains("/root"), "workspace must be normalized opaque metadata");
+        }
+    } else {
+        panic!("First journal event must be PreExecution");
+    }
+}
+
+#[tokio::test]
+async fn test_startup_recovery_scans_journal_and_reconciles_timeouts() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(crate::turn_journal::FilesystemTurnJournal::new(temp.path()));
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let svc = svc
+        .with_turn_journal(journal.clone())
+        .with_journal_data_dir(temp.path());
+
+    let unclosed = crate::turn_journal::PreTurnRecord {
+        user_id: "user_stale",
+        conversation_id: "conv_stale",
+        turn_id: "turn_stale_1",
+        parent_turn_id: None,
+        user_message: "Stale question",
+        workspace: None,
+        created_at_ms: 10_000,
+    };
+    journal.capture_pre_turn(&unclosed).await.unwrap();
+
+    // Recover unclosed turns
+    let count = svc.recover_raw_event_journals_on_startup(5_000).await;
+    assert_eq!(count, 1, "Startup recovery should reconcile the stale turn");
+
+    let raw_file = temp.path().join("users/user_stale/events/raw/conv_stale/turn_stale_1.jsonl");
+    let events = crate::turn_journal::FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[1], crate::turn_journal::RawJournalEvent::FinalOutcome { status: crate::turn_journal::TurnTerminalStatus::Timeout, .. }));
+}
+
+#[tokio::test]
+async fn test_deferred_cancel_single_terminal_outcome() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+    let svc = svc.with_turn_journal(journal.clone());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let turn_id = "turn_deferred_cancel_1";
+
+    // 1. Capture PreExecution in journal
+    let pre_record = crate::turn_journal::PreTurnRecord {
+        user_id: "user_1",
+        conversation_id: &conv.id,
+        turn_id,
+        parent_turn_id: None,
+        user_message: "Prompt before deferred cancel",
+        workspace: None,
+        created_at_ms: now_ms(),
+    };
+    journal.capture_pre_turn(&pre_record).await.unwrap();
+
+    // 2. Set deferred cancel on runtime state and claim turn
+    svc.runtime_state().defer_cancel(&conv.id, turn_id);
+    assert!(svc.runtime_state().is_turn_cancelling(&conv.id, turn_id));
+
+    let turn_claim = svc.runtime_state().try_claim_turn(&conv.id, turn_id).unwrap();
+
+    // 3. Run orchestrator synchronously on the public lifecycle seam
+    let orchestrator = crate::turn_orchestrator::ConversationTurnOrchestrator::new(
+        svc.clone(),
+        task_mgr.clone(),
+    );
+
+    let result = orchestrator.run_user_turn(crate::turn_orchestrator::TurnStartInput {
+        conversation: conv.clone(),
+        turn_id: turn_id.to_string(),
+        content: "Prompt before deferred cancel".to_string(),
+        files: vec![],
+        inject_skills: vec![],
+        build_options: BuildTaskOptions::default(),
+        stored_workspace: String::new(),
+        turn_claim,
+        user_id: "user_1".to_string(),
+        required_runtime_mode: None,
+    }).await;
+
+    assert_eq!(result.status, ConversationTurnStatus::Completed);
+
+    // 4. Verify exactly 1 PreExecution and exactly 1 FinalOutcome (Cancelled)
+    let events = journal.get_turn_events("user_1", &conv.id, turn_id).await;
+    assert_eq!(events.len(), 2, "Must record exactly one PreExecution and one FinalOutcome");
+    match &events[1] {
+        crate::turn_journal::RawJournalEvent::FinalOutcome { status, .. } => {
+            assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Cancelled);
+        }
+        _ => panic!("Expected FinalOutcome event"),
+    }
+
+    // 5. Verify turn claim was released cleanly
+    assert!(svc.runtime_state().try_claim_turn(&conv.id, turn_id).is_ok());
+}
+
+#[tokio::test]
+async fn test_run_agent_turn_capture_before_on_started_and_fail_closed() {
+    // 1. Test failure case: failing journal must fail-closed and NOT invoke on_started
+    let (svc_fail, _broadcaster, _repo, _task_mgr) = make_service();
+    let svc_fail = svc_fail.with_turn_journal(Arc::new(FailingPreTurnJournal));
+
+    let conv = svc_fail.create("user_1", make_create_req()).await.unwrap();
+    let on_started_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let on_started_clone = Arc::clone(&on_started_called);
+
+    let on_started_cb: crate::service::ConversationAgentTurnStartedCallback = Arc::new(move |_| {
+        let called = Arc::clone(&on_started_clone);
+        Box::pin(async move {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    });
+
+    let res = svc_fail.run_agent_turn(crate::service::ConversationAgentTurnRequest {
+        user_id: "user_1".to_string(),
+        conversation_id: conv.id.clone(),
+        content: "agent prompt".to_string(),
+        files: vec![],
+        inject_skills: vec![],
+        required_runtime_mode: None,
+        persist_user_message: true,
+        user_message_hidden: false,
+        on_started: Some(on_started_cb),
+    }).await;
+
+    assert!(res.is_err(), "run_agent_turn must fail closed when capture_pre_turn fails");
+    assert!(!on_started_called.load(std::sync::atomic::Ordering::SeqCst), "on_started callback MUST NOT be invoked when capture fails");
+
+    // Verify turn claim was released
+    let claim_res = svc_fail.runtime_state().try_claim_turn(&conv.id, "turn_next");
+    assert!(claim_res.is_ok(), "turn claim must be released when capture fails");
+
+    // 2. Test success case: on_started is invoked AFTER successful pre-capture
+    let (svc_ok, _broadcaster, _repo, _task_mgr) = make_service();
+    let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+    let svc_ok = svc_ok.with_turn_journal(journal.clone());
+
+    let conv_ok = svc_ok.create("user_1", make_create_req()).await.unwrap();
+    let started_recorded = Arc::new(tokio::sync::Mutex::new(None));
+    let started_clone = Arc::clone(&started_recorded);
+
+    let on_started_ok: crate::service::ConversationAgentTurnStartedCallback = Arc::new(move |started| {
+        let rec = Arc::clone(&started_clone);
+        Box::pin(async move {
+            let mut guard = rec.lock().await;
+            *guard = Some(started);
+        })
+    });
+
+    let _outcome = svc_ok.run_agent_turn(crate::service::ConversationAgentTurnRequest {
+        user_id: "user_1".to_string(),
+        conversation_id: conv_ok.id.clone(),
+        content: "agent prompt success".to_string(),
+        files: vec![],
+        inject_skills: vec![],
+        required_runtime_mode: None,
+        persist_user_message: true,
+        user_message_hidden: false,
+        on_started: Some(on_started_ok),
+    }).await.unwrap();
+
+    let started_val = started_recorded.lock().await.clone().unwrap();
+    assert_eq!(started_val.conversation_id, conv_ok.id);
+
+    // Verify journal has PreExecution event
+    let events = journal.get_turn_events("user_1", &conv_ok.id, &started_val.turn_id).await;
+    assert!(!events.is_empty(), "Journal must contain captured event");
+    assert!(matches!(events[0], crate::turn_journal::RawJournalEvent::PreExecution { .. }));
+}
+
+#[tokio::test]
+async fn test_auto_replay_records_real_per_attempt_summaries_in_single_terminal() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+    let svc = svc.with_turn_journal(journal.clone());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "transient provider error".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData { content: "replayed response".into() }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first.clone()),
+        AgentInstance::Mock(second.clone()),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 2, "Must build 2 agent instances for auto-replay");
+
+    let events = journal.get_turn_events("user_1", &conv.id, &send.turn_id).await;
+    assert_eq!(events.len(), 2, "Must record exactly 1 PreExecution and 1 FinalOutcome for entire turn");
+    assert!(matches!(events[0], crate::turn_journal::RawJournalEvent::PreExecution { .. }));
+
+    match &events[1] {
+        crate::turn_journal::RawJournalEvent::FinalOutcome {
+            status,
+            attempts,
+            last_attempt_id,
+            retry_summaries,
+            ..
+        } => {
+            assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Success);
+            assert_eq!(*attempts, 2, "Total attempts must be 2");
+            assert_eq!(
+                last_attempt_id.as_deref(),
+                Some(format!("{}-att-2", send.turn_id).as_str())
+            );
+
+            let summaries = retry_summaries
+                .as_ref()
+                .expect("Must include retry_summaries when attempts > 1");
+            assert_eq!(summaries.len(), 2, "Must include summary for both attempts");
+
+            // Attempt 1 checks
+            assert_eq!(summaries[0].attempt_id, format!("{}-att-1", send.turn_id));
+            assert!(
+                summaries[0].duration_ms.is_some(),
+                "Attempt 1 must record actual measured duration_ms"
+            );
+            assert!(
+                summaries[0].error.is_some(),
+                "Attempt 1 must record actual error"
+            );
+            assert_ne!(
+                summaries[0].error.as_deref(),
+                Some("auto_replay_trigger"),
+                "Must NOT hardcode auto_replay_trigger"
+            );
+
+            // Attempt 2 checks
+            assert_eq!(summaries[1].attempt_id, format!("{}-att-2", send.turn_id));
+            assert!(
+                summaries[1].duration_ms.is_some(),
+                "Attempt 2 must record actual measured duration_ms"
+            );
+            assert_eq!(
+                summaries[1].error, None,
+                "Attempt 2 succeeded, error must be None"
+            );
+        }
+        _ => panic!("Expected FinalOutcome event"),
+    }
+}
 }

@@ -14,7 +14,6 @@ use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
-use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
     AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
@@ -28,9 +27,11 @@ use aionui_api_types::{
     UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
+use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
+    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
+    now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
@@ -58,6 +59,7 @@ use crate::convert::{
 };
 use crate::error::ConversationError;
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
+use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
@@ -68,6 +70,12 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+
+/// Journal records use unsigned millisecond timestamps while the existing
+/// database/common timestamp API is signed. Clamp defensively at this boundary.
+pub(crate) fn journal_now_ms() -> u64 {
+    now_ms().try_into().unwrap_or_default()
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
@@ -319,6 +327,10 @@ pub struct ConversationService {
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl.
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
+    /// Hooks invoked when `cancel()` actually cancelled a turn, so upper-layer
+    /// services can drop work aimed at this conversation. See
+    /// `OnConversationTurnCancelled` for why only some branches fire.
+    turn_cancelled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnCancelled>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -345,6 +357,12 @@ pub struct ConversationService {
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
+
+    turn_journal: Arc<dyn crate::turn_journal::TurnJournal>,
+    /// Private mid-turn event coordinator sharing the production journal
+    /// instance (and therefore its lock/root) with the public seam.
+    mid_turn_coordinator: Option<Arc<crate::turn_journal::MidTurnCoordinator>>,
+    journal_data_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -403,6 +421,7 @@ impl ConversationService {
             skill_resolver,
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
+            turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -419,7 +438,57 @@ impl ConversationService {
             conversation_repo,
             agent_metadata_repo,
             acp_session_repo,
+            turn_journal: Arc::new(crate::turn_journal::InMemoryTurnJournal::new()),
+            mid_turn_coordinator: None,
+            journal_data_dir: None,
         }
+    }
+
+    pub fn with_turn_journal(mut self, turn_journal: Arc<dyn crate::turn_journal::TurnJournal>) -> Self {
+        self.turn_journal = turn_journal;
+        self.mid_turn_coordinator = None;
+        self
+    }
+
+    /// Installs the production filesystem journal for both public lifecycle
+    /// methods and the private mid-turn coordinator. Keeping one Arc here is
+    /// essential: startup recovery and live delivery must share locks and root.
+    pub fn with_filesystem_turn_journal(
+        mut self,
+        journal: Arc<crate::turn_journal::FilesystemTurnJournal>,
+    ) -> Self {
+        self.turn_journal = journal.clone();
+        self.mid_turn_coordinator = Some(Arc::new(crate::turn_journal::MidTurnCoordinator::filesystem(journal)));
+        self
+    }
+
+    pub fn with_journal_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.journal_data_dir = Some(data_dir.into());
+        self
+    }
+
+    pub fn turn_journal(&self) -> Arc<dyn crate::turn_journal::TurnJournal> {
+        Arc::clone(&self.turn_journal)
+    }
+
+    async fn record_mid_turn_event(
+        &self,
+        record: &crate::turn_journal::MidTurnRecord,
+    ) -> Result<(), ConversationError> {
+        let Some(coordinator) = &self.mid_turn_coordinator else {
+            // Test/custom TurnJournal implementations predate the private
+            // mid-turn operation. Production composition always installs the
+            // filesystem coordinator; preserve those adapters' API behavior.
+            return Ok(());
+        };
+        coordinator
+            .record(record)
+            .await
+            .map_err(|error| ConversationError::internal(format!("mid-turn journal write failed: {error}")))
+    }
+
+    pub fn journal_data_dir(&self) -> Option<&Path> {
+        self.journal_data_dir.as_deref()
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -539,6 +608,49 @@ impl ConversationService {
             })
     }
 
+    /// Resolve `@@` conversation references into the `[[AION_SESSIONS]]` block
+    /// appended to the message content.
+    ///
+    /// Atomic like `[[AION_FILES]]`: any bad reference (missing, another
+    /// user's, or team-owned) fails the whole message. Name and workspace come
+    /// from the row — never from the client.
+    pub async fn resolve_session_mentions(
+        &self,
+        user_id: &str,
+        content: &str,
+        sessions: &[SessionRef],
+        sender_workspace: Option<&str>,
+    ) -> Result<String, ConversationError> {
+        if sessions.is_empty() {
+            return Ok(content.to_owned());
+        }
+
+        let mut targets = Vec::with_capacity(sessions.len());
+        for reference in sessions {
+            // Scoped by user_id, so another user's id yields NotFound rather
+            // than Forbidden — refuse without leaking existence (spec §9.1).
+            let row = self
+                .conversation_repo
+                .get(user_id, &reference.id)
+                .await?
+                .ok_or_else(|| ConversationError::NotFound {
+                    id: reference.id.clone(),
+                })?;
+            // Empty sender id: the picker already excludes the current
+            // conversation (spec §5.3), and the CLI side re-checks it as
+            // `target_is_self`.
+            session_mentions::reject_unusable_target("", &row.id, &row.extra)?;
+            targets.push(session_mentions::SessionMentionTargetInfo {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                workspace: session_mentions::workspace_from_extra(&row.extra),
+            });
+        }
+
+        let block = session_mentions::build_sessions_block(sender_workspace, &targets);
+        Ok(format!("{content}\n\n{block}"))
+    }
+
     pub fn with_assistant_definition_repo(&self, repo: Arc<dyn IAssistantDefinitionRepository>) {
         if let Ok(mut guard) = self.assistant_definition_repo.write() {
             *guard = Some(repo);
@@ -578,6 +690,27 @@ impl ConversationService {
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
             guard.push(hook);
+        }
+    }
+
+    /// Register a hook notified when `cancel()` cancelled a turn.
+    pub fn with_turn_cancelled_hook(&self, hook: Arc<dyn OnConversationTurnCancelled>) {
+        if let Ok(mut guard) = self.turn_cancelled_hooks.write() {
+            guard.push(hook);
+        }
+    }
+
+    /// Snapshot the hook list, then drop the guard before awaiting:
+    /// `RwLockReadGuard` is not `Send`, so holding it across `.await` would
+    /// make the caller's future non-`Send`. Same pattern as `delete()`.
+    async fn notify_turn_cancelled(&self, user_id: &str, conversation_id: &str, turn_id: &str, cause: TurnCancelCause) {
+        let hooks: Vec<Arc<dyn OnConversationTurnCancelled>> = self
+            .turn_cancelled_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook.on_turn_cancelled(user_id, conversation_id, turn_id, cause).await;
         }
     }
 
@@ -3163,6 +3296,32 @@ impl ConversationService {
     }
 
     /// Return one full message for a conversation after verifying ownership.
+    /// Newest message of one type, or `None`.
+    ///
+    /// Serves the plan bar's rehydration: the paginated load alone cannot find a
+    /// plan row that its own turn buried under later messages (`upsert_message`
+    /// does not refresh `created_at`).
+    pub async fn latest_message_of_type(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        message_type: &str,
+    ) -> Result<Option<MessageResponse>, ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let row = self
+            .conversation_repo
+            .latest_message_of_type(user_id, conversation_id, message_type)
+            .await?;
+
+        row.map(row_to_message_response).transpose()
+    }
+
     pub async fn get_message(
         &self,
         user_id: &str,
@@ -3483,7 +3642,10 @@ enum MidturnOutcome {
     /// through the normal path, reusing the already-persisted message row
     /// (`Some`) or persisting normally (`None` when runtime persistence
     /// disallowed the write).
-    TurnEnded { user_msg_id: Option<String> },
+    TurnEnded {
+        user_msg_id: Option<String>,
+        source_turn_id: String,
+    },
 }
 
 /// Is this delivery error codex's "the turn already ended" steer rejection?
@@ -3561,6 +3723,71 @@ pub(crate) async fn apply_message_receipt(
 }
 
 impl ConversationService {
+    /// Persist and surface a rejected mid-turn receipt without sending the
+    /// request to the agent/memory. The journal is durable before the UI sees
+    /// the receipt, matching accepted mid-turn ordering.
+    async fn persist_rejected_mid_turn_receipt(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        resolved: &ResolvedChatMessage,
+        hidden: bool,
+        active_turn_id: &str,
+        reason: &str,
+    ) -> Result<(), ConversationError> {
+        let msg_id = Self::mint_msg_id();
+        let persisted = self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::UserMessage);
+        let created_at = now_ms();
+        if persisted {
+            let user_msg = aionui_db::models::MessageRow {
+                id: msg_id.clone(),
+                conversation_id: conversation_id.to_owned(),
+                msg_id: Some(msg_id.clone()),
+                r#type: "text".into(),
+                content: serde_json::json!({ "content": resolved.content }).to_string(),
+                position: Some("right".into()),
+                status: Some("error".into()),
+                hidden,
+                created_at,
+                backend_turn_id: None,
+            };
+            self.conversation_repo.insert_message(user_id, &user_msg).await?;
+        }
+
+        let rejected_event = crate::turn_journal::MidTurnRecord::new(
+            user_id,
+            conversation_id,
+            active_turn_id,
+            None,
+            None,
+            Some(&msg_id),
+            &resolved.content,
+            crate::turn_journal::MidTurnEventKind::Rejected,
+            Some(reason),
+            journal_now_ms(),
+        );
+        self.record_mid_turn_event(&rejected_event).await?;
+
+        if persisted {
+            self.broadcaster.broadcast(WebSocketMessage::new(
+                "message.userCreated",
+                serde_json::json!({
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "msg_id": &msg_id,
+                    "content": &resolved.content,
+                    "position": "right",
+                    "status": "error",
+                    "hidden": hidden,
+                    "created_at": created_at,
+                }),
+            ));
+        }
+        Ok(())
+    }
+
     /// B5: deliver a message into the RUNNING turn (no claim, no new turn id).
     ///
     /// Persists the user message with the pending-receipt status
@@ -3586,6 +3813,7 @@ impl ConversationService {
         let persisted = self
             .runtime_persistence()
             .allows(conversation_id, RuntimeWriteKind::UserMessage);
+        let created_at = now_ms();
         if persisted {
             let user_msg = aionui_db::models::MessageRow {
                 id: user_msg_id.clone(),
@@ -3596,7 +3824,7 @@ impl ConversationService {
                 position: Some("right".into()),
                 status: Some(MIDTURN_STATUS_QUEUED.into()),
                 hidden,
-                created_at: now_ms(),
+                created_at,
                 backend_turn_id: None,
             };
             if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
@@ -3604,6 +3832,43 @@ impl ConversationService {
                 return Err(e.into());
             }
             info!(msg_id = %user_msg_id, "Mid-turn user message persisted");
+        }
+
+        // Journal the acceptance before any UI broadcast or agent delivery.
+        // The compact event stores only a message reference and content hash.
+        let accepted_event = crate::turn_journal::MidTurnRecord::new(
+            user_id,
+            conversation_id,
+            &active_turn_id,
+            None,
+            None,
+            Some(&user_msg_id),
+            &resolved.content,
+            crate::turn_journal::MidTurnEventKind::Accepted,
+            None,
+            journal_now_ms(),
+        );
+        if let Err(error) = self.record_mid_turn_event(&accepted_event).await {
+            if persisted {
+                // Keep the persisted receipt deterministic without emitting a
+                // user-created event that would imply worker delivery.
+                let _ = self
+                    .conversation_repo
+                    .update_message(
+                        user_id,
+                        conversation_id,
+                        &user_msg_id,
+                        &aionui_db::MessageRowUpdate {
+                            content: None,
+                            status: Some(Some("error".to_owned())),
+                            hidden: None,
+                        },
+                    )
+                    .await;
+            }
+            return Err(error);
+        }
+        if persisted {
             self.broadcaster.broadcast(WebSocketMessage::new(
                 "message.userCreated",
                 serde_json::json!({
@@ -3617,7 +3882,7 @@ impl ConversationService {
                     "position": "right",
                     "status": MIDTURN_STATUS_QUEUED,
                     "hidden": hidden,
-                    "created_at": user_msg.created_at,
+                    "created_at": created_at,
                 }),
             ));
         }
@@ -3667,6 +3932,7 @@ impl ConversationService {
                 }
                 Ok(MidturnOutcome::TurnEnded {
                     user_msg_id: persisted.then_some(user_msg_id),
+                    source_turn_id: active_turn_id,
                 })
             }
             Err(e) => {
@@ -3747,11 +4013,37 @@ impl ConversationService {
 
         reject_deprecated_runtime_row(&row)?;
 
+        // `@@` references resolve at the same boundary and with the same
+        // atomicity as file attachments. Sender workspace comes from the row so
+        // the block can state `workspace: same` without the model comparing
+        // path strings.
+        //
+        // ⚠️ ORDER MATTERS TWICE, and both constraints are load-bearing:
+        //
+        // 1. This MUST stay above the mid-turn branch below: that branch
+        //    consumes the resolved content, so appending the block after it
+        //    would silently drop `@@` context whenever the message merged into
+        //    a running turn — and every unit test would still pass.
+        // 2. This MUST run BEFORE `resolve_message_attachments`, so that
+        //    `[[AION_FILES]]` stays the LAST block in the content. The
+        //    front-end's file-chip parser takes every non-empty line after the
+        //    `[[AION_FILES]]` marker as a path and bails out entirely if any of
+        //    them is not one (`MessageText.tsx`, `parseFileMarker`). With the
+        //    sessions block appended afterwards, a message carrying BOTH `@` and
+        //    `@@` lost its file chips and rendered the raw marker as text.
+        let content_with_sessions = if req.sessions.is_empty() {
+            req.content.clone()
+        } else {
+            let sender_workspace = session_mentions::workspace_from_extra(&row.extra);
+            self.resolve_session_mentions(user_id, &req.content, &req.sessions, sender_workspace.as_deref())
+                .await?
+        };
+
         // Resolve file attachments at the send boundary before any persist/claim
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
         let resolved = self
-            .resolve_message_attachments(user_id, &req.content, &req.files)
+            .resolve_message_attachments(user_id, &content_with_sessions, &req.files)
             .await?;
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────
@@ -3760,6 +4052,7 @@ impl ConversationService {
         // with the active turn's id. Every other case (including the 409 for
         // non-supporting backends) is unchanged and handled by the claim below.
         let mut fallback_user_msg: Option<String> = None;
+        let mut fallback_source_turn: Option<String> = None;
         if let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
             && let Some(agent) = task_manager.get_task(conversation_id)
             && agent.supports_midturn_delivery()
@@ -3772,12 +4065,35 @@ impl ConversationService {
             // gate. Same authoritative source the runtime summary's
             // `pending_confirmations` reads (`get_confirmations`).
             if !agent.get_confirmations().is_empty() {
-                info!(
-                    conversation_id = %conversation_id,
-                    route = "rejected_requires_action",
-                    active_turn_id = %active_turn_id,
-                    "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
-                );
+                // Once per turn, not once per attempt: the cross-session
+                // drainer retries a queued delivery every second and each
+                // retry is refused identically, which turned one unanswered
+                // card into 600 identical lines over a 10-minute TTL.
+                if self.runtime_state.should_log_once_for_turn(
+                    crate::runtime_state::OncePerTurn::MidturnRefusal,
+                    conversation_id,
+                    &active_turn_id,
+                ) {
+                    info!(
+                        conversation_id = %conversation_id,
+                        route = "rejected_requires_action",
+                        active_turn_id = %active_turn_id,
+                        "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
+                    );
+                }
+                self
+                    .persist_rejected_mid_turn_receipt(
+                        user_id,
+                        conversation_id,
+                        &resolved,
+                        req.hidden,
+                        &active_turn_id,
+                        "confirmation_required",
+                    )
+                    .await?;
+                return Err(ConversationError::Busy {
+                    reason: "conversation requires confirmation before accepting a mid-turn message".into(),
+                });
             } else {
                 match self
                     .deliver_midturn_message(
@@ -3794,7 +4110,13 @@ impl ConversationService {
                     MidturnOutcome::Delivered(response) => return Ok(response),
                     // codex rejected the steer because the turn just ended → fall
                     // through and open a NEW turn for the already-persisted message.
-                    MidturnOutcome::TurnEnded { user_msg_id } => fallback_user_msg = user_msg_id,
+                    MidturnOutcome::TurnEnded {
+                        user_msg_id,
+                        source_turn_id,
+                    } => {
+                        fallback_user_msg = user_msg_id;
+                        fallback_source_turn = Some(source_turn_id);
+                    }
                 }
             }
         }
@@ -3848,7 +4170,61 @@ impl ConversationService {
             }
 
             info!(msg_id = %user_msg_id, "User message persisted");
+        }
 
+        // Capture pre-turn in TurnJournal before WebSocket broadcast and worker launch.
+        let normalized_ws = crate::turn_journal::normalize_workspace_label(
+            crate::session_mentions::workspace_from_extra(&row.extra).as_deref(),
+        );
+        let pre_record = crate::turn_journal::PreTurnRecord {
+            user_id,
+            conversation_id,
+            turn_id: &turn_id,
+            parent_turn_id: None,
+            user_message: &resolved.content,
+            workspace: normalized_ws.as_deref(),
+            created_at_ms: journal_now_ms(),
+        };
+        if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
+            warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal; failing closed");
+            let mut turn_claim = turn_claim;
+            let was_deleting = turn_claim.release();
+            self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting).await;
+            return Err(ConversationError::internal(format!("Failed to capture pre-turn in turn journal: {e}")));
+        }
+
+        // A steer rejection is known only after the original active-turn
+        // delivery attempt. When that source turn has ended, this new turn
+        // carries the relationship metadata before any worker launch. The
+        // source turn id is never reused after its claim ended.
+        if let Some(source_turn_id) = fallback_source_turn.as_deref() {
+            for event_kind in [
+                crate::turn_journal::MidTurnEventKind::SteerRejected,
+                crate::turn_journal::MidTurnEventKind::Fallback,
+            ] {
+                let event = crate::turn_journal::MidTurnRecord::new(
+                    user_id,
+                    conversation_id,
+                    &turn_id,
+                    Some(source_turn_id),
+                    None,
+                    Some(&user_msg_id),
+                    &resolved.content,
+                    event_kind,
+                    Some("source_turn_ended"),
+                    journal_now_ms(),
+                );
+                if let Err(error) = self.record_mid_turn_event(&event).await {
+                    let mut turn_claim = turn_claim;
+                    let was_deleting = turn_claim.release();
+                    self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
+                        .await;
+                    return Err(error);
+                }
+            }
+        }
+
+        if !was_fallback {
             self.broadcaster.broadcast(WebSocketMessage::new(
                 "message.userCreated",
                 serde_json::json!({
@@ -3863,7 +4239,6 @@ impl ConversationService {
                 }),
             ));
         }
-
         // Build task options from conversation row
         let mut build_opts = match self.build_task_options(&row).await {
             Ok(opts) => opts,
@@ -3875,6 +4250,25 @@ impl ConversationService {
                 );
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
+                let failure_outcome = crate::turn_journal::TerminalOutcomeRecord {
+                    status: crate::turn_journal::TurnTerminalStatus::Failed,
+                    assistant_message: None,
+                    token_usage: None,
+                    attempts: 0,
+                    last_attempt_id: None,
+                    retry_summaries: None,
+                    error_metadata: Some(serde_json::json!({
+                        "stage": "worker_build",
+                        "error": err.to_string(),
+                        "error_code": top_level_code,
+                        "assistant_message": "unavailable",
+                        "token_usage": "unavailable"
+                    })),
+                    finished_at_ms: journal_now_ms(),
+                };
+                if let Err(je) = self.turn_journal.reconcile_terminal(user_id, conversation_id, &turn_id, &failure_outcome).await {
+                    error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on build failure; turn remains open for startup recovery reconciliation");
+                }
                 self.persist_and_broadcast_send_failure_tip(
                     user_id,
                     conversation_id,
@@ -3977,6 +4371,29 @@ impl ConversationService {
                 return Err(e.into());
             }
         }
+
+        // 1. Capture pre-turn in TurnJournal BEFORE emitting on_started or launching worker (fail-closed)
+        let normalized_ws = crate::turn_journal::normalize_workspace_label(
+            crate::session_mentions::workspace_from_extra(&row.extra).as_deref(),
+        );
+        let pre_record = crate::turn_journal::PreTurnRecord {
+            user_id: &request.user_id,
+            conversation_id: &request.conversation_id,
+            turn_id: &turn_id,
+            parent_turn_id: None,
+            user_message: &request.content,
+            workspace: normalized_ws.as_deref(),
+            created_at_ms: journal_now_ms(),
+        };
+        if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
+            warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal for agent turn; failing closed without invoking on_started");
+            let mut turn_claim = turn_claim;
+            let was_deleting = turn_claim.release();
+            self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting).await;
+            return Err(ConversationError::internal(format!("Failed to capture pre-turn in turn journal: {e}")));
+        }
+
+        // 2. Invoke on_started callback ONLY after pre-turn event is safely captured
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(ConversationAgentTurnStarted {
                 conversation_id: request.conversation_id.clone(),
@@ -3990,6 +4407,25 @@ impl ConversationService {
             Err(err) => {
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
+                let failure_outcome = crate::turn_journal::TerminalOutcomeRecord {
+                    status: crate::turn_journal::TurnTerminalStatus::Failed,
+                    assistant_message: None,
+                    token_usage: None,
+                    attempts: 0,
+                    last_attempt_id: None,
+                    retry_summaries: None,
+                    error_metadata: Some(serde_json::json!({
+                        "stage": "worker_build",
+                        "error": err.to_string(),
+                        "error_code": top_level_code,
+                        "assistant_message": "unavailable",
+                        "token_usage": "unavailable"
+                    })),
+                    finished_at_ms: journal_now_ms(),
+                };
+                if let Err(je) = self.turn_journal.reconcile_terminal(&request.user_id, &request.conversation_id, &turn_id, &failure_outcome).await {
+                    error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on agent turn build failure; turn remains open for startup recovery reconciliation");
+                }
                 self.persist_and_broadcast_send_failure_tip(
                     &request.user_id,
                     &request.conversation_id,
@@ -4196,12 +4632,35 @@ impl ConversationService {
         Ok(())
     }
 
+    /// Cancel the active turn on a user's request.
+    ///
+    /// The public entry point, and the one the cancel route and the team
+    /// adapter use. `restart_runtime` goes through `cancel_with_cause` instead
+    /// so hooks can tell a stop from a process recycle.
     pub async fn cancel(
         &self,
         user_id: &str,
         conversation_id: &str,
         turn_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<CancelConversationResponse, ConversationError> {
+        self.cancel_with_cause(
+            user_id,
+            conversation_id,
+            turn_id,
+            task_manager,
+            TurnCancelCause::UserRequested,
+        )
+        .await
+    }
+
+    async fn cancel_with_cause(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        cause: TurnCancelCause,
     ) -> Result<CancelConversationResponse, ConversationError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
@@ -4240,6 +4699,12 @@ impl ConversationService {
                 conversation_id,
                 turn_id, "Cancel arrived before the agent registered; deferring it to the build"
             );
+            // A deferred cancel IS a real cancel intent — the orchestrator
+            // applies it as soon as the task appears — so pending deliveries
+            // aimed here must go now, not after the turn we are cancelling
+            // finally starts.
+            self.notify_turn_cancelled(user_id, conversation_id, turn_id, cause)
+                .await;
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
@@ -4281,6 +4746,8 @@ impl ConversationService {
         }
 
         info!(conversation_id, turn_id, "Stream cancel acknowledged");
+        self.notify_turn_cancelled(user_id, conversation_id, turn_id, cause)
+            .await;
         Ok(CancelConversationResponse {
             runtime: self.runtime_summary_for(conversation_id).await,
         })
@@ -4435,7 +4902,19 @@ impl ConversationService {
         self.runtime_state.begin_restart(conversation_id)?;
         let restart_result = async {
             if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
-                self.cancel(user_id, conversation_id, &turn_id, task_manager).await?;
+                // `RuntimeRestart`, not a user stop: cancelling here is only a
+                // precondition for killing the agent process. The user wants the
+                // conversation working again, and the restart leaves it idle —
+                // so work queued FOR it must survive, not be discarded at the
+                // exact moment it became deliverable.
+                self.cancel_with_cause(
+                    user_id,
+                    conversation_id,
+                    &turn_id,
+                    task_manager,
+                    TurnCancelCause::RuntimeRestart,
+                )
+                .await?;
             }
 
             info!(conversation_id, "Restarting conversation runtime");
@@ -5031,6 +5510,15 @@ fn auto_provisioned_workspace_to_delete(
     Some(workspace_path)
 }
 
+/// True when `leaf` is an auto-generated workspace directory name. Auto/temp
+/// workspace leaves are always `{label}-temp-{id}` (conversations) or
+/// `team-temp-{team_id}` (teams); the `-temp-` marker has been stable across
+/// every historical layout, so it is the sole signal the root-agnostic read
+/// predicate ([`is_temp_session_workspace`]) can rely on.
+fn is_temp_leaf(leaf: &str) -> bool {
+    leaf.contains("-temp-")
+}
+
 fn is_auto_workspace_relative_path(relative: &Path) -> bool {
     let parts = relative.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>();
     let Some(parts) = parts else {
@@ -5048,12 +5536,45 @@ fn is_auto_workspace_relative_path(relative: &Path) -> bool {
 
     match parts.as_slice() {
         // legacy: bare leaf, or {Y}/{M}/{D}/leaf
-        [_file_name] => true,
-        [year, month, day, _file_name] => dated(year, month, day),
+        [leaf] => is_temp_leaf(leaf),
+        [year, month, day, leaf] => dated(year, month, day) && is_temp_leaf(leaf),
         // per-user, type-first: users/{user_dir}/{Y}/{M}/{D}/leaf
-        ["users", _user_dir, year, month, day, _file_name] => dated(year, month, day),
+        ["users", _user_dir, year, month, day, leaf] => dated(year, month, day) && is_temp_leaf(leaf),
         _ => false,
     }
+}
+
+/// True when `workspace` is a backend auto-generated temp session directory —
+/// the sidebar read model's "temp path" test.
+///
+/// Classifies on the workspace *leaf* alone: an auto/temp workspace's final
+/// path segment is always `{label}-temp-{id}` or `team-temp-{team_id}`, and the
+/// `-temp-` marker has been stable across every layout the backend has ever
+/// generated — OS temp dir, bare `<data_dir>/{leaf}`, `<data_dir>/tmp/{leaf}`,
+/// and every `<data_dir>/conversations/...` shape (bare, date-partitioned,
+/// per-user). None of those share a container segment, so the leaf is the only
+/// signal common to all of them.
+///
+/// Container-agnostic (and therefore root-agnostic) is deliberate. Users who
+/// migrated their conversation directory across releases carry `extra.workspace`
+/// values baked under a *previous* root; anchoring on the current `work_dir` (or
+/// on a `conversations`/`tmp` container that the earliest layouts lack) would
+/// strip-fail on those and misclassify historical temp sessions as projects.
+/// Trading that off, a user-selected project directory whose own name literally
+/// contains `-temp-` is a false positive here; that is accepted — a project row
+/// carries its own `kind` (`standard`/`temp`) as the authoritative signal, and a
+/// mislabeled one can be promoted `temp -> standard`.
+///
+/// Pure lexical (no filesystem access), so it is safe on the side-effect-free
+/// sidebar read path — dead/removed workspaces classify correctly rather than
+/// failing an fs probe. Exposed so the sidebar can classify a conversation's
+/// `extra.workspace` (or a team's `workspace` column) without duplicating the
+/// rule.
+pub fn is_temp_session_workspace(workspace: &Path) -> bool {
+    workspace
+        .file_name()
+        .and_then(|leaf| leaf.to_str())
+        .is_some_and(is_temp_leaf)
 }
 
 async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_path: &Path) {
@@ -5844,13 +6365,18 @@ pub(crate) async fn apply_agent_title(
     user_id: &str,
     conversation_id: &str,
     title: &str,
+    // Which consumer won the frame — "watcher" (between turns) or "relay"
+    // (inside a turn, incl. the orphan-turn window). Both are valid; logging it
+    // is what makes a lost title diagnosable: the two paths were previously
+    // indistinguishable in production logs, which is why this bug hid so long.
+    consumer: &str,
 ) -> Result<bool, ConversationError> {
     let Some(existing) = repo.get(user_id, conversation_id).await? else {
-        debug!(conversation_id, "agent title dropped: conversation not found");
+        debug!(conversation_id, consumer, "agent title dropped: conversation not found");
         return Ok(false);
     };
     if existing.name_source.as_deref() == Some("user") {
-        debug!(conversation_id, "agent title dropped: name is user-owned");
+        debug!(conversation_id, consumer, "agent title dropped: name is user-owned");
         return Ok(false);
     }
     if existing.name == title {
@@ -5896,6 +6422,7 @@ pub(crate) async fn apply_agent_title(
     info!(
         conversation_id,
         title_len = title.chars().count(),
+        consumer,
         "agent session title applied"
     );
     Ok(true)

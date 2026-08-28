@@ -83,6 +83,31 @@ impl ConversationService {
         if recovered > 0 {
             info!(recovered, "startup recovery completed for stale runtime messages");
         }
+
+        // Reconcile unclosed in-flight turn raw event journals
+        self.recover_raw_event_journals_on_startup(5_000).await;
+    }
+
+    pub async fn recover_raw_event_journals_on_startup(&self, grace_window_ms: u64) -> usize {
+        let Some(data_dir) = self.journal_data_dir() else {
+            return 0;
+        };
+        let options = crate::turn_journal::StartupRecoveryOptions {
+            grace_window_ms,
+            now_ms: crate::service::journal_now_ms(),
+        };
+        match crate::turn_journal::internal_startup_recovery(self.turn_journal().as_ref(), data_dir, &options).await {
+            Ok(count) => {
+                if count > 0 {
+                    info!(count, "startup recovery reconciled unclosed turn raw event journals to timeout");
+                }
+                count
+            }
+            Err(e) => {
+                warn!(error = %ErrorChain(&e), "startup recovery failed during turn raw event journal scan");
+                0
+            }
+        }
     }
 }
 
