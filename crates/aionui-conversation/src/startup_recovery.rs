@@ -96,7 +96,7 @@ impl ConversationService {
             grace_window_ms,
             now_ms: crate::service::journal_now_ms(),
         };
-        match crate::turn_journal::internal_startup_recovery(self.turn_journal.as_ref(), data_dir, &options).await {
+        match crate::turn_journal::internal_startup_recovery(self.turn_journal().as_ref(), data_dir, &options).await {
             Ok(count) => {
                 if count > 0 {
                     info!(count, "startup recovery reconciled unclosed turn raw event journals to timeout");
