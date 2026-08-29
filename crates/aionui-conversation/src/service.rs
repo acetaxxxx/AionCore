@@ -453,10 +453,7 @@ impl ConversationService {
     /// Installs the production filesystem journal for both public lifecycle
     /// methods and the private mid-turn coordinator. Keeping one Arc here is
     /// essential: startup recovery and live delivery must share locks and root.
-    pub fn with_filesystem_turn_journal(
-        mut self,
-        journal: Arc<crate::turn_journal::FilesystemTurnJournal>,
-    ) -> Self {
+    pub fn with_filesystem_turn_journal(mut self, journal: Arc<crate::turn_journal::FilesystemTurnJournal>) -> Self {
         self.turn_journal = journal.clone();
         self.mid_turn_coordinator = Some(Arc::new(crate::turn_journal::MidTurnCoordinator::filesystem(journal)));
         self
@@ -4065,6 +4062,15 @@ impl ConversationService {
             // gate. Same authoritative source the runtime summary's
             // `pending_confirmations` reads (`get_confirmations`).
             if !agent.get_confirmations().is_empty() {
+                // Preserve the pre-B5 running-conversation conflict while the
+                // claim is still active. A rejected receipt is only meaningful
+                // after that claim has ended; persisting one here would turn a
+                // direct 409 into a user message/broadcast side effect.
+                if self.runtime_state.is_claimed(conversation_id) {
+                    return Err(ConversationError::Busy {
+                        reason: format!("conversation {conversation_id} is already running"),
+                    });
+                }
                 // Once per turn, not once per attempt: the cross-session
                 // drainer retries a queued delivery every second and each
                 // retry is refused identically, which turned one unanswered
@@ -4081,16 +4087,15 @@ impl ConversationService {
                         "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
                     );
                 }
-                self
-                    .persist_rejected_mid_turn_receipt(
-                        user_id,
-                        conversation_id,
-                        &resolved,
-                        req.hidden,
-                        &active_turn_id,
-                        "confirmation_required",
-                    )
-                    .await?;
+                self.persist_rejected_mid_turn_receipt(
+                    user_id,
+                    conversation_id,
+                    &resolved,
+                    req.hidden,
+                    &active_turn_id,
+                    "confirmation_required",
+                )
+                .await?;
                 return Err(ConversationError::Busy {
                     reason: "conversation requires confirmation before accepting a mid-turn message".into(),
                 });
@@ -4189,8 +4194,11 @@ impl ConversationService {
             warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal; failing closed");
             let mut turn_claim = turn_claim;
             let was_deleting = turn_claim.release();
-            self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting).await;
-            return Err(ConversationError::internal(format!("Failed to capture pre-turn in turn journal: {e}")));
+            self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
+                .await;
+            return Err(ConversationError::internal(format!(
+                "Failed to capture pre-turn in turn journal: {e}"
+            )));
         }
 
         // A steer rejection is known only after the original active-turn
@@ -4266,7 +4274,11 @@ impl ConversationService {
                     })),
                     finished_at_ms: journal_now_ms(),
                 };
-                if let Err(je) = self.turn_journal.reconcile_terminal(user_id, conversation_id, &turn_id, &failure_outcome).await {
+                if let Err(je) = self
+                    .turn_journal
+                    .reconcile_terminal(user_id, conversation_id, &turn_id, &failure_outcome)
+                    .await
+                {
                     error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on build failure; turn remains open for startup recovery reconciliation");
                 }
                 self.persist_and_broadcast_send_failure_tip(
@@ -4389,8 +4401,11 @@ impl ConversationService {
             warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal for agent turn; failing closed without invoking on_started");
             let mut turn_claim = turn_claim;
             let was_deleting = turn_claim.release();
-            self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting).await;
-            return Err(ConversationError::internal(format!("Failed to capture pre-turn in turn journal: {e}")));
+            self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting)
+                .await;
+            return Err(ConversationError::internal(format!(
+                "Failed to capture pre-turn in turn journal: {e}"
+            )));
         }
 
         // 2. Invoke on_started callback ONLY after pre-turn event is safely captured
@@ -4423,7 +4438,11 @@ impl ConversationService {
                     })),
                     finished_at_ms: journal_now_ms(),
                 };
-                if let Err(je) = self.turn_journal.reconcile_terminal(&request.user_id, &request.conversation_id, &turn_id, &failure_outcome).await {
+                if let Err(je) = self
+                    .turn_journal
+                    .reconcile_terminal(&request.user_id, &request.conversation_id, &turn_id, &failure_outcome)
+                    .await
+                {
                     error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on agent turn build failure; turn remains open for startup recovery reconciliation");
                 }
                 self.persist_and_broadcast_send_failure_tip(
