@@ -9789,7 +9789,7 @@ mod session_mentions_integration {
         } = &events[0]
         {
             assert_eq!(turn_id, &send.turn_id);
-            assert_eq!(user_message, "hello");
+            assert_eq!(user_message, "Hello");
             if let Some(ws) = workspace {
                 assert!(!ws.contains("/root"), "workspace must be normalized opaque metadata");
             }
