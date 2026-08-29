@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
 use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, SendMessageRequest};
-use aionui_common::{AgentType, ConversationSource};
+use aionui_common::{AgentType, ConversationSource, ConversationStatus};
 use aionui_conversation::ConversationService;
 use aionui_db::models::AssistantSessionRow;
 use tokio::sync::broadcast;
@@ -99,6 +99,22 @@ impl ChannelMessageService {
                     "Agent task missing after warmup for conversation {conversation_id}"
                 ))
             })?;
+
+        // A turn's orchestrator releases its runtime claim asynchronously after
+        // the stream reaches a terminal event. A finished task can therefore
+        // briefly coexist with that claim; wait for the release instead of
+        // turning a follow-up channel message into a spurious 409. Running
+        // tasks retain the normal busy protection in ConversationService.
+        if self
+            .task_manager
+            .get_task(&conversation_id)
+            .is_some_and(|agent| agent.status() == Some(ConversationStatus::Finished))
+        {
+            self.conversation_svc
+                .runtime_state()
+                .wait_until_unclaimed(&conversation_id)
+                .await;
+        }
 
         self.conversation_svc
             .send_message(user_id, &conversation_id, req, &self.task_manager)

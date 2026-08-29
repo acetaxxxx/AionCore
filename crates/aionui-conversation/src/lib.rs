@@ -26,9 +26,9 @@ mod stream_persistence;
 pub mod stream_relay;
 pub mod task_options;
 mod turn_continuation_policy;
+pub mod turn_journal;
 mod turn_orchestrator;
 mod turn_recovery_policy;
-pub mod turn_journal;
 
 pub use convert::row_to_response_with_extra;
 pub use error::ConversationError;
@@ -42,9 +42,9 @@ pub use service::{
 };
 pub use state::ConversationRouterState;
 pub use turn_journal::{
-    AttemptSummary, FilesystemTurnJournal, InMemoryTurnJournal, JournalError, PreTurnRecord,
-    RawJournalEvent, StartupRecoveryOptions, TerminalOutcomeRecord, TokenUsageRecord, TurnJournal,
-    TurnTerminalStatus, validate_identifier,
+    AttemptSummary, FilesystemTurnJournal, InMemoryTurnJournal, JournalError, PreTurnRecord, RawJournalEvent,
+    StartupRecoveryOptions, TerminalOutcomeRecord, TokenUsageRecord, TurnJournal, TurnTerminalStatus,
+    validate_identifier,
 };
 
 #[cfg(test)]

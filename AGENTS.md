@@ -146,9 +146,13 @@ New subprocess spawn sites must go through `aionui_runtime`'s spawn Builder — 
 
 ### Pushing Code
 
-Always use `just push` instead of `git push`.
-It runs the full pre-push gate (migration check, lint, format, tests) before pushing, preventing CI failures.
-Supports the same arguments as `git push` (e.g. `just push -u origin feat/branch`).
+Do not run host-local `cargo`, `rustc`, or equivalent build, compile, format,
+lint, or test commands for verification unless the user explicitly requests
+local execution. Do not use `just push` as it runs a local pre-push gate.
+After review, push only an explicitly requested branch whose name matches the
+repository's CI allowlist (`feat/**` or `sync/**`); GitHub Actions is the
+verification authority. Report local checks as unexecuted when they were not
+requested or unavailable.
 
 ### Add Endpoint to Existing Crate
 

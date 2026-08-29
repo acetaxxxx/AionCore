@@ -99,7 +99,10 @@ impl ConversationService {
         match crate::turn_journal::internal_startup_recovery(self.turn_journal().as_ref(), data_dir, &options).await {
             Ok(count) => {
                 if count > 0 {
-                    info!(count, "startup recovery reconciled unclosed turn raw event journals to timeout");
+                    info!(
+                        count,
+                        "startup recovery reconciled unclosed turn raw event journals to timeout"
+                    );
                 }
                 count
             }
