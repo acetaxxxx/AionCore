@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
+use crate::memory_curation::MemoryEvidence;
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
 use crate::service::{
@@ -43,6 +44,7 @@ pub(crate) struct TurnStartInput {
     pub stored_workspace: String,
     pub turn_id: String,
     pub turn_claim: TurnClaim,
+    pub memory_source: crate::memory_curation::MemoryEvidenceSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,8 +747,30 @@ impl ConversationTurnOrchestrator {
             error_metadata: Some(serde_json::Value::Object(error_meta)),
             finished_at_ms: crate::service::journal_now_ms(),
         };
-        if let Err(je) = self.service.turn_journal().reconcile_terminal(&input.user_id, &conv_id, &turn_id, &final_outcome).await {
-            error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome in turn journal; turn remains open for startup recovery reconciliation");
+        let journal_reconciled = match self
+            .service
+            .turn_journal()
+            .reconcile_terminal(&input.user_id, &conv_id, &turn_id, &final_outcome)
+            .await
+        {
+            Ok(()) => true,
+            Err(je) => {
+                error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome in turn journal; turn remains open for startup recovery reconciliation");
+                false
+            }
+        };
+
+        if journal_reconciled {
+            let evidence = MemoryEvidence::from_turn(
+                &input.user_id,
+                &conv_id,
+                &turn_id,
+                &initial_send.content,
+                final_outcome.status,
+                input.memory_source,
+                final_outcome.finished_at_ms,
+            );
+            self.service.capture_memory_candidate(&evidence).await;
         }
 
         let was_deleting = turn_claim.release_for_turn(&turn_id);
