@@ -9882,6 +9882,9 @@ mod session_mentions_integration {
                 turn_claim,
                 user_id: "user_1".to_string(),
                 required_runtime_mode: None,
+                memory_source: crate::memory_curation::MemoryEvidenceSource::Owner,
+                pre_created_at_ms: crate::service::journal_now_ms(),
+                pre_workspace: None,
             })
             .await;
 
