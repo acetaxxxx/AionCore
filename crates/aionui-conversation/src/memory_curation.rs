@@ -1689,7 +1689,7 @@ impl FilesystemMemoryCuration {
         let ledger = read_candidates(&candidate_path(&self.data_dir, user_id))?;
         let index_path = derived_index_path(&self.data_dir, user_id);
         fs::create_dir_all(index_path.parent().expect("derived index path has a parent"))?;
-        let mut connection = Connection::open(index_path)?;
+        let connection = Connection::open(index_path)?;
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS memory_documents (
@@ -2221,7 +2221,7 @@ fn retrieve_from_candidates(
         return Err(MemoryCurationError::ExplicitRetrievalRequired);
     }
     let query = request.query.to_ascii_lowercase();
-    let mut items = candidates
+    let mut items: Vec<MemoryRetrievalItem> = candidates
         .iter()
         .filter(|candidate| candidate.status == MemoryCandidateStatus::Promoted)
         .filter(|candidate| candidate.scope == scope_name(request.scope))
