@@ -1,7 +1,8 @@
 //! Safe capture of user evidence for the future Memory Curation pipeline.
 //!
-//! This module deliberately stops at the user-scoped Candidate Ledger. It does
-//! not promote candidates into a curated vault or expose them to retrieval.
+//! This module owns the user-scoped Candidate Ledger and the bounded promotion
+//! boundary into curated Markdown. It exposes only compact `auto_inject`
+//! records; raw events and full transcripts never cross this boundary.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -17,6 +18,7 @@ use crate::turn_journal::TurnTerminalStatus;
 
 const MAX_CANDIDATE_CONTENT_CHARS: usize = 2_048;
 const APPEND_RETRY_LIMIT: usize = 3;
+const MAX_AUTO_INJECT_CHARS: usize = 4_096;
 
 /// The trust boundary used by candidate eligibility policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +29,18 @@ pub enum MemoryEvidenceSource {
     Untrusted,
     System,
     Background,
+}
+
+fn default_evidence_source() -> MemoryEvidenceSource {
+    MemoryEvidenceSource::Owner
+}
+
+fn default_memory_scope() -> String {
+    "auto_inject".to_owned()
+}
+
+fn default_privacy_classification() -> String {
+    "private".to_owned()
 }
 
 /// Raw evidence handed to the high-level Memory Curation port.
@@ -96,11 +110,19 @@ impl MemoryEvidence {
     }
 }
 
-/// Candidate lifecycle. Ticket 01 intentionally ends at `Detected`.
+/// Candidate lifecycle. Ticket 02 adds explicit promotion and recovery states
+/// while preserving `Detected` as the capture boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryCandidateStatus {
     Detected,
+    Eligible,
+    Proposed,
+    Promoting,
+    Promoted,
+    Rejected,
+    Quarantined,
+    Superseded,
 }
 
 /// A redacted, user-scoped candidate and its auditable provenance.
@@ -116,6 +138,25 @@ pub struct MemoryCandidate {
     pub fingerprint: String,
     pub content: String,
     pub detected_at_ms: u64,
+    #[serde(default = "default_evidence_source")]
+    pub source: MemoryEvidenceSource,
+    #[serde(default = "default_memory_scope")]
+    pub scope: String,
+    #[serde(default = "default_privacy_classification")]
+    pub privacy_classification: String,
+    #[serde(default)]
+    pub promoted_at_ms: Option<u64>,
+}
+
+/// A compact, already-promoted memory item safe for the `auto_inject` scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMemory {
+    pub candidate_id: String,
+    pub content: String,
+    pub source_event_id: String,
+    pub source_hash: String,
+    pub scope: String,
+    pub privacy_classification: String,
 }
 
 /// Errors from candidate policy or Candidate Ledger persistence.
@@ -138,6 +179,12 @@ pub enum MemoryCurationError {
 
     #[error("candidate capture task failed: {0}")]
     Internal(String),
+
+    #[error("candidate '{candidate_id}' is not eligible for promotion")]
+    PromotionNotEligible { candidate_id: String },
+
+    #[error("memory curation operation is unavailable")]
+    Unsupported,
 }
 
 /// Single high-level port used by conversation execution after terminal
@@ -145,6 +192,22 @@ pub enum MemoryCurationError {
 #[async_trait]
 pub trait MemoryCuration: Send + Sync {
     async fn capture_candidate(&self, evidence: &MemoryEvidence) -> Result<(), MemoryCurationError>;
+
+    async fn promote_candidate(
+        &self,
+        _user_id: &str,
+        _candidate_id: &str,
+    ) -> Result<MemoryCandidate, MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn auto_inject(
+        &self,
+        _user_id: &str,
+        _max_chars: usize,
+    ) -> Result<Vec<AgentMemory>, MemoryCurationError> {
+        Ok(Vec::new())
+    }
 }
 
 /// A no-op default for isolated callers that do not install production
@@ -197,9 +260,17 @@ impl MemoryCuration for InMemoryMemoryCuration {
         let Some(candidate) = candidate_from_evidence(evidence)? else {
             return Ok(());
         };
-        let mut candidates = self.candidates.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let mut candidate = candidate;
+        if candidate.source == MemoryEvidenceSource::CompliantAgent {
+            candidate.status = MemoryCandidateStatus::Promoted;
+            candidate.promoted_at_ms = Some(candidate.detected_at_ms);
+        }
+        let mut candidates = self
+            .candidates
+            .lock()
+            .map_err(|_| MemoryCurationError::LockUnavailable)?;
         if let Some(existing) = candidates.get(&candidate.candidate_id) {
-            if existing == &candidate {
+            if same_immutable_candidate(existing, &candidate) {
                 return Ok(());
             }
             return Err(MemoryCurationError::ConflictingCandidate {
@@ -209,6 +280,79 @@ impl MemoryCuration for InMemoryMemoryCuration {
         }
         candidates.insert(candidate.candidate_id.clone(), candidate);
         Ok(())
+    }
+
+    async fn promote_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, MemoryCurationError> {
+        let mut candidates = self
+            .candidates
+            .lock()
+            .map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let candidate = candidates
+            .get_mut(candidate_id)
+            .filter(|candidate| candidate.user_id == user_id)
+            .ok_or_else(|| MemoryCurationError::PromotionNotEligible {
+                candidate_id: candidate_id.to_owned(),
+            })?;
+        if !matches!(
+            candidate.status,
+            MemoryCandidateStatus::Detected
+                | MemoryCandidateStatus::Eligible
+                | MemoryCandidateStatus::Proposed
+                | MemoryCandidateStatus::Promoting
+                | MemoryCandidateStatus::Promoted
+        )
+            || candidate.content.is_empty()
+            || candidate.content.chars().count() > MAX_CANDIDATE_CONTENT_CHARS
+            || candidate.privacy_classification != "private"
+            || candidate.scope != "auto_inject"
+        {
+            return Err(MemoryCurationError::PromotionNotEligible {
+                candidate_id: candidate_id.to_owned(),
+            });
+        }
+        candidate.status = MemoryCandidateStatus::Promoted;
+        candidate.promoted_at_ms.get_or_insert(candidate.detected_at_ms);
+        Ok(candidate.clone())
+    }
+
+    async fn auto_inject(
+        &self,
+        user_id: &str,
+        max_chars: usize,
+    ) -> Result<Vec<AgentMemory>, MemoryCurationError> {
+        let budget = max_chars.min(MAX_AUTO_INJECT_CHARS);
+        let mut items: Vec<_> = self
+            .candidates_for_user(user_id)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.status == MemoryCandidateStatus::Promoted
+                    && candidate.scope == "auto_inject"
+                    && candidate.privacy_classification == "private"
+            })
+            .map(|candidate| AgentMemory {
+                candidate_id: candidate.candidate_id,
+                content: candidate.content,
+                source_event_id: candidate.source_event_id,
+                source_hash: candidate.source_hash,
+                scope: candidate.scope,
+                privacy_classification: candidate.privacy_classification,
+            })
+            .collect();
+        items.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
+        let mut used = 0;
+        items.retain(|item| {
+            let size = item.content.chars().count();
+            let keep = used.saturating_add(size) <= budget;
+            if keep {
+                used += size;
+            }
+            keep
+        });
+        Ok(items)
     }
 }
 
@@ -248,11 +392,182 @@ impl FilesystemMemoryCuration {
 #[async_trait]
 impl MemoryCuration for FilesystemMemoryCuration {
     async fn capture_candidate(&self, evidence: &MemoryEvidence) -> Result<(), MemoryCurationError> {
+        let candidate = candidate_from_evidence(evidence)?;
         let evidence = evidence.clone();
         let adapter = self.clone();
         tokio::task::spawn_blocking(move || adapter.capture_candidate_blocking(&evidence))
             .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))??;
+        if let Some(candidate) = candidate.filter(|candidate| {
+            candidate.source == MemoryEvidenceSource::CompliantAgent
+        }) {
+            self.promote_candidate(&candidate.user_id, &candidate.candidate_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn promote_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        let candidate_id = candidate_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.promote_candidate_blocking(&user_id, &candidate_id))
+            .await
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn auto_inject(
+        &self,
+        user_id: &str,
+        max_chars: usize,
+    ) -> Result<Vec<AgentMemory>, MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.auto_inject_blocking(&user_id, max_chars))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+}
+
+impl FilesystemMemoryCuration {
+    fn promote_candidate_blocking(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, MemoryCurationError> {
+        crate::turn_journal::validate_identifier(user_id, "user_id").map_err(|error| {
+            MemoryCurationError::InvalidIdentity {
+                reason: error.to_string(),
+            }
+        })?;
+        crate::turn_journal::validate_identifier(candidate_id, "candidate_id").map_err(|error| {
+            MemoryCurationError::InvalidIdentity {
+                reason: error.to_string(),
+            }
+        })?;
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let path = candidate_path(&self.data_dir, user_id);
+        let mut candidates = read_candidates(&path)?;
+        let Some(index) = candidates.iter().position(|candidate| {
+            candidate.candidate_id == candidate_id && candidate.user_id == user_id
+        }) else {
+            return Err(MemoryCurationError::PromotionNotEligible {
+                candidate_id: candidate_id.to_owned(),
+            });
+        };
+        let vault_path = vault_path(&self.data_dir, user_id, candidate_id);
+        if candidates[index].status == MemoryCandidateStatus::Promoted && vault_path.exists() {
+            let expected = render_memory_markdown(&candidates[index]);
+            let existing = fs::read_to_string(&vault_path)?;
+            if existing == expected {
+                return Ok(candidates[index].clone());
+            }
+            return Err(MemoryCurationError::ConflictingCandidate {
+                candidate_id: candidate_id.to_owned(),
+                user_id: user_id.to_owned(),
+            });
+        }
+        if matches!(candidates[index].status, MemoryCandidateStatus::Promoting) && vault_path.exists() {
+            let mut promoted = candidates[index].clone();
+            promoted.status = MemoryCandidateStatus::Promoted;
+            promoted.promoted_at_ms.get_or_insert(promoted.detected_at_ms);
+            let expected = render_memory_markdown(&promoted);
+            let existing = fs::read_to_string(&vault_path)?;
+            if existing != expected {
+                return Err(MemoryCurationError::ConflictingCandidate {
+                    candidate_id: candidate_id.to_owned(),
+                    user_id: user_id.to_owned(),
+                });
+            }
+            candidates[index] = promoted;
+            write_candidates_atomic(&path, &candidates)?;
+            return Ok(candidates[index].clone());
+        }
+        // A crash may have committed the ledger state after the vault was
+        // removed or never became visible. Re-enter the normal promotion
+        // protocol so a retry can recreate the verified Markdown record.
+        if candidates[index].status == MemoryCandidateStatus::Promoted && !vault_path.exists() {
+            candidates[index].status = MemoryCandidateStatus::Detected;
+            candidates[index].promoted_at_ms = None;
+        }
+        if !matches!(
+            candidates[index].status,
+            MemoryCandidateStatus::Detected
+                | MemoryCandidateStatus::Eligible
+                | MemoryCandidateStatus::Proposed
+                | MemoryCandidateStatus::Promoting
+        )
+            || candidates[index].content.is_empty()
+            || candidates[index].content.chars().count() > MAX_CANDIDATE_CONTENT_CHARS
+            || !matches!(candidates[index].source, MemoryEvidenceSource::Owner | MemoryEvidenceSource::CompliantAgent)
+            || candidates[index].scope != "auto_inject"
+            || candidates[index].privacy_classification != "private"
+        {
+            return Err(MemoryCurationError::PromotionNotEligible {
+                candidate_id: candidate_id.to_owned(),
+            });
+        }
+
+        candidates[index].status = MemoryCandidateStatus::Promoting;
+        write_candidates_atomic(&path, &candidates)?;
+        let mut promoted = candidates[index].clone();
+        promoted.status = MemoryCandidateStatus::Promoted;
+        promoted.promoted_at_ms.get_or_insert(promoted.detected_at_ms);
+        let markdown = render_memory_markdown(&promoted);
+        if vault_path.exists() {
+            let existing = fs::read_to_string(&vault_path)?;
+            if existing != markdown {
+                return Err(MemoryCurationError::ConflictingCandidate {
+                    candidate_id: candidate_id.to_owned(),
+                    user_id: user_id.to_owned(),
+                });
+            }
+        } else {
+            write_vault_atomic(&vault_path, markdown.as_bytes())?;
+        }
+        candidates[index] = promoted;
+        write_candidates_atomic(&path, &candidates)?;
+        Ok(candidates[index].clone())
+    }
+
+    fn auto_inject_blocking(&self, user_id: &str, max_chars: usize) -> Result<Vec<AgentMemory>, MemoryCurationError> {
+        crate::turn_journal::validate_identifier(user_id, "user_id").map_err(|error| MemoryCurationError::InvalidIdentity {
+            reason: error.to_string(),
+        })?;
+        let budget = max_chars.min(MAX_AUTO_INJECT_CHARS);
+        let path = candidate_path(&self.data_dir, user_id);
+        let mut items: Vec<_> = read_candidates(&path)?
+            .into_iter()
+            .filter(|candidate| {
+                candidate.status == MemoryCandidateStatus::Promoted
+                    && candidate.scope == "auto_inject"
+                    && candidate.privacy_classification == "private"
+                    && vault_path(&self.data_dir, user_id, &candidate.candidate_id).exists()
+            })
+            .map(|candidate| AgentMemory {
+                candidate_id: candidate.candidate_id,
+                content: candidate.content,
+                source_event_id: candidate.source_event_id,
+                source_hash: candidate.source_hash,
+                scope: candidate.scope,
+                privacy_classification: candidate.privacy_classification,
+            })
+            .collect();
+        items.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
+        let mut used = 0;
+        items.retain(|item| {
+            let size = item.content.chars().count();
+            let keep = used.saturating_add(size) <= budget;
+            if keep {
+                used += size;
+            }
+            keep
+        });
+        Ok(items)
     }
 }
 
@@ -269,7 +584,7 @@ impl FilesystemMemoryCuration {
         for attempt in 0..APPEND_RETRY_LIMIT {
             let existing = read_candidates(&path)?;
             if let Some(previous) = existing.iter().find(|item| item.candidate_id == candidate.candidate_id) {
-                if previous == &candidate {
+                if same_immutable_candidate(previous, &candidate) {
                     return Ok(());
                 }
                 return Err(MemoryCurationError::ConflictingCandidate {
@@ -308,6 +623,21 @@ fn validate_identity(parts: [&str; 4]) -> Result<(), MemoryCurationError> {
         })?;
     }
     Ok(())
+}
+
+fn same_immutable_candidate(left: &MemoryCandidate, right: &MemoryCandidate) -> bool {
+    left.candidate_id == right.candidate_id
+        && left.user_id == right.user_id
+        && left.conversation_id == right.conversation_id
+        && left.turn_id == right.turn_id
+        && left.source_event_id == right.source_event_id
+        && left.source_hash == right.source_hash
+        && left.fingerprint == right.fingerprint
+        && left.content == right.content
+        && left.detected_at_ms == right.detected_at_ms
+        && left.source == right.source
+        && left.scope == right.scope
+        && left.privacy_classification == right.privacy_classification
 }
 
 fn candidate_from_evidence(evidence: &MemoryEvidence) -> Result<Option<MemoryCandidate>, MemoryCurationError> {
@@ -351,6 +681,10 @@ fn candidate_from_evidence(evidence: &MemoryEvidence) -> Result<Option<MemoryCan
         fingerprint,
         content,
         detected_at_ms: evidence.observed_at_ms,
+        source: evidence.source,
+        scope: "auto_inject".to_owned(),
+        privacy_classification: "private".to_owned(),
+        promoted_at_ms: None,
     }))
 }
 
@@ -447,6 +781,77 @@ fn candidate_path(data_dir: &Path, user_id: &str) -> PathBuf {
         .join("candidates.jsonl")
 }
 
+fn vault_path(data_dir: &Path, user_id: &str, candidate_id: &str) -> PathBuf {
+    data_dir
+        .join("users")
+        .join(user_id)
+        .join("vault")
+        .join("agent-memory")
+        .join(format!("{candidate_id}.md"))
+}
+
+fn render_memory_markdown(candidate: &MemoryCandidate) -> String {
+    format!(
+        concat!(
+            "# Agent Memory\n\n",
+            "- lifecycle: promoted\n",
+            "- scope: {}\n",
+            "- privacy: {}\n\n",
+            "## Source\n\n",
+            "- candidate_id: {}\n",
+            "- conversation_id: {}\n",
+            "- turn_id: {}\n",
+            "- source_event_id: {}\n",
+            "- source_hash: {}\n",
+            "- fingerprint: {}\n\n",
+            "## Current Memory\n\n",
+            "{}\n"
+        ),
+        candidate.scope,
+        candidate.privacy_classification,
+        candidate.candidate_id,
+        candidate.conversation_id,
+        candidate.turn_id,
+        candidate.source_event_id,
+        candidate.source_hash,
+        candidate.fingerprint,
+        candidate.content,
+    )
+}
+
+fn write_vault_atomic(path: &Path, content: &[u8]) -> Result<(), MemoryCurationError> {
+    let parent = path.parent().expect("vault path has a parent");
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("md.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(content)?;
+    file.flush()?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn write_candidates_atomic(path: &Path, candidates: &[MemoryCandidate]) -> Result<(), MemoryCurationError> {
+    let temporary = path.with_extension("jsonl.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    for candidate in candidates {
+        serde_json::to_writer(&mut file, candidate)?;
+        file.write_all(b"\n")?;
+    }
+    file.flush()?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn read_candidates(path: &Path) -> Result<Vec<MemoryCandidate>, MemoryCurationError> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -540,7 +945,21 @@ mod tests {
         curation.capture_candidate(&bob).await.unwrap();
         assert_eq!(curation.candidates_for_user("alice").len(), 1);
         assert_eq!(curation.candidates_for_user("bob").len(), 1);
+        assert_eq!(curation.candidates_for_user("alice")[0].status, MemoryCandidateStatus::Promoted);
         assert_ne!(curation.candidates_for_user("alice")[0].candidate_id, curation.candidates_for_user("bob")[0].candidate_id);
+    }
+
+    #[tokio::test]
+    async fn explicit_promotion_and_budgeted_auto_inject_are_scoped() {
+        let curation = InMemoryMemoryCuration::new();
+        let owner = evidence("alice", MemoryEvidenceSource::Owner, TurnTerminalStatus::Success, "I prefer concise replies");
+        curation.capture_candidate(&owner).await.unwrap();
+        let candidate_id = curation.candidates_for_user("alice")[0].candidate_id.clone();
+        let promoted = curation.promote_candidate("alice", &candidate_id).await.unwrap();
+        assert_eq!(promoted.status, MemoryCandidateStatus::Promoted);
+        let memories = curation.auto_inject("alice", 4_096).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert!(curation.auto_inject("bob", 4_096).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -550,6 +969,19 @@ mod tests {
         let item = evidence("alice", MemoryEvidenceSource::Owner, TurnTerminalStatus::Success, "remember this");
         curation.capture_candidate(&item).await.unwrap();
         curation.capture_candidate(&item).await.unwrap();
+        let candidate_id = curation.candidates_for_user("alice").unwrap()[0].candidate_id.clone();
+        let promoted = curation.promote_candidate("alice", &candidate_id).await.unwrap();
+        assert_eq!(promoted.status, MemoryCandidateStatus::Promoted);
+        let markdown = std::fs::read_to_string(
+            temp.path()
+                .join("users/alice/vault/agent-memory")
+                .join(format!("{candidate_id}.md")),
+        )
+        .unwrap();
+        assert!(markdown.contains("## Source"));
+        assert!(markdown.contains("## Current Memory"));
+        assert!(temp.path().join("users/alice/vault/agent-memory").join(format!("{candidate_id}.md")).exists());
+        assert_eq!(curation.auto_inject("alice", 4_096).await.unwrap().len(), 1);
         assert_eq!(curation.candidates_for_user("alice").unwrap().len(), 1);
         assert!(curation.candidates_for_user("bob").unwrap().is_empty());
     }

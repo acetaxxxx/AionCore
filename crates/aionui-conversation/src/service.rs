@@ -62,7 +62,7 @@ use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder}
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
-use crate::memory_curation::{MemoryCuration, MemoryEvidence, MemoryEvidenceSource, NoopMemoryCuration};
+use crate::memory_curation::{MemoryCandidate, MemoryCuration, MemoryEvidence, MemoryEvidenceSource, NoopMemoryCuration};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
 
@@ -498,6 +498,33 @@ impl ConversationService {
                 );
             }
         });
+    }
+
+    /// Explicitly promote one user-scoped candidate into the managed Memory
+    /// Vault. The curation adapter owns eligibility and provenance checks.
+    pub async fn promote_memory_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .promote_candidate(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to promote memory candidate: {error}")))
+    }
+
+    pub(crate) async fn auto_inject_memory_context(&self, user_id: &str) -> String {
+        match self.memory_curation.auto_inject(user_id, 4_096).await {
+            Ok(items) => items
+                .into_iter()
+                .map(|item| item.content)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(error) => {
+                warn!(user_id = %user_id, error = %ErrorChain(&error), "Failed to load auto-inject agent memory");
+                String::new()
+            }
+        }
     }
 
     async fn record_mid_turn_event(

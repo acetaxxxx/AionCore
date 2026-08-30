@@ -42,8 +42,8 @@ pub use service::{
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
 };
 pub use memory_curation::{
-    FilesystemMemoryCuration, InMemoryMemoryCuration, MemoryCandidate, MemoryCandidateStatus,
-    MemoryCuration, MemoryCurationError, MemoryEvidence, MemoryEvidenceSource,
+    AgentMemory, FilesystemMemoryCuration, InMemoryMemoryCuration, MemoryCandidate,
+    MemoryCandidateStatus, MemoryCuration, MemoryCurationError, MemoryEvidence, MemoryEvidenceSource,
 };
 pub use state::ConversationRouterState;
 pub use turn_journal::{
