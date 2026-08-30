@@ -226,6 +226,13 @@ pub enum RawJournalEvent {
     MidTurn { record: MidTurnRecord },
 }
 
+/// Hash the canonical serialized raw event sequence used as Memory Candidate
+/// provenance. This helper does not alter the public two-method journal seam.
+pub(crate) fn canonical_raw_events_hash(events: &[RawJournalEvent]) -> String {
+    let payload = serde_json::to_vec(events).expect("raw journal events are serializable");
+    digest_hex(&payload)
+}
+
 impl RawJournalEvent {
     pub fn user_id(&self) -> &str {
         match self {

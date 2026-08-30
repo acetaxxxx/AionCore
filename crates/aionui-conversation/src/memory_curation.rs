@@ -56,7 +56,10 @@ impl MemoryEvidence {
         source: MemoryEvidenceSource,
         observed_at_ms: u64,
     ) -> Self {
-        let source_event_id = format!("{turn_id}:final");
+        // Raw TurnJournal events do not carry a separately allocated event
+        // id, so this is the stable logical reference to the pre+terminal
+        // pair. The canonical pair hash below binds the complete payload.
+        let source_event_id = format!("{turn_id}:pre_execution+final_outcome");
         let mut source_material = String::new();
         for part in [
             user_id,
@@ -82,6 +85,14 @@ impl MemoryEvidence {
             source,
             observed_at_ms,
         }
+    }
+
+    /// Replace the fallback provenance hash with the canonical hash of the
+    /// raw PreExecution + FinalOutcome events once terminal reconciliation has
+    /// produced the complete payload.
+    pub fn with_source_hash(mut self, source_hash: String) -> Self {
+        self.source_hash = source_hash;
+        self
     }
 }
 
@@ -124,6 +135,9 @@ pub enum MemoryCurationError {
 
     #[error("candidate ledger lock unavailable")]
     LockUnavailable,
+
+    #[error("candidate capture task failed: {0}")]
+    Internal(String),
 }
 
 /// Single high-level port used by conversation execution after terminal
@@ -200,6 +214,7 @@ impl MemoryCuration for InMemoryMemoryCuration {
 
 /// Durable user-scoped Candidate Ledger adapter. It intentionally has no
 /// public path-based read/write API beyond the supplied data root.
+#[derive(Clone)]
 pub struct FilesystemMemoryCuration {
     data_dir: PathBuf,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -233,6 +248,16 @@ impl FilesystemMemoryCuration {
 #[async_trait]
 impl MemoryCuration for FilesystemMemoryCuration {
     async fn capture_candidate(&self, evidence: &MemoryEvidence) -> Result<(), MemoryCurationError> {
+        let evidence = evidence.clone();
+        let adapter = self.clone();
+        tokio::task::spawn_blocking(move || adapter.capture_candidate_blocking(&evidence))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+}
+
+impl FilesystemMemoryCuration {
+    fn capture_candidate_blocking(&self, evidence: &MemoryEvidence) -> Result<(), MemoryCurationError> {
         let Some(candidate) = candidate_from_evidence(evidence)? else {
             return Ok(());
         };
@@ -341,10 +366,24 @@ fn normalize_candidate_content(content: &str) -> String {
 
 fn contains_secret(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
-    if (lower.contains("-----begin ") && lower.contains("private key-----")) || lower.contains("bearer ") {
+    if (lower.contains("-----begin ") && lower.contains("private key-----"))
+        || lower.contains("private key")
+        || lower.contains("bearer ")
+    {
         return true;
     }
-    for marker in ["api_key", "api-key", "secret_key", "secret-key", "password", "token"] {
+    for marker in [
+        "api_key",
+        "api-key",
+        "api key",
+        "secret_key",
+        "secret-key",
+        "secret key",
+        "password",
+        "token",
+        "cookie",
+        "set-cookie",
+    ] {
         let mut search_from = 0;
         while let Some(offset) = lower[search_from..].find(marker) {
             let start = search_from + offset + marker.len();
@@ -361,13 +400,38 @@ fn contains_secret(content: &str) -> bool {
             }
         }
     }
+    if content.split_whitespace().any(|word| {
+        word.starts_with("sk-")
+            || word.starts_with("ghp_")
+            || word.starts_with("xoxb-")
+            || word.starts_with("AKIA")
+    }) {
+        return true;
+    }
+    if lower.contains("mongodb://")
+        || lower.contains("postgres://")
+        || lower.contains("postgresql://")
+        || lower.contains("mysql://")
+        || lower.contains("redis://")
+        || lower.contains("connection string")
+    {
+        return true;
+    }
+    // JWTs have three base64url sections and begin with the conventional
+    // encoded JSON header prefix. Do not reject ordinary dotted prose.
     content.split_whitespace().any(|word| {
-        word.starts_with("sk-") || word.starts_with("ghp_") || word.starts_with("xoxb-") || word.starts_with("AKIA")
+        let sections = word.split('.').collect::<Vec<_>>();
+        word.starts_with("eyJ") && sections.len() == 3 && sections.iter().all(|section| !section.is_empty())
     })
 }
 
 fn candidate_path(data_dir: &Path, user_id: &str) -> PathBuf {
-    data_dir.join("users").join(user_id).join("memory").join("candidates.jsonl")
+    data_dir
+        .join("users")
+        .join(user_id)
+        .join("runtime")
+        .join("memory")
+        .join("candidates.jsonl")
 }
 
 fn read_candidates(path: &Path) -> Result<Vec<MemoryCandidate>, MemoryCurationError> {
@@ -430,6 +494,20 @@ mod tests {
             curation.capture_candidate(&evidence("alice", source, status, content)).await.unwrap();
         }
         assert!(curation.candidates().is_empty());
+    }
+
+    #[test]
+    fn secret_boundary_covers_common_transport_and_token_forms() {
+        for secret in [
+            "api key: value",
+            "cookie=session-value",
+            "connection string: postgres://user:pass@example.invalid/db",
+            "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
+            "jwt eyJheader.payload.signature",
+            "Authorization: Bearer opaque-token",
+        ] {
+            assert!(contains_secret(secret), "secret form was not rejected: {secret}");
+        }
     }
 
     #[tokio::test]

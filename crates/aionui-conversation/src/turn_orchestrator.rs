@@ -45,6 +45,8 @@ pub(crate) struct TurnStartInput {
     pub turn_id: String,
     pub turn_claim: TurnClaim,
     pub memory_source: crate::memory_curation::MemoryEvidenceSource,
+    pub pre_created_at_ms: u64,
+    pub pre_workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,6 +763,29 @@ impl ConversationTurnOrchestrator {
         };
 
         if journal_reconciled {
+            let pre_event = crate::turn_journal::RawJournalEvent::PreExecution {
+                user_id: input.user_id.clone(),
+                conversation_id: conv_id.clone(),
+                turn_id: turn_id.clone(),
+                parent_turn_id: None,
+                user_message: initial_send.content.clone(),
+                workspace: input.pre_workspace.clone(),
+                created_at_ms: input.pre_created_at_ms,
+            };
+            let final_event = crate::turn_journal::RawJournalEvent::FinalOutcome {
+                user_id: input.user_id.clone(),
+                conversation_id: conv_id.clone(),
+                turn_id: turn_id.clone(),
+                status: final_outcome.status,
+                assistant_message: final_outcome.assistant_message.map(ToOwned::to_owned),
+                token_usage: final_outcome.token_usage,
+                attempts: final_outcome.attempts,
+                last_attempt_id: final_outcome.last_attempt_id.map(ToOwned::to_owned),
+                retry_summaries: final_outcome.retry_summaries.clone(),
+                error_metadata: final_outcome.error_metadata.clone(),
+                finished_at_ms: final_outcome.finished_at_ms,
+            };
+            let source_hash = crate::turn_journal::canonical_raw_events_hash(&[pre_event, final_event]);
             let evidence = MemoryEvidence::from_turn(
                 &input.user_id,
                 &conv_id,
@@ -769,8 +794,9 @@ impl ConversationTurnOrchestrator {
                 final_outcome.status,
                 input.memory_source,
                 final_outcome.finished_at_ms,
-            );
-            self.service.capture_memory_candidate(&evidence).await;
+            )
+            .with_source_hash(source_hash);
+            self.service.capture_memory_candidate(evidence);
         }
 
         let was_deleting = turn_claim.release_for_turn(&turn_id);
