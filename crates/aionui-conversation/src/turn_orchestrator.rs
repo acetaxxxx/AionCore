@@ -585,14 +585,15 @@ impl ConversationTurnOrchestrator {
                 break false;
             }
 
-            let attempt_err = turn_attempt_error_message(&attempt_result.summary)
-                .or_else(|| match &attempt_result.outcome.terminal {
+            let attempt_err = turn_attempt_error_message(&attempt_result.summary).or_else(|| {
+                match &attempt_result.outcome.terminal {
                     RelayTerminal::ChannelClosed => Some("channel_closed_unexpectedly".to_string()),
-                    RelayTerminal::Error { code, .. } => {
-                        code.map(|c| format!("{:?}", c)).or_else(|| Some("relay_error".to_string()))
-                    }
+                    RelayTerminal::Error { code, .. } => code
+                        .map(|c| format!("{:?}", c))
+                        .or_else(|| Some("relay_error".to_string())),
                     _ => None,
-                });
+                }
+            });
             final_error_message = attempt_err.clone();
 
             if replayed {

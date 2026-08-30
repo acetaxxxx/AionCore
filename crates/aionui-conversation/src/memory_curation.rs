@@ -75,19 +75,11 @@ impl MemoryEvidence {
         // pair. The canonical pair hash below binds the complete payload.
         let source_event_id = format!("{turn_id}:pre_execution+final_outcome");
         let mut source_material = String::new();
-        for part in [
-            user_id,
-            conversation_id,
-            turn_id,
-            &source_event_id,
-            user_message,
-        ] {
+        for part in [user_id, conversation_id, turn_id, &source_event_id, user_message] {
             source_material.push_str(part);
             source_material.push('\0');
         }
-        source_material.push_str(
-            &serde_json::to_string(&status).expect("terminal status is serializable"),
-        );
+        source_material.push_str(&serde_json::to_string(&status).expect("terminal status is serializable"));
 
         Self {
             user_id: user_id.to_owned(),
@@ -203,11 +195,7 @@ pub trait MemoryCuration: Send + Sync {
         Err(MemoryCurationError::Unsupported)
     }
 
-    async fn auto_inject(
-        &self,
-        _user_id: &str,
-        _max_chars: usize,
-    ) -> Result<Vec<AgentMemory>, MemoryCurationError> {
+    async fn auto_inject(&self, _user_id: &str, _max_chars: usize) -> Result<Vec<AgentMemory>, MemoryCurationError> {
         Ok(Vec::new())
     }
 }
@@ -306,8 +294,7 @@ impl MemoryCuration for InMemoryMemoryCuration {
                 | MemoryCandidateStatus::Proposed
                 | MemoryCandidateStatus::Promoting
                 | MemoryCandidateStatus::Promoted
-        )
-            || candidate.content.is_empty()
+        ) || candidate.content.is_empty()
             || candidate.content.chars().count() > MAX_CANDIDATE_CONTENT_CHARS
             || candidate.privacy_classification != "private"
             || candidate.scope != "auto_inject"
@@ -321,11 +308,7 @@ impl MemoryCuration for InMemoryMemoryCuration {
         Ok(candidate.clone())
     }
 
-    async fn auto_inject(
-        &self,
-        user_id: &str,
-        max_chars: usize,
-    ) -> Result<Vec<AgentMemory>, MemoryCurationError> {
+    async fn auto_inject(&self, user_id: &str, max_chars: usize) -> Result<Vec<AgentMemory>, MemoryCurationError> {
         let budget = max_chars.min(MAX_AUTO_INJECT_CHARS);
         let mut items: Vec<_> = self
             .candidates_for_user(user_id)
@@ -375,10 +358,11 @@ impl FilesystemMemoryCuration {
     }
 
     pub fn candidates_for_user(&self, user_id: &str) -> Result<Vec<MemoryCandidate>, MemoryCurationError> {
-        crate::turn_journal::validate_identifier(user_id, "user_id")
-            .map_err(|error| MemoryCurationError::InvalidIdentity {
+        crate::turn_journal::validate_identifier(user_id, "user_id").map_err(|error| {
+            MemoryCurationError::InvalidIdentity {
                 reason: error.to_string(),
-            })?;
+            }
+        })?;
         read_candidates(&candidate_path(&self.data_dir, user_id))
     }
 
@@ -401,10 +385,10 @@ impl MemoryCuration for FilesystemMemoryCuration {
         tokio::task::spawn_blocking(move || adapter.capture_candidate_blocking(&evidence))
             .await
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))??;
-        if let Some(candidate) = candidate.filter(|candidate| {
-            candidate.source == MemoryEvidenceSource::CompliantAgent
-        }) {
-            self.promote_candidate(&candidate.user_id, &candidate.candidate_id).await?;
+        if let Some(candidate) = candidate.filter(|candidate| candidate.source == MemoryEvidenceSource::CompliantAgent)
+        {
+            self.promote_candidate(&candidate.user_id, &candidate.candidate_id)
+                .await?;
         }
         Ok(())
     }
@@ -422,11 +406,7 @@ impl MemoryCuration for FilesystemMemoryCuration {
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
     }
 
-    async fn auto_inject(
-        &self,
-        user_id: &str,
-        max_chars: usize,
-    ) -> Result<Vec<AgentMemory>, MemoryCurationError> {
+    async fn auto_inject(&self, user_id: &str, max_chars: usize) -> Result<Vec<AgentMemory>, MemoryCurationError> {
         let adapter = self.clone();
         let user_id = user_id.to_owned();
         tokio::task::spawn_blocking(move || adapter.auto_inject_blocking(&user_id, max_chars))
@@ -455,9 +435,10 @@ impl FilesystemMemoryCuration {
         let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
         let path = candidate_path(&self.data_dir, user_id);
         let mut candidates = read_candidates(&path)?;
-        let Some(index) = candidates.iter().position(|candidate| {
-            candidate.candidate_id == candidate_id && candidate.user_id == user_id
-        }) else {
+        let Some(index) = candidates
+            .iter()
+            .position(|candidate| candidate.candidate_id == candidate_id && candidate.user_id == user_id)
+        else {
             return Err(MemoryCurationError::PromotionNotEligible {
                 candidate_id: candidate_id.to_owned(),
             });
@@ -503,10 +484,12 @@ impl FilesystemMemoryCuration {
                 | MemoryCandidateStatus::Eligible
                 | MemoryCandidateStatus::Proposed
                 | MemoryCandidateStatus::Promoting
-        )
-            || candidates[index].content.is_empty()
+        ) || candidates[index].content.is_empty()
             || candidates[index].content.chars().count() > MAX_CANDIDATE_CONTENT_CHARS
-            || !matches!(candidates[index].source, MemoryEvidenceSource::Owner | MemoryEvidenceSource::CompliantAgent)
+            || !matches!(
+                candidates[index].source,
+                MemoryEvidenceSource::Owner | MemoryEvidenceSource::CompliantAgent
+            )
             || candidates[index].scope != "auto_inject"
             || candidates[index].privacy_classification != "private"
         {
@@ -538,10 +521,11 @@ impl FilesystemMemoryCuration {
     }
 
     fn auto_inject_blocking(&self, user_id: &str, max_chars: usize) -> Result<Vec<AgentMemory>, MemoryCurationError> {
-        crate::turn_journal::validate_identifier(user_id, "user_id")
-            .map_err(|error| MemoryCurationError::InvalidIdentity {
+        crate::turn_journal::validate_identifier(user_id, "user_id").map_err(|error| {
+            MemoryCurationError::InvalidIdentity {
                 reason: error.to_string(),
-            })?;
+            }
+        })?;
         let budget = max_chars.min(MAX_AUTO_INJECT_CHARS);
         let path = candidate_path(&self.data_dir, user_id);
         let mut items: Vec<_> = read_candidates(&path)?
@@ -626,9 +610,14 @@ fn evidence_identity<'a>(
 }
 
 fn validate_identity(parts: [&str; 4]) -> Result<(), MemoryCurationError> {
-    for (part, field) in parts.into_iter().zip(["user_id", "conversation_id", "turn_id", "source_event_id"]) {
-        crate::turn_journal::validate_identifier(part, field).map_err(|error| MemoryCurationError::InvalidIdentity {
-            reason: error.to_string(),
+    for (part, field) in parts
+        .into_iter()
+        .zip(["user_id", "conversation_id", "turn_id", "source_event_id"])
+    {
+        crate::turn_journal::validate_identifier(part, field).map_err(|error| {
+            MemoryCurationError::InvalidIdentity {
+                reason: error.to_string(),
+            }
         })?;
     }
     Ok(())
@@ -658,12 +647,12 @@ fn candidate_from_evidence(evidence: &MemoryEvidence) -> Result<Option<MemoryCan
     ))?;
 
     if evidence.status != TurnTerminalStatus::Success
-        || !matches!(evidence.source, MemoryEvidenceSource::Owner | MemoryEvidenceSource::CompliantAgent)
+        || !matches!(
+            evidence.source,
+            MemoryEvidenceSource::Owner | MemoryEvidenceSource::CompliantAgent
+        )
         || contains_secret(&evidence.user_message)
-        || evidence
-            .assistant_message
-            .as_deref()
-            .is_some_and(contains_secret)
+        || evidence.assistant_message.as_deref().is_some_and(contains_secret)
     {
         return Ok(None);
     }
@@ -674,7 +663,12 @@ fn candidate_from_evidence(evidence: &MemoryEvidence) -> Result<Option<MemoryCan
     }
     let fingerprint = digest_hex(content.as_bytes());
     let mut identity = String::new();
-    for part in [&evidence.user_id, &evidence.source_event_id, &evidence.source_hash, &fingerprint] {
+    for part in [
+        &evidence.user_id,
+        &evidence.source_event_id,
+        &evidence.source_hash,
+        &fingerprint,
+    ] {
         identity.push_str(part);
         identity.push('\0');
     }
@@ -757,10 +751,7 @@ fn contains_secret(content: &str) -> bool {
         }
     }
     if content.split_whitespace().any(|word| {
-        word.starts_with("sk-")
-            || word.starts_with("ghp_")
-            || word.starts_with("xoxb-")
-            || word.starts_with("AKIA")
+        word.starts_with("sk-") || word.starts_with("ghp_") || word.starts_with("xoxb-") || word.starts_with("AKIA")
     }) {
         return true;
     }
@@ -928,11 +919,26 @@ mod tests {
             (MemoryEvidenceSource::Owner, TurnTerminalStatus::Failed, "failure"),
             (MemoryEvidenceSource::Owner, TurnTerminalStatus::Cancelled, "cancelled"),
             (MemoryEvidenceSource::Owner, TurnTerminalStatus::Timeout, "timed out"),
-            (MemoryEvidenceSource::Untrusted, TurnTerminalStatus::Success, "untrusted"),
-            (MemoryEvidenceSource::Background, TurnTerminalStatus::Success, "background"),
-            (MemoryEvidenceSource::Owner, TurnTerminalStatus::Success, "api_key=secret-value"),
+            (
+                MemoryEvidenceSource::Untrusted,
+                TurnTerminalStatus::Success,
+                "untrusted",
+            ),
+            (
+                MemoryEvidenceSource::Background,
+                TurnTerminalStatus::Success,
+                "background",
+            ),
+            (
+                MemoryEvidenceSource::Owner,
+                TurnTerminalStatus::Success,
+                "api_key=secret-value",
+            ),
         ] {
-            curation.capture_candidate(&evidence("alice", source, status, content)).await.unwrap();
+            curation
+                .capture_candidate(&evidence("alice", source, status, content))
+                .await
+                .unwrap();
         }
         assert!(curation.candidates().is_empty());
     }
@@ -1019,11 +1025,19 @@ mod tests {
         );
         curation.capture_candidate(&alice).await.unwrap();
         curation.capture_candidate(&alice).await.unwrap();
-        let bob = evidence("bob", MemoryEvidenceSource::CompliantAgent, TurnTerminalStatus::Success, "remember this");
+        let bob = evidence(
+            "bob",
+            MemoryEvidenceSource::CompliantAgent,
+            TurnTerminalStatus::Success,
+            "remember this",
+        );
         curation.capture_candidate(&bob).await.unwrap();
         assert_eq!(curation.candidates_for_user("alice").len(), 1);
         assert_eq!(curation.candidates_for_user("bob").len(), 1);
-        assert_eq!(curation.candidates_for_user("alice")[0].status, MemoryCandidateStatus::Promoted);
+        assert_eq!(
+            curation.candidates_for_user("alice")[0].status,
+            MemoryCandidateStatus::Promoted
+        );
         assert_ne!(
             curation.candidates_for_user("alice")[0].candidate_id,
             curation.candidates_for_user("bob")[0].candidate_id
@@ -1052,7 +1066,12 @@ mod tests {
     async fn filesystem_ledger_is_durable_and_idempotent_per_user() {
         let temp = tempfile::tempdir().unwrap();
         let curation = FilesystemMemoryCuration::new(temp.path().to_path_buf());
-        let item = evidence("alice", MemoryEvidenceSource::Owner, TurnTerminalStatus::Success, "remember this");
+        let item = evidence(
+            "alice",
+            MemoryEvidenceSource::Owner,
+            TurnTerminalStatus::Success,
+            "remember this",
+        );
         curation.capture_candidate(&item).await.unwrap();
         curation.capture_candidate(&item).await.unwrap();
         let candidate_id = curation.candidates_for_user("alice").unwrap()[0].candidate_id.clone();
@@ -1066,7 +1085,12 @@ mod tests {
         .unwrap();
         assert!(markdown.contains("## Source"));
         assert!(markdown.contains("## Current Memory"));
-        assert!(temp.path().join("users/alice/vault/agent-memory").join(format!("{candidate_id}.md")).exists());
+        assert!(
+            temp.path()
+                .join("users/alice/vault/agent-memory")
+                .join(format!("{candidate_id}.md"))
+                .exists()
+        );
         assert_eq!(curation.auto_inject("alice", 4_096).await.unwrap().len(), 1);
         assert_eq!(curation.candidates_for_user("alice").unwrap().len(), 1);
         assert!(curation.candidates_for_user("bob").unwrap().is_empty());
