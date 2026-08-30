@@ -62,7 +62,7 @@ use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder}
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
-use crate::memory_curation::{MemoryCuration, MemoryEvidenceSource, NoopMemoryCuration};
+use crate::memory_curation::{MemoryCuration, MemoryEvidence, MemoryEvidenceSource, NoopMemoryCuration};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
 
@@ -482,16 +482,22 @@ impl ConversationService {
         Arc::clone(&self.turn_journal)
     }
 
-    pub(crate) async fn capture_memory_candidate(&self, evidence: &crate::memory_curation::MemoryEvidence) {
-        if let Err(error) = self.memory_curation.capture_candidate(evidence).await {
-            warn!(
-                user_id = %evidence.user_id,
-                conversation_id = %evidence.conversation_id,
-                turn_id = %evidence.turn_id,
-                error = %ErrorChain(&error),
-                "Failed to capture memory candidate after durable terminal"
-            );
-        }
+    pub(crate) fn capture_memory_candidate(&self, evidence: MemoryEvidence) {
+        let memory_curation = Arc::clone(&self.memory_curation);
+        tokio::spawn(async move {
+            let user_id = evidence.user_id.clone();
+            let conversation_id = evidence.conversation_id.clone();
+            let turn_id = evidence.turn_id.clone();
+            if let Err(error) = memory_curation.capture_candidate(&evidence).await {
+                warn!(
+                    user_id = %user_id,
+                    conversation_id = %conversation_id,
+                    turn_id = %turn_id,
+                    error = %ErrorChain(&error),
+                    "Failed to capture memory candidate after durable terminal"
+                );
+            }
+        });
     }
 
     async fn record_mid_turn_event(
@@ -4199,6 +4205,7 @@ impl ConversationService {
         let normalized_ws = crate::turn_journal::normalize_workspace_label(
             crate::session_mentions::workspace_from_extra(&row.extra).as_deref(),
         );
+        let pre_created_at_ms = journal_now_ms();
         let pre_record = crate::turn_journal::PreTurnRecord {
             user_id,
             conversation_id,
@@ -4206,7 +4213,7 @@ impl ConversationService {
             parent_turn_id: None,
             user_message: &resolved.content,
             workspace: normalized_ws.as_deref(),
-            created_at_ms: journal_now_ms(),
+            created_at_ms: pre_created_at_ms,
         };
         if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
             warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal; failing closed");
@@ -4324,6 +4331,8 @@ impl ConversationService {
             turn_id: turn_id.clone(),
             turn_claim,
             memory_source: MemoryEvidenceSource::Owner,
+            pre_created_at_ms,
+            pre_workspace: normalized_ws,
         });
 
         info!(
@@ -4400,6 +4409,7 @@ impl ConversationService {
         let normalized_ws = crate::turn_journal::normalize_workspace_label(
             crate::session_mentions::workspace_from_extra(&row.extra).as_deref(),
         );
+        let pre_created_at_ms = journal_now_ms();
         let pre_record = crate::turn_journal::PreTurnRecord {
             user_id: &request.user_id,
             conversation_id: &request.conversation_id,
@@ -4407,7 +4417,7 @@ impl ConversationService {
             parent_turn_id: None,
             user_message: &request.content,
             workspace: normalized_ws.as_deref(),
-            created_at_ms: journal_now_ms(),
+            created_at_ms: pre_created_at_ms,
         };
         if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
             warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal for agent turn; failing closed without invoking on_started");
@@ -4489,6 +4499,8 @@ impl ConversationService {
                 turn_id: turn_id.clone(),
                 turn_claim,
                 memory_source: MemoryEvidenceSource::CompliantAgent,
+                pre_created_at_ms,
+                pre_workspace: normalized_ws,
             })
             .await;
 

@@ -9848,6 +9848,8 @@ async fn test_deferred_cancel_single_terminal_outcome() {
         user_id: "user_1".to_string(),
         required_runtime_mode: None,
         memory_source: crate::memory_curation::MemoryEvidenceSource::Owner,
+        pre_created_at_ms: now_ms().try_into().unwrap_or_default(),
+        pre_workspace: None,
     }).await;
 
     assert_eq!(result.status, ConversationTurnStatus::Completed);
