@@ -1,8 +1,8 @@
 //! Safe capture of user evidence for the future Memory Curation pipeline.
 //!
-//! This module owns the user-scoped Candidate Ledger and the bounded promotion
-//! boundary into curated Markdown. It exposes only compact `auto_inject`
-//! records; raw events and full transcripts never cross this boundary.
+//! This module owns the user-scoped Candidate Ledger, the bounded promotion
+//! boundary into curated Markdown, and its rebuildable derived retrieval index.
+//! Raw events and full transcripts never cross the governed retrieval boundary.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -41,6 +42,10 @@ fn default_memory_scope() -> String {
 
 fn default_privacy_classification() -> String {
     "private".to_owned()
+}
+
+fn default_retrieval_budget() -> usize {
+    MAX_AUTO_INJECT_CHARS
 }
 
 /// Raw evidence handed to the high-level Memory Curation port.
@@ -193,6 +198,86 @@ pub struct AgentMemory {
     pub privacy_classification: String,
 }
 
+/// The policy scope a caller must explicitly select before derived retrieval.
+/// Raw journal events are deliberately not represented by this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRetrievalScope {
+    AutoInject,
+    SemanticSearch,
+    OnDemand,
+    ManualOnly,
+}
+
+/// A bounded, policy-bearing request against the derived index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRetrievalRequest {
+    pub scope: MemoryRetrievalScope,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default = "default_retrieval_budget")]
+    pub max_chars: usize,
+    #[serde(default)]
+    pub explicit: bool,
+    #[serde(default)]
+    pub include_sidecar_metadata: bool,
+}
+
+impl MemoryRetrievalRequest {
+    pub fn auto_inject(max_chars: usize) -> Self {
+        Self {
+            scope: MemoryRetrievalScope::AutoInject,
+            query: String::new(),
+            max_chars,
+            explicit: false,
+            include_sidecar_metadata: false,
+        }
+    }
+
+    pub fn semantic_search(query: impl Into<String>, max_chars: usize) -> Self {
+        Self {
+            scope: MemoryRetrievalScope::SemanticSearch,
+            query: query.into(),
+            max_chars,
+            explicit: true,
+            include_sidecar_metadata: false,
+        }
+    }
+
+    pub fn on_demand(query: impl Into<String>, max_chars: usize) -> Self {
+        Self {
+            scope: MemoryRetrievalScope::OnDemand,
+            query: query.into(),
+            max_chars,
+            explicit: true,
+            include_sidecar_metadata: false,
+        }
+    }
+
+    pub fn manual_sidecar(query: impl Into<String>) -> Self {
+        Self {
+            scope: MemoryRetrievalScope::ManualOnly,
+            query: query.into(),
+            max_chars: MAX_AUTO_INJECT_CHARS,
+            explicit: true,
+            include_sidecar_metadata: true,
+        }
+    }
+}
+
+/// A derived, user-scoped result. Its content comes only from curated vault
+/// records; provenance is a reference/hash and never raw event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRetrievalItem {
+    pub candidate_id: String,
+    pub content: String,
+    pub sidecar_metadata: Option<String>,
+    pub source_event_id: String,
+    pub source_hash: String,
+    pub scope: String,
+    pub privacy_classification: String,
+}
+
 /// Errors from candidate policy or Candidate Ledger persistence.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryCurationError {
@@ -222,6 +307,12 @@ pub enum MemoryCurationError {
 
     #[error("memory curation operation is unavailable")]
     Unsupported,
+
+    #[error("derived memory index error: {0}")]
+    DerivedIndex(#[from] rusqlite::Error),
+
+    #[error("explicit retrieval request is required for this memory scope")]
+    ExplicitRetrievalRequired,
 }
 
 /// Single high-level port used by conversation execution after terminal
@@ -290,6 +381,18 @@ pub trait MemoryCuration: Send + Sync {
 
     async fn auto_inject(&self, _user_id: &str, _max_chars: usize) -> Result<Vec<AgentMemory>, MemoryCurationError> {
         Ok(Vec::new())
+    }
+
+    async fn rebuild_derived_index(&self, _user_id: &str) -> Result<(), MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn retrieve(
+        &self,
+        _user_id: &str,
+        _request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<MemoryRetrievalItem>, MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
     }
 }
 
@@ -573,6 +676,20 @@ impl MemoryCuration for InMemoryMemoryCuration {
         });
         Ok(items)
     }
+
+    async fn rebuild_derived_index(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        Ok(())
+    }
+
+    async fn retrieve(
+        &self,
+        user_id: &str,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<MemoryRetrievalItem>, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        retrieve_from_candidates(&self.candidates_for_user(user_id), request)
+    }
 }
 
 /// Durable user-scoped Candidate Ledger adapter. It intentionally has no
@@ -720,6 +837,27 @@ impl MemoryCuration for FilesystemMemoryCuration {
         let adapter = self.clone();
         let user_id = user_id.to_owned();
         tokio::task::spawn_blocking(move || adapter.auto_inject_blocking(&user_id, max_chars))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn rebuild_derived_index(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.rebuild_derived_index_blocking(&user_id))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn retrieve(
+        &self,
+        user_id: &str,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<MemoryRetrievalItem>, MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || adapter.retrieve_blocking(&user_id, &request))
             .await
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
     }
@@ -1056,6 +1194,131 @@ impl FilesystemMemoryCuration {
         });
         Ok(items)
     }
+
+    fn rebuild_derived_index_blocking(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        self.rebuild_derived_index_locked(user_id)
+    }
+
+    fn retrieve_blocking(
+        &self,
+        user_id: &str,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<MemoryRetrievalItem>, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        if matches!(request.scope, MemoryRetrievalScope::OnDemand | MemoryRetrievalScope::ManualOnly)
+            && !request.explicit
+        {
+            return Err(MemoryCurationError::ExplicitRetrievalRequired);
+        }
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        self.rebuild_derived_index_locked(user_id)?;
+        let connection = Connection::open(derived_index_path(&self.data_dir, user_id))?;
+        let Some(query) = fts_query(&request.query) else {
+            return Ok(if request.scope == MemoryRetrievalScope::AutoInject {
+                read_auto_inject_rows(&connection, request.max_chars)?
+            } else {
+                Vec::new()
+            });
+        };
+        let mut statement = connection.prepare(
+            "SELECT d.candidate_id, d.content, d.sidecar_metadata, d.source_event_id, d.source_hash, d.scope, d.privacy_classification
+             FROM memory_documents_fts f JOIN memory_documents d ON d.candidate_id = f.candidate_id
+             WHERE memory_documents_fts MATCH ?1 AND d.scope = ?2 ORDER BY d.candidate_id",
+        )?;
+        let mut rows = statement.query(params![query, scope_name(request.scope)])?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next()? {
+            let item = MemoryRetrievalItem {
+                candidate_id: row.get(0)?,
+                content: row.get(1)?,
+                sidecar_metadata: row.get(2)?,
+                source_event_id: row.get(3)?,
+                source_hash: row.get(4)?,
+                scope: row.get(5)?,
+                privacy_classification: row.get(6)?,
+            };
+            if request.scope == MemoryRetrievalScope::ManualOnly && !request.include_sidecar_metadata {
+                continue;
+            }
+            items.push(item);
+        }
+        bound_retrieval_items(&mut items, request.max_chars);
+        Ok(items)
+    }
+
+    fn rebuild_derived_index_locked(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        let ledger = read_candidates(&candidate_path(&self.data_dir, user_id))?;
+        let index_path = derived_index_path(&self.data_dir, user_id);
+        fs::create_dir_all(index_path.parent().expect("derived index path has a parent"))?;
+        let mut connection = Connection::open(index_path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS memory_documents (
+                 candidate_id TEXT PRIMARY KEY,
+                 user_id TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 privacy_classification TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 sidecar_metadata TEXT,
+                 source_event_id TEXT NOT NULL,
+                 source_hash TEXT NOT NULL
+             );
+             CREATE VIRTUAL TABLE IF NOT EXISTS memory_documents_fts USING fts5(
+                 candidate_id UNINDEXED, content, sidecar_metadata
+             );",
+        )?;
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute("DELETE FROM memory_documents_fts", [])?;
+        transaction.execute("DELETE FROM memory_documents", [])?;
+        for candidate in ledger {
+            if candidate.user_id != user_id
+                || candidate.status != MemoryCandidateStatus::Promoted
+                || !matches!(candidate.scope.as_str(), "auto_inject" | "semantic_search" | "on_demand" | "manual_only")
+            {
+                continue;
+            }
+            validate_review_identity(user_id, &candidate.candidate_id)?;
+            let markdown_path = vault_path(&self.data_dir, user_id, &candidate.candidate_id);
+            let Ok(markdown) = fs::read_to_string(markdown_path) else {
+                continue;
+            };
+            let content = markdown_current_memory(&markdown).unwrap_or_default();
+            let (indexed_content, sidecar_metadata) = if candidate.scope == "manual_only" {
+                (String::new(), Some(manual_sidecar_metadata(&candidate)))
+            } else if content.is_empty() {
+                continue;
+            } else {
+                (content, None)
+            };
+            transaction.execute(
+                "INSERT INTO memory_documents (candidate_id, user_id, scope, privacy_classification, content, sidecar_metadata, source_event_id, source_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &candidate.candidate_id,
+                    &user_id,
+                    &candidate.scope,
+                    &candidate.privacy_classification,
+                    &indexed_content,
+                    &sidecar_metadata,
+                    &candidate.source_event_id,
+                    &candidate.source_hash,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO memory_documents_fts (candidate_id, content, sidecar_metadata) VALUES (?1, ?2, ?3)",
+                params![
+                    &candidate.candidate_id,
+                    &indexed_content,
+                    sidecar_metadata.as_deref().unwrap_or(""),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 impl FilesystemMemoryCuration {
@@ -1218,6 +1481,135 @@ fn normalize_candidate_content(content: &str) -> String {
         .collect()
 }
 
+fn validate_retrieval_user(user_id: &str) -> Result<(), MemoryCurationError> {
+    crate::turn_journal::validate_identifier(user_id, "user_id").map_err(|error| {
+        MemoryCurationError::InvalidIdentity {
+            reason: error.to_string(),
+        }
+    })
+}
+
+fn scope_name(scope: MemoryRetrievalScope) -> &'static str {
+    match scope {
+        MemoryRetrievalScope::AutoInject => "auto_inject",
+        MemoryRetrievalScope::SemanticSearch => "semantic_search",
+        MemoryRetrievalScope::OnDemand => "on_demand",
+        MemoryRetrievalScope::ManualOnly => "manual_only",
+    }
+}
+
+fn fts_query(query: &str) -> Option<String> {
+    let terms: Vec<_> = query
+        .split_whitespace()
+        .map(|term| term.chars().filter(|character| character.is_alphanumeric() || *character == '_').collect::<String>())
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{term}\""))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" AND "))
+}
+
+fn manual_sidecar_metadata(candidate: &MemoryCandidate) -> String {
+    format!(
+        "candidate_id={} source_event_id={} source_hash={} privacy={}",
+        candidate.candidate_id, candidate.source_event_id, candidate.source_hash, candidate.privacy_classification
+    )
+}
+
+fn bound_retrieval_items(items: &mut Vec<MemoryRetrievalItem>, max_chars: usize) {
+    let budget = max_chars.min(MAX_AUTO_INJECT_CHARS);
+    let mut used: usize = 0;
+    items.retain(|item| {
+        let size = item.content.chars().count()
+            + item.sidecar_metadata.as_deref().map_or(0, |value| value.chars().count());
+        let keep = used.saturating_add(size) <= budget;
+        if keep {
+            used += size;
+        }
+        keep
+    });
+}
+
+fn read_auto_inject_rows(
+    connection: &Connection,
+    max_chars: usize,
+) -> Result<Vec<MemoryRetrievalItem>, MemoryCurationError> {
+    let mut statement = connection.prepare(
+        "SELECT candidate_id, content, sidecar_metadata, source_event_id, source_hash, scope, privacy_classification
+         FROM memory_documents WHERE scope = 'auto_inject' AND privacy_classification = 'private' ORDER BY candidate_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next()? {
+        items.push(MemoryRetrievalItem {
+            candidate_id: row.get(0)?,
+            content: row.get(1)?,
+            sidecar_metadata: row.get(2)?,
+            source_event_id: row.get(3)?,
+            source_hash: row.get(4)?,
+            scope: row.get(5)?,
+            privacy_classification: row.get(6)?,
+        });
+    }
+    bound_retrieval_items(&mut items, max_chars);
+    Ok(items)
+}
+
+fn retrieve_from_candidates(
+    candidates: &[MemoryCandidate],
+    request: &MemoryRetrievalRequest,
+) -> Result<Vec<MemoryRetrievalItem>, MemoryCurationError> {
+    if matches!(request.scope, MemoryRetrievalScope::OnDemand | MemoryRetrievalScope::ManualOnly)
+        && !request.explicit
+    {
+        return Err(MemoryCurationError::ExplicitRetrievalRequired);
+    }
+    let query = request.query.to_ascii_lowercase();
+    let mut items = candidates
+        .iter()
+        .filter(|candidate| candidate.status == MemoryCandidateStatus::Promoted)
+        .filter(|candidate| candidate.scope == scope_name(request.scope))
+        .filter(|candidate| {
+            request.scope != MemoryRetrievalScope::AutoInject
+                || candidate.privacy_classification == "private"
+        })
+        .filter_map(|candidate| {
+            let content = candidate
+                .curated_content
+                .clone()
+                .unwrap_or_else(|| candidate.content.clone());
+            let sidecar_metadata = (request.scope == MemoryRetrievalScope::ManualOnly)
+                .then(|| manual_sidecar_metadata(candidate));
+            if request.scope == MemoryRetrievalScope::ManualOnly && !request.include_sidecar_metadata {
+                return None;
+            }
+            let searchable = format!("{content} {}", sidecar_metadata.as_deref().unwrap_or_default())
+                .to_ascii_lowercase();
+            if !query.is_empty() && !query.split_whitespace().all(|term| searchable.contains(term)) {
+                return None;
+            }
+            Some(MemoryRetrievalItem {
+                candidate_id: candidate.candidate_id.clone(),
+                content: if request.scope == MemoryRetrievalScope::ManualOnly {
+                    String::new()
+                } else {
+                    content
+                },
+                sidecar_metadata,
+                source_event_id: candidate.source_event_id.clone(),
+                source_hash: candidate.source_hash.clone(),
+                scope: candidate.scope.clone(),
+                privacy_classification: candidate.privacy_classification.clone(),
+            })
+        })
+        .collect();
+    items.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
+    if request.scope == MemoryRetrievalScope::SemanticSearch && query.is_empty() {
+        items.clear();
+    }
+    bound_retrieval_items(&mut items, request.max_chars);
+    Ok(items)
+}
+
 fn contains_secret(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     if (lower.contains("-----begin ") && lower.contains("private key-----"))
@@ -1296,6 +1688,15 @@ fn candidate_path(data_dir: &Path, user_id: &str) -> PathBuf {
         .join("runtime")
         .join("memory")
         .join("candidates.jsonl")
+}
+
+fn derived_index_path(data_dir: &Path, user_id: &str) -> PathBuf {
+    data_dir
+        .join("users")
+        .join(user_id)
+        .join("runtime")
+        .join("memory")
+        .join("derived-index.sqlite3")
 }
 
 fn vault_path(data_dir: &Path, user_id: &str, candidate_id: &str) -> PathBuf {
@@ -1811,5 +2212,88 @@ mod tests {
         assert!(staged.contains("Agent Proposal"));
         assert!(staged.contains("Preimage"));
         assert!(staged.contains(&candidate.source_event_id));
+    }
+
+    #[tokio::test]
+    async fn derived_retrieval_honors_document_scope_and_manual_sidecar_boundary() {
+        let curation = InMemoryMemoryCuration::new();
+        let semantic = evidence(
+            "alice",
+            MemoryEvidenceSource::Owner,
+            TurnTerminalStatus::Success,
+            "Project Atlas uses a weekly summary",
+        );
+        curation.capture_candidate(&semantic).await.unwrap();
+        let semantic_id = curation.candidates_for_user("alice")[0].candidate_id.clone();
+        {
+            let mut candidates = curation.candidates.lock().unwrap();
+            let candidate = candidates.get_mut(&semantic_id).unwrap();
+            candidate.status = MemoryCandidateStatus::Promoted;
+            candidate.scope = "semantic_search".to_owned();
+        }
+        let matches = curation
+            .retrieve("alice", &MemoryRetrievalRequest::semantic_search("Atlas", 4_096))
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].scope, "semantic_search");
+
+        let manual = evidence(
+            "alice",
+            MemoryEvidenceSource::Owner,
+            TurnTerminalStatus::Success,
+            "private note that must not enter prompts",
+        );
+        curation.capture_candidate(&manual).await.unwrap();
+        let manual_id = curation
+            .candidates_for_user("alice")
+            .into_iter()
+            .find(|candidate| candidate.content.contains("private note"))
+            .unwrap()
+            .candidate_id;
+        {
+            let mut candidates = curation.candidates.lock().unwrap();
+            let candidate = candidates.get_mut(&manual_id).unwrap();
+            candidate.status = MemoryCandidateStatus::Promoted;
+            candidate.scope = "manual_only".to_owned();
+        }
+        let sidecar = curation
+            .retrieve("alice", &MemoryRetrievalRequest::manual_sidecar("private"))
+            .await
+            .unwrap();
+        assert_eq!(sidecar.len(), 1);
+        assert!(sidecar[0].content.is_empty());
+        assert!(sidecar[0].sidecar_metadata.is_some());
+    }
+
+    #[tokio::test]
+    async fn filesystem_rebuilds_user_scoped_sqlite_fts_index_without_raw_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let curation = FilesystemMemoryCuration::new(temp.path().to_path_buf());
+        curation
+            .capture_candidate(&evidence(
+                "alice",
+                MemoryEvidenceSource::Owner,
+                TurnTerminalStatus::Success,
+                "I prefer concise replies",
+            ))
+            .await
+            .unwrap();
+        let candidate_id = curation.candidates_for_user("alice").unwrap()[0].candidate_id.clone();
+        curation.promote_candidate("alice", &candidate_id).await.unwrap();
+        curation.rebuild_derived_index("alice").await.unwrap();
+        let results = curation
+            .retrieve("alice", &MemoryRetrievalRequest::auto_inject(4_096))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "I prefer concise replies");
+        assert!(results[0].sidecar_metadata.is_none());
+        assert!(derived_index_path(temp.path(), "alice").exists());
+        assert!(curation
+            .retrieve("bob", &MemoryRetrievalRequest::auto_inject(4_096))
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

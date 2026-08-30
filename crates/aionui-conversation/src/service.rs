@@ -59,7 +59,8 @@ use crate::convert::{
 };
 use crate::error::ConversationError;
 use crate::memory_curation::{
-    MemoryCandidate, MemoryCuration, MemoryEvidence, MemoryEvidenceSource, MemoryRecord, NoopMemoryCuration,
+    MemoryCandidate, MemoryCuration, MemoryEvidence, MemoryEvidenceSource, MemoryRecord, MemoryRetrievalItem,
+    MemoryRetrievalRequest, NoopMemoryCuration,
 };
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::session_mentions;
@@ -591,6 +592,24 @@ impl ConversationService {
                 String::new()
             }
         }
+    }
+
+    pub async fn rebuild_memory_index(&self, user_id: &str) -> Result<(), ConversationError> {
+        self.memory_curation
+            .rebuild_derived_index(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to rebuild memory index: {error}")))
+    }
+
+    pub async fn retrieve_memory(
+        &self,
+        user_id: &str,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<MemoryRetrievalItem>, ConversationError> {
+        self.memory_curation
+            .retrieve(user_id, request)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to retrieve memory: {error}")))
     }
 
     async fn record_mid_turn_event(

@@ -593,6 +593,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
