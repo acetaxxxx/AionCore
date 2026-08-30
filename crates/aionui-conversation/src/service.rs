@@ -59,8 +59,8 @@ use crate::convert::{
 };
 use crate::error::ConversationError;
 use crate::memory_curation::{
-    MemoryCandidate, MemoryCuration, MemoryEvidence, MemoryEvidenceSource, MemoryRecord, MemoryRetrievalItem,
-    MemoryRetrievalRequest, NoopMemoryCuration,
+    MemoryCandidate, MemoryConsolidationReport, MemoryCuration, MemoryEvidence, MemoryEvidenceSource, MemoryRecord,
+    MemoryRetrievalItem, MemoryRetrievalRequest, NoopMemoryCuration,
 };
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::session_mentions;
@@ -488,14 +488,27 @@ impl ConversationService {
             let user_id = evidence.user_id.clone();
             let conversation_id = evidence.conversation_id.clone();
             let turn_id = evidence.turn_id.clone();
-            if let Err(error) = memory_curation.capture_candidate(&evidence).await {
-                warn!(
-                    user_id = %user_id,
-                    conversation_id = %conversation_id,
-                    turn_id = %turn_id,
-                    error = %ErrorChain(&error),
-                    "Failed to capture memory candidate after durable terminal"
-                );
+            match memory_curation.capture_candidate(&evidence).await {
+                Ok(()) => {
+                    if let Err(error) = memory_curation.micro_consolidate(&user_id).await {
+                        warn!(
+                            user_id = %user_id,
+                            conversation_id = %conversation_id,
+                            turn_id = %turn_id,
+                            error = %ErrorChain(&error),
+                            "Failed to run micro memory consolidation after candidate capture"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        user_id = %user_id,
+                        conversation_id = %conversation_id,
+                        turn_id = %turn_id,
+                        error = %ErrorChain(&error),
+                        "Failed to capture memory candidate after durable terminal"
+                    );
+                }
             }
         });
     }
@@ -610,6 +623,37 @@ impl ConversationService {
             .retrieve(user_id, request)
             .await
             .map_err(|error| ConversationError::internal(format!("Failed to retrieve memory: {error}")))
+    }
+
+    pub async fn micro_consolidate_memory(
+        &self,
+        user_id: &str,
+    ) -> Result<MemoryConsolidationReport, ConversationError> {
+        self.memory_curation
+            .micro_consolidate(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to consolidate memory: {error}")))
+    }
+
+    pub async fn deep_consolidate_memory(
+        &self,
+        user_id: &str,
+        dry_run: bool,
+    ) -> Result<MemoryConsolidationReport, ConversationError> {
+        self.memory_curation
+            .deep_consolidate(user_id, dry_run)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to deep-consolidate memory: {error}")))
+    }
+
+    pub async fn recover_memory_consolidation(
+        &self,
+        user_id: &str,
+    ) -> Result<MemoryConsolidationReport, ConversationError> {
+        self.memory_curation
+            .recover_promoting(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to recover memory consolidation: {error}")))
     }
 
     async fn record_mid_turn_event(

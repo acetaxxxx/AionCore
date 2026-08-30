@@ -8,9 +8,13 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::TimeZone;
+use chrono_tz::Tz;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -278,6 +282,102 @@ pub struct MemoryRetrievalItem {
     pub privacy_classification: String,
 }
 
+/// Global process-level gate shared by all consolidation jobs in one app.
+#[derive(Clone, Default)]
+pub struct MemoryConsolidationScheduler {
+    paused: Arc<AtomicBool>,
+}
+
+impl MemoryConsolidationScheduler {
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Compute the next local midnight without assuming the host timezone.
+    pub fn next_daily_run_at_ms(&self, timezone: &str, now_ms: u64) -> Result<u64, MemoryCurationError> {
+        let timezone: Tz = timezone
+            .parse()
+            .map_err(|_| MemoryCurationError::InvalidTimezone { timezone: timezone.to_owned() })?;
+        let now = chrono::Utc
+            .timestamp_millis_opt(now_ms.try_into().unwrap_or(i64::MAX))
+            .single()
+            .ok_or_else(|| MemoryCurationError::InvalidTimezone { timezone: timezone.to_string() })?;
+        let local = now.with_timezone(&timezone);
+        let next_date = local
+            .date_naive()
+            .succ_opt()
+            .ok_or_else(|| MemoryCurationError::InvalidTimezone { timezone: timezone.to_string() })?;
+        let next_midnight = next_date.and_hms_opt(0, 0, 0).ok_or_else(|| {
+            MemoryCurationError::InvalidTimezone {
+                timezone: timezone.to_string(),
+            }
+        })?;
+        timezone
+            .from_local_datetime(&next_midnight)
+            .single()
+            .map(|instant| instant.timestamp_millis().try_into().unwrap_or(u64::MAX))
+            .ok_or_else(|| MemoryCurationError::InvalidTimezone { timezone: timezone.to_string() })
+    }
+
+    /// Start a detached, non-blocking daily worker. The caller owns the
+    /// scheduler gate; pausing it prevents the worker from invoking deep
+    /// consolidation while preserving its next local-midnight wake-up.
+    pub fn spawn_daily(
+        &self,
+        curation: Arc<dyn MemoryCuration>,
+        user_id: String,
+        timezone: String,
+    ) -> Result<tokio::task::JoinHandle<()>, MemoryCurationError> {
+        validate_retrieval_user(&user_id)?;
+        let now_ms = chrono::Utc::now().timestamp_millis().try_into().unwrap_or_default();
+        self.next_daily_run_at_ms(&timezone, now_ms)?;
+        let scheduler = self.clone();
+        Ok(tokio::spawn(async move {
+            loop {
+                let now_ms = chrono::Utc::now().timestamp_millis().try_into().unwrap_or_default();
+                let next_ms = match scheduler.next_daily_run_at_ms(&timezone, now_ms) {
+                    Ok(next_ms) => next_ms,
+                    Err(_) => return,
+                };
+                let wait_ms = next_ms.saturating_sub(now_ms);
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                if !scheduler.is_paused() {
+                    let _ = curation.deep_consolidate(&user_id, false).await;
+                }
+            }
+        }))
+    }
+}
+
+/// Outcome metadata for asynchronous consolidation. `review_log` is a
+/// user-scoped path and can be inspected before a deep apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryConsolidationReport {
+    pub user_id: String,
+    pub job_id: String,
+    pub paused: bool,
+    pub dry_run: bool,
+    pub considered: usize,
+    pub applied: usize,
+    pub recovered: usize,
+    pub review_log: Option<String>,
+}
+
+impl MemoryConsolidationReport {
+    fn with_paused(mut self) -> Self {
+        self.paused = true;
+        self
+    }
+}
+
 /// Errors from candidate policy or Candidate Ledger persistence.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryCurationError {
@@ -313,6 +413,9 @@ pub enum MemoryCurationError {
 
     #[error("explicit retrieval request is required for this memory scope")]
     ExplicitRetrievalRequired,
+
+    #[error("invalid user timezone: {timezone}")]
+    InvalidTimezone { timezone: String },
 }
 
 /// Single high-level port used by conversation execution after terminal
@@ -392,6 +495,28 @@ pub trait MemoryCuration: Send + Sync {
         _user_id: &str,
         _request: &MemoryRetrievalRequest,
     ) -> Result<Vec<MemoryRetrievalItem>, MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn micro_consolidate(
+        &self,
+        _user_id: &str,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn deep_consolidate(
+        &self,
+        _user_id: &str,
+        _dry_run: bool,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn recover_promoting(
+        &self,
+        _user_id: &str,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
         Err(MemoryCurationError::Unsupported)
     }
 }
@@ -690,6 +815,46 @@ impl MemoryCuration for InMemoryMemoryCuration {
         validate_retrieval_user(user_id)?;
         retrieve_from_candidates(&self.candidates_for_user(user_id), request)
     }
+
+    async fn micro_consolidate(
+        &self,
+        user_id: &str,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        let candidates = self.candidates_for_user(user_id);
+        Ok(consolidation_report(user_id, "micro", false, candidates.len(), 0, 0, None))
+    }
+
+    async fn deep_consolidate(
+        &self,
+        user_id: &str,
+        dry_run: bool,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        let candidates = self.candidates_for_user(user_id);
+        Ok(consolidation_report(
+            user_id,
+            "deep",
+            dry_run,
+            candidates.len(),
+            0,
+            0,
+            None,
+        ))
+    }
+
+    async fn recover_promoting(
+        &self,
+        user_id: &str,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        let recovered = self
+            .candidates_for_user(user_id)
+            .into_iter()
+            .filter(|candidate| candidate.status == MemoryCandidateStatus::Promoting)
+            .count();
+        Ok(consolidation_report(user_id, "recovery", false, recovered, 0, recovered, None))
+    }
 }
 
 /// Durable user-scoped Candidate Ledger adapter. It intentionally has no
@@ -698,6 +863,7 @@ impl MemoryCuration for InMemoryMemoryCuration {
 pub struct FilesystemMemoryCuration {
     data_dir: PathBuf,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    consolidation_scheduler: MemoryConsolidationScheduler,
 }
 
 impl FilesystemMemoryCuration {
@@ -705,7 +871,12 @@ impl FilesystemMemoryCuration {
         Self {
             data_dir,
             locks: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_scheduler: MemoryConsolidationScheduler::default(),
         }
+    }
+
+    pub fn consolidation_scheduler(&self) -> MemoryConsolidationScheduler {
+        self.consolidation_scheduler.clone()
     }
 
     pub fn candidates_for_user(&self, user_id: &str) -> Result<Vec<MemoryCandidate>, MemoryCurationError> {
@@ -858,6 +1029,40 @@ impl MemoryCuration for FilesystemMemoryCuration {
         let user_id = user_id.to_owned();
         let request = request.clone();
         tokio::task::spawn_blocking(move || adapter.retrieve_blocking(&user_id, &request))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn micro_consolidate(
+        &self,
+        user_id: &str,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.micro_consolidate_blocking(&user_id))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn deep_consolidate(
+        &self,
+        user_id: &str,
+        dry_run: bool,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.deep_consolidate_blocking(&user_id, dry_run))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn recover_promoting(
+        &self,
+        user_id: &str,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.recover_promoting_blocking(&user_id))
             .await
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
     }
@@ -1319,6 +1524,99 @@ impl FilesystemMemoryCuration {
         transaction.commit()?;
         Ok(())
     }
+
+    fn micro_consolidate_blocking(&self, user_id: &str) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        if self.consolidation_scheduler.is_paused() {
+            return Ok(consolidation_report(user_id, "micro", false, 0, 0, 0, None).with_paused());
+        }
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let considered = read_candidates(&candidate_path(&self.data_dir, user_id))?
+            .into_iter()
+            .filter(|candidate| candidate.status == MemoryCandidateStatus::Promoted)
+            .count();
+        self.rebuild_derived_index_locked(user_id)?;
+        Ok(consolidation_report(user_id, "micro", false, considered, 0, 0, None))
+    }
+
+    fn deep_consolidate_blocking(
+        &self,
+        user_id: &str,
+        dry_run: bool,
+    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        if self.consolidation_scheduler.is_paused() {
+            return Ok(consolidation_report(user_id, "deep", dry_run, 0, 0, 0, None).with_paused());
+        }
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let candidates: Vec<_> = read_candidates(&candidate_path(&self.data_dir, user_id))?
+            .into_iter()
+            .filter(|candidate| candidate.status == MemoryCandidateStatus::Promoted)
+            .collect();
+        let job_id = consolidation_job_id(user_id, "deep");
+        let review_path = consolidation_review_path(&self.data_dir, user_id, &job_id);
+        let review = serde_json::json!({
+            "job_id": job_id,
+            "user_id": user_id,
+            "dry_run": dry_run,
+            "candidates": candidates.iter().map(|candidate| serde_json::json!({
+                "candidate_id": candidate.candidate_id,
+                "source_event_id": candidate.source_event_id,
+                "source_hash": candidate.source_hash,
+                "scope": candidate.scope,
+                "privacy_classification": candidate.privacy_classification,
+            })).collect::<Vec<_>>(),
+            "applied": false,
+            "loss_guard": "curated-vault-and-candidate-ledger-unchanged",
+        });
+        write_file_atomic(&review_path, serde_json::to_vec_pretty(&review)?.as_slice())?;
+        if !dry_run {
+            // The current core has no multi-note rewrite engine. Applying a
+            // deep run therefore only refreshes the derived index; candidate
+            // and curated-vault truth remains untouched until a reviewed
+            // rewrite operation exists.
+            self.rebuild_derived_index_locked(user_id)?;
+        }
+        Ok(consolidation_report(
+            user_id,
+            "deep",
+            dry_run,
+            candidates.len(),
+            0,
+            0,
+            Some(review_path.to_string_lossy().into_owned()),
+        ))
+    }
+
+    fn recover_promoting_blocking(&self, user_id: &str) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        if self.consolidation_scheduler.is_paused() {
+            return Ok(consolidation_report(user_id, "recovery", false, 0, 0, 0, None).with_paused());
+        }
+        let candidates = read_candidates(&candidate_path(&self.data_dir, user_id))?;
+        let ids: Vec<_> = candidates
+            .into_iter()
+            .filter(|candidate| candidate.status == MemoryCandidateStatus::Promoting)
+            .map(|candidate| candidate.candidate_id)
+            .collect();
+        let considered = ids.len();
+        let mut recovered = 0;
+        for candidate_id in ids {
+            self.promote_candidate_blocking(user_id, &candidate_id)?;
+            recovered += 1;
+        }
+        Ok(consolidation_report(
+            user_id,
+            "recovery",
+            false,
+            considered,
+            0,
+            recovered,
+            None,
+        ))
+    }
 }
 
 impl FilesystemMemoryCuration {
@@ -1529,6 +1827,32 @@ fn bound_retrieval_items(items: &mut Vec<MemoryRetrievalItem>, max_chars: usize)
     });
 }
 
+fn consolidation_job_id(user_id: &str, kind: &str) -> String {
+    digest_hex(format!("{user_id}\0{kind}").as_bytes())
+}
+
+fn consolidation_report(
+    user_id: &str,
+    kind: &str,
+    dry_run: bool,
+    considered: usize,
+    applied: usize,
+    recovered: usize,
+    review_log: Option<String>,
+) -> MemoryConsolidationReport {
+    let job_id = consolidation_job_id(user_id, kind);
+    MemoryConsolidationReport {
+        user_id: user_id.to_owned(),
+        job_id,
+        paused: false,
+        dry_run,
+        considered,
+        applied,
+        recovered,
+        review_log,
+    }
+}
+
 fn read_auto_inject_rows(
     connection: &Connection,
     max_chars: usize,
@@ -1699,6 +2023,16 @@ fn derived_index_path(data_dir: &Path, user_id: &str) -> PathBuf {
         .join("derived-index.sqlite3")
 }
 
+fn consolidation_review_path(data_dir: &Path, user_id: &str, job_id: &str) -> PathBuf {
+    data_dir
+        .join("users")
+        .join(user_id)
+        .join("runtime")
+        .join("memory")
+        .join("consolidation-review")
+        .join(format!("{job_id}.json"))
+}
+
 fn vault_path(data_dir: &Path, user_id: &str, candidate_id: &str) -> PathBuf {
     data_dir
         .join("users")
@@ -1854,6 +2188,22 @@ fn write_vault_atomic(path: &Path, content: &[u8]) -> Result<(), MemoryCurationE
     let parent = path.parent().expect("vault path has a parent");
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension("md.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(content)?;
+    file.flush()?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn write_file_atomic(path: &Path, content: &[u8]) -> Result<(), MemoryCurationError> {
+    let parent = path.parent().expect("file path has a parent");
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("tmp");
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -2295,5 +2645,48 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn consolidation_scheduler_uses_user_timezone_and_global_pause_gate() {
+        let scheduler = MemoryConsolidationScheduler::default();
+        let now_ms = 1_700_000_000_000;
+        let next = scheduler.next_daily_run_at_ms("Asia/Taipei", now_ms).unwrap();
+        assert!(next > now_ms);
+        assert!(!scheduler.is_paused());
+        scheduler.pause();
+        assert!(scheduler.is_paused());
+        scheduler.resume();
+        assert!(!scheduler.is_paused());
+    }
+
+    #[tokio::test]
+    async fn deep_consolidation_is_dry_run_reviewable_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let curation = FilesystemMemoryCuration::new(temp.path().to_path_buf());
+        curation
+            .capture_candidate(&evidence(
+                "alice",
+                MemoryEvidenceSource::Owner,
+                TurnTerminalStatus::Success,
+                "I prefer concise replies",
+            ))
+            .await
+            .unwrap();
+        let candidate_id = curation.candidates_for_user("alice").unwrap()[0].candidate_id.clone();
+        curation.promote_candidate("alice", &candidate_id).await.unwrap();
+        let before = curation.inspect_memory("alice", &candidate_id).await.unwrap();
+        let dry_run = curation.deep_consolidate("alice", true).await.unwrap();
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.applied, 0);
+        let review_path = dry_run.review_log.clone().unwrap();
+        assert!(std::path::Path::new(&review_path).exists());
+        let applied = curation.deep_consolidate("alice", false).await.unwrap();
+        assert!(!applied.dry_run);
+        assert_eq!(applied.job_id, dry_run.job_id);
+        assert_eq!(applied.applied, 0);
+        let after = curation.inspect_memory("alice", &candidate_id).await.unwrap();
+        assert_eq!(before.source_hash, after.source_hash);
+        assert_eq!(before.markdown, after.markdown);
     }
 }
