@@ -58,6 +58,11 @@ use crate::convert::{
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
+use crate::memory_curation::{
+    MemoryCandidate, MemoryConsolidationReport, MemoryCuration, MemoryEvidence, MemoryEvidenceSource,
+    MemoryPrivacyPurgeRequest, MemoryPurgeReport, MemoryRecord, MemoryRetentionPolicy, MemoryRetentionReport,
+    MemoryRetrievalItem, MemoryRetrievalRequest, NoopMemoryCuration,
+};
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
@@ -363,6 +368,7 @@ pub struct ConversationService {
     /// instance (and therefore its lock/root) with the public seam.
     mid_turn_coordinator: Option<Arc<crate::turn_journal::MidTurnCoordinator>>,
     journal_data_dir: Option<PathBuf>,
+    memory_curation: Arc<dyn MemoryCuration>,
 }
 
 #[derive(Clone)]
@@ -441,6 +447,7 @@ impl ConversationService {
             turn_journal: Arc::new(crate::turn_journal::InMemoryTurnJournal::new()),
             mid_turn_coordinator: None,
             journal_data_dir: None,
+            memory_curation: Arc::new(NoopMemoryCuration),
         }
     }
 
@@ -464,8 +471,247 @@ impl ConversationService {
         self
     }
 
+    /// Installs the high-level Memory Curation port. The adapter owns its
+    /// user-scoped Candidate Ledger and is invoked only after terminal journal
+    /// durability has succeeded.
+    pub fn with_memory_curation(mut self, memory_curation: Arc<dyn MemoryCuration>) -> Self {
+        self.memory_curation = memory_curation;
+        self
+    }
+
     pub fn turn_journal(&self) -> Arc<dyn crate::turn_journal::TurnJournal> {
         Arc::clone(&self.turn_journal)
+    }
+
+    pub(crate) fn capture_memory_candidate(&self, evidence: MemoryEvidence) {
+        let memory_curation = Arc::clone(&self.memory_curation);
+        tokio::spawn(async move {
+            let user_id = evidence.user_id.clone();
+            let conversation_id = evidence.conversation_id.clone();
+            let turn_id = evidence.turn_id.clone();
+            match memory_curation.capture_candidate(&evidence).await {
+                Ok(()) => {
+                    if let Err(error) = memory_curation.micro_consolidate(&user_id).await {
+                        warn!(
+                            user_id = %user_id,
+                            conversation_id = %conversation_id,
+                            turn_id = %turn_id,
+                            error = %ErrorChain(&error),
+                            "Failed to run micro memory consolidation after candidate capture"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        user_id = %user_id,
+                        conversation_id = %conversation_id,
+                        turn_id = %turn_id,
+                        error = %ErrorChain(&error),
+                        "Failed to capture memory candidate after durable terminal"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Explicitly promote one user-scoped candidate into the managed Memory
+    /// Vault. The curation adapter owns eligibility and provenance checks.
+    pub async fn promote_memory_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .promote_candidate(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to promote memory candidate: {error}")))
+    }
+
+    pub async fn inspect_memory_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .inspect_candidate(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect memory candidate: {error}")))
+    }
+
+    pub async fn inspect_memory(&self, user_id: &str, candidate_id: &str) -> Result<MemoryRecord, ConversationError> {
+        self.memory_curation
+            .inspect_memory(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect memory: {error}")))
+    }
+
+    pub async fn accept_memory_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryRecord, ConversationError> {
+        self.memory_curation
+            .accept_candidate(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to accept memory candidate: {error}")))
+    }
+
+    pub async fn reject_memory_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .reject_candidate(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to reject memory candidate: {error}")))
+    }
+
+    pub async fn edit_memory(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+        content: &str,
+    ) -> Result<MemoryRecord, ConversationError> {
+        self.memory_curation
+            .edit_memory(user_id, candidate_id, content)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to edit memory: {error}")))
+    }
+
+    pub async fn remove_memory(&self, user_id: &str, candidate_id: &str) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .remove_memory(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to remove memory: {error}")))
+    }
+
+    pub async fn soft_remove_memory(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .soft_remove_memory(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to soft-remove memory: {error}")))
+    }
+
+    pub async fn pause_memory_processing(&self, user_id: &str) -> Result<(), ConversationError> {
+        self.memory_curation
+            .pause_memory_processing(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to pause memory processing: {error}")))
+    }
+
+    pub async fn resume_memory_processing(&self, user_id: &str) -> Result<(), ConversationError> {
+        self.memory_curation
+            .resume_memory_processing(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to resume memory processing: {error}")))
+    }
+
+    pub async fn is_memory_processing_paused(&self, user_id: &str) -> Result<bool, ConversationError> {
+        self.memory_curation
+            .is_memory_processing_paused(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect memory processing state: {error}")))
+    }
+
+    pub async fn configure_memory_retention(
+        &self,
+        user_id: &str,
+        policy: MemoryRetentionPolicy,
+    ) -> Result<MemoryRetentionPolicy, ConversationError> {
+        self.memory_curation
+            .configure_raw_retention(user_id, policy)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to configure memory retention: {error}")))
+    }
+
+    pub async fn run_memory_retention(
+        &self,
+        user_id: &str,
+        now_ms: u64,
+    ) -> Result<MemoryRetentionReport, ConversationError> {
+        self.memory_curation
+            .run_raw_retention(user_id, now_ms)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to run memory retention: {error}")))
+    }
+
+    pub async fn privacy_purge_memory(
+        &self,
+        user_id: &str,
+        request: &MemoryPrivacyPurgeRequest,
+    ) -> Result<MemoryPurgeReport, ConversationError> {
+        self.memory_curation
+            .privacy_purge(user_id, request)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to purge memory: {error}")))
+    }
+
+    pub(crate) async fn auto_inject_memory_context(&self, user_id: &str) -> String {
+        match self.memory_curation.auto_inject(user_id, 4_096).await {
+            Ok(items) => items
+                .into_iter()
+                .map(|item| item.content)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(error) => {
+                warn!(user_id = %user_id, error = %ErrorChain(&error), "Failed to load auto-inject agent memory");
+                String::new()
+            }
+        }
+    }
+
+    pub async fn rebuild_memory_index(&self, user_id: &str) -> Result<(), ConversationError> {
+        self.memory_curation
+            .rebuild_derived_index(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to rebuild memory index: {error}")))
+    }
+
+    pub async fn retrieve_memory(
+        &self,
+        user_id: &str,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<MemoryRetrievalItem>, ConversationError> {
+        self.memory_curation
+            .retrieve(user_id, request)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to retrieve memory: {error}")))
+    }
+
+    pub async fn micro_consolidate_memory(
+        &self,
+        user_id: &str,
+    ) -> Result<MemoryConsolidationReport, ConversationError> {
+        self.memory_curation
+            .micro_consolidate(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to consolidate memory: {error}")))
+    }
+
+    pub async fn deep_consolidate_memory(
+        &self,
+        user_id: &str,
+        dry_run: bool,
+    ) -> Result<MemoryConsolidationReport, ConversationError> {
+        self.memory_curation
+            .deep_consolidate(user_id, dry_run)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to deep-consolidate memory: {error}")))
+    }
+
+    pub async fn recover_memory_consolidation(
+        &self,
+        user_id: &str,
+    ) -> Result<MemoryConsolidationReport, ConversationError> {
+        self.memory_curation
+            .recover_promoting(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to recover memory consolidation: {error}")))
     }
 
     async fn record_mid_turn_event(
@@ -4181,6 +4427,7 @@ impl ConversationService {
         let normalized_ws = crate::turn_journal::normalize_workspace_label(
             crate::session_mentions::workspace_from_extra(&row.extra).as_deref(),
         );
+        let pre_created_at_ms = journal_now_ms();
         let pre_record = crate::turn_journal::PreTurnRecord {
             user_id,
             conversation_id,
@@ -4188,7 +4435,7 @@ impl ConversationService {
             parent_turn_id: None,
             user_message: &resolved.content,
             workspace: normalized_ws.as_deref(),
-            created_at_ms: journal_now_ms(),
+            created_at_ms: pre_created_at_ms,
         };
         if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
             warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal; failing closed");
@@ -4312,6 +4559,9 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
+            memory_source: MemoryEvidenceSource::Owner,
+            pre_created_at_ms,
+            pre_workspace: normalized_ws,
         });
 
         info!(
@@ -4388,6 +4638,7 @@ impl ConversationService {
         let normalized_ws = crate::turn_journal::normalize_workspace_label(
             crate::session_mentions::workspace_from_extra(&row.extra).as_deref(),
         );
+        let pre_created_at_ms = journal_now_ms();
         let pre_record = crate::turn_journal::PreTurnRecord {
             user_id: &request.user_id,
             conversation_id: &request.conversation_id,
@@ -4395,7 +4646,7 @@ impl ConversationService {
             parent_turn_id: None,
             user_message: &request.content,
             workspace: normalized_ws.as_deref(),
-            created_at_ms: journal_now_ms(),
+            created_at_ms: pre_created_at_ms,
         };
         if let Err(e) = self.turn_journal.capture_pre_turn(&pre_record).await {
             warn!(turn_id = %turn_id, error = %ErrorChain(&e), "Failed to capture pre-turn in turn journal for agent turn; failing closed without invoking on_started");
@@ -4483,6 +4734,9 @@ impl ConversationService {
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
+                memory_source: MemoryEvidenceSource::CompliantAgent,
+                pre_created_at_ms,
+                pre_workspace: normalized_ws,
             })
             .await;
 

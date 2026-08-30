@@ -477,7 +477,10 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     .with_filesystem_turn_journal(Arc::new(aionui_conversation::FilesystemTurnJournal::new(
         deps.data_dir.clone(),
     )))
-    .with_journal_data_dir(deps.data_dir)
+    .with_journal_data_dir(deps.data_dir.clone())
+    .with_memory_curation(Arc::new(aionui_conversation::FilesystemMemoryCuration::new(
+        deps.data_dir,
+    )))
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
     .with_runtime_token_service(deps.runtime_token_service);
