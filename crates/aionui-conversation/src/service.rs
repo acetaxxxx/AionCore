@@ -59,7 +59,7 @@ use crate::convert::{
 };
 use crate::error::ConversationError;
 use crate::memory_curation::{
-    MemoryCandidate, MemoryCuration, MemoryEvidence, MemoryEvidenceSource, NoopMemoryCuration,
+    MemoryCandidate, MemoryCuration, MemoryEvidence, MemoryEvidenceSource, MemoryRecord, NoopMemoryCuration,
 };
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::session_mentions;
@@ -510,6 +510,73 @@ impl ConversationService {
             .promote_candidate(user_id, candidate_id)
             .await
             .map_err(|error| ConversationError::internal(format!("Failed to promote memory candidate: {error}")))
+    }
+
+    pub async fn inspect_memory_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .inspect_candidate(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect memory candidate: {error}")))
+    }
+
+    pub async fn inspect_memory(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryRecord, ConversationError> {
+        self.memory_curation
+            .inspect_memory(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect memory: {error}")))
+    }
+
+    pub async fn accept_memory_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryRecord, ConversationError> {
+        self.memory_curation
+            .accept_candidate(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to accept memory candidate: {error}")))
+    }
+
+    pub async fn reject_memory_candidate(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .reject_candidate(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to reject memory candidate: {error}")))
+    }
+
+    pub async fn edit_memory(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+        content: &str,
+    ) -> Result<MemoryRecord, ConversationError> {
+        self.memory_curation
+            .edit_memory(user_id, candidate_id, content)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to edit memory: {error}")))
+    }
+
+    pub async fn remove_memory(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .remove_memory(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to remove memory: {error}")))
     }
 
     pub(crate) async fn auto_inject_memory_context(&self, user_id: &str) -> String {
