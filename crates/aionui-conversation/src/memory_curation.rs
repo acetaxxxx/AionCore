@@ -343,7 +343,7 @@ impl MemoryCuration for InMemoryMemoryCuration {
             })
             .collect();
         items.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
-        let mut used = 0;
+        let mut used: usize = 0;
         items.retain(|item| {
             let size = item.content.chars().count();
             let keep = used.saturating_add(size) <= budget;
@@ -558,7 +558,7 @@ impl FilesystemMemoryCuration {
             })
             .collect();
         items.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
-        let mut used = 0;
+        let mut used: usize = 0;
         items.retain(|item| {
             let size = item.content.chars().count();
             let keep = used.saturating_add(size) <= budget;
