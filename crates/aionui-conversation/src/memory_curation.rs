@@ -369,6 +369,9 @@ fn contains_secret(content: &str) -> bool {
     if (lower.contains("-----begin ") && lower.contains("private key-----"))
         || lower.contains("private key")
         || lower.contains("bearer ")
+        || lower.contains("authorization: basic")
+        || lower.contains("authorization=basic")
+        || lower.contains("authorization basic ")
     {
         return true;
     }
@@ -376,9 +379,19 @@ fn contains_secret(content: &str) -> bool {
         "api_key",
         "api-key",
         "api key",
+        "apikey",
         "secret_key",
         "secret-key",
         "secret key",
+        "secretkey",
+        "access_token",
+        "access-token",
+        "access token",
+        "accesstoken",
+        "refresh_token",
+        "refresh-token",
+        "refresh token",
+        "refreshtoken",
         "password",
         "token",
         "cookie",
@@ -500,11 +513,18 @@ mod tests {
     fn secret_boundary_covers_common_transport_and_token_forms() {
         for secret in [
             "api key: value",
+            "apiKey=value",
+            "secretKey: value",
+            "access_token=value",
+            "accessToken=value",
+            "refresh_token: value",
+            "refreshToken: value",
             "cookie=session-value",
             "connection string: postgres://user:pass@example.invalid/db",
             "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
             "jwt eyJheader.payload.signature",
             "Authorization: Bearer opaque-token",
+            "Authorization: Basic dXNlcjpwYXNz",
         ] {
             assert!(contains_secret(secret), "secret form was not rejected: {secret}");
         }
