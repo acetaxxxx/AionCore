@@ -7,8 +7,8 @@ mod background_stream;
 mod convert;
 pub mod error;
 pub(crate) mod message_cursor;
-mod message_persistence;
 mod memory_curation;
+mod message_persistence;
 pub mod response_middleware;
 pub mod routes;
 pub mod routes_aux;
@@ -33,6 +33,10 @@ mod turn_recovery_policy;
 
 pub use convert::row_to_response_with_extra;
 pub use error::ConversationError;
+pub use memory_curation::{
+    AgentMemory, FilesystemMemoryCuration, InMemoryMemoryCuration, MemoryCandidate,
+    MemoryCandidateStatus, MemoryCuration, MemoryCurationError, MemoryEvidence, MemoryEvidenceSource,
+};
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
@@ -40,10 +44,6 @@ pub use service::is_temp_session_workspace;
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
-};
-pub use memory_curation::{
-    AgentMemory, FilesystemMemoryCuration, InMemoryMemoryCuration, MemoryCandidate,
-    MemoryCandidateStatus, MemoryCuration, MemoryCurationError, MemoryEvidence, MemoryEvidenceSource,
 };
 pub use state::ConversationRouterState;
 pub use turn_journal::{

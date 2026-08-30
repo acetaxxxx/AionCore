@@ -85,7 +85,9 @@ impl MemoryEvidence {
             source_material.push_str(part);
             source_material.push('\0');
         }
-        source_material.push_str(&serde_json::to_string(&status).expect("terminal status is serializable"));
+        source_material.push_str(
+            &serde_json::to_string(&status).expect("terminal status is serializable"),
+        );
 
         Self {
             user_id: user_id.to_owned(),

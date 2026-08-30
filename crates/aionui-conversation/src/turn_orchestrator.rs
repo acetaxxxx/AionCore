@@ -484,15 +484,16 @@ impl ConversationTurnOrchestrator {
                 })),
                 finished_at_ms: crate::service::journal_now_ms(),
             };
-            if let Err(je) = self.service.turn_journal().reconcile_terminal(&input.user_id, &conv_id, &turn_id, &cancel_outcome).await {
+            if let Err(je) = self
+                .service
+                .turn_journal()
+                .reconcile_terminal(&input.user_id, &conv_id, &turn_id, &cancel_outcome)
+                .await
+            {
                 error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on deferred cancel; turn remains open for startup recovery reconciliation");
             }
-            self.service.broadcast_turn_settled_without_relay(
-                &input.user_id,
-                &conv_id,
-                &turn_id,
-                &first_turn_msg_id,
-            );
+            self.service
+                .broadcast_turn_settled_without_relay(&input.user_id, &conv_id, &turn_id, &first_turn_msg_id);
             let was_deleting = turn_claim.release_for_turn(&turn_id);
             self.service
                 .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
@@ -746,13 +747,22 @@ impl ConversationTurnOrchestrator {
             error_meta.insert("error".to_string(), serde_json::Value::String(err.clone()));
         }
         if matches!(&last_attempt_terminal, Some(RelayTerminal::ChannelClosed)) {
-            error_meta.insert("reason".to_string(), serde_json::Value::String("channel_closed_unexpectedly".to_string()));
+            error_meta.insert(
+                "reason".to_string(),
+                serde_json::Value::String("channel_closed_unexpectedly".to_string()),
+            );
             if final_error_message.is_none() {
                 final_error_message = Some("stream_channel_closed_unexpectedly".to_string());
             }
         }
-        error_meta.insert("assistant_message".to_string(), serde_json::Value::String("unavailable".to_string()));
-        error_meta.insert("token_usage".to_string(), serde_json::Value::String("unavailable".to_string()));
+        error_meta.insert(
+            "assistant_message".to_string(),
+            serde_json::Value::String("unavailable".to_string()),
+        );
+        error_meta.insert(
+            "token_usage".to_string(),
+            serde_json::Value::String("unavailable".to_string()),
+        );
 
         let final_outcome = crate::turn_journal::TerminalOutcomeRecord {
             status: terminal_status,
