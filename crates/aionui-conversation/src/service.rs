@@ -62,6 +62,7 @@ use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder}
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
+use crate::memory_curation::{MemoryCuration, MemoryEvidenceSource, NoopMemoryCuration};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
 
@@ -363,6 +364,7 @@ pub struct ConversationService {
     /// instance (and therefore its lock/root) with the public seam.
     mid_turn_coordinator: Option<Arc<crate::turn_journal::MidTurnCoordinator>>,
     journal_data_dir: Option<PathBuf>,
+    memory_curation: Arc<dyn MemoryCuration>,
 }
 
 #[derive(Clone)]
@@ -441,6 +443,7 @@ impl ConversationService {
             turn_journal: Arc::new(crate::turn_journal::InMemoryTurnJournal::new()),
             mid_turn_coordinator: None,
             journal_data_dir: None,
+            memory_curation: Arc::new(NoopMemoryCuration),
         }
     }
 
@@ -467,8 +470,28 @@ impl ConversationService {
         self
     }
 
+    /// Installs the high-level Memory Curation port. The adapter owns its
+    /// user-scoped Candidate Ledger and is invoked only after terminal journal
+    /// durability has succeeded.
+    pub fn with_memory_curation(mut self, memory_curation: Arc<dyn MemoryCuration>) -> Self {
+        self.memory_curation = memory_curation;
+        self
+    }
+
     pub fn turn_journal(&self) -> Arc<dyn crate::turn_journal::TurnJournal> {
         Arc::clone(&self.turn_journal)
+    }
+
+    pub(crate) async fn capture_memory_candidate(&self, evidence: &crate::memory_curation::MemoryEvidence) {
+        if let Err(error) = self.memory_curation.capture_candidate(evidence).await {
+            warn!(
+                user_id = %evidence.user_id,
+                conversation_id = %evidence.conversation_id,
+                turn_id = %evidence.turn_id,
+                error = %ErrorChain(&error),
+                "Failed to capture memory candidate after durable terminal"
+            );
+        }
     }
 
     async fn record_mid_turn_event(
@@ -4300,6 +4323,7 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
+            memory_source: MemoryEvidenceSource::Owner,
         });
 
         info!(
@@ -4464,6 +4488,7 @@ impl ConversationService {
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
+                memory_source: MemoryEvidenceSource::CompliantAgent,
             })
             .await;
 

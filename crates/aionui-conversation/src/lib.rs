@@ -8,6 +8,7 @@ mod convert;
 pub mod error;
 pub(crate) mod message_cursor;
 mod message_persistence;
+mod memory_curation;
 pub mod response_middleware;
 pub mod routes;
 pub mod routes_aux;
@@ -39,6 +40,10 @@ pub use service::is_temp_session_workspace;
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
+};
+pub use memory_curation::{
+    FilesystemMemoryCuration, InMemoryMemoryCuration, MemoryCandidate, MemoryCandidateStatus,
+    MemoryCuration, MemoryCurationError, MemoryEvidence, MemoryEvidenceSource,
 };
 pub use state::ConversationRouterState;
 pub use turn_journal::{
