@@ -538,11 +538,7 @@ impl ConversationService {
             .map_err(|error| ConversationError::internal(format!("Failed to inspect memory candidate: {error}")))
     }
 
-    pub async fn inspect_memory(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryRecord, ConversationError> {
+    pub async fn inspect_memory(&self, user_id: &str, candidate_id: &str) -> Result<MemoryRecord, ConversationError> {
         self.memory_curation
             .inspect_memory(user_id, candidate_id)
             .await
@@ -583,11 +579,7 @@ impl ConversationService {
             .map_err(|error| ConversationError::internal(format!("Failed to edit memory: {error}")))
     }
 
-    pub async fn remove_memory(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryCandidate, ConversationError> {
+    pub async fn remove_memory(&self, user_id: &str, candidate_id: &str) -> Result<MemoryCandidate, ConversationError> {
         self.memory_curation
             .remove_memory(user_id, candidate_id)
             .await

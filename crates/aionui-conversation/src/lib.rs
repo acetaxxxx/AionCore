@@ -35,10 +35,10 @@ pub use convert::row_to_response_with_extra;
 pub use error::ConversationError;
 pub use memory_curation::{
     AgentMemory, FilesystemMemoryCuration, InMemoryMemoryCuration, MemoryCandidate, MemoryCandidateLifecycleEvent,
-    MemoryCandidateStatus, MemoryCuration, MemoryCurationError, MemoryEvidence, MemoryEvidenceSource, MemoryRecord,
-    MemoryConsolidationReport, MemoryConsolidationScheduler, MemoryRetrievalItem, MemoryRetrievalRequest,
-    MemoryRetrievalScope, MemoryRetentionPolicy, MemoryRetentionReport, MemoryPrivacyPurgeRequest,
-    MemoryPurgeReport,
+    MemoryCandidateStatus, MemoryConsolidationReport, MemoryConsolidationScheduler, MemoryCuration,
+    MemoryCurationError, MemoryEvidence, MemoryEvidenceSource, MemoryPrivacyPurgeRequest, MemoryPurgeReport,
+    MemoryRecord, MemoryRetentionPolicy, MemoryRetentionReport, MemoryRetrievalItem, MemoryRetrievalRequest,
+    MemoryRetrievalScope,
 };
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
 pub use routes::conversation_routes;

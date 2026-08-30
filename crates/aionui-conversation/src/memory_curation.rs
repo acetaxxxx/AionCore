@@ -303,28 +303,34 @@ impl MemoryConsolidationScheduler {
 
     /// Compute the next local midnight without assuming the host timezone.
     pub fn next_daily_run_at_ms(&self, timezone: &str, now_ms: u64) -> Result<u64, MemoryCurationError> {
-        let timezone: Tz = timezone
-            .parse()
-            .map_err(|_| MemoryCurationError::InvalidTimezone { timezone: timezone.to_owned() })?;
+        let timezone: Tz = timezone.parse().map_err(|_| MemoryCurationError::InvalidTimezone {
+            timezone: timezone.to_owned(),
+        })?;
         let now = chrono::Utc
             .timestamp_millis_opt(now_ms.try_into().unwrap_or(i64::MAX))
             .single()
-            .ok_or_else(|| MemoryCurationError::InvalidTimezone { timezone: timezone.to_string() })?;
+            .ok_or_else(|| MemoryCurationError::InvalidTimezone {
+                timezone: timezone.to_string(),
+            })?;
         let local = now.with_timezone(&timezone);
         let next_date = local
             .date_naive()
             .succ_opt()
-            .ok_or_else(|| MemoryCurationError::InvalidTimezone { timezone: timezone.to_string() })?;
-        let next_midnight = next_date.and_hms_opt(0, 0, 0).ok_or_else(|| {
-            MemoryCurationError::InvalidTimezone {
+            .ok_or_else(|| MemoryCurationError::InvalidTimezone {
                 timezone: timezone.to_string(),
-            }
-        })?;
+            })?;
+        let next_midnight = next_date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| MemoryCurationError::InvalidTimezone {
+                timezone: timezone.to_string(),
+            })?;
         timezone
             .from_local_datetime(&next_midnight)
             .single()
             .map(|instant| instant.timestamp_millis().try_into().unwrap_or(u64::MAX))
-            .ok_or_else(|| MemoryCurationError::InvalidTimezone { timezone: timezone.to_string() })
+            .ok_or_else(|| MemoryCurationError::InvalidTimezone {
+                timezone: timezone.to_string(),
+            })
     }
 
     /// Start a detached, non-blocking daily worker. The caller owns the
@@ -488,19 +494,11 @@ pub trait MemoryCuration: Send + Sync {
         Err(MemoryCurationError::Unsupported)
     }
 
-    async fn inspect_memory(
-        &self,
-        _user_id: &str,
-        _candidate_id: &str,
-    ) -> Result<MemoryRecord, MemoryCurationError> {
+    async fn inspect_memory(&self, _user_id: &str, _candidate_id: &str) -> Result<MemoryRecord, MemoryCurationError> {
         Err(MemoryCurationError::Unsupported)
     }
 
-    async fn accept_candidate(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryRecord, MemoryCurationError> {
+    async fn accept_candidate(&self, user_id: &str, candidate_id: &str) -> Result<MemoryRecord, MemoryCurationError> {
         let candidate = self.promote_candidate(user_id, candidate_id).await?;
         Ok(memory_record_from_candidate(candidate, String::new()))
     }
@@ -522,11 +520,7 @@ pub trait MemoryCuration: Send + Sync {
         Err(MemoryCurationError::Unsupported)
     }
 
-    async fn remove_memory(
-        &self,
-        _user_id: &str,
-        _candidate_id: &str,
-    ) -> Result<MemoryCandidate, MemoryCurationError> {
+    async fn remove_memory(&self, _user_id: &str, _candidate_id: &str) -> Result<MemoryCandidate, MemoryCurationError> {
         Err(MemoryCurationError::Unsupported)
     }
 
@@ -590,10 +584,7 @@ pub trait MemoryCuration: Send + Sync {
         Err(MemoryCurationError::Unsupported)
     }
 
-    async fn micro_consolidate(
-        &self,
-        _user_id: &str,
-    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+    async fn micro_consolidate(&self, _user_id: &str) -> Result<MemoryConsolidationReport, MemoryCurationError> {
         Err(MemoryCurationError::Unsupported)
     }
 
@@ -605,10 +596,7 @@ pub trait MemoryCuration: Send + Sync {
         Err(MemoryCurationError::Unsupported)
     }
 
-    async fn recover_promoting(
-        &self,
-        _user_id: &str,
-    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+    async fn recover_promoting(&self, _user_id: &str) -> Result<MemoryConsolidationReport, MemoryCurationError> {
         Err(MemoryCurationError::Unsupported)
     }
 }
@@ -730,12 +718,7 @@ impl MemoryCuration for InMemoryMemoryCuration {
         candidate.status = MemoryCandidateStatus::Promoted;
         candidate.promoted_at_ms.get_or_insert(candidate.detected_at_ms);
         let promoted_at_ms = candidate.promoted_at_ms.unwrap_or(candidate.detected_at_ms);
-        append_lifecycle_event(
-            candidate,
-            MemoryCandidateStatus::Promoted,
-            promoted_at_ms,
-            "accepted",
-        );
+        append_lifecycle_event(candidate, MemoryCandidateStatus::Promoted, promoted_at_ms, "accepted");
         Ok(candidate.clone())
     }
 
@@ -755,11 +738,7 @@ impl MemoryCuration for InMemoryMemoryCuration {
             })
     }
 
-    async fn inspect_memory(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryRecord, MemoryCurationError> {
+    async fn inspect_memory(&self, user_id: &str, candidate_id: &str) -> Result<MemoryRecord, MemoryCurationError> {
         let candidate = self.inspect_candidate(user_id, candidate_id).await?;
         if candidate.status != MemoryCandidateStatus::Promoted {
             return Err(MemoryCurationError::PromotionNotEligible {
@@ -770,11 +749,7 @@ impl MemoryCuration for InMemoryMemoryCuration {
         Ok(memory_record_from_candidate(candidate, markdown))
     }
 
-    async fn accept_candidate(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryRecord, MemoryCurationError> {
+    async fn accept_candidate(&self, user_id: &str, candidate_id: &str) -> Result<MemoryRecord, MemoryCurationError> {
         let candidate = self.promote_candidate(user_id, candidate_id).await?;
         let markdown = render_memory_markdown(&candidate);
         Ok(memory_record_from_candidate(candidate, markdown))
@@ -795,14 +770,22 @@ impl MemoryCuration for InMemoryMemoryCuration {
             .ok_or_else(|| MemoryCurationError::PromotionNotEligible {
                 candidate_id: candidate_id.to_owned(),
             })?;
-        if matches!(candidate.status, MemoryCandidateStatus::Promoted | MemoryCandidateStatus::Superseded) {
+        if matches!(
+            candidate.status,
+            MemoryCandidateStatus::Promoted | MemoryCandidateStatus::Superseded
+        ) {
             return Err(MemoryCurationError::PromotionNotEligible {
                 candidate_id: candidate_id.to_owned(),
             });
         }
         candidate.status = MemoryCandidateStatus::Rejected;
         let detected_at_ms = candidate.detected_at_ms;
-        append_lifecycle_event(candidate, MemoryCandidateStatus::Rejected, detected_at_ms, "human_rejected");
+        append_lifecycle_event(
+            candidate,
+            MemoryCandidateStatus::Rejected,
+            detected_at_ms,
+            "human_rejected",
+        );
         Ok(candidate.clone())
     }
 
@@ -834,17 +817,18 @@ impl MemoryCuration for InMemoryMemoryCuration {
         candidate.curated_content = Some(content);
         candidate.human_authored = true;
         let detected_at_ms = candidate.detected_at_ms;
-        append_lifecycle_event(candidate, MemoryCandidateStatus::Promoted, detected_at_ms, "human_edited");
+        append_lifecycle_event(
+            candidate,
+            MemoryCandidateStatus::Promoted,
+            detected_at_ms,
+            "human_edited",
+        );
         let candidate = candidate.clone();
         let markdown = render_human_memory_markdown(&candidate);
         Ok(memory_record_from_candidate(candidate, markdown))
     }
 
-    async fn remove_memory(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryCandidate, MemoryCurationError> {
+    async fn remove_memory(&self, user_id: &str, candidate_id: &str) -> Result<MemoryCandidate, MemoryCurationError> {
         let mut candidates = self
             .candidates
             .lock()
@@ -865,7 +849,12 @@ impl MemoryCuration for InMemoryMemoryCuration {
         }
         candidate.status = MemoryCandidateStatus::Superseded;
         let detected_at_ms = candidate.detected_at_ms;
-        append_lifecycle_event(candidate, MemoryCandidateStatus::Superseded, detected_at_ms, "human_removed");
+        append_lifecycle_event(
+            candidate,
+            MemoryCandidateStatus::Superseded,
+            detected_at_ms,
+            "human_removed",
+        );
         Ok(candidate.clone())
     }
 
@@ -965,13 +954,18 @@ impl MemoryCuration for InMemoryMemoryCuration {
         retrieve_from_candidates(&self.candidates_for_user(user_id), request)
     }
 
-    async fn micro_consolidate(
-        &self,
-        user_id: &str,
-    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+    async fn micro_consolidate(&self, user_id: &str) -> Result<MemoryConsolidationReport, MemoryCurationError> {
         validate_retrieval_user(user_id)?;
         let candidates = self.candidates_for_user(user_id);
-        Ok(consolidation_report(user_id, "micro", false, candidates.len(), 0, 0, None))
+        Ok(consolidation_report(
+            user_id,
+            "micro",
+            false,
+            candidates.len(),
+            0,
+            0,
+            None,
+        ))
     }
 
     async fn deep_consolidate(
@@ -992,17 +986,16 @@ impl MemoryCuration for InMemoryMemoryCuration {
         ))
     }
 
-    async fn recover_promoting(
-        &self,
-        user_id: &str,
-    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+    async fn recover_promoting(&self, user_id: &str) -> Result<MemoryConsolidationReport, MemoryCurationError> {
         validate_retrieval_user(user_id)?;
         let recovered = self
             .candidates_for_user(user_id)
             .into_iter()
             .filter(|candidate| candidate.status == MemoryCandidateStatus::Promoting)
             .count();
-        Ok(consolidation_report(user_id, "recovery", false, recovered, 0, recovered, None))
+        Ok(consolidation_report(
+            user_id, "recovery", false, recovered, 0, recovered, None,
+        ))
     }
 }
 
@@ -1107,11 +1100,7 @@ impl MemoryCuration for FilesystemMemoryCuration {
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
     }
 
-    async fn inspect_memory(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryRecord, MemoryCurationError> {
+    async fn inspect_memory(&self, user_id: &str, candidate_id: &str) -> Result<MemoryRecord, MemoryCurationError> {
         let adapter = self.clone();
         let user_id = user_id.to_owned();
         let candidate_id = candidate_id.to_owned();
@@ -1120,11 +1109,7 @@ impl MemoryCuration for FilesystemMemoryCuration {
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
     }
 
-    async fn accept_candidate(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryRecord, MemoryCurationError> {
+    async fn accept_candidate(&self, user_id: &str, candidate_id: &str) -> Result<MemoryRecord, MemoryCurationError> {
         self.promote_candidate(user_id, candidate_id).await?;
         self.inspect_memory(user_id, candidate_id).await
     }
@@ -1157,11 +1142,7 @@ impl MemoryCuration for FilesystemMemoryCuration {
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
     }
 
-    async fn remove_memory(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryCandidate, MemoryCurationError> {
+    async fn remove_memory(&self, user_id: &str, candidate_id: &str) -> Result<MemoryCandidate, MemoryCurationError> {
         let adapter = self.clone();
         let user_id = user_id.to_owned();
         let candidate_id = candidate_id.to_owned();
@@ -1199,10 +1180,7 @@ impl MemoryCuration for FilesystemMemoryCuration {
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
     }
 
-    async fn micro_consolidate(
-        &self,
-        user_id: &str,
-    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+    async fn micro_consolidate(&self, user_id: &str) -> Result<MemoryConsolidationReport, MemoryCurationError> {
         let adapter = self.clone();
         let user_id = user_id.to_owned();
         tokio::task::spawn_blocking(move || adapter.micro_consolidate_blocking(&user_id))
@@ -1222,10 +1200,7 @@ impl MemoryCuration for FilesystemMemoryCuration {
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
     }
 
-    async fn recover_promoting(
-        &self,
-        user_id: &str,
-    ) -> Result<MemoryConsolidationReport, MemoryCurationError> {
+    async fn recover_promoting(&self, user_id: &str) -> Result<MemoryConsolidationReport, MemoryCurationError> {
         let adapter = self.clone();
         let user_id = user_id.to_owned();
         tokio::task::spawn_blocking(move || adapter.recover_promoting_blocking(&user_id))
@@ -1309,11 +1284,7 @@ impl FilesystemMemoryCuration {
             })
     }
 
-    fn inspect_memory_blocking(
-        &self,
-        user_id: &str,
-        candidate_id: &str,
-    ) -> Result<MemoryRecord, MemoryCurationError> {
+    fn inspect_memory_blocking(&self, user_id: &str, candidate_id: &str) -> Result<MemoryRecord, MemoryCurationError> {
         let candidate = self.inspect_candidate_blocking(user_id, candidate_id)?;
         if candidate.status != MemoryCandidateStatus::Promoted {
             return Err(MemoryCurationError::PromotionNotEligible {
@@ -1340,14 +1311,22 @@ impl FilesystemMemoryCuration {
             .ok_or_else(|| MemoryCurationError::PromotionNotEligible {
                 candidate_id: candidate_id.to_owned(),
             })?;
-        if matches!(candidate.status, MemoryCandidateStatus::Promoted | MemoryCandidateStatus::Superseded) {
+        if matches!(
+            candidate.status,
+            MemoryCandidateStatus::Promoted | MemoryCandidateStatus::Superseded
+        ) {
             return Err(MemoryCurationError::PromotionNotEligible {
                 candidate_id: candidate_id.to_owned(),
             });
         }
         candidate.status = MemoryCandidateStatus::Rejected;
         let detected_at_ms = candidate.detected_at_ms;
-        append_lifecycle_event(candidate, MemoryCandidateStatus::Rejected, detected_at_ms, "human_rejected");
+        append_lifecycle_event(
+            candidate,
+            MemoryCandidateStatus::Rejected,
+            detected_at_ms,
+            "human_rejected",
+        );
         let result = candidate.clone();
         write_candidates_atomic(&path, &candidates)?;
         Ok(result)
@@ -1382,7 +1361,12 @@ impl FilesystemMemoryCuration {
         candidate.curated_content = Some(content);
         candidate.human_authored = true;
         let detected_at_ms = candidate.detected_at_ms;
-        append_lifecycle_event(candidate, MemoryCandidateStatus::Promoted, detected_at_ms, "human_edited");
+        append_lifecycle_event(
+            candidate,
+            MemoryCandidateStatus::Promoted,
+            detected_at_ms,
+            "human_edited",
+        );
         let candidate = candidate.clone();
         write_candidates_atomic(&path, &candidates)?;
         let markdown = render_human_memory_markdown(&candidate);
@@ -1416,7 +1400,12 @@ impl FilesystemMemoryCuration {
         }
         candidate.status = MemoryCandidateStatus::Superseded;
         let detected_at_ms = candidate.detected_at_ms;
-        append_lifecycle_event(candidate, MemoryCandidateStatus::Superseded, detected_at_ms, "human_removed");
+        append_lifecycle_event(
+            candidate,
+            MemoryCandidateStatus::Superseded,
+            detected_at_ms,
+            "human_removed",
+        );
         let result = candidate.clone();
         write_candidates_atomic(&path, &candidates)?;
         let note_path = vault_path(&self.data_dir, user_id, candidate_id);
@@ -1643,8 +1632,10 @@ impl FilesystemMemoryCuration {
         request: &MemoryRetrievalRequest,
     ) -> Result<Vec<MemoryRetrievalItem>, MemoryCurationError> {
         validate_retrieval_user(user_id)?;
-        if matches!(request.scope, MemoryRetrievalScope::OnDemand | MemoryRetrievalScope::ManualOnly)
-            && !request.explicit
+        if matches!(
+            request.scope,
+            MemoryRetrievalScope::OnDemand | MemoryRetrievalScope::ManualOnly
+        ) && !request.explicit
         {
             return Err(MemoryCurationError::ExplicitRetrievalRequired);
         }
@@ -1712,7 +1703,10 @@ impl FilesystemMemoryCuration {
         for candidate in ledger {
             if candidate.user_id != user_id
                 || candidate.status != MemoryCandidateStatus::Promoted
-                || !matches!(candidate.scope.as_str(), "auto_inject" | "semantic_search" | "on_demand" | "manual_only")
+                || !matches!(
+                    candidate.scope.as_str(),
+                    "auto_inject" | "semantic_search" | "on_demand" | "manual_only"
+                )
             {
                 continue;
             }
@@ -1838,13 +1832,7 @@ impl FilesystemMemoryCuration {
             recovered += 1;
         }
         Ok(consolidation_report(
-            user_id,
-            "recovery",
-            false,
-            considered,
-            0,
-            recovered,
-            None,
+            user_id, "recovery", false, considered, 0, recovered, None,
         ))
     }
 }
@@ -1919,7 +1907,9 @@ impl FilesystemMemoryCuration {
             let relative = source
                 .strip_prefix(&raw_root)
                 .map_err(|error| MemoryCurationError::Internal(error.to_string()))?;
-            let archive = raw_archive_path(&self.data_dir, user_id).join(relative).with_extension("jsonl.archive");
+            let archive = raw_archive_path(&self.data_dir, user_id)
+                .join(relative)
+                .with_extension("jsonl.archive");
             if let Some(parent) = archive.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -2113,10 +2103,8 @@ fn normalize_candidate_content(content: &str) -> String {
 }
 
 fn validate_retrieval_user(user_id: &str) -> Result<(), MemoryCurationError> {
-    crate::turn_journal::validate_identifier(user_id, "user_id").map_err(|error| {
-        MemoryCurationError::InvalidIdentity {
-            reason: error.to_string(),
-        }
+    crate::turn_journal::validate_identifier(user_id, "user_id").map_err(|error| MemoryCurationError::InvalidIdentity {
+        reason: error.to_string(),
     })
 }
 
@@ -2132,7 +2120,11 @@ fn scope_name(scope: MemoryRetrievalScope) -> &'static str {
 fn fts_query(query: &str) -> Option<String> {
     let terms: Vec<_> = query
         .split_whitespace()
-        .map(|term| term.chars().filter(|character| character.is_alphanumeric() || *character == '_').collect::<String>())
+        .map(|term| {
+            term.chars()
+                .filter(|character| character.is_alphanumeric() || *character == '_')
+                .collect::<String>()
+        })
         .filter(|term| !term.is_empty())
         .map(|term| format!("\"{term}\""))
         .collect();
@@ -2151,7 +2143,10 @@ fn bound_retrieval_items(items: &mut Vec<MemoryRetrievalItem>, max_chars: usize)
     let mut used: usize = 0;
     items.retain(|item| {
         let size = item.content.chars().count()
-            + item.sidecar_metadata.as_deref().map_or(0, |value| value.chars().count());
+            + item
+                .sidecar_metadata
+                .as_deref()
+                .map_or(0, |value| value.chars().count());
         let keep = used.saturating_add(size) <= budget;
         if keep {
             used += size;
@@ -2215,8 +2210,10 @@ fn retrieve_from_candidates(
     candidates: &[MemoryCandidate],
     request: &MemoryRetrievalRequest,
 ) -> Result<Vec<MemoryRetrievalItem>, MemoryCurationError> {
-    if matches!(request.scope, MemoryRetrievalScope::OnDemand | MemoryRetrievalScope::ManualOnly)
-        && !request.explicit
+    if matches!(
+        request.scope,
+        MemoryRetrievalScope::OnDemand | MemoryRetrievalScope::ManualOnly
+    ) && !request.explicit
     {
         return Err(MemoryCurationError::ExplicitRetrievalRequired);
     }
@@ -2226,21 +2223,20 @@ fn retrieve_from_candidates(
         .filter(|candidate| candidate.status == MemoryCandidateStatus::Promoted)
         .filter(|candidate| candidate.scope == scope_name(request.scope))
         .filter(|candidate| {
-            request.scope != MemoryRetrievalScope::AutoInject
-                || candidate.privacy_classification == "private"
+            request.scope != MemoryRetrievalScope::AutoInject || candidate.privacy_classification == "private"
         })
         .filter_map(|candidate| {
             let content = candidate
                 .curated_content
                 .clone()
                 .unwrap_or_else(|| candidate.content.clone());
-            let sidecar_metadata = (request.scope == MemoryRetrievalScope::ManualOnly)
-                .then(|| manual_sidecar_metadata(candidate));
+            let sidecar_metadata =
+                (request.scope == MemoryRetrievalScope::ManualOnly).then(|| manual_sidecar_metadata(candidate));
             if request.scope == MemoryRetrievalScope::ManualOnly && !request.include_sidecar_metadata {
                 return None;
             }
-            let searchable = format!("{content} {}", sidecar_metadata.as_deref().unwrap_or_default())
-                .to_ascii_lowercase();
+            let searchable =
+                format!("{content} {}", sidecar_metadata.as_deref().unwrap_or_default()).to_ascii_lowercase();
             if !query.is_empty() && !query.split_whitespace().all(|term| searchable.contains(term)) {
                 return None;
             }
@@ -2454,10 +2450,7 @@ fn collect_raw_event_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), 
     Ok(())
 }
 
-fn validate_purge_request(
-    user_id: &str,
-    request: &MemoryPrivacyPurgeRequest,
-) -> Result<(), MemoryCurationError> {
+fn validate_purge_request(user_id: &str, request: &MemoryPrivacyPurgeRequest) -> Result<(), MemoryCurationError> {
     if request.authenticated_user_id != user_id
         || !request.confirm
         || !request.reauthenticated
@@ -2541,12 +2534,7 @@ fn render_conflict_staging(candidate: &MemoryCandidate, human: &str, proposal: &
             "\n## Preimage\n\n",
             "{}\n"
         ),
-        candidate.candidate_id,
-        candidate.source_event_id,
-        candidate.source_hash,
-        human,
-        proposal,
-        candidate.content,
+        candidate.candidate_id, candidate.source_event_id, candidate.source_hash, human, proposal, candidate.content,
     )
 }
 
@@ -2583,14 +2571,13 @@ fn markdown_current_memory(markdown: &str) -> Option<String> {
         .filter(|content| !content.is_empty())
 }
 
-fn append_lifecycle_event(
-    candidate: &mut MemoryCandidate,
-    status: MemoryCandidateStatus,
-    at_ms: u64,
-    reason: &str,
-) {
+fn append_lifecycle_event(candidate: &mut MemoryCandidate, status: MemoryCandidateStatus, at_ms: u64, reason: &str) {
     if candidate.lifecycle_events.last().map(|event| event.status) == Some(status)
-        && candidate.lifecycle_events.last().and_then(|event| event.reason.as_deref()) == Some(reason)
+        && candidate
+            .lifecycle_events
+            .last()
+            .and_then(|event| event.reason.as_deref())
+            == Some(reason)
     {
         return;
     }
@@ -2911,10 +2898,12 @@ mod tests {
         assert_eq!(rejected.status, MemoryCandidateStatus::Rejected);
         assert_eq!(rejected.source_hash, source_hash);
         assert_eq!(rejected.content, "I prefer concise replies");
-        assert!(rejected
-            .lifecycle_events
-            .iter()
-            .any(|event| event.status == MemoryCandidateStatus::Rejected));
+        assert!(
+            rejected
+                .lifecycle_events
+                .iter()
+                .any(|event| event.status == MemoryCandidateStatus::Rejected)
+        );
         assert!(curation.inspect_candidate("bob", &candidate_id).await.is_err());
     }
 
@@ -2970,10 +2959,12 @@ mod tests {
         assert!(matches!(result, Err(MemoryCurationError::ConflictingCandidate { .. })));
         let candidate = curation.inspect_candidate("alice", &candidate_id).await.unwrap();
         assert_eq!(candidate.status, MemoryCandidateStatus::Proposed);
-        assert!(candidate
-            .lifecycle_events
-            .iter()
-            .any(|event| event.status == MemoryCandidateStatus::Proposed));
+        assert!(
+            candidate
+                .lifecycle_events
+                .iter()
+                .any(|event| event.status == MemoryCandidateStatus::Proposed)
+        );
         let staged = fs::read_to_string(conflict_staging_path(temp.path(), "alice", &candidate_id)).unwrap();
         assert!(staged.contains("Human Version"));
         assert!(staged.contains("Agent Proposal"));
@@ -3057,11 +3048,13 @@ mod tests {
         assert_eq!(results[0].content, "I prefer concise replies");
         assert!(results[0].sidecar_metadata.is_none());
         assert!(derived_index_path(temp.path(), "alice").exists());
-        assert!(curation
-            .retrieve("bob", &MemoryRetrievalRequest::auto_inject(4_096))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            curation
+                .retrieve("bob", &MemoryRetrievalRequest::auto_inject(4_096))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3155,7 +3148,9 @@ mod tests {
         assert_eq!(removed.status, MemoryCandidateStatus::Superseded);
         assert!(!vault_path(temp.path(), "alice", &candidate_id).exists());
         assert!(memory_archive_path(temp.path(), "alice", &candidate_id).exists());
-        let raw = raw_events_path(temp.path(), "alice").join("conversation").join("turn.jsonl");
+        let raw = raw_events_path(temp.path(), "alice")
+            .join("conversation")
+            .join("turn.jsonl");
         fs::create_dir_all(raw.parent().unwrap()).unwrap();
         fs::write(&raw, b"raw evidence").unwrap();
         let no_policy = curation.run_raw_retention("alice", u64::MAX).await.unwrap();
@@ -3175,7 +3170,11 @@ mod tests {
         assert_eq!(retained.archived_files, 1);
         assert_eq!(retained.deleted_files, 1);
         assert!(!raw.exists());
-        assert!(raw_archive_path(temp.path(), "alice").join("conversation/turn.jsonl.archive").exists());
+        assert!(
+            raw_archive_path(temp.path(), "alice")
+                .join("conversation/turn.jsonl.archive")
+                .exists()
+        );
     }
 
     #[tokio::test]
