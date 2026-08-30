@@ -52,6 +52,8 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
+use crate::turn_journal::TurnJournal;
+use crate::turn_orchestrator::ConversationTurnStatus;
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
@@ -9711,332 +9713,393 @@ mod session_mentions_integration {
             );
         }
     }
-struct FailingPreTurnJournal;
+    struct FailingPreTurnJournal;
 
-#[async_trait::async_trait]
-impl crate::turn_journal::TurnJournal for FailingPreTurnJournal {
-    async fn capture_pre_turn(&self, _record: &crate::turn_journal::PreTurnRecord<'_>) -> Result<(), crate::turn_journal::JournalError> {
-        Err(crate::turn_journal::JournalError::Internal("Simulated journal write failure".to_string()))
-    }
-
-    async fn reconcile_terminal(
-        &self,
-        _user_id: &str,
-        _conversation_id: &str,
-        _turn_id: &str,
-        _outcome: &crate::turn_journal::TerminalOutcomeRecord<'_>,
-    ) -> Result<(), crate::turn_journal::JournalError> {
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn test_send_message_pre_capture_fail_closed_releases_claim_and_does_not_broadcast() {
-    let (svc, broadcaster, _repo, task_mgr) = make_service();
-    let svc = svc.with_turn_journal(Arc::new(FailingPreTurnJournal));
-
-    let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let res = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await;
-
-    assert!(res.is_err(), "send_message must fail closed when turn journal capture fails");
-
-    // Verify turn claim was released (not stuck)
-    let claim_res = svc.runtime_state().try_claim_turn(&conv.id, "turn_next");
-    assert!(claim_res.is_ok(), "turn claim must be released on fail-closed compensation");
-
-    // Verify NO userCreated broadcast was emitted
-    let events = broadcaster.take_events();
-    let has_user_created = events.iter().any(|e| e.name == "message.userCreated");
-    assert!(!has_user_created, "message.userCreated must NOT be broadcast when pre-turn capture fails");
-}
-
-#[tokio::test]
-async fn test_send_message_captures_pre_turn_in_journal_with_normalized_workspace() {
-    let (svc, _broadcaster, _repo, task_mgr) = make_service();
-    let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
-    let svc = svc.with_turn_journal(journal.clone());
-
-    let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let send = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await.unwrap();
-
-    let events = journal.get_turn_events("user_1", &conv.id, &send.turn_id).await;
-    assert!(!events.is_empty(), "PreTurn event must be recorded in journal");
-
-    if let crate::turn_journal::RawJournalEvent::PreExecution { turn_id, user_message, workspace, .. } = &events[0] {
-        assert_eq!(turn_id, &send.turn_id);
-        assert_eq!(user_message, "hello");
-        if let Some(ref ws) = workspace {
-            assert!(!ws.contains("/root"), "workspace must be normalized opaque metadata");
+    #[async_trait::async_trait]
+    impl crate::turn_journal::TurnJournal for FailingPreTurnJournal {
+        async fn capture_pre_turn(
+            &self,
+            _record: &crate::turn_journal::PreTurnRecord<'_>,
+        ) -> Result<(), crate::turn_journal::JournalError> {
+            Err(crate::turn_journal::JournalError::Internal(
+                "Simulated journal write failure".to_string(),
+            ))
         }
-    } else {
-        panic!("First journal event must be PreExecution");
-    }
-}
 
-#[tokio::test]
-async fn test_startup_recovery_scans_journal_and_reconciles_timeouts() {
-    let temp = tempfile::tempdir().unwrap();
-    let journal = Arc::new(crate::turn_journal::FilesystemTurnJournal::new(temp.path()));
-    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let svc = svc
-        .with_turn_journal(journal.clone())
-        .with_journal_data_dir(temp.path());
-
-    let unclosed = crate::turn_journal::PreTurnRecord {
-        user_id: "user_stale",
-        conversation_id: "conv_stale",
-        turn_id: "turn_stale_1",
-        parent_turn_id: None,
-        user_message: "Stale question",
-        workspace: None,
-        created_at_ms: 10_000,
-    };
-    journal.capture_pre_turn(&unclosed).await.unwrap();
-
-    // Recover unclosed turns
-    let count = svc.recover_raw_event_journals_on_startup(5_000).await;
-    assert_eq!(count, 1, "Startup recovery should reconcile the stale turn");
-
-    let raw_file = temp.path().join("users/user_stale/events/raw/conv_stale/turn_stale_1.jsonl");
-    let events = crate::turn_journal::FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file).await.unwrap();
-    assert_eq!(events.len(), 2);
-    assert!(matches!(events[1], crate::turn_journal::RawJournalEvent::FinalOutcome { status: crate::turn_journal::TurnTerminalStatus::Timeout, .. }));
-}
-
-#[tokio::test]
-async fn test_deferred_cancel_single_terminal_outcome() {
-    let (svc, _broadcaster, _repo, task_mgr) = make_service();
-    let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
-    let svc = svc.with_turn_journal(journal.clone());
-
-    let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let turn_id = "turn_deferred_cancel_1";
-
-    // 1. Capture PreExecution in journal
-    let pre_record = crate::turn_journal::PreTurnRecord {
-        user_id: "user_1",
-        conversation_id: &conv.id,
-        turn_id,
-        parent_turn_id: None,
-        user_message: "Prompt before deferred cancel",
-        workspace: None,
-        created_at_ms: now_ms(),
-    };
-    journal.capture_pre_turn(&pre_record).await.unwrap();
-
-    // 2. Set deferred cancel on runtime state and claim turn
-    svc.runtime_state().defer_cancel(&conv.id, turn_id);
-    assert!(svc.runtime_state().is_turn_cancelling(&conv.id, turn_id));
-
-    let turn_claim = svc.runtime_state().try_claim_turn(&conv.id, turn_id).unwrap();
-
-    // 3. Run orchestrator synchronously on the public lifecycle seam
-    let orchestrator = crate::turn_orchestrator::ConversationTurnOrchestrator::new(
-        svc.clone(),
-        task_mgr.clone(),
-    );
-
-    let result = orchestrator.run_user_turn(crate::turn_orchestrator::TurnStartInput {
-        conversation: conv.clone(),
-        turn_id: turn_id.to_string(),
-        content: "Prompt before deferred cancel".to_string(),
-        files: vec![],
-        inject_skills: vec![],
-        build_options: BuildTaskOptions::default(),
-        stored_workspace: String::new(),
-        turn_claim,
-        user_id: "user_1".to_string(),
-        required_runtime_mode: None,
-        memory_source: crate::memory_curation::MemoryEvidenceSource::Owner,
-        pre_created_at_ms: now_ms().try_into().unwrap_or_default(),
-        pre_workspace: None,
-    }).await;
-
-    assert_eq!(result.status, ConversationTurnStatus::Completed);
-
-    // 4. Verify exactly 1 PreExecution and exactly 1 FinalOutcome (Cancelled)
-    let events = journal.get_turn_events("user_1", &conv.id, turn_id).await;
-    assert_eq!(events.len(), 2, "Must record exactly one PreExecution and one FinalOutcome");
-    match &events[1] {
-        crate::turn_journal::RawJournalEvent::FinalOutcome { status, .. } => {
-            assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Cancelled);
+        async fn reconcile_terminal(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _turn_id: &str,
+            _outcome: &crate::turn_journal::TerminalOutcomeRecord<'_>,
+        ) -> Result<(), crate::turn_journal::JournalError> {
+            Ok(())
         }
-        _ => panic!("Expected FinalOutcome event"),
     }
 
-    // 5. Verify turn claim was released cleanly
-    assert!(svc.runtime_state().try_claim_turn(&conv.id, turn_id).is_ok());
-}
+    #[tokio::test]
+    async fn test_send_message_pre_capture_fail_closed_releases_claim_and_does_not_broadcast() {
+        let (svc, broadcaster, _repo, task_mgr) = make_service();
+        let svc = svc.with_turn_journal(Arc::new(FailingPreTurnJournal));
 
-#[tokio::test]
-async fn test_run_agent_turn_capture_before_on_started_and_fail_closed() {
-    // 1. Test failure case: failing journal must fail-closed and NOT invoke on_started
-    let (svc_fail, _broadcaster, _repo, _task_mgr) = make_service();
-    let svc_fail = svc_fail.with_turn_journal(Arc::new(FailingPreTurnJournal));
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        let res = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await;
 
-    let conv = svc_fail.create("user_1", make_create_req()).await.unwrap();
-    let on_started_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let on_started_clone = Arc::clone(&on_started_called);
+        assert!(
+            res.is_err(),
+            "send_message must fail closed when turn journal capture fails"
+        );
 
-    let on_started_cb: crate::service::ConversationAgentTurnStartedCallback = Arc::new(move |_| {
-        let called = Arc::clone(&on_started_clone);
-        Box::pin(async move {
-            called.store(true, std::sync::atomic::Ordering::SeqCst);
-        })
-    });
+        // Verify turn claim was released (not stuck)
+        let claim_res = svc.runtime_state().try_claim_turn(&conv.id, "turn_next");
+        assert!(
+            claim_res.is_ok(),
+            "turn claim must be released on fail-closed compensation"
+        );
 
-    let res = svc_fail.run_agent_turn(crate::service::ConversationAgentTurnRequest {
-        user_id: "user_1".to_string(),
-        conversation_id: conv.id.clone(),
-        content: "agent prompt".to_string(),
-        files: vec![],
-        inject_skills: vec![],
-        required_runtime_mode: None,
-        persist_user_message: true,
-        user_message_hidden: false,
-        on_started: Some(on_started_cb),
-    }).await;
+        // Verify NO userCreated broadcast was emitted
+        let events = broadcaster.take_events();
+        let has_user_created = events.iter().any(|e| e.name == "message.userCreated");
+        assert!(
+            !has_user_created,
+            "message.userCreated must NOT be broadcast when pre-turn capture fails"
+        );
+    }
 
-    assert!(res.is_err(), "run_agent_turn must fail closed when capture_pre_turn fails");
-    assert!(!on_started_called.load(std::sync::atomic::Ordering::SeqCst), "on_started callback MUST NOT be invoked when capture fails");
+    #[tokio::test]
+    async fn test_send_message_captures_pre_turn_in_journal_with_normalized_workspace() {
+        let (svc, _broadcaster, _repo, task_mgr) = make_service();
+        let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+        let svc = svc.with_turn_journal(journal.clone());
 
-    // Verify turn claim was released
-    let claim_res = svc_fail.runtime_state().try_claim_turn(&conv.id, "turn_next");
-    assert!(claim_res.is_ok(), "turn claim must be released when capture fails");
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        let send = svc
+            .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+            .await
+            .unwrap();
 
-    // 2. Test success case: on_started is invoked AFTER successful pre-capture
-    let (svc_ok, _broadcaster, _repo, _task_mgr) = make_service();
-    let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
-    let svc_ok = svc_ok.with_turn_journal(journal.clone());
+        let events = journal.get_turn_events("user_1", &conv.id, &send.turn_id).await;
+        assert!(!events.is_empty(), "PreTurn event must be recorded in journal");
 
-    let conv_ok = svc_ok.create("user_1", make_create_req()).await.unwrap();
-    let started_recorded = Arc::new(tokio::sync::Mutex::new(None));
-    let started_clone = Arc::clone(&started_recorded);
-
-    let on_started_ok: crate::service::ConversationAgentTurnStartedCallback = Arc::new(move |started| {
-        let rec = Arc::clone(&started_clone);
-        Box::pin(async move {
-            let mut guard = rec.lock().await;
-            *guard = Some(started);
-        })
-    });
-
-    let _outcome = svc_ok.run_agent_turn(crate::service::ConversationAgentTurnRequest {
-        user_id: "user_1".to_string(),
-        conversation_id: conv_ok.id.clone(),
-        content: "agent prompt success".to_string(),
-        files: vec![],
-        inject_skills: vec![],
-        required_runtime_mode: None,
-        persist_user_message: true,
-        user_message_hidden: false,
-        on_started: Some(on_started_ok),
-    }).await.unwrap();
-
-    let started_val = started_recorded.lock().await.clone().unwrap();
-    assert_eq!(started_val.conversation_id, conv_ok.id);
-
-    // Verify journal has PreExecution event
-    let events = journal.get_turn_events("user_1", &conv_ok.id, &started_val.turn_id).await;
-    assert!(!events.is_empty(), "Journal must contain captured event");
-    assert!(matches!(events[0], crate::turn_journal::RawJournalEvent::PreExecution { .. }));
-}
-
-#[tokio::test]
-async fn test_auto_replay_records_real_per_attempt_summaries_in_single_terminal() {
-    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
-    let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
-    let svc = svc.with_turn_journal(journal.clone());
-
-    let conv = svc.create("user_1", make_create_req()).await.unwrap();
-
-    let first = Arc::new(ScriptedAgent::new(
-        &conv.id,
-        vec![vec![AgentStreamEvent::Error(ErrorEventData {
-            message: "transient provider error".into(),
-            code: Some(AgentErrorCode::UnknownUpstreamError),
-            ownership: None,
-            detail: None,
-            workspace_path: None,
-            retryable: Some(true),
-            feedback_recommended: None,
-            resolution: None,
-        })]],
-    ));
-    let second = Arc::new(ScriptedAgent::new(
-        &conv.id,
-        vec![vec![
-            AgentStreamEvent::Text(TextEventData { content: "replayed response".into() }),
-            AgentStreamEvent::Finish(FinishEventData::default()),
-        ]],
-    ));
-    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
-        AgentInstance::Mock(first.clone()),
-        AgentInstance::Mock(second.clone()),
-    ]));
-
-    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
-    let send = svc
-        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
-        .await
-        .unwrap();
-
-    wait_for_turn_released(&svc, &conv.id).await;
-
-    assert_eq!(task_mgr.build_count(), 2, "Must build 2 agent instances for auto-replay");
-
-    let events = journal.get_turn_events("user_1", &conv.id, &send.turn_id).await;
-    assert_eq!(events.len(), 2, "Must record exactly 1 PreExecution and 1 FinalOutcome for entire turn");
-    assert!(matches!(events[0], crate::turn_journal::RawJournalEvent::PreExecution { .. }));
-
-    match &events[1] {
-        crate::turn_journal::RawJournalEvent::FinalOutcome {
-            status,
-            attempts,
-            last_attempt_id,
-            retry_summaries,
+        if let crate::turn_journal::RawJournalEvent::PreExecution {
+            turn_id,
+            user_message,
+            workspace,
             ..
-        } => {
-            assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Success);
-            assert_eq!(*attempts, 2, "Total attempts must be 2");
-            assert_eq!(
-                last_attempt_id.as_deref(),
-                Some(format!("{}-att-2", send.turn_id).as_str())
-            );
-
-            let summaries = retry_summaries
-                .as_ref()
-                .expect("Must include retry_summaries when attempts > 1");
-            assert_eq!(summaries.len(), 2, "Must include summary for both attempts");
-
-            // Attempt 1 checks
-            assert_eq!(summaries[0].attempt_id, format!("{}-att-1", send.turn_id));
-            assert!(
-                summaries[0].duration_ms.is_some(),
-                "Attempt 1 must record actual measured duration_ms"
-            );
-            assert!(
-                summaries[0].error.is_some(),
-                "Attempt 1 must record actual error"
-            );
-            assert_ne!(
-                summaries[0].error.as_deref(),
-                Some("auto_replay_trigger"),
-                "Must NOT hardcode auto_replay_trigger"
-            );
-
-            // Attempt 2 checks
-            assert_eq!(summaries[1].attempt_id, format!("{}-att-2", send.turn_id));
-            assert!(
-                summaries[1].duration_ms.is_some(),
-                "Attempt 2 must record actual measured duration_ms"
-            );
-            assert_eq!(
-                summaries[1].error, None,
-                "Attempt 2 succeeded, error must be None"
-            );
+        } = &events[0]
+        {
+            assert_eq!(turn_id, &send.turn_id);
+            assert_eq!(user_message, "Hello");
+            if let Some(ws) = workspace {
+                assert!(!ws.contains("/root"), "workspace must be normalized opaque metadata");
+            }
+        } else {
+            panic!("First journal event must be PreExecution");
         }
-        _ => panic!("Expected FinalOutcome event"),
     }
-}
+
+    #[tokio::test]
+    async fn test_startup_recovery_scans_journal_and_reconciles_timeouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(crate::turn_journal::FilesystemTurnJournal::new(temp.path()));
+        let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+        let svc = svc
+            .with_turn_journal(journal.clone())
+            .with_journal_data_dir(temp.path());
+
+        let unclosed = crate::turn_journal::PreTurnRecord {
+            user_id: "user_stale",
+            conversation_id: "conv_stale",
+            turn_id: "turn_stale_1",
+            parent_turn_id: None,
+            user_message: "Stale question",
+            workspace: None,
+            created_at_ms: 10_000,
+        };
+        journal.capture_pre_turn(&unclosed).await.unwrap();
+
+        // Recover unclosed turns
+        let count = svc.recover_raw_event_journals_on_startup(5_000).await;
+        assert_eq!(count, 1, "Startup recovery should reconcile the stale turn");
+
+        let raw_file = temp
+            .path()
+            .join("users/user_stale/events/raw/conv_stale/turn_stale_1.jsonl");
+        let events = crate::turn_journal::FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[1],
+            crate::turn_journal::RawJournalEvent::FinalOutcome {
+                status: crate::turn_journal::TurnTerminalStatus::Timeout,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_deferred_cancel_single_terminal_outcome() {
+        let (svc, _broadcaster, repo, task_mgr) = make_service();
+        let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+        let svc = svc.with_turn_journal(journal.clone());
+
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        let conversation_row = get_row(&repo, "user_1", &conv.id).await;
+        let turn_id = "turn_deferred_cancel_1";
+
+        // 1. Capture PreExecution in journal
+        let pre_record = crate::turn_journal::PreTurnRecord {
+            user_id: "user_1",
+            conversation_id: &conv.id,
+            turn_id,
+            parent_turn_id: None,
+            user_message: "Prompt before deferred cancel",
+            workspace: None,
+            created_at_ms: crate::service::journal_now_ms(),
+        };
+        journal.capture_pre_turn(&pre_record).await.unwrap();
+
+        // 2. Set deferred cancel on runtime state and claim turn
+        svc.runtime_state().defer_cancel(&conv.id, turn_id);
+        assert!(svc.runtime_state().take_deferred_cancel(&conv.id, turn_id));
+        svc.runtime_state().defer_cancel(&conv.id, turn_id);
+
+        let turn_claim = svc.runtime_state().try_claim_turn(&conv.id, turn_id).unwrap();
+
+        // 3. Run orchestrator synchronously on the public lifecycle seam
+        let orchestrator = crate::turn_orchestrator::ConversationTurnOrchestrator::new(svc.clone(), task_mgr.clone());
+
+        let result = orchestrator
+            .run_user_turn(crate::turn_orchestrator::TurnStartInput {
+                conversation: conversation_row.clone(),
+                turn_id: turn_id.to_string(),
+                content: "Prompt before deferred cancel".to_string(),
+                files: vec![],
+                inject_skills: vec![],
+                build_options: svc.build_task_options(&conversation_row).await.unwrap(),
+                stored_workspace: String::new(),
+                turn_claim,
+                user_id: "user_1".to_string(),
+                required_runtime_mode: None,
+                memory_source: crate::memory_curation::MemoryEvidenceSource::Owner,
+                pre_created_at_ms: crate::service::journal_now_ms(),
+                pre_workspace: None,
+            })
+            .await;
+
+        assert_eq!(result.status, ConversationTurnStatus::Completed);
+
+        // 4. Verify exactly 1 PreExecution and exactly 1 FinalOutcome (Cancelled)
+        let events = journal.get_turn_events("user_1", &conv.id, turn_id).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "Must record exactly one PreExecution and one FinalOutcome"
+        );
+        match &events[1] {
+            crate::turn_journal::RawJournalEvent::FinalOutcome { status, .. } => {
+                assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Cancelled);
+            }
+            _ => panic!("Expected FinalOutcome event"),
+        }
+
+        // 5. Verify turn claim was released cleanly
+        assert!(svc.runtime_state().try_claim_turn(&conv.id, turn_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_run_agent_turn_capture_before_on_started_and_fail_closed() {
+        // 1. Test failure case: failing journal must fail-closed and NOT invoke on_started
+        let (svc_fail, _broadcaster, _repo, _task_mgr) = make_service();
+        let svc_fail = svc_fail.with_turn_journal(Arc::new(FailingPreTurnJournal));
+
+        let conv = svc_fail.create("user_1", make_create_req()).await.unwrap();
+        let on_started_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_started_clone = Arc::clone(&on_started_called);
+
+        let on_started_cb: crate::service::ConversationAgentTurnStartedCallback = Arc::new(move |_| {
+            let called = Arc::clone(&on_started_clone);
+            Box::pin(async move {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+
+        let res = svc_fail
+            .run_agent_turn(crate::service::ConversationAgentTurnRequest {
+                user_id: "user_1".to_string(),
+                conversation_id: conv.id.clone(),
+                content: "agent prompt".to_string(),
+                files: vec![],
+                inject_skills: vec![],
+                required_runtime_mode: None,
+                persist_user_message: true,
+                user_message_hidden: false,
+                on_started: Some(on_started_cb),
+            })
+            .await;
+
+        assert!(
+            res.is_err(),
+            "run_agent_turn must fail closed when capture_pre_turn fails"
+        );
+        assert!(
+            !on_started_called.load(std::sync::atomic::Ordering::SeqCst),
+            "on_started callback MUST NOT be invoked when capture fails"
+        );
+
+        // Verify turn claim was released
+        let claim_res = svc_fail.runtime_state().try_claim_turn(&conv.id, "turn_next");
+        assert!(claim_res.is_ok(), "turn claim must be released when capture fails");
+
+        // 2. Test success case: on_started is invoked AFTER successful pre-capture
+        let (svc_ok, _broadcaster, _repo, _task_mgr) = make_service();
+        let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+        let svc_ok = svc_ok.with_turn_journal(journal.clone());
+
+        let conv_ok = svc_ok.create("user_1", make_create_req()).await.unwrap();
+        let started_recorded = Arc::new(tokio::sync::Mutex::new(None));
+        let started_clone = Arc::clone(&started_recorded);
+
+        let on_started_ok: crate::service::ConversationAgentTurnStartedCallback = Arc::new(move |started| {
+            let rec = Arc::clone(&started_clone);
+            Box::pin(async move {
+                let mut guard = rec.lock().await;
+                *guard = Some(started);
+            })
+        });
+
+        let _outcome = svc_ok
+            .run_agent_turn(crate::service::ConversationAgentTurnRequest {
+                user_id: "user_1".to_string(),
+                conversation_id: conv_ok.id.clone(),
+                content: "agent prompt success".to_string(),
+                files: vec![],
+                inject_skills: vec![],
+                required_runtime_mode: None,
+                persist_user_message: true,
+                user_message_hidden: false,
+                on_started: Some(on_started_ok),
+            })
+            .await
+            .unwrap();
+
+        let started_val = started_recorded.lock().await.clone().unwrap();
+        assert_eq!(started_val.conversation_id, conv_ok.id);
+
+        // Verify journal has PreExecution event
+        let events = journal
+            .get_turn_events("user_1", &conv_ok.id, &started_val.turn_id)
+            .await;
+        assert!(!events.is_empty(), "Journal must contain captured event");
+        assert!(matches!(
+            events[0],
+            crate::turn_journal::RawJournalEvent::PreExecution { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_auto_replay_records_real_per_attempt_summaries_in_single_terminal() {
+        let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+        let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+        let svc = svc.with_turn_journal(journal.clone());
+
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+        let first = Arc::new(ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Error(ErrorEventData {
+                message: "transient provider error".into(),
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                ownership: None,
+                detail: None,
+                workspace_path: None,
+                retryable: Some(true),
+                feedback_recommended: None,
+                resolution: None,
+            })]],
+        ));
+        let second = Arc::new(ScriptedAgent::new(
+            &conv.id,
+            vec![vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "replayed response".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ]],
+        ));
+        let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+            AgentInstance::Mock(first.clone()),
+            AgentInstance::Mock(second.clone()),
+        ]));
+
+        let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+        let send = svc
+            .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+            .await
+            .unwrap();
+
+        wait_for_turn_released(&svc, &conv.id).await;
+
+        assert_eq!(
+            task_mgr.build_count(),
+            2,
+            "Must build 2 agent instances for auto-replay"
+        );
+
+        let events = journal.get_turn_events("user_1", &conv.id, &send.turn_id).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "Must record exactly 1 PreExecution and 1 FinalOutcome for entire turn"
+        );
+        assert!(matches!(
+            events[0],
+            crate::turn_journal::RawJournalEvent::PreExecution { .. }
+        ));
+
+        match &events[1] {
+            crate::turn_journal::RawJournalEvent::FinalOutcome {
+                status,
+                attempts,
+                last_attempt_id,
+                retry_summaries,
+                ..
+            } => {
+                assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Success);
+                assert_eq!(*attempts, 2, "Total attempts must be 2");
+                assert_eq!(
+                    last_attempt_id.as_deref(),
+                    Some(format!("{}-att-2", send.turn_id).as_str())
+                );
+
+                let summaries = retry_summaries
+                    .as_ref()
+                    .expect("Must include retry_summaries when attempts > 1");
+                assert_eq!(summaries.len(), 2, "Must include summary for both attempts");
+
+                // Attempt 1 checks
+                assert_eq!(summaries[0].attempt_id, format!("{}-att-1", send.turn_id));
+                assert!(
+                    summaries[0].duration_ms.is_some(),
+                    "Attempt 1 must record actual measured duration_ms"
+                );
+                assert!(summaries[0].error.is_some(), "Attempt 1 must record actual error");
+                assert_ne!(
+                    summaries[0].error.as_deref(),
+                    Some("auto_replay_trigger"),
+                    "Must NOT hardcode auto_replay_trigger"
+                );
+
+                // Attempt 2 checks
+                assert_eq!(summaries[1].attempt_id, format!("{}-att-2", send.turn_id));
+                assert!(
+                    summaries[1].duration_ms.is_some(),
+                    "Attempt 2 must record actual measured duration_ms"
+                );
+                assert_eq!(summaries[1].error, None, "Attempt 2 succeeded, error must be None");
+            }
+            _ => panic!("Expected FinalOutcome event"),
+        }
+    }
 }
