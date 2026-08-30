@@ -37,7 +37,8 @@ pub use memory_curation::{
     AgentMemory, FilesystemMemoryCuration, InMemoryMemoryCuration, MemoryCandidate, MemoryCandidateLifecycleEvent,
     MemoryCandidateStatus, MemoryCuration, MemoryCurationError, MemoryEvidence, MemoryEvidenceSource, MemoryRecord,
     MemoryConsolidationReport, MemoryConsolidationScheduler, MemoryRetrievalItem, MemoryRetrievalRequest,
-    MemoryRetrievalScope,
+    MemoryRetrievalScope, MemoryRetentionPolicy, MemoryRetentionReport, MemoryPrivacyPurgeRequest,
+    MemoryPurgeReport,
 };
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
 pub use routes::conversation_routes;

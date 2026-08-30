@@ -59,7 +59,8 @@ use crate::convert::{
 };
 use crate::error::ConversationError;
 use crate::memory_curation::{
-    MemoryCandidate, MemoryConsolidationReport, MemoryCuration, MemoryEvidence, MemoryEvidenceSource, MemoryRecord,
+    MemoryCandidate, MemoryConsolidationReport, MemoryCuration, MemoryEvidence, MemoryEvidenceSource,
+    MemoryPrivacyPurgeRequest, MemoryPurgeReport, MemoryRecord, MemoryRetentionPolicy, MemoryRetentionReport,
     MemoryRetrievalItem, MemoryRetrievalRequest, NoopMemoryCuration,
 };
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
@@ -591,6 +592,71 @@ impl ConversationService {
             .remove_memory(user_id, candidate_id)
             .await
             .map_err(|error| ConversationError::internal(format!("Failed to remove memory: {error}")))
+    }
+
+    pub async fn soft_remove_memory(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, ConversationError> {
+        self.memory_curation
+            .soft_remove_memory(user_id, candidate_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to soft-remove memory: {error}")))
+    }
+
+    pub async fn pause_memory_processing(&self, user_id: &str) -> Result<(), ConversationError> {
+        self.memory_curation
+            .pause_memory_processing(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to pause memory processing: {error}")))
+    }
+
+    pub async fn resume_memory_processing(&self, user_id: &str) -> Result<(), ConversationError> {
+        self.memory_curation
+            .resume_memory_processing(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to resume memory processing: {error}")))
+    }
+
+    pub async fn is_memory_processing_paused(&self, user_id: &str) -> Result<bool, ConversationError> {
+        self.memory_curation
+            .is_memory_processing_paused(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect memory processing state: {error}")))
+    }
+
+    pub async fn configure_memory_retention(
+        &self,
+        user_id: &str,
+        policy: MemoryRetentionPolicy,
+    ) -> Result<MemoryRetentionPolicy, ConversationError> {
+        self.memory_curation
+            .configure_raw_retention(user_id, policy)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to configure memory retention: {error}")))
+    }
+
+    pub async fn run_memory_retention(
+        &self,
+        user_id: &str,
+        now_ms: u64,
+    ) -> Result<MemoryRetentionReport, ConversationError> {
+        self.memory_curation
+            .run_raw_retention(user_id, now_ms)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to run memory retention: {error}")))
+    }
+
+    pub async fn privacy_purge_memory(
+        &self,
+        user_id: &str,
+        request: &MemoryPrivacyPurgeRequest,
+    ) -> Result<MemoryPurgeReport, ConversationError> {
+        self.memory_curation
+            .privacy_purge(user_id, request)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to purge memory: {error}")))
     }
 
     pub(crate) async fn auto_inject_memory_context(&self, user_id: &str) -> String {

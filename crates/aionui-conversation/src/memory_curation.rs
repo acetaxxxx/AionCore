@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::TimeZone;
@@ -371,6 +371,51 @@ pub struct MemoryConsolidationReport {
     pub review_log: Option<String>,
 }
 
+/// User-controlled raw-event retention. `None` deliberately disables
+/// destructive collection; archival is required before any deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRetentionPolicy {
+    #[serde(default)]
+    pub raw_retention_days: Option<u64>,
+    #[serde(default)]
+    pub archive_before_delete: bool,
+}
+
+impl Default for MemoryRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            raw_retention_days: None,
+            archive_before_delete: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRetentionReport {
+    pub user_id: String,
+    pub policy: MemoryRetentionPolicy,
+    pub archived_files: usize,
+    pub deleted_files: usize,
+}
+
+/// Explicit authorization proof for privacy purge. Agent tools never receive
+/// this request from the application boundary and `agent_initiated` is a
+/// fail-closed guard for accidental internal forwarding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPrivacyPurgeRequest {
+    pub authenticated_user_id: String,
+    pub confirm: bool,
+    pub reauthenticated: bool,
+    #[serde(default)]
+    pub agent_initiated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPurgeReport {
+    pub user_id: String,
+    pub removed_user_tree: bool,
+}
+
 impl MemoryConsolidationReport {
     fn with_paused(mut self) -> Self {
         self.paused = true;
@@ -416,6 +461,9 @@ pub enum MemoryCurationError {
 
     #[error("invalid user timezone: {timezone}")]
     InvalidTimezone { timezone: String },
+
+    #[error("privacy purge requires authenticated confirmation and reauthentication")]
+    UnauthorizedPurge,
 }
 
 /// Single high-level port used by conversation execution after terminal
@@ -482,6 +530,50 @@ pub trait MemoryCuration: Send + Sync {
         Err(MemoryCurationError::Unsupported)
     }
 
+    async fn pause_memory_processing(&self, _user_id: &str) -> Result<(), MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn resume_memory_processing(&self, _user_id: &str) -> Result<(), MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn is_memory_processing_paused(&self, _user_id: &str) -> Result<bool, MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn soft_remove_memory(
+        &self,
+        user_id: &str,
+        candidate_id: &str,
+    ) -> Result<MemoryCandidate, MemoryCurationError> {
+        self.remove_memory(user_id, candidate_id).await
+    }
+
+    async fn configure_raw_retention(
+        &self,
+        _user_id: &str,
+        _policy: MemoryRetentionPolicy,
+    ) -> Result<MemoryRetentionPolicy, MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn run_raw_retention(
+        &self,
+        _user_id: &str,
+        _now_ms: u64,
+    ) -> Result<MemoryRetentionReport, MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
+    async fn privacy_purge(
+        &self,
+        _user_id: &str,
+        _request: &MemoryPrivacyPurgeRequest,
+    ) -> Result<MemoryPurgeReport, MemoryCurationError> {
+        Err(MemoryCurationError::Unsupported)
+    }
+
     async fn auto_inject(&self, _user_id: &str, _max_chars: usize) -> Result<Vec<AgentMemory>, MemoryCurationError> {
         Ok(Vec::new())
     }
@@ -537,6 +629,7 @@ impl MemoryCuration for NoopMemoryCuration {
 #[derive(Clone, Default)]
 pub struct InMemoryMemoryCuration {
     candidates: Arc<Mutex<HashMap<String, MemoryCandidate>>>,
+    paused_users: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl InMemoryMemoryCuration {
@@ -568,6 +661,9 @@ impl InMemoryMemoryCuration {
 #[async_trait]
 impl MemoryCuration for InMemoryMemoryCuration {
     async fn capture_candidate(&self, evidence: &MemoryEvidence) -> Result<(), MemoryCurationError> {
+        if self.is_memory_processing_paused(&evidence.user_id).await? {
+            return Ok(());
+        }
         let Some(candidate) = candidate_from_evidence(evidence)? else {
             return Ok(());
         };
@@ -759,6 +855,9 @@ impl MemoryCuration for InMemoryMemoryCuration {
             .ok_or_else(|| MemoryCurationError::PromotionNotEligible {
                 candidate_id: candidate_id.to_owned(),
             })?;
+        if candidate.status == MemoryCandidateStatus::Superseded {
+            return Ok(candidate.clone());
+        }
         if candidate.status != MemoryCandidateStatus::Promoted {
             return Err(MemoryCurationError::PromotionNotEligible {
                 candidate_id: candidate_id.to_owned(),
@@ -768,6 +867,56 @@ impl MemoryCuration for InMemoryMemoryCuration {
         let detected_at_ms = candidate.detected_at_ms;
         append_lifecycle_event(candidate, MemoryCandidateStatus::Superseded, detected_at_ms, "human_removed");
         Ok(candidate.clone())
+    }
+
+    async fn pause_memory_processing(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        self.paused_users
+            .lock()
+            .map_err(|_| MemoryCurationError::LockUnavailable)?
+            .insert(user_id.to_owned(), true);
+        Ok(())
+    }
+
+    async fn resume_memory_processing(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        self.paused_users
+            .lock()
+            .map_err(|_| MemoryCurationError::LockUnavailable)?
+            .remove(user_id);
+        Ok(())
+    }
+
+    async fn is_memory_processing_paused(&self, user_id: &str) -> Result<bool, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        Ok(self
+            .paused_users
+            .lock()
+            .map_err(|_| MemoryCurationError::LockUnavailable)?
+            .get(user_id)
+            .copied()
+            .unwrap_or(false))
+    }
+
+    async fn privacy_purge(
+        &self,
+        user_id: &str,
+        request: &MemoryPrivacyPurgeRequest,
+    ) -> Result<MemoryPurgeReport, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        validate_purge_request(user_id, request)?;
+        self.candidates
+            .lock()
+            .map_err(|_| MemoryCurationError::LockUnavailable)?
+            .retain(|_, candidate| candidate.user_id != user_id);
+        self.paused_users
+            .lock()
+            .map_err(|_| MemoryCurationError::LockUnavailable)?
+            .remove(user_id);
+        Ok(MemoryPurgeReport {
+            user_id: user_id.to_owned(),
+            removed_user_tree: true,
+        })
     }
 
     async fn auto_inject(&self, user_id: &str, max_chars: usize) -> Result<Vec<AgentMemory>, MemoryCurationError> {
@@ -863,6 +1012,7 @@ impl MemoryCuration for InMemoryMemoryCuration {
 pub struct FilesystemMemoryCuration {
     data_dir: PathBuf,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    paused_users: Arc<Mutex<HashMap<String, bool>>>,
     consolidation_scheduler: MemoryConsolidationScheduler,
 }
 
@@ -871,6 +1021,7 @@ impl FilesystemMemoryCuration {
         Self {
             data_dir,
             locks: Arc::new(Mutex::new(HashMap::new())),
+            paused_users: Arc::new(Mutex::new(HashMap::new())),
             consolidation_scheduler: MemoryConsolidationScheduler::default(),
         }
     }
@@ -896,6 +1047,20 @@ impl FilesystemMemoryCuration {
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         ))
     }
+
+    fn memory_processing_paused(&self, user_id: &str) -> Result<bool, MemoryCurationError> {
+        if self
+            .paused_users
+            .lock()
+            .map_err(|_| MemoryCurationError::LockUnavailable)?
+            .get(user_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+        Ok(read_memory_policy(&memory_policy_path(&self.data_dir, user_id))?.paused)
+    }
 }
 
 #[async_trait]
@@ -908,6 +1073,7 @@ impl MemoryCuration for FilesystemMemoryCuration {
             .await
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))??;
         if let Some(candidate) = candidate.filter(|candidate| candidate.source == MemoryEvidenceSource::CompliantAgent)
+            && !self.memory_processing_paused(&candidate.user_id)?
         {
             self.promote_candidate(&candidate.user_id, &candidate.candidate_id)
                 .await?;
@@ -1066,6 +1232,64 @@ impl MemoryCuration for FilesystemMemoryCuration {
             .await
             .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
     }
+
+    async fn pause_memory_processing(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.pause_memory_processing_blocking(&user_id))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn resume_memory_processing(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.resume_memory_processing_blocking(&user_id))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn is_memory_processing_paused(&self, user_id: &str) -> Result<bool, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        self.memory_processing_paused(user_id)
+    }
+
+    async fn configure_raw_retention(
+        &self,
+        user_id: &str,
+        policy: MemoryRetentionPolicy,
+    ) -> Result<MemoryRetentionPolicy, MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.configure_raw_retention_blocking(&user_id, &policy))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn run_raw_retention(
+        &self,
+        user_id: &str,
+        now_ms: u64,
+    ) -> Result<MemoryRetentionReport, MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::task::spawn_blocking(move || adapter.run_raw_retention_blocking(&user_id, now_ms))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
+
+    async fn privacy_purge(
+        &self,
+        user_id: &str,
+        request: &MemoryPrivacyPurgeRequest,
+    ) -> Result<MemoryPurgeReport, MemoryCurationError> {
+        let adapter = self.clone();
+        let user_id = user_id.to_owned();
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || adapter.privacy_purge_blocking(&user_id, &request))
+            .await
+            .map_err(|error| MemoryCurationError::Internal(error.to_string()))?
+    }
 }
 
 impl FilesystemMemoryCuration {
@@ -1182,6 +1406,9 @@ impl FilesystemMemoryCuration {
             .ok_or_else(|| MemoryCurationError::PromotionNotEligible {
                 candidate_id: candidate_id.to_owned(),
             })?;
+        if candidate.status == MemoryCandidateStatus::Superseded {
+            return Ok(candidate.clone());
+        }
         if candidate.status != MemoryCandidateStatus::Promoted {
             return Err(MemoryCurationError::PromotionNotEligible {
                 candidate_id: candidate_id.to_owned(),
@@ -1192,10 +1419,13 @@ impl FilesystemMemoryCuration {
         append_lifecycle_event(candidate, MemoryCandidateStatus::Superseded, detected_at_ms, "human_removed");
         let result = candidate.clone();
         write_candidates_atomic(&path, &candidates)?;
-        if let Err(error) = fs::remove_file(vault_path(&self.data_dir, user_id, candidate_id))
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(error.into());
+        let note_path = vault_path(&self.data_dir, user_id, candidate_id);
+        if note_path.exists() {
+            let archive_path = memory_archive_path(&self.data_dir, user_id, candidate_id);
+            if let Some(parent) = archive_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(note_path, archive_path)?;
         }
         Ok(result)
     }
@@ -1620,10 +1850,113 @@ impl FilesystemMemoryCuration {
 }
 
 impl FilesystemMemoryCuration {
+    fn pause_memory_processing_blocking(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let mut policy = read_memory_policy(&memory_policy_path(&self.data_dir, user_id))?;
+        policy.paused = true;
+        write_memory_policy(&memory_policy_path(&self.data_dir, user_id), &policy)
+    }
+
+    fn resume_memory_processing_blocking(&self, user_id: &str) -> Result<(), MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let mut policy = read_memory_policy(&memory_policy_path(&self.data_dir, user_id))?;
+        policy.paused = false;
+        write_memory_policy(&memory_policy_path(&self.data_dir, user_id), &policy)
+    }
+
+    fn configure_raw_retention_blocking(
+        &self,
+        user_id: &str,
+        retention: &MemoryRetentionPolicy,
+    ) -> Result<MemoryRetentionPolicy, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let mut policy = read_memory_policy(&memory_policy_path(&self.data_dir, user_id))?;
+        policy.retention = retention.clone();
+        write_memory_policy(&memory_policy_path(&self.data_dir, user_id), &policy)?;
+        Ok(policy.retention)
+    }
+
+    fn run_raw_retention_blocking(
+        &self,
+        user_id: &str,
+        now_ms: u64,
+    ) -> Result<MemoryRetentionReport, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let policy = read_memory_policy(&memory_policy_path(&self.data_dir, user_id))?.retention;
+        let mut report = MemoryRetentionReport {
+            user_id: user_id.to_owned(),
+            policy: policy.clone(),
+            archived_files: 0,
+            deleted_files: 0,
+        };
+        let Some(days) = policy.raw_retention_days else {
+            return Ok(report);
+        };
+        if !policy.archive_before_delete {
+            return Ok(report);
+        }
+        let retention_ms = days.saturating_mul(24 * 60 * 60 * 1_000);
+        let cutoff_ms = now_ms.saturating_sub(retention_ms);
+        let raw_root = raw_events_path(&self.data_dir, user_id);
+        let mut raw_files = Vec::new();
+        collect_raw_event_files(&raw_root, &mut raw_files)?;
+        for source in raw_files {
+            let modified_ms = fs::metadata(&source)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(system_time_ms);
+            if modified_ms.is_none_or(|modified| modified >= cutoff_ms) {
+                continue;
+            }
+            let relative = source
+                .strip_prefix(&raw_root)
+                .map_err(|error| MemoryCurationError::Internal(error.to_string()))?;
+            let archive = raw_archive_path(&self.data_dir, user_id).join(relative).with_extension("jsonl.archive");
+            if let Some(parent) = archive.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(source, archive)?;
+            report.archived_files += 1;
+            report.deleted_files += 1;
+        }
+        Ok(report)
+    }
+
+    fn privacy_purge_blocking(
+        &self,
+        user_id: &str,
+        request: &MemoryPrivacyPurgeRequest,
+    ) -> Result<MemoryPurgeReport, MemoryCurationError> {
+        validate_retrieval_user(user_id)?;
+        validate_purge_request(user_id, request)?;
+        let lock = self.user_lock(user_id)?;
+        let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
+        let root = user_root(&self.data_dir, user_id);
+        let existed = root.exists();
+        if existed {
+            fs::remove_dir_all(&root)?;
+        }
+        Ok(MemoryPurgeReport {
+            user_id: user_id.to_owned(),
+            removed_user_tree: existed,
+        })
+    }
+
     fn capture_candidate_blocking(&self, evidence: &MemoryEvidence) -> Result<(), MemoryCurationError> {
         let Some(candidate) = candidate_from_evidence(evidence)? else {
             return Ok(());
         };
+        if self.memory_processing_paused(&candidate.user_id)? {
+            return Ok(());
+        }
         let lock = self.user_lock(&candidate.user_id)?;
         let _guard = lock.lock().map_err(|_| MemoryCurationError::LockUnavailable)?;
         let path = candidate_path(&self.data_dir, &candidate.user_id);
@@ -2014,6 +2347,28 @@ fn candidate_path(data_dir: &Path, user_id: &str) -> PathBuf {
         .join("candidates.jsonl")
 }
 
+fn user_root(data_dir: &Path, user_id: &str) -> PathBuf {
+    data_dir.join("users").join(user_id)
+}
+
+fn raw_events_path(data_dir: &Path, user_id: &str) -> PathBuf {
+    user_root(data_dir, user_id).join("events").join("raw")
+}
+
+fn raw_archive_path(data_dir: &Path, user_id: &str) -> PathBuf {
+    user_root(data_dir, user_id)
+        .join("runtime")
+        .join("memory")
+        .join("raw-archive")
+}
+
+fn memory_policy_path(data_dir: &Path, user_id: &str) -> PathBuf {
+    user_root(data_dir, user_id)
+        .join("runtime")
+        .join("memory")
+        .join("policy.json")
+}
+
 fn derived_index_path(data_dir: &Path, user_id: &str) -> PathBuf {
     data_dir
         .join("users")
@@ -2042,6 +2397,13 @@ fn vault_path(data_dir: &Path, user_id: &str, candidate_id: &str) -> PathBuf {
         .join(format!("{candidate_id}.md"))
 }
 
+fn memory_archive_path(data_dir: &Path, user_id: &str, candidate_id: &str) -> PathBuf {
+    user_root(data_dir, user_id)
+        .join("vault")
+        .join("Archive")
+        .join(format!("{candidate_id}.md"))
+}
+
 fn conflict_staging_path(data_dir: &Path, user_id: &str, candidate_id: &str) -> PathBuf {
     data_dir
         .join("users")
@@ -2049,6 +2411,61 @@ fn conflict_staging_path(data_dir: &Path, user_id: &str, candidate_id: &str) -> 
         .join("vault")
         .join("Inbox Staging")
         .join(format!("{candidate_id}-conflict.md"))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MemoryPolicyFile {
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    retention: MemoryRetentionPolicy,
+}
+
+fn read_memory_policy(path: &Path) -> Result<MemoryPolicyFile, MemoryCurationError> {
+    if !path.exists() {
+        return Ok(MemoryPolicyFile::default());
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_memory_policy(path: &Path, policy: &MemoryPolicyFile) -> Result<(), MemoryCurationError> {
+    write_file_atomic(path, serde_json::to_vec_pretty(policy)?.as_slice())
+}
+
+fn system_time_ms(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| duration.as_millis().try_into().ok())
+}
+
+fn collect_raw_event_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), MemoryCurationError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_raw_event_files(&entry_path, files)?;
+        } else if entry_path.extension().is_some_and(|extension| extension == "jsonl") {
+            files.push(entry_path);
+        }
+    }
+    Ok(())
+}
+
+fn validate_purge_request(
+    user_id: &str,
+    request: &MemoryPrivacyPurgeRequest,
+) -> Result<(), MemoryCurationError> {
+    if request.authenticated_user_id != user_id
+        || !request.confirm
+        || !request.reauthenticated
+        || request.agent_initiated
+    {
+        return Err(MemoryCurationError::UnauthorizedPurge);
+    }
+    Ok(())
 }
 
 fn render_memory_markdown(candidate: &MemoryCandidate) -> String {
@@ -2688,5 +3105,124 @@ mod tests {
         let after = curation.inspect_memory("alice", &candidate_id).await.unwrap();
         assert_eq!(before.source_hash, after.source_hash);
         assert_eq!(before.markdown, after.markdown);
+    }
+
+    #[tokio::test]
+    async fn memory_pause_is_user_scoped_and_resume_allows_capture() {
+        let curation = InMemoryMemoryCuration::new();
+        curation.pause_memory_processing("alice").await.unwrap();
+        assert!(curation.is_memory_processing_paused("alice").await.unwrap());
+        curation
+            .capture_candidate(&evidence(
+                "alice",
+                MemoryEvidenceSource::Owner,
+                TurnTerminalStatus::Success,
+                "Alice paused memory",
+            ))
+            .await
+            .unwrap();
+        assert!(curation.candidates_for_user("alice").is_empty());
+        assert!(!curation.is_memory_processing_paused("bob").await.unwrap());
+        curation.resume_memory_processing("alice").await.unwrap();
+        curation
+            .capture_candidate(&evidence(
+                "alice",
+                MemoryEvidenceSource::Owner,
+                TurnTerminalStatus::Success,
+                "Alice resumed memory",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(curation.candidates_for_user("alice").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn filesystem_soft_remove_archives_note_and_retention_archives_raw_before_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let curation = FilesystemMemoryCuration::new(temp.path().to_path_buf());
+        curation
+            .capture_candidate(&evidence(
+                "alice",
+                MemoryEvidenceSource::Owner,
+                TurnTerminalStatus::Success,
+                "I prefer concise replies",
+            ))
+            .await
+            .unwrap();
+        let candidate_id = curation.candidates_for_user("alice").unwrap()[0].candidate_id.clone();
+        curation.promote_candidate("alice", &candidate_id).await.unwrap();
+        let removed = curation.soft_remove_memory("alice", &candidate_id).await.unwrap();
+        assert_eq!(removed.status, MemoryCandidateStatus::Superseded);
+        assert!(!vault_path(temp.path(), "alice", &candidate_id).exists());
+        assert!(memory_archive_path(temp.path(), "alice", &candidate_id).exists());
+        let raw = raw_events_path(temp.path(), "alice").join("conversation").join("turn.jsonl");
+        fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        fs::write(&raw, b"raw evidence").unwrap();
+        let no_policy = curation.run_raw_retention("alice", u64::MAX).await.unwrap();
+        assert_eq!(no_policy.deleted_files, 0);
+        assert!(raw.exists());
+        curation
+            .configure_raw_retention(
+                "alice",
+                MemoryRetentionPolicy {
+                    raw_retention_days: Some(1),
+                    archive_before_delete: true,
+                },
+            )
+            .await
+            .unwrap();
+        let retained = curation.run_raw_retention("alice", u64::MAX).await.unwrap();
+        assert_eq!(retained.archived_files, 1);
+        assert_eq!(retained.deleted_files, 1);
+        assert!(!raw.exists());
+        assert!(raw_archive_path(temp.path(), "alice").join("conversation/turn.jsonl.archive").exists());
+    }
+
+    #[tokio::test]
+    async fn privacy_purge_requires_user_confirmation_and_is_user_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let curation = FilesystemMemoryCuration::new(temp.path().to_path_buf());
+        for user in ["alice", "bob"] {
+            curation
+                .capture_candidate(&evidence(
+                    user,
+                    MemoryEvidenceSource::Owner,
+                    TurnTerminalStatus::Success,
+                    "A private preference",
+                ))
+                .await
+                .unwrap();
+        }
+        let denied = MemoryPrivacyPurgeRequest {
+            authenticated_user_id: "alice".to_owned(),
+            confirm: false,
+            reauthenticated: true,
+            agent_initiated: false,
+        };
+        assert!(matches!(
+            curation.privacy_purge("alice", &denied).await,
+            Err(MemoryCurationError::UnauthorizedPurge)
+        ));
+        assert!(user_root(temp.path(), "alice").exists());
+        let agent_request = MemoryPrivacyPurgeRequest {
+            authenticated_user_id: "alice".to_owned(),
+            confirm: true,
+            reauthenticated: true,
+            agent_initiated: true,
+        };
+        assert!(matches!(
+            curation.privacy_purge("alice", &agent_request).await,
+            Err(MemoryCurationError::UnauthorizedPurge)
+        ));
+        let approved = MemoryPrivacyPurgeRequest {
+            authenticated_user_id: "alice".to_owned(),
+            confirm: true,
+            reauthenticated: true,
+            agent_initiated: false,
+        };
+        let report = curation.privacy_purge("alice", &approved).await.unwrap();
+        assert!(report.removed_user_tree);
+        assert!(!user_root(temp.path(), "alice").exists());
+        assert!(user_root(temp.path(), "bob").exists());
     }
 }
