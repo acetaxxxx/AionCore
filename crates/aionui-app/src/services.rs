@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
 use aionui_ai_agent::{
@@ -20,7 +21,7 @@ use aionui_db::{
     SqliteUserRepository,
 };
 use aionui_project::ProjectService;
-use aionui_push::PushDeliveryService;
+use aionui_push::{DisabledPushSender, PushDeliveryService, PushSender, WebPushSender};
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_session_message::QueueClearingCancelHook;
 use aionui_session_message::queue::{DeliveryQueue, SystemClock};
@@ -62,7 +63,8 @@ pub struct AppServices {
     /// router states only receive the narrow capability handle.
     pub push_service: Arc<PushDeliveryService>,
     /// Public half of the deployment VAPID configuration. The private key is
-    /// intentionally not represented in application or database state yet.
+    /// held only by the sender adapter and is never exposed through app or DB
+    /// state.
     pub push_public_vapid_key: Option<String>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
@@ -257,9 +259,20 @@ impl AppServices {
         }
 
         let encryption_key = derive_encryption_key(&encryption_secret);
-        let push_service = Arc::new(PushDeliveryService::new(Arc::new(
-            aionui_db::SqlitePushSubscriptionRepository::new(database.pool().clone(), encryption_key),
-        )));
+        let push_sender: Arc<dyn PushSender> = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok()
+            .and_then(WebPushSender::from_env)
+            .map(|sender| Arc::new(sender) as Arc<dyn PushSender>)
+            .unwrap_or_else(|| Arc::new(DisabledPushSender));
+        let push_service = Arc::new(
+            PushDeliveryService::new(Arc::new(aionui_db::SqlitePushSubscriptionRepository::new(
+                database.pool().clone(),
+                encryption_key,
+            )))
+            .with_sender(push_sender),
+        );
         let push_public_vapid_key = std::env::var("AIONUI_VAPID_PUBLIC_KEY")
             .ok()
             .map(|value| value.trim().to_owned())
@@ -412,6 +425,7 @@ impl AppServices {
         // crate (see `OnConversationTurnCancelled`).
         conversation_service
             .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(session_message_queue.clone())));
+        conversation_service.with_turn_terminal_hook(push_service.clone());
 
         Ok(Self {
             database,

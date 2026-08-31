@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
+use aionui_common::{OnConversationTurnTerminal, TurnTerminalNotice};
 use aionui_db::{IPushSubscriptionRepository, UpsertPushSubscriptionParams};
 use base64::Engine;
 use url::Url;
 
 use crate::error::PushError;
+use crate::payload::build_terminal_payload;
+use crate::sender::{DisabledPushSender, PushSendError, PushSender};
 
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_USER_ID_BYTES: usize = 256;
@@ -21,13 +24,27 @@ pub struct PushSubscriptionRef {
     pub id: String,
 }
 
+#[derive(Clone)]
 pub struct PushDeliveryService {
     repository: Arc<dyn IPushSubscriptionRepository>,
+    sender: Arc<dyn PushSender>,
 }
 
 impl PushDeliveryService {
     pub fn new(repository: Arc<dyn IPushSubscriptionRepository>) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            sender: Arc::new(DisabledPushSender),
+        }
+    }
+
+    pub fn with_sender(mut self, sender: Arc<dyn PushSender>) -> Self {
+        self.sender = sender;
+        self
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.sender.is_configured()
     }
 
     pub async fn upsert_subscription(
@@ -56,6 +73,67 @@ impl PushDeliveryService {
         }
         self.repository.delete(&user_id, subscription_id.trim()).await?;
         Ok(())
+    }
+
+    /// Dispatches one trusted terminal notice to every current subscription
+    /// owned by the notice. Each provider call is isolated; a provider error
+    /// never changes the already durable conversation result.
+    pub async fn deliver_terminal_notice(&self, notice: TurnTerminalNotice) {
+        let Ok(payload) = build_terminal_payload(&notice) else {
+            tracing::warn!("terminal push notification was rejected by payload policy");
+            return;
+        };
+        if !self.sender.is_configured() {
+            return;
+        }
+        let subscriptions = match self.repository.list_for_user(&notice.user_id).await {
+            Ok(subscriptions) => subscriptions,
+            Err(_) => {
+                tracing::warn!("terminal push fanout skipped because subscriptions could not be loaded");
+                return;
+            }
+        };
+        let mut deliveries = tokio::task::JoinSet::new();
+        for subscription in subscriptions {
+            let sender = Arc::clone(&self.sender);
+            let repository = Arc::clone(&self.repository);
+            let payload = payload.clone();
+            deliveries.spawn(async move {
+                match sender.send(&subscription, &payload).await {
+                    Ok(()) => {}
+                    Err(PushSendError::Gone) => {
+                        if repository
+                            .delete_by_endpoint(&subscription.user_id, &subscription.endpoint)
+                            .await
+                            .is_err()
+                        {
+                            tracing::debug!("gone push subscription cleanup failed");
+                        }
+                    }
+                    Err(PushSendError::Unavailable | PushSendError::Rejected | PushSendError::Transport) => {
+                        tracing::debug!("one terminal push delivery failed; continuing fanout");
+                    }
+                }
+            });
+        }
+        while let Some(result) = deliveries.join_next().await {
+            if result.is_err() {
+                tracing::debug!("one terminal push delivery task failed; continuing fanout");
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl OnConversationTurnTerminal for PushDeliveryService {
+    async fn on_turn_terminal(&self, notice: TurnTerminalNotice) {
+        // The conversation terminal path is deliberately not coupled to
+        // provider latency or availability. The owned service clone keeps the
+        // repository/sender alive until this best-effort task finishes.
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.deliver_terminal_notice(notice).await;
+        });
     }
 }
 

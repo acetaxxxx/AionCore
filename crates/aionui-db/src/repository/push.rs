@@ -30,5 +30,9 @@ pub trait IPushSubscriptionRepository: Send + Sync {
 
     async fn delete(&self, user_id: &str, subscription_id: &str) -> Result<(), DbError>;
 
+    /// Removes one provider-reported endpoint without allowing a caller to
+    /// cross the authenticated owner scope.
+    async fn delete_by_endpoint(&self, user_id: &str, endpoint: &str) -> Result<(), DbError>;
+
     async fn list_for_user(&self, user_id: &str) -> Result<Vec<PushSubscriptionRecord>, DbError>;
 }

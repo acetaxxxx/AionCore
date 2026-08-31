@@ -21,7 +21,7 @@ pub fn push_routes(state: PushRouterState) -> Router {
 
 async fn config(State(state): State<PushRouterState>) -> Json<ApiResponse<PushConfigResponse>> {
     Json(ApiResponse::ok(PushConfigResponse {
-        enabled: state.public_vapid_key.is_some(),
+        enabled: state.public_vapid_key.is_some() && state.service.is_enabled(),
         public_vapid_key: state.public_vapid_key,
     }))
 }

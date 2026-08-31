@@ -3,13 +3,17 @@
 //! Browser push subscription lifecycle.
 
 mod error;
+mod payload;
 pub mod routes;
 pub mod service;
+mod sender;
 pub mod state;
 
 pub use error::PushError;
+pub use payload::{PUSH_PAYLOAD_SCHEMA_VERSION, PushPayload, build_terminal_payload};
 pub use routes::push_routes;
 pub use service::{PushDeliveryService, PushSubscriptionInput, PushSubscriptionRef};
+pub use sender::{DisabledPushSender, PushSendError, PushSender, WebPushSender};
 pub use state::PushRouterState;
 
 #[cfg(test)]
@@ -174,6 +178,21 @@ mod testing {
             Ok(())
         }
 
+        async fn delete_by_endpoint(&self, user_id: &str, endpoint: &str) -> Result<(), DbError> {
+            let mut records = self
+                .records
+                .lock()
+                .expect("in-memory push repository lock should not be poisoned");
+            if records
+                .get(endpoint)
+                .is_some_and(|record| record.user_id == user_id)
+            {
+                records.remove(endpoint);
+                return Ok(());
+            }
+            Err(DbError::NotFound("push subscription not found".into()))
+        }
+
         async fn list_for_user(&self, user_id: &str) -> Result<Vec<PushSubscriptionRecord>, DbError> {
             Ok(self
                 .records
@@ -184,5 +203,142 @@ mod testing {
                 .cloned()
                 .collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_delivery_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use base64::Engine;
+    use aionui_common::{
+        OnConversationTurnTerminal, TerminalNoticeStatus, TerminalTargetKind, TurnTerminalNotice,
+    };
+    use aionui_db::PushSubscriptionRecord;
+
+    use super::{
+        PushDeliveryService, PushPayload, PushSendError, PushSender, build_terminal_payload,
+    };
+    use crate::testing::InMemoryPushSubscriptionRepository;
+
+    fn key_material(length: usize, value: u8) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![value; length])
+    }
+
+    #[derive(Default)]
+    struct RecordingSender {
+        payloads: Mutex<Vec<PushPayload>>,
+        fail_endpoint: Option<String>,
+        notify: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl PushSender for RecordingSender {
+        async fn send(
+            &self,
+            subscription: &PushSubscriptionRecord,
+            payload: &PushPayload,
+        ) -> Result<(), PushSendError> {
+            if self.fail_endpoint.as_deref() == Some(subscription.endpoint.as_str()) {
+                return Err(PushSendError::Transport);
+            }
+            self.payloads.lock().expect("sender lock").push(payload.clone());
+            self.notify.notify_one();
+            Ok(())
+        }
+
+        fn is_configured(&self) -> bool {
+            true
+        }
+    }
+
+    fn notice(status: TerminalNoticeStatus) -> TurnTerminalNotice {
+        TurnTerminalNotice::new(
+            "user-a",
+            TerminalTargetKind::Conversation,
+            "conversation-1",
+            "turn-1",
+            status,
+            123,
+        )
+        .expect("test notice should be valid")
+    }
+
+    #[test]
+    fn terminal_payload_is_bounded_and_does_not_copy_runtime_content() {
+        let payload = build_terminal_payload(&notice(TerminalNoticeStatus::Success)).expect("payload");
+        let encoded = serde_json::to_string(&payload).expect("payload json");
+
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(payload.target_kind, "conversation");
+        assert!(!encoded.contains("assistant"));
+        assert!(!encoded.contains("secret"));
+        assert!(payload.title.len() <= 80);
+        assert!(payload.body.len() <= 160);
+    }
+
+    #[tokio::test]
+    async fn terminal_notice_fanout_attempts_each_subscription_and_is_async_hook() {
+        let repository = Arc::new(InMemoryPushSubscriptionRepository::default());
+        let sender = Arc::new(RecordingSender::default());
+        let service = Arc::new(PushDeliveryService::new(repository.clone()).with_sender(sender.clone()));
+
+        for (endpoint, value) in [("https://push.example/a", 1), ("https://push.example/b", 2)] {
+            service
+                .upsert_subscription(
+                    "user-a",
+                    super::PushSubscriptionInput {
+                        endpoint: endpoint.into(),
+                        p256dh: key_material(65, value),
+                        auth: key_material(16, value + 10),
+                    },
+                )
+                .await
+                .expect("subscription");
+        }
+
+        OnConversationTurnTerminal::on_turn_terminal(service.as_ref(), notice(TerminalNoticeStatus::Success)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if sender.payloads.lock().expect("sender lock").len() == 2 {
+                    break;
+                }
+                sender.notify.notified().await;
+            }
+        })
+        .await
+        .expect("terminal delivery should finish asynchronously");
+
+        assert_eq!(sender.payloads.lock().expect("sender lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sender_failure_does_not_suppress_other_subscriptions() {
+        let repository = Arc::new(InMemoryPushSubscriptionRepository::default());
+        let sender = Arc::new(RecordingSender {
+            payloads: Mutex::new(Vec::new()),
+            fail_endpoint: Some("https://push.example/a".into()),
+            notify: tokio::sync::Notify::new(),
+        });
+        let service = PushDeliveryService::new(repository.clone()).with_sender(sender.clone());
+
+        for (endpoint, value) in [("https://push.example/a", 1), ("https://push.example/b", 2)] {
+            service
+                .upsert_subscription(
+                    "user-a",
+                    super::PushSubscriptionInput {
+                        endpoint: endpoint.into(),
+                        p256dh: key_material(65, value),
+                        auth: key_material(16, value + 10),
+                    },
+                )
+                .await
+                .expect("subscription");
+        }
+
+        service.deliver_terminal_notice(notice(TerminalNoticeStatus::Failed)).await;
+
+        assert_eq!(sender.payloads.lock().expect("sender lock").len(), 1);
     }
 }

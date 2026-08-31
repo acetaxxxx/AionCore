@@ -30,8 +30,9 @@ use aionui_api_types::{
 use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
-    now_ms, validate_workspace_path_availability,
+    OnConversationTurnCancelled, OnConversationTurnTerminal, PaginatedResult, TerminalNoticeStatus, TerminalTargetKind,
+    TurnCancelCause, TurnTerminalNotice, WorkspacePathValidationError, generate_short_id, now_ms,
+    validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
@@ -336,6 +337,9 @@ pub struct ConversationService {
     /// services can drop work aimed at this conversation. See
     /// `OnConversationTurnCancelled` for why only some branches fire.
     turn_cancelled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnCancelled>>>>,
+    /// Hooks receive only newly durable terminal outcomes. Delivery adapters
+    /// must enqueue/spawn their work and keep this lifecycle path network-free.
+    turn_terminal_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnTerminal>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -408,6 +412,15 @@ pub struct ConversationAgentTurnOutcome {
     pub runtime: ConversationRuntimeSummary,
 }
 
+fn terminal_notice_status(status: crate::turn_journal::TurnTerminalStatus) -> TerminalNoticeStatus {
+    match status {
+        crate::turn_journal::TurnTerminalStatus::Success => TerminalNoticeStatus::Success,
+        crate::turn_journal::TurnTerminalStatus::Failed => TerminalNoticeStatus::Failed,
+        crate::turn_journal::TurnTerminalStatus::Cancelled => TerminalNoticeStatus::Cancelled,
+        crate::turn_journal::TurnTerminalStatus::Timeout => TerminalNoticeStatus::Timeout,
+    }
+}
+
 // ── Construction & Dependency Injection ──────────────────────────────
 
 impl ConversationService {
@@ -428,6 +441,7 @@ impl ConversationService {
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
+            turn_terminal_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -941,6 +955,89 @@ impl ConversationService {
         if let Ok(mut guard) = self.turn_cancelled_hooks.write() {
             guard.push(hook);
         }
+    }
+
+    /// Register a hook for a newly committed terminal outcome. Hooks are
+    /// intentionally registered after construction so AppServices remains the
+    /// composition root without introducing a dependency cycle.
+    pub fn with_turn_terminal_hook(&self, hook: Arc<dyn OnConversationTurnTerminal>) {
+        if let Ok(mut guard) = self.turn_terminal_hooks.write() {
+            guard.push(hook);
+        }
+    }
+
+    async fn notify_turn_terminal(&self, notice: TurnTerminalNotice) {
+        let hooks: Vec<Arc<dyn OnConversationTurnTerminal>> = self
+            .turn_terminal_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook.on_turn_terminal(notice.clone()).await;
+        }
+    }
+
+    /// Commit a terminal journal outcome and notify optional delivery hooks
+    /// only when this call appended a new durable outcome. Journal errors are
+    /// returned to the caller; hook work is best effort and never changes the
+    /// committed result.
+    pub(crate) async fn reconcile_terminal_and_notify(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        outcome: &crate::turn_journal::TerminalOutcomeRecord<'_>,
+    ) -> Result<crate::turn_journal::TerminalReconcileResult, crate::turn_journal::JournalError> {
+        let result = self
+            .turn_journal
+            .reconcile_terminal(user_id, conversation_id, turn_id, outcome)
+            .await?;
+        if result == crate::turn_journal::TerminalReconcileResult::CommittedNew {
+            self.notify_new_terminal_outcome(
+                user_id,
+                conversation_id,
+                turn_id,
+                outcome.status,
+                outcome.finished_at_ms,
+            )
+            .await;
+        }
+        Ok(result)
+    }
+
+    async fn notify_new_terminal_outcome(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        status: crate::turn_journal::TurnTerminalStatus,
+        finished_at_ms: u64,
+    ) {
+        let Some(row) = self.conversation_repo.get(user_id, conversation_id).await.ok().flatten() else {
+            tracing::warn!(
+                turn_id,
+                "terminal outcome committed but notification target could not be resolved"
+            );
+            return;
+        };
+        let (target_kind, target_id) = match session_mentions::team_id_from_extra_str(&row.extra) {
+            Some(team_id) => (TerminalTargetKind::Team, team_id),
+            None => (TerminalTargetKind::Conversation, conversation_id.to_owned()),
+        };
+        let Some(notice) = TurnTerminalNotice::new(
+            user_id,
+            target_kind,
+            &target_id,
+            turn_id,
+            terminal_notice_status(status),
+            finished_at_ms,
+        )
+        .ok()
+        else {
+            tracing::warn!(turn_id, "terminal outcome committed but notification target was invalid");
+            return;
+        };
+        self.notify_turn_terminal(notice).await;
     }
 
     /// Snapshot the hook list, then drop the guard before awaiting:
@@ -4521,11 +4618,7 @@ impl ConversationService {
                     })),
                     finished_at_ms: journal_now_ms(),
                 };
-                if let Err(je) = self
-                    .turn_journal
-                    .reconcile_terminal(user_id, conversation_id, &turn_id, &failure_outcome)
-                    .await
-                {
+                if let Err(je) = self.reconcile_terminal_and_notify(user_id, conversation_id, &turn_id, &failure_outcome).await {
                     error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on build failure; turn remains open for startup recovery reconciliation");
                 }
                 self.persist_and_broadcast_send_failure_tip(
@@ -4690,8 +4783,7 @@ impl ConversationService {
                     finished_at_ms: journal_now_ms(),
                 };
                 if let Err(je) = self
-                    .turn_journal
-                    .reconcile_terminal(&request.user_id, &request.conversation_id, &turn_id, &failure_outcome)
+                    .reconcile_terminal_and_notify(&request.user_id, &request.conversation_id, &turn_id, &failure_outcome)
                     .await
                 {
                     error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on agent turn build failure; turn remains open for startup recovery reconciliation");

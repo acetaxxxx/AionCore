@@ -117,6 +117,19 @@ impl IPushSubscriptionRepository for SqlitePushSubscriptionRepository {
         Ok(())
     }
 
+    async fn delete_by_endpoint(&self, user_id: &str, endpoint: &str) -> Result<(), DbError> {
+        let endpoint_hash = Self::endpoint_digest(endpoint);
+        let result = sqlx::query("DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint_hash = ?")
+            .bind(user_id)
+            .bind(endpoint_hash)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound("push subscription not found".into()));
+        }
+        Ok(())
+    }
+
     async fn list_for_user(&self, user_id: &str) -> Result<Vec<PushSubscriptionRecord>, DbError> {
         let rows = sqlx::query_as::<_, StoredPushSubscriptionRow>(
             "SELECT id, user_id, endpoint_hash, endpoint_encrypted, p256dh_encrypted, auth_encrypted, created_at, updated_at \
