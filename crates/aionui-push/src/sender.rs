@@ -101,6 +101,13 @@ impl WebPushSender {
         })
     }
 
+    /// Returns the public half derived from the validated private key for the
+    /// authenticated capability response. It is never persisted alongside
+    /// browser subscriptions and does not expose the signing key.
+    pub fn public_key(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.public_key)
+    }
+
     fn vapid_authorization(&self, endpoint: &str) -> Result<HeaderValue, PushSendError> {
         let endpoint_url = url::Url::parse(endpoint).map_err(|_| PushSendError::Rejected)?;
         let host = endpoint_url.host_str().ok_or(PushSendError::Rejected)?;

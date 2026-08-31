@@ -259,11 +259,13 @@ impl AppServices {
         }
 
         let encryption_key = derive_encryption_key(&encryption_secret);
-        let push_sender: Arc<dyn PushSender> = reqwest::Client::builder()
+        let configured_push_sender = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .ok()
-            .and_then(WebPushSender::from_env)
+            .and_then(WebPushSender::from_env);
+        let push_public_vapid_key = configured_push_sender.as_ref().map(WebPushSender::public_key);
+        let push_sender: Arc<dyn PushSender> = configured_push_sender
             .map(|sender| Arc::new(sender) as Arc<dyn PushSender>)
             .unwrap_or_else(|| Arc::new(DisabledPushSender));
         let push_service = Arc::new(
@@ -273,10 +275,6 @@ impl AppServices {
             )))
             .with_sender(push_sender),
         );
-        let push_public_vapid_key = std::env::var("AIONUI_VAPID_PUBLIC_KEY")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));

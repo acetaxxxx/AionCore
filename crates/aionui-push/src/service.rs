@@ -30,6 +30,13 @@ pub struct PushDeliveryService {
     sender: Arc<dyn PushSender>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DeliveryOutcome {
+    Delivered,
+    Removed,
+    Failed,
+}
+
 impl PushDeliveryService {
     pub fn new(repository: Arc<dyn IPushSubscriptionRepository>) -> Self {
         Self {
@@ -94,32 +101,58 @@ impl PushDeliveryService {
             }
         };
         let mut deliveries = tokio::task::JoinSet::new();
+        let mut attempted = 0_u32;
         for subscription in subscriptions {
+            attempted = attempted.saturating_add(1);
             let sender = Arc::clone(&self.sender);
             let repository = Arc::clone(&self.repository);
             let payload = payload.clone();
             deliveries.spawn(async move {
                 match sender.send(&subscription, &payload).await {
-                    Ok(()) => {}
+                    Ok(()) => DeliveryOutcome::Delivered,
                     Err(PushSendError::Gone) => {
                         if repository
                             .delete_by_endpoint(&subscription.user_id, &subscription.endpoint)
                             .await
-                            .is_err()
+                            .is_ok()
                         {
+                            DeliveryOutcome::Removed
+                        } else {
                             tracing::debug!("gone push subscription cleanup failed");
+                            DeliveryOutcome::Failed
                         }
                     }
                     Err(PushSendError::Unavailable | PushSendError::Rejected | PushSendError::Transport) => {
                         tracing::debug!("one terminal push delivery failed; continuing fanout");
+                        DeliveryOutcome::Failed
                     }
                 }
             });
         }
+        let mut delivered = 0_u32;
+        let mut removed = 0_u32;
+        let mut failed = 0_u32;
         while let Some(result) = deliveries.join_next().await {
-            if result.is_err() {
-                tracing::debug!("one terminal push delivery task failed; continuing fanout");
+            match result {
+                Ok(DeliveryOutcome::Delivered) => delivered = delivered.saturating_add(1),
+                Ok(DeliveryOutcome::Removed) => removed = removed.saturating_add(1),
+                Ok(DeliveryOutcome::Failed) => failed = failed.saturating_add(1),
+                Err(_) => {
+                    failed = failed.saturating_add(1);
+                    tracing::debug!("one terminal push delivery task failed; continuing fanout");
+                }
             }
+        }
+        if attempted > 0 {
+            tracing::info!(
+                status = %payload.status,
+                target_kind = %payload.target_kind,
+                attempted,
+                delivered,
+                removed,
+                failed,
+                "terminal push fanout completed"
+            );
         }
     }
 }
