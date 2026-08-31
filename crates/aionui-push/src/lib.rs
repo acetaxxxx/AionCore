@@ -130,6 +130,16 @@ mod testing {
                 .filter(|record| record.user_id == user_id)
                 .count()
         }
+
+        pub async fn endpoints_for_user(&self, user_id: &str) -> Vec<String> {
+            self.records
+                .lock()
+                .expect("in-memory push repository lock should not be poisoned")
+                .values()
+                .filter(|record| record.user_id == user_id)
+                .map(|record| record.endpoint.clone())
+                .collect()
+        }
     }
 
     #[async_trait::async_trait]
@@ -230,6 +240,7 @@ mod terminal_delivery_tests {
     struct RecordingSender {
         payloads: Mutex<Vec<PushPayload>>,
         fail_endpoint: Option<String>,
+        gone_endpoint: Option<String>,
         notify: tokio::sync::Notify,
     }
 
@@ -240,6 +251,9 @@ mod terminal_delivery_tests {
             subscription: &PushSubscriptionRecord,
             payload: &PushPayload,
         ) -> Result<(), PushSendError> {
+            if self.gone_endpoint.as_deref() == Some(subscription.endpoint.as_str()) {
+                return Err(PushSendError::Gone);
+            }
             if self.fail_endpoint.as_deref() == Some(subscription.endpoint.as_str()) {
                 return Err(PushSendError::Transport);
             }
@@ -319,6 +333,7 @@ mod terminal_delivery_tests {
         let sender = Arc::new(RecordingSender {
             payloads: Mutex::new(Vec::new()),
             fail_endpoint: Some("https://push.example/a".into()),
+            gone_endpoint: None,
             notify: tokio::sync::Notify::new(),
         });
         let service = PushDeliveryService::new(repository.clone()).with_sender(sender.clone());
@@ -340,5 +355,62 @@ mod terminal_delivery_tests {
         service.deliver_terminal_notice(notice(TerminalNoticeStatus::Failed)).await;
 
         assert_eq!(sender.payloads.lock().expect("sender lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_gone_removes_only_the_affected_subscription() {
+        let repository = Arc::new(InMemoryPushSubscriptionRepository::default());
+        let sender = Arc::new(RecordingSender {
+            payloads: Mutex::new(Vec::new()),
+            fail_endpoint: None,
+            gone_endpoint: Some("https://push.example/a".into()),
+            notify: tokio::sync::Notify::new(),
+        });
+        let service = PushDeliveryService::new(repository.clone()).with_sender(sender);
+
+        for (endpoint, value) in [("https://push.example/a", 1), ("https://push.example/b", 2)] {
+            service
+                .upsert_subscription(
+                    "user-a",
+                    super::PushSubscriptionInput {
+                        endpoint: endpoint.into(),
+                        p256dh: key_material(65, value),
+                        auth: key_material(16, value + 10),
+                    },
+                )
+                .await
+                .expect("subscription");
+        }
+
+        service.deliver_terminal_notice(notice(TerminalNoticeStatus::Timeout)).await;
+
+        assert_eq!(repository.endpoints_for_user("user-a").await, vec!["https://push.example/b"]);
+    }
+
+    #[test]
+    fn all_terminal_statuses_use_the_same_bounded_payload_seam() {
+        let cases = [
+            (TerminalNoticeStatus::Success, "success"),
+            (TerminalNoticeStatus::Failed, "failed"),
+            (TerminalNoticeStatus::Cancelled, "cancelled"),
+            (TerminalNoticeStatus::Timeout, "timeout"),
+        ];
+
+        for (status, expected_status) in cases {
+            let payload = build_terminal_payload(&notice(status)).expect("payload");
+            assert_eq!(payload.status, expected_status);
+            assert_eq!(payload.target_kind, "conversation");
+            assert_eq!(payload.target_id, "conversation-1");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_vapid_configuration_disables_push_without_delivery_error() {
+        let repository = Arc::new(InMemoryPushSubscriptionRepository::default());
+        let service = PushDeliveryService::new(repository.clone());
+
+        assert!(!service.is_enabled());
+        service.deliver_terminal_notice(notice(TerminalNoticeStatus::Success)).await;
+        assert_eq!(repository.count_for_user("user-a").await, 0);
     }
 }

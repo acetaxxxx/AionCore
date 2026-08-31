@@ -1994,10 +1994,15 @@ mod tests {
             now_ms: 25_000,
         };
 
-        let reconciled = internal_startup_recovery(&journal, temp.path(), &options)
+        let outcomes = internal_startup_recovery_with_outcomes(&journal, temp.path(), &options)
             .await
             .unwrap();
-        assert_eq!(reconciled, 1);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].user_id, "user_eve");
+        assert_eq!(outcomes[0].conversation_id, "conv_222");
+        assert_eq!(outcomes[0].turn_id, "turn_008");
+        assert_eq!(outcomes[0].status, TurnTerminalStatus::Timeout);
+        assert_eq!(outcomes[0].finished_at_ms, 25_000);
 
         let raw_file = temp.path().join("users/user_eve/events/raw/conv_222/turn_008.jsonl");
         let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
@@ -2016,10 +2021,10 @@ mod tests {
             _ => panic!("Expected FinalOutcome event"),
         }
 
-        let second_run = internal_startup_recovery(&journal, temp.path(), &options)
+        let second_run = internal_startup_recovery_with_outcomes(&journal, temp.path(), &options)
             .await
             .unwrap();
-        assert_eq!(second_run, 0);
+        assert!(second_run.is_empty());
     }
 
     #[tokio::test]

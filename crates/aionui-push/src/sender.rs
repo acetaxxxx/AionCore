@@ -230,3 +230,28 @@ fn decode_exact(value: &str, expected: usize) -> Result<Vec<u8>, PushSendError> 
     }
     Ok(decoded)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    #[test]
+    fn malformed_vapid_private_key_disables_sender_configuration() {
+        let result = WebPushSender::new(reqwest::Client::new(), "not-a-vapid-key", "mailto:ops@example.com");
+
+        assert!(matches!(result, Err(PushSendError::Unavailable)));
+    }
+
+    #[test]
+    fn unsupported_vapid_subject_disables_sender_configuration() {
+        let mut private_key = [0_u8; 32];
+        private_key[31] = 1;
+        let encoded = URL_SAFE_NO_PAD.encode(private_key);
+
+        let result = WebPushSender::new(reqwest::Client::new(), &encoded, "javascript:alert(1)");
+
+        assert!(matches!(result, Err(PushSendError::Unavailable)));
+    }
+}
