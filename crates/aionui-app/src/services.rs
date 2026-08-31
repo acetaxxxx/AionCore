@@ -20,6 +20,7 @@ use aionui_db::{
     SqliteUserRepository,
 };
 use aionui_project::ProjectService;
+use aionui_push::PushDeliveryService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_session_message::QueueClearingCancelHook;
 use aionui_session_message::queue::{DeliveryQueue, SystemClock};
@@ -57,6 +58,12 @@ pub struct AppServices {
     /// delete hook (path-1 cascade), the team service (path-2 cascade), and the
     /// sidebar read state. Cheap to clone (Arc). See sidebar design §4.
     pub user_order_store: Arc<dyn IUserOrderStore>,
+    /// Browser push subscription service. Construction stays in AppServices;
+    /// router states only receive the narrow capability handle.
+    pub push_service: Arc<PushDeliveryService>,
+    /// Public half of the deployment VAPID configuration. The private key is
+    /// intentionally not represented in application or database state yet.
+    pub push_public_vapid_key: Option<String>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -250,6 +257,13 @@ impl AppServices {
         }
 
         let encryption_key = derive_encryption_key(&encryption_secret);
+        let push_service = Arc::new(PushDeliveryService::new(Arc::new(
+            aionui_db::SqlitePushSubscriptionRepository::new(database.pool().clone(), encryption_key),
+        )));
+        let push_public_vapid_key = std::env::var("AIONUI_VAPID_PUBLIC_KEY")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
@@ -418,6 +432,8 @@ impl AppServices {
             session_message_notify,
             project_service,
             user_order_store,
+            push_service,
+            push_public_vapid_key,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,

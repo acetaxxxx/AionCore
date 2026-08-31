@@ -25,6 +25,7 @@ members = [
     "crates/aionui-project",
     "crates/aionui-sidebar",
     "crates/aionui-cron",
+    "crates/aionui-push",
     "crates/aionui-assistant",
     "crates/aionui-app",
 ]
@@ -60,6 +61,7 @@ aionui-team = { path = "crates/aionui-team" }
 aionui-project = { path = "crates/aionui-project" }
 aionui-sidebar = { path = "crates/aionui-sidebar" }
 aionui-cron = { path = "crates/aionui-cron" }
+aionui-push = { path = "crates/aionui-push" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
@@ -221,4 +223,3 @@ incremental = false
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 incremental = false
-
