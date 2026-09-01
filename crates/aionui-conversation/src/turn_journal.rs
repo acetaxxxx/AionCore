@@ -23,6 +23,16 @@ pub enum TurnTerminalStatus {
     Timeout,
 }
 
+/// Reports whether a terminal reconciliation appended a new durable outcome
+/// or observed the exact already-committed payload.  Delivery hooks must only
+/// react to [`Self::CommittedNew`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalReconcileResult {
+    CommittedNew,
+    AlreadyPresent,
+}
+
 /// Token usage details recorded at turn completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TokenUsageRecord {
@@ -318,7 +328,7 @@ pub trait TurnJournal: Send + Sync {
         conversation_id: &str,
         turn_id: &str,
         outcome: &TerminalOutcomeRecord<'_>,
-    ) -> Result<(), JournalError>;
+    ) -> Result<TerminalReconcileResult, JournalError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -681,7 +691,7 @@ impl TurnJournal for FilesystemTurnJournal {
         conversation_id: &str,
         turn_id: &str,
         outcome: &TerminalOutcomeRecord<'_>,
-    ) -> Result<(), JournalError> {
+    ) -> Result<TerminalReconcileResult, JournalError> {
         validate_identifier(user_id, "user_id")?;
         validate_identifier(conversation_id, "conversation_id")?;
         validate_identifier(turn_id, "turn_id")?;
@@ -730,7 +740,7 @@ impl TurnJournal for FilesystemTurnJournal {
 
                 if is_exact_match {
                     // Exact identical terminal payload: Idempotent No-op
-                    return Ok(());
+                    return Ok(TerminalReconcileResult::AlreadyPresent);
                 } else {
                     // Conflicting outcome (different status OR different payload): Reject
                     return Err(JournalError::ConflictingOutcome {
@@ -770,7 +780,9 @@ impl TurnJournal for FilesystemTurnJournal {
             finished_at_ms: outcome.finished_at_ms,
         };
 
-        self.append_event_durable(&file_path, &terminal_event).await
+        self.append_event_durable(&file_path, &terminal_event)
+            .await
+            .map(|_| TerminalReconcileResult::CommittedNew)
     }
 }
 
@@ -955,7 +967,7 @@ impl TurnJournal for InMemoryTurnJournal {
         conversation_id: &str,
         turn_id: &str,
         outcome: &TerminalOutcomeRecord<'_>,
-    ) -> Result<(), JournalError> {
+    ) -> Result<TerminalReconcileResult, JournalError> {
         validate_identifier(user_id, "user_id")?;
         validate_identifier(conversation_id, "conversation_id")?;
         validate_identifier(turn_id, "turn_id")?;
@@ -999,7 +1011,7 @@ impl TurnJournal for InMemoryTurnJournal {
                     && *finished_at_ms == outcome.finished_at_ms;
 
                 if is_exact_match {
-                    return Ok(());
+                    return Ok(TerminalReconcileResult::AlreadyPresent);
                 } else {
                     return Err(JournalError::ConflictingOutcome {
                         turn_id: turn_id.to_string(),
@@ -1038,7 +1050,7 @@ impl TurnJournal for InMemoryTurnJournal {
             finished_at_ms: outcome.finished_at_ms,
         };
         entry.push(terminal_event);
-        Ok(())
+        Ok(TerminalReconcileResult::CommittedNew)
     }
 }
 
@@ -1053,21 +1065,47 @@ pub struct StartupRecoveryOptions {
     pub now_ms: u64,
 }
 
+/// Metadata for a startup recovery outcome that was newly appended.  The
+/// recovery scanner does not own conversation hooks; the service layer uses
+/// these trusted identifiers to dispatch the same terminal notice path as a
+/// live turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredTerminalOutcome {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub status: TurnTerminalStatus,
+    pub finished_at_ms: u64,
+}
+
 /// Internal bootstrap operation to scan and reconcile unclosed in-flight turns across all users.
 ///
 /// Uses the provided shared [`TurnJournal`] instance to guarantee per-turn locking, payload validation,
 /// path jail checks, and durable `sync_all` writes without bypassing safety invariants.
+#[cfg(test)]
 pub(crate) async fn internal_startup_recovery(
     journal: &dyn TurnJournal,
     base_dir: &Path,
     options: &StartupRecoveryOptions,
 ) -> Result<usize, JournalError> {
+    Ok(internal_startup_recovery_with_outcomes(journal, base_dir, options)
+        .await?
+        .len())
+}
+
+/// Startup recovery variant that returns only newly committed terminal
+/// outcomes so the owning service can notify its optional hooks exactly once.
+pub(crate) async fn internal_startup_recovery_with_outcomes(
+    journal: &dyn TurnJournal,
+    base_dir: &Path,
+    options: &StartupRecoveryOptions,
+) -> Result<Vec<RecoveredTerminalOutcome>, JournalError> {
     let users_dir = base_dir.join("users");
     if !users_dir.exists() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
-    let mut reconciled_count = 0;
+    let mut reconciled_outcomes = Vec::new();
     let mut user_entries = tokio::fs::read_dir(&users_dir).await?;
 
     while let Some(user_entry) = user_entries.next_entry().await? {
@@ -1173,17 +1211,25 @@ pub(crate) async fn internal_startup_recovery(
                         };
 
                         // Use shared reconcile_terminal with per-turn lock, PreExecution verification, and sync_all
-                        journal
+                        let result = journal
                             .reconcile_terminal(&user_id, &conv_id, &turn_id, &timeout_outcome)
                             .await?;
-                        reconciled_count += 1;
+                        if result == TerminalReconcileResult::CommittedNew {
+                            reconciled_outcomes.push(RecoveredTerminalOutcome {
+                                user_id: user_id.clone(),
+                                conversation_id: conv_id.clone(),
+                                turn_id: turn_id.clone(),
+                                status: TurnTerminalStatus::Timeout,
+                                finished_at_ms: options.now_ms,
+                            });
+                        }
                     }
                 }
             }
         }
     }
 
-    Ok(reconciled_count)
+    Ok(reconciled_outcomes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,15 +1531,17 @@ mod tests {
             finished_at_ms: 3000,
         };
 
-        journal
+        let first_result = journal
             .reconcile_terminal("user_bob", "conv_456", "turn_003", &outcome)
             .await
             .unwrap();
+        assert_eq!(first_result, TerminalReconcileResult::CommittedNew);
 
-        journal
+        let replay_result = journal
             .reconcile_terminal("user_bob", "conv_456", "turn_003", &outcome)
             .await
             .unwrap();
+        assert_eq!(replay_result, TerminalReconcileResult::AlreadyPresent);
 
         let raw_file = temp.path().join("users/user_bob/events/raw/conv_456/turn_003.jsonl");
         let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
@@ -1948,10 +1996,15 @@ mod tests {
             now_ms: 25_000,
         };
 
-        let reconciled = internal_startup_recovery(&journal, temp.path(), &options)
+        let outcomes = internal_startup_recovery_with_outcomes(&journal, temp.path(), &options)
             .await
             .unwrap();
-        assert_eq!(reconciled, 1);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].user_id, "user_eve");
+        assert_eq!(outcomes[0].conversation_id, "conv_222");
+        assert_eq!(outcomes[0].turn_id, "turn_008");
+        assert_eq!(outcomes[0].status, TurnTerminalStatus::Timeout);
+        assert_eq!(outcomes[0].finished_at_ms, 25_000);
 
         let raw_file = temp.path().join("users/user_eve/events/raw/conv_222/turn_008.jsonl");
         let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_file)
@@ -1970,10 +2023,10 @@ mod tests {
             _ => panic!("Expected FinalOutcome event"),
         }
 
-        let second_run = internal_startup_recovery(&journal, temp.path(), &options)
+        let second_run = internal_startup_recovery_with_outcomes(&journal, temp.path(), &options)
             .await
             .unwrap();
-        assert_eq!(second_run, 0);
+        assert!(second_run.is_empty());
     }
 
     #[tokio::test]

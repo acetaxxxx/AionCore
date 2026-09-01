@@ -96,8 +96,25 @@ impl ConversationService {
             grace_window_ms,
             now_ms: crate::service::journal_now_ms(),
         };
-        match crate::turn_journal::internal_startup_recovery(self.turn_journal().as_ref(), data_dir, &options).await {
-            Ok(count) => {
+        match crate::turn_journal::internal_startup_recovery_with_outcomes(
+            self.turn_journal().as_ref(),
+            data_dir,
+            &options,
+        )
+        .await
+        {
+            Ok(outcomes) => {
+                let count = outcomes.len();
+                for outcome in &outcomes {
+                    self.notify_new_terminal_outcome(
+                        &outcome.user_id,
+                        &outcome.conversation_id,
+                        &outcome.turn_id,
+                        outcome.status,
+                        outcome.finished_at_ms,
+                    )
+                    .await;
+                }
                 if count > 0 {
                     info!(
                         count,

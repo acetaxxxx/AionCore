@@ -6,6 +6,97 @@
 
 use async_trait::async_trait;
 
+const MAX_TERMINAL_NOTICE_ID_BYTES: usize = 128;
+
+/// The only navigation targets that may be embedded in a terminal push
+/// notification.  A complete URL is deliberately not a valid target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalTargetKind {
+    Team,
+    Conversation,
+}
+
+/// The terminal states that are safe to expose as a user-facing reminder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalNoticeStatus {
+    Success,
+    Failed,
+    Cancelled,
+    Timeout,
+}
+
+/// Immutable, identity-bound terminal outcome metadata shared across the
+/// conversation domain and optional delivery adapters.
+///
+/// This value intentionally contains no prompt, assistant output, provider
+/// error, token, endpoint, or user-supplied URL.  The `user_id` is retained
+/// only for the trusted repository lookup; delivery payloads must omit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnTerminalNotice {
+    pub user_id: String,
+    pub target_kind: TerminalTargetKind,
+    pub target_id: String,
+    pub turn_id: String,
+    pub status: TerminalNoticeStatus,
+    pub finished_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TerminalNoticeError {
+    #[error("terminal notice {0} must not be empty")]
+    EmptyField(&'static str),
+    #[error("terminal notice {0} contains an invalid route identifier")]
+    InvalidRouteIdentifier(&'static str),
+}
+
+impl TurnTerminalNotice {
+    pub fn new(
+        user_id: &str,
+        target_kind: TerminalTargetKind,
+        target_id: &str,
+        turn_id: &str,
+        status: TerminalNoticeStatus,
+        finished_at_ms: u64,
+    ) -> Result<Self, TerminalNoticeError> {
+        if user_id.trim().is_empty() {
+            return Err(TerminalNoticeError::EmptyField("user_id"));
+        }
+        if target_id.is_empty() {
+            return Err(TerminalNoticeError::EmptyField("target_id"));
+        }
+        if turn_id.is_empty() {
+            return Err(TerminalNoticeError::EmptyField("turn_id"));
+        }
+        for (field, value) in [("target_id", target_id), ("turn_id", turn_id)] {
+            if value.len() > MAX_TERMINAL_NOTICE_ID_BYTES
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(TerminalNoticeError::InvalidRouteIdentifier(field));
+            }
+        }
+        Ok(Self {
+            user_id: user_id.trim().to_owned(),
+            target_kind,
+            target_id: target_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            status,
+            finished_at_ms,
+        })
+    }
+}
+
+/// Receives a newly durable conversation terminal outcome.
+///
+/// Implementations must be best effort: hook failures must not alter the
+/// already-committed conversation result.  Delivery adapters should enqueue
+/// or spawn their work so the terminal path is never network-bound.
+#[async_trait]
+pub trait OnConversationTurnTerminal: Send + Sync {
+    async fn on_turn_terminal(&self, notice: TurnTerminalNotice);
+}
+
 /// Notified before a conversation row is deleted via
 /// `ConversationService::delete`.
 ///

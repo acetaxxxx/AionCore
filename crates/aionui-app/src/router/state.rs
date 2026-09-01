@@ -36,6 +36,7 @@ use aionui_mcp::{
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
+use aionui_push::PushRouterState;
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
@@ -144,6 +145,7 @@ pub struct ModuleStates {
     pub team: TeamRouterState,
     pub session_message: SessionMessageRouterState,
     pub cron: CronRouterState,
+    pub push: PushRouterState,
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
@@ -328,6 +330,7 @@ pub async fn build_module_states(
         }),
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
         cron,
+        push: build_module_state_phase(&boot, "push", || build_push_state(services)),
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
@@ -1045,6 +1048,11 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         cron_service,
         conversation_service: conv_service,
     }
+}
+
+/// Build the browser push state from the AppServices-owned capability.
+pub fn build_push_state(services: &AppServices) -> PushRouterState {
+    PushRouterState::new(services.push_service.clone(), services.push_public_vapid_key.clone())
 }
 
 /// Build the default `OfficeRouterState` from application services.
