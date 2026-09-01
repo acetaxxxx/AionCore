@@ -1,13 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aes_gcm::aead::{Aead, KeyInit};
 use aionui_db::PushSubscriptionRecord;
 use async_trait::async_trait;
-use aes_gcm::aead::{Aead, KeyInit};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use p256::ecdsa::signature::Signer;
-use p256::ecdsa::{Signature, SigningKey};
 use p256::ecdh::diffie_hellman;
+use p256::ecdsa::signature::{Signature as SignatureBytes, Signer};
+use p256::ecdsa::{Signature, SigningKey};
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
@@ -79,7 +79,7 @@ impl WebPushSender {
             .decode(private_key.trim())
             .map_err(|_| PushSendError::Unavailable)?;
         let private_bytes: [u8; 32] = bytes.try_into().map_err(|_| PushSendError::Unavailable)?;
-        let signing_key = SigningKey::from_bytes((&private_bytes).into()).map_err(|_| PushSendError::Unavailable)?;
+        let signing_key = SigningKey::from_bytes(private_bytes.as_slice()).map_err(|_| PushSendError::Unavailable)?;
         let encoded = signing_key.verifying_key().to_encoded_point(false);
         let public_key: [u8; 65] = encoded.as_bytes().try_into().map_err(|_| PushSendError::Unavailable)?;
         let subject = subject.trim();
