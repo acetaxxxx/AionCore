@@ -1225,7 +1225,6 @@ pub(crate) async fn internal_startup_recovery_with_outcomes(
                 }
             }
         }
-    }
 
     Ok(reconciled_outcomes)
 }

@@ -1052,10 +1052,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
 
 /// Build the browser push state from the AppServices-owned capability.
 pub fn build_push_state(services: &AppServices) -> PushRouterState {
-    PushRouterState::new(
-        services.push_service.clone(),
-        services.push_public_vapid_key.clone(),
-    )
+    PushRouterState::new(services.push_service.clone(), services.push_public_vapid_key.clone())
 }
 
 /// Build the default `OfficeRouterState` from application services.

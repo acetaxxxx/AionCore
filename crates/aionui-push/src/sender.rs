@@ -37,8 +37,7 @@ pub enum PushSendError {
 /// endpoint or browser key material.
 #[async_trait]
 pub trait PushSender: Send + Sync {
-    async fn send(&self, subscription: &PushSubscriptionRecord, payload: &PushPayload)
-        -> Result<(), PushSendError>;
+    async fn send(&self, subscription: &PushSubscriptionRecord, payload: &PushPayload) -> Result<(), PushSendError>;
 
     fn is_configured(&self) -> bool;
 }
@@ -48,11 +47,7 @@ pub struct DisabledPushSender;
 
 #[async_trait]
 impl PushSender for DisabledPushSender {
-    async fn send(
-        &self,
-        _subscription: &PushSubscriptionRecord,
-        _payload: &PushPayload,
-    ) -> Result<(), PushSendError> {
+    async fn send(&self, _subscription: &PushSubscriptionRecord, _payload: &PushPayload) -> Result<(), PushSendError> {
         Err(PushSendError::Unavailable)
     }
 
@@ -85,10 +80,7 @@ impl WebPushSender {
         let private_bytes: [u8; 32] = bytes.try_into().map_err(|_| PushSendError::Unavailable)?;
         let signing_key = SigningKey::from_bytes((&private_bytes).into()).map_err(|_| PushSendError::Unavailable)?;
         let encoded = signing_key.verifying_key().to_encoded_point(false);
-        let public_key: [u8; 65] = encoded
-            .as_bytes()
-            .try_into()
-            .map_err(|_| PushSendError::Unavailable)?;
+        let public_key: [u8; 65] = encoded.as_bytes().try_into().map_err(|_| PushSendError::Unavailable)?;
         let subject = subject.trim();
         if !is_valid_vapid_subject(subject) {
             return Err(PushSendError::Unavailable);
@@ -181,7 +173,7 @@ impl WebPushSender {
         let cipher = aes_gcm::Aes128Gcm::new_from_slice(&cek).map_err(|_| PushSendError::Rejected)?;
         let ciphertext = cipher
             .encrypt(aes_gcm::Nonce::from_slice(&nonce), plaintext.as_ref())
-        .map_err(|_| PushSendError::Rejected)?;
+            .map_err(|_| PushSendError::Rejected)?;
 
         let mut body = Vec::with_capacity(16 + 4 + 1 + 65 + ciphertext.len());
         body.extend_from_slice(&salt);
@@ -195,11 +187,7 @@ impl WebPushSender {
 
 #[async_trait]
 impl PushSender for WebPushSender {
-    async fn send(
-        &self,
-        subscription: &PushSubscriptionRecord,
-        payload: &PushPayload,
-    ) -> Result<(), PushSendError> {
+    async fn send(&self, subscription: &PushSubscriptionRecord, payload: &PushPayload) -> Result<(), PushSendError> {
         let body = self.encrypt_payload(subscription, payload)?;
         let authorization = self.vapid_authorization(&subscription.endpoint)?;
         let response = self

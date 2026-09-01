@@ -69,7 +69,9 @@ impl TurnTerminalNotice {
         }
         for (field, value) in [("target_id", target_id), ("turn_id", turn_id)] {
             if value.len() > MAX_TERMINAL_NOTICE_ID_BYTES
-                || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
             {
                 return Err(TerminalNoticeError::InvalidRouteIdentifier(field));
             }

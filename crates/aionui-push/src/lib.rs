@@ -5,15 +5,15 @@
 mod error;
 mod payload;
 pub mod routes;
-pub mod service;
 mod sender;
+pub mod service;
 pub mod state;
 
 pub use error::PushError;
 pub use payload::{PUSH_PAYLOAD_SCHEMA_VERSION, PushPayload, build_terminal_payload};
 pub use routes::push_routes;
-pub use service::{PushDeliveryService, PushSubscriptionInput, PushSubscriptionRef};
 pub use sender::{DisabledPushSender, PushSendError, PushSender, WebPushSender};
+pub use service::{PushDeliveryService, PushSubscriptionInput, PushSubscriptionRef};
 pub use state::PushRouterState;
 
 #[cfg(test)]
