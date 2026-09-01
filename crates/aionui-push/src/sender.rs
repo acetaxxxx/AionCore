@@ -90,7 +90,7 @@ impl WebPushSender {
             .try_into()
             .map_err(|_| PushSendError::Unavailable)?;
         let subject = subject.trim();
-        if !(subject.starts_with("mailto:") || subject.starts_with("https://") || subject.starts_with("http://")) {
+        if !is_valid_vapid_subject(subject) {
             return Err(PushSendError::Unavailable);
         }
         Ok(Self {
@@ -227,6 +227,29 @@ impl PushSender for WebPushSender {
     }
 }
 
+fn is_valid_vapid_subject(subject: &str) -> bool {
+    if let Some(mailbox) = subject.strip_prefix("mailto:") {
+        let mailbox = mailbox.trim();
+        let Some((local, domain)) = mailbox.split_once('@') else {
+            return false;
+        };
+        return !local.is_empty()
+            && !domain.is_empty()
+            && !domain.starts_with('.')
+            && !domain.ends_with('.')
+            && !mailbox.chars().any(char::is_whitespace);
+    }
+
+    let Ok(url) = url::Url::parse(subject) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+}
+
 fn decode_exact(value: &str, expected: usize) -> Result<Vec<u8>, PushSendError> {
     let decoded = URL_SAFE_NO_PAD
         .decode(value)
@@ -260,5 +283,34 @@ mod tests {
         let result = WebPushSender::new(reqwest::Client::new(), &encoded, "javascript:alert(1)");
 
         assert!(matches!(result, Err(PushSendError::Unavailable)));
+    }
+
+    #[test]
+    fn malformed_vapid_subjects_disable_sender_configuration() {
+        let mut private_key = [0_u8; 32];
+        private_key[31] = 1;
+        let encoded = URL_SAFE_NO_PAD.encode(private_key);
+
+        for subject in ["mailto:", "https://", "http://ops.example.com"] {
+            let result = WebPushSender::new(reqwest::Client::new(), &encoded, subject);
+
+            assert!(
+                matches!(result, Err(PushSendError::Unavailable)),
+                "subject should be rejected: {subject}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_vapid_subjects_keep_sender_configuration_available() {
+        let mut private_key = [0_u8; 32];
+        private_key[31] = 1;
+        let encoded = URL_SAFE_NO_PAD.encode(private_key);
+
+        for subject in ["mailto:ops@example.com", "https://ops.example.com"] {
+            let result = WebPushSender::new(reqwest::Client::new(), &encoded, subject);
+
+            assert!(result.is_ok(), "subject should be accepted: {subject}");
+        }
     }
 }
