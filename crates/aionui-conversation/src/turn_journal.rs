@@ -1087,7 +1087,9 @@ pub(crate) async fn internal_startup_recovery(
     base_dir: &Path,
     options: &StartupRecoveryOptions,
 ) -> Result<usize, JournalError> {
-    Ok(internal_startup_recovery_with_outcomes(journal, base_dir, options).await?.len())
+    Ok(internal_startup_recovery_with_outcomes(journal, base_dir, options)
+        .await?
+        .len())
 }
 
 /// Startup recovery variant that returns only newly committed terminal
@@ -1207,19 +1209,18 @@ pub(crate) async fn internal_startup_recovery_with_outcomes(
                             finished_at_ms: options.now_ms,
                         };
 
-                            // Use shared reconcile_terminal with per-turn lock, PreExecution verification, and sync_all
-                            let result = journal
-                                .reconcile_terminal(&user_id, &conv_id, &turn_id, &timeout_outcome)
-                                .await?;
-                            if result == TerminalReconcileResult::CommittedNew {
-                                reconciled_outcomes.push(RecoveredTerminalOutcome {
-                                    user_id: user_id.clone(),
-                                    conversation_id: conv_id.clone(),
-                                    turn_id: turn_id.clone(),
-                                    status: TurnTerminalStatus::Timeout,
-                                    finished_at_ms: options.now_ms,
-                                });
-                            }
+                        // Use shared reconcile_terminal with per-turn lock, PreExecution verification, and sync_all
+                        let result = journal
+                            .reconcile_terminal(&user_id, &conv_id, &turn_id, &timeout_outcome)
+                            .await?;
+                        if result == TerminalReconcileResult::CommittedNew {
+                            reconciled_outcomes.push(RecoveredTerminalOutcome {
+                                user_id: user_id.clone(),
+                                conversation_id: conv_id.clone(),
+                                turn_id: turn_id.clone(),
+                                status: TurnTerminalStatus::Timeout,
+                                finished_at_ms: options.now_ms,
+                            });
                         }
                     }
                 }

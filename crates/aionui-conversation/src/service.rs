@@ -1005,7 +1005,7 @@ impl ConversationService {
         Ok(result)
     }
 
-    async fn notify_new_terminal_outcome(
+    pub(crate) async fn notify_new_terminal_outcome(
         &self,
         user_id: &str,
         conversation_id: &str,

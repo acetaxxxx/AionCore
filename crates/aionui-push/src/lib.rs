@@ -144,10 +144,7 @@ mod testing {
 
     #[async_trait::async_trait]
     impl IPushSubscriptionRepository for InMemoryPushSubscriptionRepository {
-        async fn upsert(
-            &self,
-            params: UpsertPushSubscriptionParams,
-        ) -> Result<PushSubscriptionRecord, DbError> {
+        async fn upsert(&self, params: UpsertPushSubscriptionParams) -> Result<PushSubscriptionRecord, DbError> {
             let mut records = self
                 .records
                 .lock()
@@ -193,10 +190,7 @@ mod testing {
                 .records
                 .lock()
                 .expect("in-memory push repository lock should not be poisoned");
-            if records
-                .get(endpoint)
-                .is_some_and(|record| record.user_id == user_id)
-            {
+            if records.get(endpoint).is_some_and(|record| record.user_id == user_id) {
                 records.remove(endpoint);
                 return Ok(());
             }
@@ -221,15 +215,11 @@ mod terminal_delivery_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use base64::Engine;
-    use aionui_common::{
-        OnConversationTurnTerminal, TerminalNoticeStatus, TerminalTargetKind, TurnTerminalNotice,
-    };
+    use aionui_common::{OnConversationTurnTerminal, TerminalNoticeStatus, TerminalTargetKind, TurnTerminalNotice};
     use aionui_db::PushSubscriptionRecord;
+    use base64::Engine;
 
-    use super::{
-        PushDeliveryService, PushPayload, PushSendError, PushSender, build_terminal_payload,
-    };
+    use super::{PushDeliveryService, PushPayload, PushSendError, PushSender, build_terminal_payload};
     use crate::testing::InMemoryPushSubscriptionRepository;
 
     fn key_material(length: usize, value: u8) -> String {
@@ -352,7 +342,9 @@ mod terminal_delivery_tests {
                 .expect("subscription");
         }
 
-        service.deliver_terminal_notice(notice(TerminalNoticeStatus::Failed)).await;
+        service
+            .deliver_terminal_notice(notice(TerminalNoticeStatus::Failed))
+            .await;
 
         assert_eq!(sender.payloads.lock().expect("sender lock").len(), 1);
     }
@@ -382,9 +374,14 @@ mod terminal_delivery_tests {
                 .expect("subscription");
         }
 
-        service.deliver_terminal_notice(notice(TerminalNoticeStatus::Timeout)).await;
+        service
+            .deliver_terminal_notice(notice(TerminalNoticeStatus::Timeout))
+            .await;
 
-        assert_eq!(repository.endpoints_for_user("user-a").await, vec!["https://push.example/b"]);
+        assert_eq!(
+            repository.endpoints_for_user("user-a").await,
+            vec!["https://push.example/b"]
+        );
     }
 
     #[test]
@@ -410,7 +407,9 @@ mod terminal_delivery_tests {
         let service = PushDeliveryService::new(repository.clone());
 
         assert!(!service.is_enabled());
-        service.deliver_terminal_notice(notice(TerminalNoticeStatus::Success)).await;
+        service
+            .deliver_terminal_notice(notice(TerminalNoticeStatus::Success))
+            .await;
         assert_eq!(repository.count_for_user("user-a").await, 0);
     }
 }

@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
@@ -15,7 +17,10 @@ pub fn push_routes(state: PushRouterState) -> Router {
     Router::new()
         .route("/api/push/config", get(config))
         .route("/api/push/subscription", put(upsert_subscription))
-        .route("/api/push/subscription/{id}", axum::routing::delete(delete_subscription))
+        .route(
+            "/api/push/subscription/{id}",
+            axum::routing::delete(delete_subscription),
+        )
         .with_state(state)
 }
 
