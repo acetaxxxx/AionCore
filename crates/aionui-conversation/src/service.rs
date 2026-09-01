@@ -1013,7 +1013,13 @@ impl ConversationService {
         status: crate::turn_journal::TurnTerminalStatus,
         finished_at_ms: u64,
     ) {
-        let Some(row) = self.conversation_repo.get(user_id, conversation_id).await.ok().flatten() else {
+        let Some(row) = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await
+            .ok()
+            .flatten()
+        else {
             tracing::warn!(
                 turn_id,
                 "terminal outcome committed but notification target could not be resolved"
@@ -1032,9 +1038,11 @@ impl ConversationService {
             terminal_notice_status(status),
             finished_at_ms,
         )
-        .ok()
-        else {
-            tracing::warn!(turn_id, "terminal outcome committed but notification target was invalid");
+        .ok() else {
+            tracing::warn!(
+                turn_id,
+                "terminal outcome committed but notification target was invalid"
+            );
             return;
         };
         self.notify_turn_terminal(notice).await;
@@ -4618,7 +4626,10 @@ impl ConversationService {
                     })),
                     finished_at_ms: journal_now_ms(),
                 };
-                if let Err(je) = self.reconcile_terminal_and_notify(user_id, conversation_id, &turn_id, &failure_outcome).await {
+                if let Err(je) = self
+                    .reconcile_terminal_and_notify(user_id, conversation_id, &turn_id, &failure_outcome)
+                    .await
+                {
                     error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on build failure; turn remains open for startup recovery reconciliation");
                 }
                 self.persist_and_broadcast_send_failure_tip(
@@ -4783,7 +4794,12 @@ impl ConversationService {
                     finished_at_ms: journal_now_ms(),
                 };
                 if let Err(je) = self
-                    .reconcile_terminal_and_notify(&request.user_id, &request.conversation_id, &turn_id, &failure_outcome)
+                    .reconcile_terminal_and_notify(
+                        &request.user_id,
+                        &request.conversation_id,
+                        &turn_id,
+                        &failure_outcome,
+                    )
                     .await
                 {
                     error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on agent turn build failure; turn remains open for startup recovery reconciliation");

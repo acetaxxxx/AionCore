@@ -1082,6 +1082,7 @@ pub(crate) struct RecoveredTerminalOutcome {
 ///
 /// Uses the provided shared [`TurnJournal`] instance to guarantee per-turn locking, payload validation,
 /// path jail checks, and durable `sync_all` writes without bypassing safety invariants.
+#[cfg(test)]
 pub(crate) async fn internal_startup_recovery(
     journal: &dyn TurnJournal,
     base_dir: &Path,
