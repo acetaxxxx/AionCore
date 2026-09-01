@@ -51,8 +51,8 @@ pub use service::{
 pub use state::ConversationRouterState;
 pub use turn_journal::{
     AttemptSummary, FilesystemTurnJournal, InMemoryTurnJournal, JournalError, PreTurnRecord, RawJournalEvent,
-    StartupRecoveryOptions, TerminalOutcomeRecord, TokenUsageRecord, TurnJournal, TurnTerminalStatus,
-    validate_identifier,
+    StartupRecoveryOptions, TerminalOutcomeRecord, TerminalReconcileResult, TokenUsageRecord, TurnJournal,
+    TurnTerminalStatus, validate_identifier,
 };
 
 #[cfg(test)]

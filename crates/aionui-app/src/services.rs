@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
 use aionui_ai_agent::{
@@ -20,6 +21,7 @@ use aionui_db::{
     SqliteUserRepository,
 };
 use aionui_project::ProjectService;
+use aionui_push::{DisabledPushSender, PushDeliveryService, PushSender, WebPushSender};
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_session_message::QueueClearingCancelHook;
 use aionui_session_message::queue::{DeliveryQueue, SystemClock};
@@ -57,6 +59,13 @@ pub struct AppServices {
     /// delete hook (path-1 cascade), the team service (path-2 cascade), and the
     /// sidebar read state. Cheap to clone (Arc). See sidebar design §4.
     pub user_order_store: Arc<dyn IUserOrderStore>,
+    /// Browser push subscription service. Construction stays in AppServices;
+    /// router states only receive the narrow capability handle.
+    pub push_service: Arc<PushDeliveryService>,
+    /// Public half of the deployment VAPID configuration. The private key is
+    /// held only by the sender adapter and is never exposed through app or DB
+    /// state.
+    pub push_public_vapid_key: Option<String>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -250,6 +259,22 @@ impl AppServices {
         }
 
         let encryption_key = derive_encryption_key(&encryption_secret);
+        let configured_push_sender = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok()
+            .and_then(WebPushSender::from_env);
+        let push_public_vapid_key = configured_push_sender.as_ref().map(WebPushSender::public_key);
+        let push_sender: Arc<dyn PushSender> = configured_push_sender
+            .map(|sender| Arc::new(sender) as Arc<dyn PushSender>)
+            .unwrap_or_else(|| Arc::new(DisabledPushSender));
+        let push_service = Arc::new(
+            PushDeliveryService::new(Arc::new(aionui_db::SqlitePushSubscriptionRepository::new(
+                database.pool().clone(),
+                encryption_key,
+            )))
+            .with_sender(push_sender),
+        );
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
@@ -398,6 +423,7 @@ impl AppServices {
         // crate (see `OnConversationTurnCancelled`).
         conversation_service
             .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(session_message_queue.clone())));
+        conversation_service.with_turn_terminal_hook(push_service.clone());
 
         Ok(Self {
             database,
@@ -418,6 +444,8 @@ impl AppServices {
             session_message_notify,
             project_service,
             user_order_store,
+            push_service,
+            push_public_vapid_key,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,

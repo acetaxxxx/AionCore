@@ -9732,8 +9732,8 @@ mod session_mentions_integration {
             _conversation_id: &str,
             _turn_id: &str,
             _outcome: &crate::turn_journal::TerminalOutcomeRecord<'_>,
-        ) -> Result<(), crate::turn_journal::JournalError> {
-            Ok(())
+        ) -> Result<crate::turn_journal::TerminalReconcileResult, crate::turn_journal::JournalError> {
+            Ok(crate::turn_journal::TerminalReconcileResult::CommittedNew)
         }
     }
 
@@ -9836,6 +9836,54 @@ mod session_mentions_integration {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_notifies_terminal_hook_once_after_durable_reconciliation() {
+        use aionui_common::{OnConversationTurnTerminal, TerminalNoticeStatus, TurnTerminalNotice};
+
+        struct RecordingTerminalHook(Mutex<Vec<TurnTerminalNotice>>);
+
+        #[async_trait::async_trait]
+        impl OnConversationTurnTerminal for RecordingTerminalHook {
+            async fn on_turn_terminal(&self, notice: TurnTerminalNotice) {
+                self.0.lock().unwrap().push(notice);
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(crate::turn_journal::FilesystemTurnJournal::new(temp.path()));
+        let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+        let svc = svc
+            .with_turn_journal(journal.clone())
+            .with_journal_data_dir(temp.path());
+        let hook = Arc::new(RecordingTerminalHook(Mutex::new(Vec::new())));
+        svc.with_turn_terminal_hook(hook.clone());
+
+        let conversation = svc.create("user_1", make_create_req()).await.unwrap();
+        journal
+            .capture_pre_turn(&crate::turn_journal::PreTurnRecord {
+                user_id: "user_1",
+                conversation_id: &conversation.id,
+                turn_id: "turn_recovered_push",
+                parent_turn_id: None,
+                user_message: "Stale question",
+                workspace: None,
+                created_at_ms: 10_000,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(svc.recover_raw_event_journals_on_startup(5_000).await, 1);
+        let notices = hook.0.lock().unwrap().clone();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].user_id, "user_1");
+        assert_eq!(notices[0].target_id, conversation.id);
+        assert_eq!(notices[0].turn_id, "turn_recovered_push");
+        assert_eq!(notices[0].status, TerminalNoticeStatus::Timeout);
+
+        assert_eq!(svc.recover_raw_event_journals_on_startup(5_000).await, 0);
+        assert_eq!(hook.0.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

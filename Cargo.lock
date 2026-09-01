@@ -415,6 +415,7 @@ dependencies = [
  "aionui-office",
  "aionui-process",
  "aionui-project",
+ "aionui-push",
  "aionui-realtime",
  "aionui-runtime",
  "aionui-session",
@@ -642,8 +643,10 @@ dependencies = [
  "aionui-common",
  "async-trait",
  "fs2",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
@@ -815,6 +818,31 @@ dependencies = [
  "tower",
  "tracing",
  "trash",
+ "url",
+]
+
+[[package]]
+name = "aionui-push"
+version = "0.1.72"
+dependencies = [
+ "aes-gcm",
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "async-trait",
+ "axum",
+ "base64",
+ "getrandom 0.2.17",
+ "hkdf",
+ "p256",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "url",
 ]
 
@@ -2606,6 +2634,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "hkdf",
  "pkcs8 0.9.0",
  "rand_core 0.6.4",
  "sec1",

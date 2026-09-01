@@ -486,8 +486,7 @@ impl ConversationTurnOrchestrator {
             };
             if let Err(je) = self
                 .service
-                .turn_journal()
-                .reconcile_terminal(&input.user_id, &conv_id, &turn_id, &cancel_outcome)
+                .reconcile_terminal_and_notify(&input.user_id, &conv_id, &turn_id, &cancel_outcome)
                 .await
             {
                 error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome on deferred cancel; turn remains open for startup recovery reconciliation");
@@ -777,11 +776,10 @@ impl ConversationTurnOrchestrator {
         };
         let journal_reconciled = match self
             .service
-            .turn_journal()
-            .reconcile_terminal(&input.user_id, &conv_id, &turn_id, &final_outcome)
+            .reconcile_terminal_and_notify(&input.user_id, &conv_id, &turn_id, &final_outcome)
             .await
         {
-            Ok(()) => true,
+            Ok(_) => true,
             Err(je) => {
                 error!(turn_id = %turn_id, error = %ErrorChain(&je), "Failed to reconcile terminal outcome in turn journal; turn remains open for startup recovery reconciliation");
                 false
