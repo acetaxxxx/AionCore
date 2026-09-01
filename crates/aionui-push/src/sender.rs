@@ -9,6 +9,7 @@ use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
 use reqwest::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue};
 use serde_json::json;
@@ -129,7 +130,7 @@ impl WebPushSender {
         );
         let signing_input = format!("{header}.{claims}");
         let signature: Signature = self.signing_key.sign(signing_input.as_bytes());
-        let jwt = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()));
+        let jwt = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.as_bytes()));
         HeaderValue::from_str(&format!("vapid t={jwt}, k={}", URL_SAFE_NO_PAD.encode(self.public_key)))
             .map_err(|_| PushSendError::Unavailable)
     }
@@ -143,7 +144,7 @@ impl WebPushSender {
         let auth_secret = decode_exact(&subscription.auth, 16)?;
         let ua_key = PublicKey::from_sec1_bytes(&ua_public).map_err(|_| PushSendError::Rejected)?;
         let ephemeral_secret = SecretKey::random(&mut OsRng);
-        let ephemeral_public = PublicKey::from(&ephemeral_secret);
+        let ephemeral_public = ephemeral_secret.public_key();
         let ephemeral_public_bytes = ephemeral_public.to_encoded_point(false);
         let shared = diffie_hellman(ephemeral_secret.to_nonzero_scalar(), ua_key.as_affine());
 
@@ -153,7 +154,7 @@ impl WebPushSender {
         let auth_prk = hkdf::Hkdf::<Sha256>::new(Some(&auth_secret), shared.raw_secret_bytes());
         let mut ikm = [0u8; 32];
         auth_prk
-            .expand(&[&key_info], &mut ikm)
+            .expand(&key_info, &mut ikm)
             .map_err(|_| PushSendError::Rejected)?;
 
         let mut salt = [0u8; 16];
@@ -162,10 +163,10 @@ impl WebPushSender {
         let mut cek = [0u8; 16];
         let mut nonce = [0u8; 12];
         content_prk
-            .expand(&[b"Content-Encoding: aes128gcm\0"], &mut cek)
+            .expand(b"Content-Encoding: aes128gcm\0", &mut cek)
             .map_err(|_| PushSendError::Rejected)?;
         content_prk
-            .expand(&[b"Content-Encoding: nonce\0"], &mut nonce)
+            .expand(b"Content-Encoding: nonce\0", &mut nonce)
             .map_err(|_| PushSendError::Rejected)?;
 
         let mut plaintext = serde_json::to_vec(payload).map_err(|_| PushSendError::Rejected)?;
