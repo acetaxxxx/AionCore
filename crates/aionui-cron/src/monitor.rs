@@ -27,9 +27,7 @@ use tokio::sync::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::scheduler::{
-    compute_cron_next_run, normalize_cron_expr, validate_cron_expression, validate_timezone,
-};
+use crate::scheduler::{compute_cron_next_run, normalize_cron_expr, validate_cron_expression, validate_timezone};
 use crate::types::CronSchedule;
 
 // ---------------------------------------------------------------------------
@@ -547,8 +545,12 @@ impl MonitorScanResult {
     }
 
     pub fn multi_target(target_results: Vec<TargetScanResult>) -> Self {
-        let any_failed = target_results.iter().any(|r| r.outcome != MonitorRunOutcome::Success || r.is_untrusted_structure);
-        let all_failed = target_results.iter().all(|r| r.outcome != MonitorRunOutcome::Success || r.is_untrusted_structure);
+        let any_failed = target_results
+            .iter()
+            .any(|r| r.outcome != MonitorRunOutcome::Success || r.is_untrusted_structure);
+        let all_failed = target_results
+            .iter()
+            .all(|r| r.outcome != MonitorRunOutcome::Success || r.is_untrusted_structure);
         let outcome = if all_failed {
             MonitorRunOutcome::Failed
         } else if any_failed {
@@ -730,8 +732,10 @@ pub trait MonitorRunner: Send + Sync {
 #[async_trait::async_trait]
 pub trait IMonitorJobRepository: Send + Sync {
     async fn save(&self, job: &MonitorJob) -> Result<(), MonitorError>;
-    async fn get(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<Option<MonitorJob>, MonitorError>;
-    async fn list_by_conversation(&self, user_id: &str, conversation_id: &str) -> Result<Vec<MonitorJob>, MonitorError>;
+    async fn get(&self, user_id: &str, conversation_id: &str, job_id: &str)
+    -> Result<Option<MonitorJob>, MonitorError>;
+    async fn list_by_conversation(&self, user_id: &str, conversation_id: &str)
+    -> Result<Vec<MonitorJob>, MonitorError>;
     async fn delete(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<bool, MonitorError>;
     async fn get_run_report(
         &self,
@@ -800,7 +804,12 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         Ok(())
     }
 
-    async fn get(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<Option<MonitorJob>, MonitorError> {
+    async fn get(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+    ) -> Result<Option<MonitorJob>, MonitorError> {
         let guard = self.jobs.read().await;
         if let Some(job) = guard.get(job_id) {
             if job.user_id == user_id && job.conversation_id == conversation_id {
@@ -810,7 +819,11 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         Ok(None)
     }
 
-    async fn list_by_conversation(&self, user_id: &str, conversation_id: &str) -> Result<Vec<MonitorJob>, MonitorError> {
+    async fn list_by_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<MonitorJob>, MonitorError> {
         let guard = self.jobs.read().await;
         let mut matching: Vec<MonitorJob> = guard
             .values()
@@ -875,7 +888,13 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
 
         let mut cursors_guard = self.cursors.write().await;
         for c in cursors {
-            let ckey = cursor_key(&job.user_id, &job.conversation_id, &c.job_id, &c.target_id, c.query_revision);
+            let ckey = cursor_key(
+                &job.user_id,
+                &job.conversation_id,
+                &c.job_id,
+                &c.target_id,
+                c.query_revision,
+            );
             cursors_guard.insert(ckey, c.clone());
         }
 
@@ -920,7 +939,13 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         conversation_id: &str,
         cursor: &MonitorCursor,
     ) -> Result<(), MonitorError> {
-        let key = cursor_key(user_id, conversation_id, &cursor.job_id, &cursor.target_id, cursor.query_revision);
+        let key = cursor_key(
+            user_id,
+            conversation_id,
+            &cursor.job_id,
+            &cursor.target_id,
+            cursor.query_revision,
+        );
         let mut guard = self.cursors.write().await;
         guard.insert(key, cursor.clone());
         Ok(())
@@ -1289,9 +1314,7 @@ impl MonitorControlService {
 
         if let Some(mut prof) = self.repo.find_profile_by_id(profile_id).await? {
             if prof.user_id != user_id {
-                return Err(MonitorError::AccessDenied(
-                    "Profile belongs to another user".into(),
-                ));
+                return Err(MonitorError::AccessDenied("Profile belongs to another user".into()));
             }
             prof.auth_state = ProfileAuthState::Authenticated;
             prof.updated_at_ms = now_ms;
@@ -1304,9 +1327,7 @@ impl MonitorControlService {
         let mut resumed_jobs = Vec::new();
 
         for mut job in jobs {
-            if job.profile_ref.as_deref() == Some(profile_id)
-                && job.status == MonitorJobStatus::Paused
-            {
+            if job.profile_ref.as_deref() == Some(profile_id) && job.status == MonitorJobStatus::Paused {
                 let is_auth_paused = matches!(
                     job.stop_reason,
                     Some(MonitorStopReason::AuthExpired)
@@ -1318,11 +1339,7 @@ impl MonitorControlService {
                     job.status = MonitorJobStatus::Active;
                     job.stop_reason = None;
                     job.updated_at_ms = now_ms;
-                    job.next_execution_at_ms = compute_next_run_after_occurrence(
-                        &job.schedule,
-                        now_ms,
-                        now_ms,
-                    );
+                    job.next_execution_at_ms = compute_next_run_after_occurrence(&job.schedule, now_ms, now_ms);
                     self.repo.save(&job).await?;
                     resumed_jobs.push(job);
                 }
@@ -1442,11 +1459,7 @@ impl MonitorControlService {
     }
 
     /// List all monitor jobs bound to the originating conversation.
-    pub async fn list_jobs(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-    ) -> Result<Vec<MonitorJob>, MonitorError> {
+    pub async fn list_jobs(&self, user_id: &str, conversation_id: &str) -> Result<Vec<MonitorJob>, MonitorError> {
         Self::validate_ownership_scope(user_id, conversation_id)?;
         self.repo.list_by_conversation(user_id, conversation_id).await
     }
@@ -1489,11 +1502,10 @@ impl MonitorControlService {
                 ))
             })?;
 
-        let item = cursor.items.get_mut(observation_id).ok_or_else(|| {
-            MonitorError::NotFound(format!(
-                "Observation {observation_id} not found in cursor"
-            ))
-        })?;
+        let item = cursor
+            .items
+            .get_mut(observation_id)
+            .ok_or_else(|| MonitorError::NotFound(format!("Observation {observation_id} not found in cursor")))?;
 
         item.acknowledged_at_ms = Some(ack_time_ms);
         let updated = item.clone();
@@ -1616,7 +1628,9 @@ impl MonitorControlService {
                     // Untrusted DOM structure or unknown layout fails closed: never advances cursor
                     failed_targets.push(TargetFailure {
                         target_id: tid.clone(),
-                        reason: tr.error_message.unwrap_or("Untrusted DOM structure / changed layout".into()),
+                        reason: tr
+                            .error_message
+                            .unwrap_or("Untrusted DOM structure / changed layout".into()),
                     });
                 }
                 Some(tr) if tr.outcome == MonitorRunOutcome::Success => {
@@ -1728,7 +1742,9 @@ impl MonitorControlService {
                 }
                 Some(tr) => {
                     // Target failed or unavailable: preserves existing cursor, does not advance
-                    let reason = tr.error_message.unwrap_or_else(|| format!("Target scan returned {:?}", tr.outcome));
+                    let reason = tr
+                        .error_message
+                        .unwrap_or_else(|| format!("Target scan returned {:?}", tr.outcome));
                     failed_targets.push(TargetFailure {
                         target_id: tid.clone(),
                         reason,
@@ -1747,7 +1763,10 @@ impl MonitorControlService {
         let aggregate_outcome = if scan.outcome == MonitorRunOutcome::AuthExpired {
             MonitorRunOutcome::AuthExpired
         } else if successful_targets.is_empty() {
-            if failed_targets.iter().all(|f| f.reason.to_lowercase().contains("unavailable")) {
+            if failed_targets
+                .iter()
+                .all(|f| f.reason.to_lowercase().contains("unavailable"))
+            {
                 MonitorRunOutcome::Unavailable
             } else {
                 MonitorRunOutcome::Failed
@@ -1822,17 +1841,12 @@ impl MonitorControlService {
                 }
             }
         } else {
-            job.next_execution_at_ms = compute_next_run_after_occurrence(
-                &job.schedule,
-                scheduled_at_ms,
-                scheduled_at_ms,
-            );
+            job.next_execution_at_ms =
+                compute_next_run_after_occurrence(&job.schedule, scheduled_at_ms, scheduled_at_ms);
         }
 
         // Durable atomic save
-        self.repo
-            .save_run_completion(&report, &job, &updated_cursors)
-            .await
+        self.repo.save_run_completion(&report, &job, &updated_cursors).await
     }
 
     /// List reports for a job in its originating conversation scope.
@@ -1878,11 +1892,7 @@ impl MonitorControlService {
 // Schedule helper
 // ---------------------------------------------------------------------------
 
-fn compute_next_run_after_occurrence(
-    schedule: &CronSchedule,
-    scheduled_at_ms: u64,
-    now_ms: u64,
-) -> Option<u64> {
+fn compute_next_run_after_occurrence(schedule: &CronSchedule, scheduled_at_ms: u64, now_ms: u64) -> Option<u64> {
     match schedule {
         CronSchedule::At { at_ms, .. } => {
             let at_u64 = *at_ms as u64;

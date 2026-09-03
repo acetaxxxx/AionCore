@@ -14,20 +14,17 @@
 use std::sync::Arc;
 
 use aionui_cron::facebook_adapter::{
-    compute_normalized_content_hash, FacebookBrowserCapabilityAdapter, IFacebookBrowserDriver,
-    IFacebookBrowserSession, RawPostData, RawTargetScanOutcome,
+    FacebookBrowserCapabilityAdapter, IFacebookBrowserDriver, IFacebookBrowserSession, RawPostData,
+    RawTargetScanOutcome, compute_normalized_content_hash,
 };
 use aionui_cron::monitor::{
-    CreateMonitorJobOutcome, CreateMonitorJobRequest, CursorItemState, FacebookObservation,
-    FacebookProfile, FacebookTarget, IMonitorJobRepository, InMemoryMonitorJobRepository,
-    LookbackScope, MonitorControlService, MonitorCursor, MonitorError, MonitorJob,
-    MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunReport, MonitorRunner,
-    MonitorScanResult, MonitorStopReason, ObservationDeltaKind, ProfileAuthState,
-    ReportedObservation, TargetFailure, TargetScanResult, propose_default_schedule,
-    validate_schedule,
+    CreateMonitorJobOutcome, CreateMonitorJobRequest, CursorItemState, FacebookObservation, FacebookProfile,
+    FacebookTarget, IMonitorJobRepository, InMemoryMonitorJobRepository, LookbackScope, MonitorControlService,
+    MonitorCursor, MonitorError, MonitorJob, MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunReport,
+    MonitorRunner, MonitorScanResult, MonitorStopReason, ObservationDeltaKind, ProfileAuthState, ReportedObservation,
+    TargetFailure, TargetScanResult, propose_default_schedule, validate_schedule,
 };
 use aionui_cron::types::CronSchedule;
-
 
 struct FakeMonitorRunner;
 
@@ -66,11 +63,20 @@ impl IMonitorJobRepository for FailingCompletionRepository {
         self.inner.save(job).await
     }
 
-    async fn get(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<Option<MonitorJob>, MonitorError> {
+    async fn get(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+    ) -> Result<Option<MonitorJob>, MonitorError> {
         self.inner.get(user_id, conversation_id, job_id).await
     }
 
-    async fn list_by_conversation(&self, user_id: &str, conversation_id: &str) -> Result<Vec<MonitorJob>, MonitorError> {
+    async fn list_by_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<MonitorJob>, MonitorError> {
         self.inner.list_by_conversation(user_id, conversation_id).await
     }
 
@@ -78,8 +84,16 @@ impl IMonitorJobRepository for FailingCompletionRepository {
         self.inner.delete(user_id, conversation_id, job_id).await
     }
 
-    async fn get_run_report(&self, user_id: &str, conversation_id: &str, job_id: &str, scheduled_at_ms: u64) -> Result<Option<MonitorRunReport>, MonitorError> {
-        self.inner.get_run_report(user_id, conversation_id, job_id, scheduled_at_ms).await
+    async fn get_run_report(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        scheduled_at_ms: u64,
+    ) -> Result<Option<MonitorRunReport>, MonitorError> {
+        self.inner
+            .get_run_report(user_id, conversation_id, job_id, scheduled_at_ms)
+            .await
     }
 
     async fn save_run_report(&self, report: &MonitorRunReport) -> Result<(), MonitorError> {
@@ -95,8 +109,12 @@ impl IMonitorJobRepository for FailingCompletionRepository {
         Err(MonitorError::Repository("transaction unavailable".into()))
     }
 
-
-    async fn list_run_reports(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<Vec<MonitorRunReport>, MonitorError> {
+    async fn list_run_reports(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+    ) -> Result<Vec<MonitorRunReport>, MonitorError> {
         self.inner.list_run_reports(user_id, conversation_id, job_id).await
     }
 
@@ -108,7 +126,9 @@ impl IMonitorJobRepository for FailingCompletionRepository {
         target_id: &str,
         query_revision: u64,
     ) -> Result<Option<MonitorCursor>, MonitorError> {
-        self.inner.get_cursor(user_id, conversation_id, job_id, target_id, query_revision).await
+        self.inner
+            .get_cursor(user_id, conversation_id, job_id, target_id, query_revision)
+            .await
     }
 
     async fn save_cursor(
@@ -132,8 +152,6 @@ impl IMonitorJobRepository for FailingCompletionRepository {
         self.inner.find_profile_by_id(profile_id).await
     }
 }
-
-
 
 fn valid_target(id: &str, name: &str) -> FacebookTarget {
     FacebookTarget::new(id).with_display_name(name)
@@ -201,37 +219,25 @@ async fn test_incomplete_scope_is_rejected_without_creating_job() {
     // 1. Missing targets
     let mut req = valid_request(None);
     req.targets = vec![];
-    let err = svc
-        .create_job("user_hank", "conv_1", req, 1000)
-        .await
-        .unwrap_err();
+    let err = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap_err();
     assert!(matches!(err, MonitorError::IncompleteScope(_)));
 
     // 2. Target with whitespace-only id
     let mut req = valid_request(None);
     req.targets = vec![FacebookTarget::new("  \t ")];
-    let err = svc
-        .create_job("user_hank", "conv_1", req, 1000)
-        .await
-        .unwrap_err();
+    let err = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap_err();
     assert!(matches!(err, MonitorError::InvalidTargetScope(_)));
 
     // 3. Blank query
     let mut req = valid_request(None);
     req.query = MonitorQuery::new("   \n ");
-    let err = svc
-        .create_job("user_hank", "conv_1", req, 1000)
-        .await
-        .unwrap_err();
+    let err = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap_err();
     assert!(matches!(err, MonitorError::InvalidQueryScope(_)));
 
     // 4. Zero lookback duration
     let mut req = valid_request(None);
     req.lookback = LookbackScope::from_millis(0);
-    let err = svc
-        .create_job("user_hank", "conv_1", req, 1000)
-        .await
-        .unwrap_err();
+    let err = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap_err();
     assert!(matches!(err, MonitorError::InvalidLookbackScope(_)));
 
     // Verify no jobs exist
@@ -285,9 +291,28 @@ async fn test_invalid_schedule_scope_rejected() {
     assert!(matches!(err, MonitorError::InvalidScheduleScope(_)));
 
     // Direct validate_schedule helper tests
-    assert!(validate_schedule(&CronSchedule::Every { every_ms: 60000, description: None }).is_ok());
-    assert!(validate_schedule(&CronSchedule::Cron { expr: "0 */5 * * * *".into(), tz: Some("Asia/Taipei".into()), description: None }).is_ok());
-    assert!(validate_schedule(&CronSchedule::Every { every_ms: -1, description: None }).is_err());
+    assert!(
+        validate_schedule(&CronSchedule::Every {
+            every_ms: 60000,
+            description: None
+        })
+        .is_ok()
+    );
+    assert!(
+        validate_schedule(&CronSchedule::Cron {
+            expr: "0 */5 * * * *".into(),
+            tz: Some("Asia/Taipei".into()),
+            description: None
+        })
+        .is_ok()
+    );
+    assert!(
+        validate_schedule(&CronSchedule::Every {
+            every_ms: -1,
+            description: None
+        })
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -315,16 +340,25 @@ async fn test_blank_user_or_conversation_rejected_fail_closed() {
     assert!(matches!(err, MonitorError::IncompleteScope(_)));
 
     // Blank identifiers on pause/resume/cancel
-    let err = svc.pause_job("", "conv_1", "job_1", MonitorStopReason::ExplicitUserPause, 1000).await.unwrap_err();
+    let err = svc
+        .pause_job("", "conv_1", "job_1", MonitorStopReason::ExplicitUserPause, 1000)
+        .await
+        .unwrap_err();
     assert!(matches!(err, MonitorError::IncompleteScope(_)));
 
     let err = svc.resume_job("user_1", "", "job_1", 1000).await.unwrap_err();
     assert!(matches!(err, MonitorError::IncompleteScope(_)));
 
-    let err = svc.cancel_job("   ", "   ", "job_1", MonitorStopReason::ExplicitUserCancellation, 1000).await.unwrap_err();
+    let err = svc
+        .cancel_job("   ", "   ", "job_1", MonitorStopReason::ExplicitUserCancellation, 1000)
+        .await
+        .unwrap_err();
     assert!(matches!(err, MonitorError::IncompleteScope(_)));
 
-    let err = svc.on_conversation_ended("", "conv_1", MonitorStopReason::ConversationClosed, 1000).await.unwrap_err();
+    let err = svc
+        .on_conversation_ended("", "conv_1", MonitorStopReason::ConversationClosed, 1000)
+        .await
+        .unwrap_err();
     assert!(matches!(err, MonitorError::IncompleteScope(_)));
 }
 
@@ -402,8 +436,7 @@ fn test_monitor_payload_serde_uses_existing_cron_schedule_contract() {
     let encoded = serde_json::to_value(&request).expect("request should serialize");
     assert_eq!(encoded["schedule"]["kind"], "cron");
     assert_eq!(encoded["schedule"]["expr"], "0 30 9 * * MON-FRI");
-    let decoded: CreateMonitorJobRequest =
-        serde_json::from_value(encoded).expect("request should deserialize");
+    let decoded: CreateMonitorJobRequest = serde_json::from_value(encoded).expect("request should deserialize");
     assert_eq!(decoded.schedule, Some(schedule));
 
     let outcome = CreateMonitorJobOutcome::Active {
@@ -427,8 +460,7 @@ fn test_monitor_payload_serde_uses_existing_cron_schedule_contract() {
     let encoded = serde_json::to_value(&outcome).expect("outcome should serialize");
     assert_eq!(encoded["type"], "active");
     assert_eq!(encoded["job"]["schedule"]["kind"], "cron");
-    let decoded: CreateMonitorJobOutcome =
-        serde_json::from_value(encoded).expect("outcome should deserialize");
+    let decoded: CreateMonitorJobOutcome = serde_json::from_value(encoded).expect("outcome should deserialize");
     assert_eq!(decoded, outcome);
 }
 
@@ -458,10 +490,7 @@ async fn test_lifecycle_pause_resume_cancel_controls() {
         .await
         .expect("pause should succeed");
     assert_eq!(paused.status, MonitorJobStatus::Paused);
-    assert_eq!(
-        paused.stop_reason,
-        Some(MonitorStopReason::CheckpointDetected)
-    );
+    assert_eq!(paused.stop_reason, Some(MonitorStopReason::CheckpointDetected));
     assert!(paused.next_execution_at_ms.is_none());
 
     // 2. Resume after resolution
@@ -485,17 +514,11 @@ async fn test_lifecycle_pause_resume_cancel_controls() {
         .await
         .expect("cancel should succeed");
     assert_eq!(cancelled.status, MonitorJobStatus::Cancelled);
-    assert_eq!(
-        cancelled.stop_reason,
-        Some(MonitorStopReason::ExplicitUserCancellation)
-    );
+    assert_eq!(cancelled.stop_reason, Some(MonitorStopReason::ExplicitUserCancellation));
     assert!(cancelled.next_execution_at_ms.is_none());
 
     // 4. Cannot resume cancelled job
-    let err = svc
-        .resume_job("user_hank", "conv_1", &job_id, 5000)
-        .await
-        .unwrap_err();
+    let err = svc.resume_job("user_hank", "conv_1", &job_id, 5000).await.unwrap_err();
     assert!(matches!(
         err,
         MonitorError::InvalidLifecycleTransition {
@@ -542,7 +565,10 @@ async fn test_scheduled_occurrence_runs_existing_monitor_job_through_runner_seam
         svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner),
         svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner),
     );
-    assert_eq!(first.expect("first concurrent delivery should succeed"), second.expect("second concurrent delivery should succeed"));
+    assert_eq!(
+        first.expect("first concurrent delivery should succeed"),
+        second.expect("second concurrent delivery should succeed")
+    );
     assert_eq!(
         svc.list_run_reports("user_hank", "conv_1", &job_id)
             .await
@@ -653,12 +679,16 @@ async fn test_completion_failure_does_not_expose_partial_report_or_job_state() {
         .await
         .unwrap_err();
     assert!(matches!(err, MonitorError::Repository(_)));
-    assert!(svc
-        .list_run_reports("user_hank", "conv_1", &job_id)
-        .await
-        .unwrap()
-        .is_empty());
-    assert_eq!(svc.get_job("user_hank", "conv_1", &job_id).await.unwrap().last_outcome, None);
+    assert!(
+        svc.list_run_reports("user_hank", "conv_1", &job_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        svc.get_job("user_hank", "conv_1", &job_id).await.unwrap().last_outcome,
+        None
+    );
 }
 
 #[tokio::test]
@@ -669,10 +699,7 @@ async fn test_strict_isolation_across_users_and_conversations() {
         every_ms: 3600000,
         description: Some("hourly".into()),
     }));
-    let outcome = svc
-        .create_job("user_alice", "conv_alice_1", req, 1000)
-        .await
-        .unwrap();
+    let outcome = svc.create_job("user_alice", "conv_alice_1", req, 1000).await.unwrap();
     let job_id = match outcome {
         CreateMonitorJobOutcome::Active { job } => job.id,
         _ => panic!("Expected active job"),
@@ -684,7 +711,13 @@ async fn test_strict_isolation_across_users_and_conversations() {
 
     // User Bob attempts to pause Alice's job -> NotFound
     let err = svc
-        .pause_job("user_bob", "conv_alice_1", &job_id, MonitorStopReason::ExplicitUserPause, 2000)
+        .pause_job(
+            "user_bob",
+            "conv_alice_1",
+            &job_id,
+            MonitorStopReason::ExplicitUserPause,
+            2000,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MonitorError::NotFound(_)));
@@ -742,7 +775,15 @@ async fn test_conversation_lifecycle_termination_ends_monitors() {
     };
 
     // Pause job2 on auth expired
-    svc.pause_job("user_hank", "conv_target", &job2_id, MonitorStopReason::AuthExpired, 1500).await.unwrap();
+    svc.pause_job(
+        "user_hank",
+        "conv_target",
+        &job2_id,
+        MonitorStopReason::AuthExpired,
+        1500,
+    )
+    .await
+    .unwrap();
 
     // Create 1 job in conv_other
     let out3 = svc
@@ -764,12 +805,7 @@ async fn test_conversation_lifecycle_termination_ends_monitors() {
 
     // End conv_target (e.g. ConversationDeleted)
     let cancelled = svc
-        .on_conversation_ended(
-            "user_hank",
-            "conv_target",
-            MonitorStopReason::ConversationDeleted,
-            2000,
-        )
+        .on_conversation_ended("user_hank", "conv_target", MonitorStopReason::ConversationDeleted, 2000)
         .await
         .unwrap();
     assert_eq!(cancelled, 2);
@@ -849,10 +885,7 @@ async fn test_first_successful_observation_reported_as_new_and_recorded_in_curso
     assert_eq!(report.outcome, MonitorRunOutcome::Success);
     assert_eq!(report.observations_count, 1);
     assert_eq!(report.reported_observations.len(), 1);
-    assert_eq!(
-        report.reported_observations[0].delta_kind,
-        ObservationDeltaKind::New
-    );
+    assert_eq!(report.reported_observations[0].delta_kind, ObservationDeltaKind::New);
     assert_eq!(report.reported_observations[0].observation.id, "post_101");
 
     // Check cursor state
@@ -894,23 +927,38 @@ async fn test_normalized_content_change_reported_as_changed_and_unchanged_omitte
     let obs1 = FacebookObservation::new("post_101", "fb_group_react_tw", "hash_alpha");
     let obs2 = FacebookObservation::new("post_102", "fb_group_react_tw", "hash_beta");
     let runner1 = ObservationMonitorRunner::with_observations(vec![obs1.clone(), obs2.clone()]);
-    let report1 = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1).await.unwrap();
+    let report1 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1)
+        .await
+        .unwrap();
     assert_eq!(report1.reported_observations.len(), 2);
 
     // Run 2: post_101 changed to hash_alpha_v2; post_102 unchanged (hash_beta)
     let obs1_changed = FacebookObservation::new("post_101", "fb_group_react_tw", "hash_alpha_v2");
     let runner2 = ObservationMonitorRunner::with_observations(vec![obs1_changed.clone(), obs2.clone()]);
-    let report2 = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2).await.unwrap();
+    let report2 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2)
+        .await
+        .unwrap();
 
     // Only post_101 is reported with Changed; post_102 is unchanged and omitted from report
     assert_eq!(report2.reported_observations.len(), 1);
-    assert_eq!(report2.reported_observations[0].delta_kind, ObservationDeltaKind::Changed);
+    assert_eq!(
+        report2.reported_observations[0].delta_kind,
+        ObservationDeltaKind::Changed
+    );
     assert_eq!(report2.reported_observations[0].observation.id, "post_101");
-    assert_eq!(report2.reported_observations[0].observation.content_hash, "hash_alpha_v2");
+    assert_eq!(
+        report2.reported_observations[0].observation.content_hash,
+        "hash_alpha_v2"
+    );
 
     // Run 3: both post_101 (hash_alpha_v2) and post_102 (hash_beta) unchanged
     let runner3 = ObservationMonitorRunner::with_observations(vec![obs1_changed, obs2]);
-    let report3 = svc.run_occurrence("user_hank", "conv_1", &job_id, 4000, &runner3).await.unwrap();
+    let report3 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 4000, &runner3)
+        .await
+        .unwrap();
 
     // Both are unchanged; report has 0 reported_observations (not emitted again)
     assert!(report3.reported_observations.is_empty());
@@ -931,10 +979,16 @@ async fn test_seen_reported_acknowledged_states_and_unacknowledged_needs_attenti
 
     let obs = FacebookObservation::new("post_201", "fb_group_react_tw", "hash_initial");
     let runner = ObservationMonitorRunner::with_observations(vec![obs.clone()]);
-    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner).await.unwrap();
+    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner)
+        .await
+        .unwrap();
 
     // Initial state: seen, reported, but NOT acknowledged -> is_unread_needs_attention = true
-    let cursor = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
+    let cursor = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap()
+        .unwrap();
     let item = cursor.items.get("post_201").unwrap();
     assert_eq!(item.reported_at_ms, Some(2000));
     assert_eq!(item.acknowledged_at_ms, None);
@@ -943,12 +997,25 @@ async fn test_seen_reported_acknowledged_states_and_unacknowledged_needs_attenti
 
     // Subsequent unchanged run: item is still unread/needs_attention without repeated alerts
     let runner2 = ObservationMonitorRunner::with_observations(vec![obs.clone()]);
-    let report2 = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2).await.unwrap();
-    assert!(report2.reported_observations.is_empty(), "Unchanged item is not repeatedly alerted");
+    let report2 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2)
+        .await
+        .unwrap();
+    assert!(
+        report2.reported_observations.is_empty(),
+        "Unchanged item is not repeatedly alerted"
+    );
 
-    let cursor2 = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
+    let cursor2 = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap()
+        .unwrap();
     let item2 = cursor2.items.get("post_201").unwrap();
-    assert!(item2.is_unread_needs_attention(), "Unacknowledged item retains unread/needs_attention");
+    assert!(
+        item2.is_unread_needs_attention(),
+        "Unacknowledged item retains unread/needs_attention"
+    );
 
     // User explicitly acknowledges the item
     let acked_item = svc
@@ -962,10 +1029,17 @@ async fn test_seen_reported_acknowledged_states_and_unacknowledged_needs_attenti
 
     // After acknowledgement, run 3 with unchanged item maintains acknowledged state
     let runner3 = ObservationMonitorRunner::with_observations(vec![obs]);
-    let report3 = svc.run_occurrence("user_hank", "conv_1", &job_id, 4000, &runner3).await.unwrap();
+    let report3 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 4000, &runner3)
+        .await
+        .unwrap();
     assert!(report3.reported_observations.is_empty());
 
-    let cursor3 = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
+    let cursor3 = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap()
+        .unwrap();
     let item3 = cursor3.items.get("post_201").unwrap();
     assert!(item3.is_acknowledged());
     assert!(!item3.is_unread_needs_attention());
@@ -973,13 +1047,26 @@ async fn test_seen_reported_acknowledged_states_and_unacknowledged_needs_attenti
     // Content change resets acknowledgement: needs attention again
     let obs_edited = FacebookObservation::new("post_201", "fb_group_react_tw", "hash_edited");
     let runner4 = ObservationMonitorRunner::with_observations(vec![obs_edited]);
-    let report4 = svc.run_occurrence("user_hank", "conv_1", &job_id, 5000, &runner4).await.unwrap();
+    let report4 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 5000, &runner4)
+        .await
+        .unwrap();
     assert_eq!(report4.reported_observations.len(), 1);
-    assert_eq!(report4.reported_observations[0].delta_kind, ObservationDeltaKind::Changed);
+    assert_eq!(
+        report4.reported_observations[0].delta_kind,
+        ObservationDeltaKind::Changed
+    );
 
-    let cursor4 = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
+    let cursor4 = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap()
+        .unwrap();
     let item4 = cursor4.items.get("post_201").unwrap();
-    assert!(item4.is_unread_needs_attention(), "Edited content requires attention again");
+    assert!(
+        item4.is_unread_needs_attention(),
+        "Edited content requires attention again"
+    );
     assert!(!item4.is_acknowledged());
 }
 
@@ -999,7 +1086,9 @@ async fn test_cursor_advances_only_on_success_and_preserves_on_failure() {
     // Step 1: Successful initial run with post_1
     let obs1 = FacebookObservation::new("post_1", "fb_group_react_tw", "hash_v1");
     let runner1 = ObservationMonitorRunner::with_observations(vec![obs1]);
-    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1).await.unwrap();
+    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1)
+        .await
+        .unwrap();
 
     let cursor_before = svc
         .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
@@ -1023,7 +1112,11 @@ async fn test_cursor_advances_only_on_success_and_preserves_on_failure() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(cursor_after.last_successful_observed_at_ms, Some(2000), "Cursor should not advance on failed run");
+    assert_eq!(
+        cursor_after.last_successful_observed_at_ms,
+        Some(2000),
+        "Cursor should not advance on failed run"
+    );
     assert_eq!(cursor_after.items.len(), 1);
     assert_eq!(cursor_after.items.get("post_1").unwrap().last_seen_at_ms, 2000);
 
@@ -1036,7 +1129,10 @@ async fn test_cursor_advances_only_on_success_and_preserves_on_failure() {
         every_ms: 3600000,
         description: None,
     }));
-    let out2 = svc_fail_repo.create_job("user_hank", "conv_1", req2, 1000).await.unwrap();
+    let out2 = svc_fail_repo
+        .create_job("user_hank", "conv_1", req2, 1000)
+        .await
+        .unwrap();
     let job2_id = match out2 {
         CreateMonitorJobOutcome::Active { job } => job.id,
         _ => panic!(),
@@ -1044,14 +1140,20 @@ async fn test_cursor_advances_only_on_success_and_preserves_on_failure() {
 
     let obs_new = FacebookObservation::new("post_fail", "fb_group_react_tw", "hash_new");
     let runner_ok = ObservationMonitorRunner::with_observations(vec![obs_new]);
-    let err = svc_fail_repo.run_occurrence("user_hank", "conv_1", &job2_id, 4000, &runner_ok).await.unwrap_err();
+    let err = svc_fail_repo
+        .run_occurrence("user_hank", "conv_1", &job2_id, 4000, &runner_ok)
+        .await
+        .unwrap_err();
     assert!(matches!(err, MonitorError::Repository(_)));
 
     let cursor_fail = svc_fail_repo
         .get_cursor("user_hank", "conv_1", &job2_id, "fb_group_react_tw", 1)
         .await
         .unwrap();
-    assert!(cursor_fail.is_none(), "Cursor must not be persisted when durable report write fails");
+    assert!(
+        cursor_fail.is_none(),
+        "Cursor must not be persisted when durable report write fails"
+    );
 }
 
 #[tokio::test]
@@ -1071,12 +1173,21 @@ async fn test_repeated_scheduled_run_idempotency_with_delta_reporting() {
     let runner = ObservationMonitorRunner::with_observations(vec![obs]);
 
     // First call at 2000 ms
-    let report1 = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner).await.unwrap();
+    let report1 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner)
+        .await
+        .unwrap();
     assert_eq!(report1.reported_observations.len(), 1);
 
     // Repeated call with SAME scheduled_at_ms (2000 ms)
-    let report2 = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner).await.unwrap();
-    assert_eq!(report1, report2, "Repeated delivery must return identical canonical report");
+    let report2 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner)
+        .await
+        .unwrap();
+    assert_eq!(
+        report1, report2,
+        "Repeated delivery must return identical canonical report"
+    );
 
     // All reports for this job list exactly 1 entry
     let all_reports = svc.list_run_reports("user_hank", "conv_1", &job_id).await.unwrap();
@@ -1098,7 +1209,9 @@ async fn test_cursor_isolation_across_users_and_conversations() {
 
     let obs = FacebookObservation::new("post_secret", "fb_group_react_tw", "hash_secret");
     let runner = ObservationMonitorRunner::with_observations(vec![obs]);
-    svc.run_occurrence("user_alice", "conv_alice", &job_id, 2000, &runner).await.unwrap();
+    svc.run_occurrence("user_alice", "conv_alice", &job_id, 2000, &runner)
+        .await
+        .unwrap();
 
     // User Bob cannot read Alice's cursor
     let bob_cursor = svc
@@ -1109,14 +1222,30 @@ async fn test_cursor_isolation_across_users_and_conversations() {
 
     // User Bob cannot acknowledge Alice's cursor observation
     let err = svc
-        .acknowledge_observation("user_bob", "conv_alice", &job_id, "fb_group_react_tw", 1, "post_secret", 2500)
+        .acknowledge_observation(
+            "user_bob",
+            "conv_alice",
+            &job_id,
+            "fb_group_react_tw",
+            1,
+            "post_secret",
+            2500,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MonitorError::NotFound(_)));
 
     // Conversation other cannot read or acknowledge
     let err = svc
-        .acknowledge_observation("user_alice", "conv_other", &job_id, "fb_group_react_tw", 1, "post_secret", 2500)
+        .acknowledge_observation(
+            "user_alice",
+            "conv_other",
+            &job_id,
+            "fb_group_react_tw",
+            1,
+            "post_secret",
+            2500,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MonitorError::NotFound(_)));
@@ -1140,10 +1269,12 @@ async fn test_editing_query_bumps_revision_and_creates_isolated_cursor() {
     };
 
     // Run occurrence 1 under revision 1
-    let obs1 = FacebookObservation::new("post_1", "fb_group_react_tw", "hash_1")
-        .with_published_at(1500);
+    let obs1 = FacebookObservation::new("post_1", "fb_group_react_tw", "hash_1").with_published_at(1500);
     let runner1 = ObservationMonitorRunner::with_observations(vec![obs1]);
-    let report1 = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1).await.unwrap();
+    let report1 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1)
+        .await
+        .unwrap();
     assert_eq!(report1.reported_observations.len(), 1);
     assert_eq!(report1.reported_observations[0].delta_kind, ObservationDeltaKind::New);
 
@@ -1220,13 +1351,14 @@ async fn test_revised_query_lookback_labels_existing_as_backfill_and_recent_as_n
     // Run occurrence under revision 2 at 3000 ms:
     // - post_old was published at 1500 ms (< 2500 ms revision boundary): existing in lookback window
     // - post_fresh was published at 2800 ms (>= 2500 ms revision boundary): newly published post
-    let post_old = FacebookObservation::new("post_old", "fb_group_react_tw", "hash_old")
-        .with_published_at(1500);
-    let post_fresh = FacebookObservation::new("post_fresh", "fb_group_react_tw", "hash_fresh")
-        .with_published_at(2800);
+    let post_old = FacebookObservation::new("post_old", "fb_group_react_tw", "hash_old").with_published_at(1500);
+    let post_fresh = FacebookObservation::new("post_fresh", "fb_group_react_tw", "hash_fresh").with_published_at(2800);
 
     let runner = ObservationMonitorRunner::with_observations(vec![post_old.clone(), post_fresh.clone()]);
-    let report = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner).await.unwrap();
+    let report = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner)
+        .await
+        .unwrap();
 
     assert_eq!(report.outcome, MonitorRunOutcome::Success);
     assert_eq!(report.query_revision, Some(2));
@@ -1263,32 +1395,32 @@ async fn test_replaying_revised_query_produces_no_duplicate_backfill() {
         _ => panic!(),
     };
 
-    svc.update_query(
-        "user_hank",
-        "conv_1",
-        &job_id,
-        "lead rust engineer",
-        None,
-        None,
-        2500,
-    )
-    .await
-    .unwrap();
+    svc.update_query("user_hank", "conv_1", &job_id, "lead rust engineer", None, None, 2500)
+        .await
+        .unwrap();
 
-    let post_backfill = FacebookObservation::new("post_bf", "fb_group_react_tw", "hash_bf")
-        .with_published_at(1800);
+    let post_backfill = FacebookObservation::new("post_bf", "fb_group_react_tw", "hash_bf").with_published_at(1800);
     let runner = ObservationMonitorRunner::with_observations(vec![post_backfill.clone()]);
 
     // Initial run of revision 2: reports 1 backfill observation
-    let report1 = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner).await.unwrap();
+    let report1 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner)
+        .await
+        .unwrap();
     assert_eq!(report1.backfill_findings().len(), 1);
 
     // Replay on subsequent run at 4000 ms with the same observation unchanged:
     let runner2 = ObservationMonitorRunner::with_observations(vec![post_backfill]);
-    let report2 = svc.run_occurrence("user_hank", "conv_1", &job_id, 4000, &runner2).await.unwrap();
+    let report2 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 4000, &runner2)
+        .await
+        .unwrap();
 
     // Idempotent delta reporting: unchanged backfill item is NOT emitted again
-    assert!(report2.reported_observations.is_empty(), "Replaying same revision produces no duplicate backfill");
+    assert!(
+        report2.reported_observations.is_empty(),
+        "Replaying same revision produces no duplicate backfill"
+    );
     assert!(report2.backfill_findings().is_empty());
 }
 
@@ -1335,9 +1467,15 @@ async fn test_updating_query_validation_and_lifecycle_guards() {
     assert!(matches!(err, MonitorError::NotFound(_)));
 
     // 4. Cancelled job cannot be updated
-    svc.cancel_job("user_hank", "conv_1", &job_id, MonitorStopReason::ExplicitUserCancellation, 2500)
-        .await
-        .unwrap();
+    svc.cancel_job(
+        "user_hank",
+        "conv_1",
+        &job_id,
+        MonitorStopReason::ExplicitUserCancellation,
+        2500,
+    )
+    .await
+    .unwrap();
 
     let err = svc
         .update_query("user_hank", "conv_1", &job_id, "valid query", None, None, 3000)
@@ -1377,8 +1515,7 @@ async fn test_client_cannot_bind_another_users_facebook_profile_fail_closed() {
     let svc = MonitorControlService::with_in_memory_repo();
 
     // Alice registers her profile
-    let alice_prof = FacebookProfile::new("prof_alice_primary", "user_alice")
-        .with_display_name("Alice Facebook");
+    let alice_prof = FacebookProfile::new("prof_alice_primary", "user_alice").with_display_name("Alice Facebook");
     svc.register_profile(alice_prof).await.unwrap();
 
     // Bob tries to create a job referencing Alice's profile
@@ -1424,12 +1561,17 @@ async fn test_auth_expiry_checkpoint_captcha_auto_pauses_without_auto_retry() {
     };
 
     let runner_expired = AuthFailingRunner { kind: "expired" };
-    svc.run_occurrence("user_hank", "conv_1", &job1_id, 2000, &runner_expired).await.unwrap();
+    svc.run_occurrence("user_hank", "conv_1", &job1_id, 2000, &runner_expired)
+        .await
+        .unwrap();
 
     let job1 = svc.get_job("user_hank", "conv_1", &job1_id).await.unwrap();
     assert_eq!(job1.status, MonitorJobStatus::Paused);
     assert_eq!(job1.stop_reason, Some(MonitorStopReason::AuthExpired));
-    assert_eq!(job1.next_execution_at_ms, None, "Must perform no automatic authentication retry");
+    assert_eq!(
+        job1.next_execution_at_ms, None,
+        "Must perform no automatic authentication retry"
+    );
 
     let p1 = svc.get_profile("user_hank", "prof_hank").await.unwrap().unwrap();
     assert_eq!(p1.auth_state, ProfileAuthState::Expired);
@@ -1442,7 +1584,9 @@ async fn test_auth_expiry_checkpoint_captcha_auto_pauses_without_auto_retry() {
     };
 
     let runner_cp = AuthFailingRunner { kind: "checkpoint" };
-    svc.run_occurrence("user_hank", "conv_1", &job2_id, 3000, &runner_cp).await.unwrap();
+    svc.run_occurrence("user_hank", "conv_1", &job2_id, 3000, &runner_cp)
+        .await
+        .unwrap();
 
     let job2 = svc.get_job("user_hank", "conv_1", &job2_id).await.unwrap();
     assert_eq!(job2.status, MonitorJobStatus::Paused);
@@ -1457,7 +1601,9 @@ async fn test_auth_expiry_checkpoint_captcha_auto_pauses_without_auto_retry() {
     };
 
     let runner_captcha = AuthFailingRunner { kind: "captcha" };
-    svc.run_occurrence("user_hank", "conv_1", &job3_id, 4000, &runner_captcha).await.unwrap();
+    svc.run_occurrence("user_hank", "conv_1", &job3_id, 4000, &runner_captcha)
+        .await
+        .unwrap();
 
     let job3 = svc.get_job("user_hank", "conv_1", &job3_id).await.unwrap();
     assert_eq!(job3.status, MonitorJobStatus::Paused);
@@ -1484,7 +1630,9 @@ async fn test_liveview_reauth_resumes_paused_jobs_only_for_next_scheduled_run() 
         _ => panic!(),
     };
     let runner_expired = AuthFailingRunner { kind: "expired" };
-    svc.run_occurrence("user_hank", "conv_1", &job_a_id, 2000, &runner_expired).await.unwrap();
+    svc.run_occurrence("user_hank", "conv_1", &job_a_id, 2000, &runner_expired)
+        .await
+        .unwrap();
 
     // Job B in conv_1 (Explicit user pause, NOT auth failure)
     let out_b = svc.create_job("user_hank", "conv_1", req.clone(), 1000).await.unwrap();
@@ -1492,15 +1640,28 @@ async fn test_liveview_reauth_resumes_paused_jobs_only_for_next_scheduled_run() 
         CreateMonitorJobOutcome::Active { job } => job.id,
         _ => panic!(),
     };
-    svc.pause_job("user_hank", "conv_1", &job_b_id, MonitorStopReason::ExplicitUserPause, 2100).await.unwrap();
+    svc.pause_job(
+        "user_hank",
+        "conv_1",
+        &job_b_id,
+        MonitorStopReason::ExplicitUserPause,
+        2100,
+    )
+    .await
+    .unwrap();
 
     // Job C in conv_other (AuthExpired, but in different conversation)
-    let out_c = svc.create_job("user_hank", "conv_other", req.clone(), 1000).await.unwrap();
+    let out_c = svc
+        .create_job("user_hank", "conv_other", req.clone(), 1000)
+        .await
+        .unwrap();
     let job_c_id = match out_c {
         CreateMonitorJobOutcome::Active { job } => job.id,
         _ => panic!(),
     };
-    svc.run_occurrence("user_hank", "conv_other", &job_c_id, 2200, &runner_expired).await.unwrap();
+    svc.run_occurrence("user_hank", "conv_other", &job_c_id, 2200, &runner_expired)
+        .await
+        .unwrap();
 
     // User completes interactive LiveView re-auth at 5000 ms in conv_1
     let resumed = svc
@@ -1554,7 +1715,9 @@ async fn test_liveview_interactive_precedence_over_background_monitor_run() {
     };
 
     // User starts LiveView session
-    svc.start_liveview_session("user_hank", "prof_interactive").await.unwrap();
+    svc.start_liveview_session("user_hank", "prof_interactive")
+        .await
+        .unwrap();
     assert!(svc.is_liveview_active("prof_interactive").await);
 
     // Conflicting background MonitorRun attempts to execute
@@ -1590,7 +1753,10 @@ async fn test_passwords_and_mfa_secrets_not_stored_in_domain_or_reports() {
     assert!(!serialized_prof.contains("secret"));
     assert!(!serialized_prof.contains("token"));
 
-    let req = valid_request(Some(CronSchedule::Every { every_ms: 60000, description: None }));
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 60000,
+        description: None,
+    }));
     let serialized_req = serde_json::to_string(&req).unwrap();
     assert!(!serialized_req.contains("password"));
     assert!(!serialized_req.contains("mfa"));
@@ -1648,13 +1814,19 @@ async fn test_multi_target_partial_results_isolated_failure() {
         ],
     };
 
-    let report = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner).await.unwrap();
+    let report = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner)
+        .await
+        .unwrap();
 
     // 1. Overall outcome is explicitly Partial
     assert_eq!(report.outcome, MonitorRunOutcome::Partial);
 
     // 2. Identifies successful and failed targets
-    assert_eq!(report.successful_targets, vec!["group_a".to_string(), "group_c".to_string()]);
+    assert_eq!(
+        report.successful_targets,
+        vec!["group_a".to_string(), "group_c".to_string()]
+    );
     assert_eq!(report.failed_targets.len(), 1);
     assert_eq!(report.failed_targets[0].target_id, "group_b");
     assert!(report.failed_targets[0].reason.contains("Rate limited"));
@@ -1667,16 +1839,27 @@ async fn test_multi_target_partial_results_isolated_failure() {
     assert!(ids.contains(&"post_c1"));
 
     // 4. Healthy target cursors advanced
-    let cursor_a = svc.get_cursor("user_hank", "conv_1", &job_id, "group_a", 1).await.unwrap().unwrap();
+    let cursor_a = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "group_a", 1)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(cursor_a.last_successful_observed_at_ms, Some(2000));
     assert!(cursor_a.items.contains_key("post_a1"));
 
-    let cursor_c = svc.get_cursor("user_hank", "conv_1", &job_id, "group_c", 1).await.unwrap().unwrap();
+    let cursor_c = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "group_c", 1)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(cursor_c.last_successful_observed_at_ms, Some(2000));
     assert!(cursor_c.items.contains_key("post_c1"));
 
     // 5. Failed target cursor did NOT advance
-    let cursor_b = svc.get_cursor("user_hank", "conv_1", &job_id, "group_b", 1).await.unwrap();
+    let cursor_b = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "group_b", 1)
+        .await
+        .unwrap();
     assert!(cursor_b.is_none(), "Failed target cursor must not be advanced");
 }
 
@@ -1696,15 +1879,24 @@ async fn test_confirmed_deletion_reports_removed_and_cleans_cursor() {
     // Run 1 discovers post_1
     let obs1 = FacebookObservation::new("post_1", "fb_group_react_tw", "hash_1");
     let runner1 = ObservationMonitorRunner::with_observations(vec![obs1]);
-    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1).await.unwrap();
+    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1)
+        .await
+        .unwrap();
 
-    let cursor = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
+    let cursor = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(cursor.items.contains_key("post_1"));
 
     // Run 2: post_1 is confirmed deleted (platform returned 404/post removed)
     let del_obs = FacebookObservation::confirmed_deleted("post_1", "fb_group_react_tw");
     let runner2 = ObservationMonitorRunner::with_observations(vec![del_obs]);
-    let report2 = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2).await.unwrap();
+    let report2 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2)
+        .await
+        .unwrap();
 
     // Reported as Removed
     assert_eq!(report2.outcome, MonitorRunOutcome::Success);
@@ -1713,8 +1905,15 @@ async fn test_confirmed_deletion_reports_removed_and_cleans_cursor() {
     assert_eq!(removed[0].id, "post_1");
 
     // Cursor removes the item but advances its timestamp
-    let cursor2 = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
-    assert!(!cursor2.items.contains_key("post_1"), "Confirmed deleted item must be removed from cursor");
+    let cursor2 = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !cursor2.items.contains_key("post_1"),
+        "Confirmed deleted item must be removed from cursor"
+    );
     assert_eq!(cursor2.last_successful_observed_at_ms, Some(3000));
 }
 
@@ -1734,21 +1933,36 @@ async fn test_temporary_unavailability_preserves_content_and_last_seen_time() {
     // Run 1 discovers post_transient
     let obs1 = FacebookObservation::new("post_transient", "fb_group_react_tw", "hash_original");
     let runner1 = ObservationMonitorRunner::with_observations(vec![obs1]);
-    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1).await.unwrap();
+    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1)
+        .await
+        .unwrap();
 
     // Run 2: post is temporarily unavailable (unconfirmed deletion / access timeout)
     let unavail_obs = FacebookObservation::temporarily_unavailable("post_transient", "fb_group_react_tw");
     let runner2 = ObservationMonitorRunner::with_observations(vec![unavail_obs]);
-    let report2 = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2).await.unwrap();
+    let report2 = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2)
+        .await
+        .unwrap();
 
     // Reported as Unavailable, NEVER Removed
     assert_eq!(report2.unavailable_findings().len(), 1);
     assert_eq!(report2.unavailable_findings()[0].id, "post_transient");
-    assert!(report2.removed_findings().is_empty(), "Transient unavailability must never be reported as removed");
+    assert!(
+        report2.removed_findings().is_empty(),
+        "Transient unavailability must never be reported as removed"
+    );
 
     // Cursor PRESERVES item content hash and first seen time
-    let cursor = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
-    let item = cursor.items.get("post_transient").expect("Item must be preserved in cursor");
+    let cursor = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let item = cursor
+        .items
+        .get("post_transient")
+        .expect("Item must be preserved in cursor");
     assert_eq!(item.content_hash, "hash_original");
     assert_eq!(item.first_seen_at_ms, 2000);
 }
@@ -1768,15 +1982,16 @@ async fn test_untrusted_dom_structure_fails_closed_and_does_not_advance_cursor()
 
     // Runner encounters changed or untrusted DOM structure
     let runner = MultiTargetRunner {
-        results: vec![
-            TargetScanResult::untrusted_dom(
-                "fb_group_react_tw",
-                "Facebook post container layout changed or unrecognizable DOM tree",
-            ),
-        ],
+        results: vec![TargetScanResult::untrusted_dom(
+            "fb_group_react_tw",
+            "Facebook post container layout changed or unrecognizable DOM tree",
+        )],
     };
 
-    let report = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner).await.unwrap();
+    let report = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner)
+        .await
+        .unwrap();
 
     // Fails closed
     assert_eq!(report.outcome, MonitorRunOutcome::Failed);
@@ -1784,7 +1999,10 @@ async fn test_untrusted_dom_structure_fails_closed_and_does_not_advance_cursor()
     assert!(report.failed_targets[0].reason.contains("layout changed"));
 
     // Cursor is NOT advanced
-    let cursor = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap();
+    let cursor = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap();
     assert!(cursor.is_none(), "Untrusted DOM scan must not advance or save cursor");
 }
 
@@ -1961,7 +2179,11 @@ async fn test_adapter_observes_authorized_target_and_normalizes_hash_and_closes_
     assert!(cursor.items.contains_key("post_raw_1"));
 
     // 3. Browser context was bounded and cleanly closed!
-    assert_eq!(*closed.lock().await, 1, "Browser session context must be closed after run");
+    assert_eq!(
+        *closed.lock().await,
+        1,
+        "Browser session context must be closed after run"
+    );
     assert_eq!(opened.lock().await.len(), 1);
 }
 
@@ -1976,7 +2198,10 @@ async fn test_adapter_context_isolation_per_user_and_conversation() {
     // Alice profile & job
     let prof_a = FacebookProfile::new("prof_alice", "user_alice");
     svc.register_profile(prof_a).await.unwrap();
-    let mut req_a = valid_request(Some(CronSchedule::Every { every_ms: 3600000, description: None }));
+    let mut req_a = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
     req_a.profile_ref = Some("prof_alice".into());
     let job_a_id = match svc.create_job("user_alice", "conv_alice", req_a, 1000).await.unwrap() {
         CreateMonitorJobOutcome::Active { job } => job.id,
@@ -1986,7 +2211,10 @@ async fn test_adapter_context_isolation_per_user_and_conversation() {
     // Bob profile & job
     let prof_b = FacebookProfile::new("prof_bob", "user_bob");
     svc.register_profile(prof_b).await.unwrap();
-    let mut req_b = valid_request(Some(CronSchedule::Every { every_ms: 3600000, description: None }));
+    let mut req_b = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
     req_b.profile_ref = Some("prof_bob".into());
     let job_b_id = match svc.create_job("user_bob", "conv_bob", req_b, 1000).await.unwrap() {
         CreateMonitorJobOutcome::Active { job } => job.id,
@@ -1994,13 +2222,31 @@ async fn test_adapter_context_isolation_per_user_and_conversation() {
     };
 
     // Run both jobs
-    svc.run_occurrence("user_alice", "conv_alice", &job_a_id, 2000, &adapter).await.unwrap();
-    svc.run_occurrence("user_bob", "conv_bob", &job_b_id, 2100, &adapter).await.unwrap();
+    svc.run_occurrence("user_alice", "conv_alice", &job_a_id, 2000, &adapter)
+        .await
+        .unwrap();
+    svc.run_occurrence("user_bob", "conv_bob", &job_b_id, 2100, &adapter)
+        .await
+        .unwrap();
 
     let records = opened.lock().await.clone();
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0], ("user_alice".to_string(), "conv_alice".to_string(), Some("prof_alice".to_string())));
-    assert_eq!(records[1], ("user_bob".to_string(), "conv_bob".to_string(), Some("prof_bob".to_string())));
+    assert_eq!(
+        records[0],
+        (
+            "user_alice".to_string(),
+            "conv_alice".to_string(),
+            Some("prof_alice".to_string())
+        )
+    );
+    assert_eq!(
+        records[1],
+        (
+            "user_bob".to_string(),
+            "conv_bob".to_string(),
+            Some("prof_bob".to_string())
+        )
+    );
 
     // Both sessions were closed independently
     assert_eq!(*closed.lock().await, 2);
@@ -2016,27 +2262,42 @@ async fn test_adapter_untrusted_observation_text_cannot_override_job_security_or
         Some("attacker".into()),
         1500,
     );
-    outcomes.insert("fb_group_react_tw".to_string(), RawTargetScanOutcome::Success(vec![injection_post]));
+    outcomes.insert(
+        "fb_group_react_tw".to_string(),
+        RawTargetScanOutcome::Success(vec![injection_post]),
+    );
 
     let (driver, _, closed) = MockFacebookBrowserDriver::new(outcomes);
     let adapter = FacebookBrowserCapabilityAdapter::new(Arc::new(driver));
 
     let svc = MonitorControlService::with_in_memory_repo();
-    let req = valid_request(Some(CronSchedule::Every { every_ms: 3600000, description: None }));
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
     let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
     let job_id = match outcome {
         CreateMonitorJobOutcome::Active { job } => job.id,
         _ => panic!(),
     };
 
-    let report = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &adapter).await.unwrap();
+    let report = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &adapter)
+        .await
+        .unwrap();
     assert_eq!(report.outcome, MonitorRunOutcome::Success);
 
     // Job properties remain completely intact and untouched
     let job_after = svc.get_job("user_hank", "conv_1", &job_id).await.unwrap();
     assert_eq!(job_after.user_id, "user_hank");
     assert_eq!(job_after.conversation_id, "conv_1");
-    assert_eq!(job_after.schedule, CronSchedule::Every { every_ms: 3600000, description: None });
+    assert_eq!(
+        job_after.schedule,
+        CronSchedule::Every {
+            every_ms: 3600000,
+            description: None
+        }
+    );
     assert_eq!(job_after.status, MonitorJobStatus::Active);
 
     // The post is treated purely as observation data
@@ -2060,14 +2321,20 @@ async fn test_adapter_auth_expired_checkpoint_captcha_fail_closed_with_closed_co
     let prof = FacebookProfile::new("prof_cp", "user_hank");
     svc.register_profile(prof).await.unwrap();
 
-    let mut req = valid_request(Some(CronSchedule::Every { every_ms: 3600000, description: None }));
+    let mut req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
     req.profile_ref = Some("prof_cp".into());
     let job_id = match svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap() {
         CreateMonitorJobOutcome::Active { job } => job.id,
         _ => panic!(),
     };
 
-    let report = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &adapter).await.unwrap();
+    let report = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &adapter)
+        .await
+        .unwrap();
     assert_eq!(report.outcome, MonitorRunOutcome::AuthExpired);
 
     // Job transitions to Paused without automatic retries
@@ -2092,19 +2359,28 @@ async fn test_adapter_untrusted_dom_drift_fails_closed_and_closes_context() {
     let adapter = FacebookBrowserCapabilityAdapter::new(Arc::new(driver));
 
     let svc = MonitorControlService::with_in_memory_repo();
-    let req = valid_request(Some(CronSchedule::Every { every_ms: 3600000, description: None }));
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
     let job_id = match svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap() {
         CreateMonitorJobOutcome::Active { job } => job.id,
         _ => panic!(),
     };
 
-    let report = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &adapter).await.unwrap();
+    let report = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &adapter)
+        .await
+        .unwrap();
     assert_eq!(report.outcome, MonitorRunOutcome::Failed);
     assert_eq!(report.failed_targets.len(), 1);
     assert!(report.failed_targets[0].reason.contains("Unrecognized feed HTML"));
 
     // Cursor is not advanced
-    let cursor = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap();
+    let cursor = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap();
     assert!(cursor.is_none());
 
     // Context is closed
