@@ -8,12 +8,12 @@
 //! - Deterministically closes browser context after each run; no permanent resident browser.
 //! - Operates at the public `MonitorRunner` seam without exposing generic browser automation.
 
-use std::sync::Arc;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use crate::monitor::{
-    FacebookObservation, LookbackScope, MonitorJob, MonitorRunOutcome, MonitorRunner,
-    MonitorScanResult, TargetScanResult, MonitorQuery,
+    FacebookObservation, LookbackScope, MonitorJob, MonitorQuery, MonitorRunOutcome, MonitorRunner, MonitorScanResult,
+    TargetScanResult,
 };
 
 /// Raw post item extracted from a target group.
@@ -110,11 +110,7 @@ pub trait IFacebookBrowserDriver: Send + Sync {
 }
 
 /// Compute a deterministic SHA-256 content hash of normalized post text.
-pub fn compute_normalized_content_hash(
-    title: Option<&str>,
-    body: Option<&str>,
-    author: Option<&str>,
-) -> String {
+pub fn compute_normalized_content_hash(title: Option<&str>, body: Option<&str>, author: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     let t = title.unwrap_or("").trim();
     let b = body.unwrap_or("").trim();
@@ -151,30 +147,21 @@ impl MonitorRunner for FacebookBrowserCapabilityAdapter {
     async fn run_scan(&self, job: &MonitorJob) -> Result<MonitorScanResult, String> {
         let mut session = self
             .driver
-            .create_session(
-                &job.user_id,
-                &job.conversation_id,
-                job.profile_ref.as_deref(),
-            )
+            .create_session(&job.user_id, &job.conversation_id, job.profile_ref.as_deref())
             .await?;
 
         let mut target_results = Vec::new();
         let mut top_auth_expired = None;
 
         for target in &job.targets {
-            let scan_outcome = session
-                .scan_target(&target.target_id, &job.query, job.lookback)
-                .await;
+            let scan_outcome = session.scan_target(&target.target_id, &job.query, job.lookback).await;
 
             match scan_outcome {
                 Ok(RawTargetScanOutcome::Success(raw_posts)) => {
                     let mut observations = Vec::new();
                     for raw in raw_posts {
                         if raw.is_confirmed_deleted {
-                            observations.push(FacebookObservation::confirmed_deleted(
-                                raw.raw_id,
-                                &target.target_id,
-                            ));
+                            observations.push(FacebookObservation::confirmed_deleted(raw.raw_id, &target.target_id));
                         } else if raw.is_temporarily_unavailable {
                             observations.push(FacebookObservation::temporarily_unavailable(
                                 raw.raw_id,
@@ -184,11 +171,8 @@ impl MonitorRunner for FacebookBrowserCapabilityAdapter {
                             let title = raw.raw_title.as_deref().map(sanitize_observation_text);
                             let body = raw.raw_body.as_deref().map(sanitize_observation_text);
                             let author = raw.raw_author.as_deref().map(sanitize_observation_text);
-                            let hash = compute_normalized_content_hash(
-                                title.as_deref(),
-                                body.as_deref(),
-                                author.as_deref(),
-                            );
+                            let hash =
+                                compute_normalized_content_hash(title.as_deref(), body.as_deref(), author.as_deref());
                             let obs = FacebookObservation::new(raw.raw_id, &target.target_id, hash)
                                 .with_content(title, body, author)
                                 .with_published_at(raw.published_at_ms);
