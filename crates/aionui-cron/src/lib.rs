@@ -22,8 +22,10 @@ pub use monitor::{
     LookbackScope, MonitorControlService, MonitorCursor, MonitorError, MonitorJob,
     MonitorJobProposal, MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunReport,
     MonitorRunner, MonitorScanResult, MonitorStopReason, ObservationDeltaKind, ProfileAuthState,
-    ReportedObservation, propose_default_schedule, validate_schedule,
+    ReportedObservation, TargetFailure, TargetScanResult, propose_default_schedule,
+    validate_schedule,
 };
+
 
 
 

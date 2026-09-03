@@ -1,6 +1,6 @@
 //! Conversation-bound Facebook MonitorJob control domain and public service seam.
 //!
-//! Implements Tickets 01, 02, 03, 04, and 05:
+//! Implements Tickets 01, 02, 03, 04, 05, and 06:
 //! - Conversation-owned `MonitorJob` domain aggregate and lifecycle.
 //! - Complete target, query, lookback, and schedule scope enforcement.
 //! - Supplied schedule acceptance vs. agent-proposed default schedule approval flow.
@@ -16,6 +16,9 @@
 //! - Authentication failure (AuthExpired, Checkpoint, CAPTCHA) auto-pause without automatic retries.
 //! - Interactive LiveView re-authentication resuming eligible jobs only for their next scheduled run.
 //! - LiveView session precedence over background MonitorRun.
+//! - Multi-target isolated evaluation: partial results, healthy group reporting on partial target failure.
+//! - Post availability status: `Removed` (confirmed deletion) vs `Unavailable` (temporary access issue preserving last known content/time).
+//! - Untrusted DOM / validation failure fails closed without advancing cursor.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -125,6 +128,8 @@ pub enum ObservationDeltaKind {
     Changed,
     Unchanged,
     Backfill,
+    Removed,
+    Unavailable,
 }
 
 /// Authentication state for a user-owned Facebook profile.
@@ -187,6 +192,10 @@ pub struct FacebookObservation {
     pub author: Option<String>,
     #[serde(default)]
     pub published_at_ms: u64,
+    #[serde(default)]
+    pub is_confirmed_deleted: bool,
+    #[serde(default)]
+    pub is_temporarily_unavailable: bool,
 }
 
 impl FacebookObservation {
@@ -199,6 +208,36 @@ impl FacebookObservation {
             body: None,
             author: None,
             published_at_ms: 0,
+            is_confirmed_deleted: false,
+            is_temporarily_unavailable: false,
+        }
+    }
+
+    pub fn confirmed_deleted(id: impl Into<String>, target_id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            target_id: target_id.into(),
+            content_hash: String::new(),
+            title: None,
+            body: None,
+            author: None,
+            published_at_ms: 0,
+            is_confirmed_deleted: true,
+            is_temporarily_unavailable: false,
+        }
+    }
+
+    pub fn temporarily_unavailable(id: impl Into<String>, target_id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            target_id: target_id.into(),
+            content_hash: String::new(),
+            title: None,
+            body: None,
+            author: None,
+            published_at_ms: 0,
+            is_confirmed_deleted: false,
+            is_temporarily_unavailable: true,
         }
     }
 
@@ -419,10 +458,71 @@ pub enum CreateMonitorJobOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// MonitorRunner Port Seam (for Ticket 02+ execution)
+// Scan Outcome and Multi-Target Types
 // ---------------------------------------------------------------------------
 
-/// Scan outcome produced by a bounded runner execution.
+/// Per-target scan outcome produced by a bounded runner execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetScanResult {
+    pub target_id: String,
+    pub outcome: MonitorRunOutcome,
+    #[serde(default)]
+    pub observations: Vec<FacebookObservation>,
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub is_untrusted_structure: bool,
+}
+
+impl TargetScanResult {
+    pub fn success(target_id: impl Into<String>, observations: Vec<FacebookObservation>) -> Self {
+        Self {
+            target_id: target_id.into(),
+            outcome: MonitorRunOutcome::Success,
+            observations,
+            error_message: None,
+            is_untrusted_structure: false,
+        }
+    }
+
+    pub fn failed(target_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            target_id: target_id.into(),
+            outcome: MonitorRunOutcome::Failed,
+            observations: Vec::new(),
+            error_message: Some(message.into()),
+            is_untrusted_structure: false,
+        }
+    }
+
+    pub fn unavailable(target_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            target_id: target_id.into(),
+            outcome: MonitorRunOutcome::Unavailable,
+            observations: Vec::new(),
+            error_message: Some(message.into()),
+            is_untrusted_structure: false,
+        }
+    }
+
+    pub fn untrusted_dom(target_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            target_id: target_id.into(),
+            outcome: MonitorRunOutcome::Failed,
+            observations: Vec::new(),
+            error_message: Some(message.into()),
+            is_untrusted_structure: true,
+        }
+    }
+}
+
+/// Target failure record indicating target ID and failure reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetFailure {
+    pub target_id: String,
+    pub reason: String,
+}
+
+/// Overall scan outcome produced by a bounded runner execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorScanResult {
     pub outcome: MonitorRunOutcome,
@@ -430,6 +530,8 @@ pub struct MonitorScanResult {
     pub error_message: Option<String>,
     #[serde(default)]
     pub observations: Vec<FacebookObservation>,
+    #[serde(default)]
+    pub target_results: Vec<TargetScanResult>,
 }
 
 impl MonitorScanResult {
@@ -440,6 +542,27 @@ impl MonitorScanResult {
             observations_count: count,
             error_message: None,
             observations,
+            target_results: Vec::new(),
+        }
+    }
+
+    pub fn multi_target(target_results: Vec<TargetScanResult>) -> Self {
+        let any_failed = target_results.iter().any(|r| r.outcome != MonitorRunOutcome::Success || r.is_untrusted_structure);
+        let all_failed = target_results.iter().all(|r| r.outcome != MonitorRunOutcome::Success || r.is_untrusted_structure);
+        let outcome = if all_failed {
+            MonitorRunOutcome::Failed
+        } else if any_failed {
+            MonitorRunOutcome::Partial
+        } else {
+            MonitorRunOutcome::Success
+        };
+        let observations_count = target_results.iter().map(|r| r.observations.len()).sum();
+        Self {
+            outcome,
+            observations_count,
+            error_message: None,
+            observations: Vec::new(),
+            target_results,
         }
     }
 
@@ -449,6 +572,7 @@ impl MonitorScanResult {
             observations_count: 0,
             error_message: Some(message.into()),
             observations: Vec::new(),
+            target_results: Vec::new(),
         }
     }
 
@@ -458,6 +582,7 @@ impl MonitorScanResult {
             observations_count: 0,
             error_message: Some(message.into()),
             observations: Vec::new(),
+            target_results: Vec::new(),
         }
     }
 }
@@ -480,6 +605,10 @@ pub struct MonitorRunReport {
     pub query_revision: Option<u64>,
     #[serde(default)]
     pub lookback_window_ms: Option<u64>,
+    #[serde(default)]
+    pub successful_targets: Vec<String>,
+    #[serde(default)]
+    pub failed_targets: Vec<TargetFailure>,
 }
 
 impl MonitorRunReport {
@@ -507,7 +636,23 @@ impl MonitorRunReport {
             .collect()
     }
 
-    /// Formatted presentation grouping backfill findings separately with
+    pub fn removed_findings(&self) -> Vec<&FacebookObservation> {
+        self.reported_observations
+            .iter()
+            .filter(|r| r.delta_kind == ObservationDeltaKind::Removed)
+            .map(|r| &r.observation)
+            .collect()
+    }
+
+    pub fn unavailable_findings(&self) -> Vec<&FacebookObservation> {
+        self.reported_observations
+            .iter()
+            .filter(|r| r.delta_kind == ObservationDeltaKind::Unavailable)
+            .map(|r| &r.observation)
+            .collect()
+    }
+
+    /// Formatted presentation grouping findings separately with
     /// query revision and lookback window shown.
     pub fn format_conversation_report(&self) -> String {
         let mut out = String::new();
@@ -520,6 +665,8 @@ impl MonitorRunReport {
         let backfills = self.backfill_findings();
         let news = self.new_findings();
         let changed = self.changed_findings();
+        let removed = self.removed_findings();
+        let unavailable = self.unavailable_findings();
 
         if !backfills.is_empty() {
             out.push_str(&format!(
@@ -542,6 +689,27 @@ impl MonitorRunReport {
             out.push_str("### Changed Findings\n");
             for item in changed {
                 out.push_str(&format!("- [Changed] {} (hash: {})\n", item.id, item.content_hash));
+            }
+        }
+
+        if !removed.is_empty() {
+            out.push_str("### Removed Findings\n");
+            for item in removed {
+                out.push_str(&format!("- [Removed] {}\n", item.id));
+            }
+        }
+
+        if !unavailable.is_empty() {
+            out.push_str("### Unavailable Findings\n");
+            for item in unavailable {
+                out.push_str(&format!("- [Unavailable] {}\n", item.id));
+            }
+        }
+
+        if !self.failed_targets.is_empty() {
+            out.push_str("### Failed Targets\n");
+            for f in &self.failed_targets {
+                out.push_str(&format!("- Target {}: {}\n", f.target_id, f.reason));
             }
         }
 
@@ -573,12 +741,12 @@ pub trait IMonitorJobRepository: Send + Sync {
         scheduled_at_ms: u64,
     ) -> Result<Option<MonitorRunReport>, MonitorError>;
     async fn save_run_report(&self, report: &MonitorRunReport) -> Result<(), MonitorError>;
-    /// Atomically persist the canonical report, the job's post-run state, and optionally cursor.
+    /// Atomically persist the canonical report, the job's post-run state, and updated cursors.
     async fn save_run_completion(
         &self,
         report: &MonitorRunReport,
         job: &MonitorJob,
-        cursor: Option<&MonitorCursor>,
+        cursors: &[MonitorCursor],
     ) -> Result<MonitorRunReport, MonitorError>;
     async fn list_run_reports(
         &self,
@@ -692,7 +860,7 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         &self,
         report: &MonitorRunReport,
         job: &MonitorJob,
-        cursor: Option<&MonitorCursor>,
+        cursors: &[MonitorCursor],
     ) -> Result<MonitorRunReport, MonitorError> {
         let report_key = run_report_key(
             &report.user_id,
@@ -705,10 +873,10 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         let canonical = reports.entry(report_key).or_insert_with(|| report.clone()).clone();
         jobs.insert(job.id.clone(), job.clone());
 
-        if let Some(c) = cursor {
+        let mut cursors_guard = self.cursors.write().await;
+        for c in cursors {
             let ckey = cursor_key(&job.user_id, &job.conversation_id, &c.job_id, &c.target_id, c.query_revision);
-            let mut cursors = self.cursors.write().await;
-            cursors.insert(ckey, c.clone());
+            cursors_guard.insert(ckey, c.clone());
         }
 
         Ok(canonical)
@@ -937,7 +1105,6 @@ impl MonitorControlService {
         Self::validate_ownership_scope(user_id, conversation_id)?;
         Self::validate_scope(&req.targets, &req.query, &req.lookback)?;
 
-        // Server-authorized user profile ownership verification: client input cannot choose another user's profile
         if let Some(ref pid) = req.profile_ref {
             if let Some(existing) = self.repo.find_profile_by_id(pid).await? {
                 if existing.user_id != user_id {
@@ -1131,7 +1298,6 @@ impl MonitorControlService {
             self.repo.save_profile(&prof).await?;
         }
 
-        // End LiveView session
         self.end_liveview_session(profile_id).await;
 
         let jobs = self.repo.list_by_conversation(user_id, conversation_id).await?;
@@ -1141,7 +1307,6 @@ impl MonitorControlService {
             if job.profile_ref.as_deref() == Some(profile_id)
                 && job.status == MonitorJobStatus::Paused
             {
-                // Only resume jobs paused due to authentication / checkpoint / captcha
                 let is_auth_paused = matches!(
                     job.stop_reason,
                     Some(MonitorStopReason::AuthExpired)
@@ -1153,7 +1318,6 @@ impl MonitorControlService {
                     job.status = MonitorJobStatus::Active;
                     job.stop_reason = None;
                     job.updated_at_ms = now_ms;
-                    // Resumes eligible ONLY for next scheduled occurrence!
                     job.next_execution_at_ms = compute_next_run_after_occurrence(
                         &job.schedule,
                         now_ms,
@@ -1341,9 +1505,8 @@ impl MonitorControlService {
     }
 
     /// Run one bounded occurrence for an existing active job and persist its
-    /// report in the originating conversation scope. Performs single-target delta
-    /// evaluation, query revision scoping, backfill detection, auth pause handling,
-    /// and advances the cursor only on scan and report success.
+    /// report in the originating conversation scope. Supports multi-target independent
+    /// evaluation, partial results, removed vs unavailable posts, and untrusted DOM fail-closed.
     pub async fn run_occurrence(
         &self,
         user_id: &str,
@@ -1413,130 +1576,217 @@ impl MonitorControlService {
                     observations_count: 0,
                     error_message: Some(error_message),
                     observations: Vec::new(),
+                    target_results: Vec::new(),
                 }
             }
         };
 
-        let target_id = job.targets.first().map(|t| t.target_id.clone());
         let query_revision = job.query.revision;
         let mut delta_observations = Vec::new();
-        let mut updated_cursor = None;
+        let mut updated_cursors = Vec::new();
+        let mut successful_targets = Vec::new();
+        let mut failed_targets = Vec::new();
 
-        // Perform delta evaluation and advance cursor only on success
-        if let Some(ref tid) = target_id {
-            let mut cursor = self
-                .repo
-                .get_cursor(user_id, conversation_id, job_id, tid, query_revision)
-                .await?
-                .unwrap_or_else(|| MonitorCursor::new(job_id, tid, query_revision));
+        // Evaluate targets independently
+        for target in &job.targets {
+            let tid = &target.target_id;
 
-            if scan.outcome == MonitorRunOutcome::Success {
-                for obs in &scan.observations {
-                    let delta_kind = match cursor.items.get(&obs.id) {
-                        None => {
-                            if job.query.revision > 1 {
-                                let revised_at = job.query_revised_at_ms.unwrap_or(scheduled_at_ms);
-                                if obs.published_at_ms > 0 && obs.published_at_ms < revised_at {
-                                    ObservationDeltaKind::Backfill
-                                } else if obs.published_at_ms >= revised_at {
-                                    ObservationDeltaKind::New
-                                } else {
-                                    ObservationDeltaKind::Backfill
+            // Find target scan result if present, or construct from top-level scan
+            let target_result = if !scan.target_results.is_empty() {
+                scan.target_results.iter().find(|tr| &tr.target_id == tid).cloned()
+            } else {
+                // Backwards compatibility for single-target runners
+                let target_obs: Vec<FacebookObservation> = scan
+                    .observations
+                    .iter()
+                    .filter(|o| o.target_id.is_empty() || &o.target_id == tid)
+                    .cloned()
+                    .collect();
+                Some(TargetScanResult {
+                    target_id: tid.clone(),
+                    outcome: scan.outcome.clone(),
+                    observations: target_obs,
+                    error_message: scan.error_message.clone(),
+                    is_untrusted_structure: false,
+                })
+            };
+
+            match target_result {
+                Some(tr) if tr.is_untrusted_structure => {
+                    // Untrusted DOM structure or unknown layout fails closed: never advances cursor
+                    failed_targets.push(TargetFailure {
+                        target_id: tid.clone(),
+                        reason: tr.error_message.unwrap_or("Untrusted DOM structure / changed layout".into()),
+                    });
+                }
+                Some(tr) if tr.outcome == MonitorRunOutcome::Success => {
+                    successful_targets.push(tid.clone());
+
+                    let mut cursor = self
+                        .repo
+                        .get_cursor(user_id, conversation_id, job_id, tid, query_revision)
+                        .await?
+                        .unwrap_or_else(|| MonitorCursor::new(job_id, tid, query_revision));
+
+                    for obs in &tr.observations {
+                        if obs.is_confirmed_deleted {
+                            if cursor.items.contains_key(&obs.id) {
+                                delta_observations.push(ReportedObservation {
+                                    delta_kind: ObservationDeltaKind::Removed,
+                                    observation: obs.clone(),
+                                });
+                                cursor.items.remove(&obs.id);
+                            }
+                        } else if obs.is_temporarily_unavailable {
+                            if cursor.items.contains_key(&obs.id) {
+                                delta_observations.push(ReportedObservation {
+                                    delta_kind: ObservationDeltaKind::Unavailable,
+                                    observation: obs.clone(),
+                                });
+                                // Preserves last known content and observation time; never deletes!
+                            }
+                        } else {
+                            let delta_kind = match cursor.items.get(&obs.id) {
+                                None => {
+                                    if job.query.revision > 1 {
+                                        let revised_at = job.query_revised_at_ms.unwrap_or(scheduled_at_ms);
+                                        if obs.published_at_ms > 0 && obs.published_at_ms < revised_at {
+                                            ObservationDeltaKind::Backfill
+                                        } else if obs.published_at_ms >= revised_at {
+                                            ObservationDeltaKind::New
+                                        } else {
+                                            ObservationDeltaKind::Backfill
+                                        }
+                                    } else {
+                                        ObservationDeltaKind::New
+                                    }
                                 }
-                            } else {
-                                ObservationDeltaKind::New
-                            }
-                        }
-                        Some(existing) => {
-                            if existing.content_hash != obs.content_hash {
-                                ObservationDeltaKind::Changed
-                            } else {
-                                ObservationDeltaKind::Unchanged
-                            }
-                        }
-                    };
+                                Some(existing) => {
+                                    if existing.content_hash != obs.content_hash {
+                                        ObservationDeltaKind::Changed
+                                    } else {
+                                        ObservationDeltaKind::Unchanged
+                                    }
+                                }
+                            };
 
-                    match delta_kind {
-                        ObservationDeltaKind::New | ObservationDeltaKind::Backfill => {
-                            cursor.items.insert(
-                                obs.id.clone(),
-                                CursorItemState {
-                                    observation_id: obs.id.clone(),
-                                    target_id: tid.clone(),
-                                    content_hash: obs.content_hash.clone(),
-                                    first_seen_at_ms: scheduled_at_ms,
-                                    last_seen_at_ms: scheduled_at_ms,
-                                    reported_at_ms: Some(scheduled_at_ms),
-                                    acknowledged_at_ms: None,
-                                },
-                            );
-                            delta_observations.push(ReportedObservation {
-                                delta_kind,
-                                observation: obs.clone(),
-                            });
-                        }
-                        ObservationDeltaKind::Changed => {
-                            let first_seen = cursor
-                                .items
-                                .get(&obs.id)
-                                .map(|i| i.first_seen_at_ms)
-                                .unwrap_or(scheduled_at_ms);
-                            cursor.items.insert(
-                                obs.id.clone(),
-                                CursorItemState {
-                                    observation_id: obs.id.clone(),
-                                    target_id: tid.clone(),
-                                    content_hash: obs.content_hash.clone(),
-                                    first_seen_at_ms: first_seen,
-                                    last_seen_at_ms: scheduled_at_ms,
-                                    reported_at_ms: Some(scheduled_at_ms),
-                                    acknowledged_at_ms: None,
-                                },
-                            );
-                            delta_observations.push(ReportedObservation {
-                                delta_kind,
-                                observation: obs.clone(),
-                            });
-                        }
-                        ObservationDeltaKind::Unchanged => {
-                            if let Some(existing) = cursor.items.get_mut(&obs.id) {
-                                existing.last_seen_at_ms = scheduled_at_ms;
+                            match delta_kind {
+                                ObservationDeltaKind::New | ObservationDeltaKind::Backfill => {
+                                    cursor.items.insert(
+                                        obs.id.clone(),
+                                        CursorItemState {
+                                            observation_id: obs.id.clone(),
+                                            target_id: tid.clone(),
+                                            content_hash: obs.content_hash.clone(),
+                                            first_seen_at_ms: scheduled_at_ms,
+                                            last_seen_at_ms: scheduled_at_ms,
+                                            reported_at_ms: Some(scheduled_at_ms),
+                                            acknowledged_at_ms: None,
+                                        },
+                                    );
+                                    delta_observations.push(ReportedObservation {
+                                        delta_kind,
+                                        observation: obs.clone(),
+                                    });
+                                }
+                                ObservationDeltaKind::Changed => {
+                                    let first_seen = cursor
+                                        .items
+                                        .get(&obs.id)
+                                        .map(|i| i.first_seen_at_ms)
+                                        .unwrap_or(scheduled_at_ms);
+                                    cursor.items.insert(
+                                        obs.id.clone(),
+                                        CursorItemState {
+                                            observation_id: obs.id.clone(),
+                                            target_id: tid.clone(),
+                                            content_hash: obs.content_hash.clone(),
+                                            first_seen_at_ms: first_seen,
+                                            last_seen_at_ms: scheduled_at_ms,
+                                            reported_at_ms: Some(scheduled_at_ms),
+                                            acknowledged_at_ms: None,
+                                        },
+                                    );
+                                    delta_observations.push(ReportedObservation {
+                                        delta_kind,
+                                        observation: obs.clone(),
+                                    });
+                                }
+                                ObservationDeltaKind::Unchanged => {
+                                    if let Some(existing) = cursor.items.get_mut(&obs.id) {
+                                        existing.last_seen_at_ms = scheduled_at_ms;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
-                }
 
-                cursor.last_successful_observed_at_ms = Some(scheduled_at_ms);
-                cursor.updated_at_ms = scheduled_at_ms;
-                updated_cursor = Some(cursor);
+                    cursor.last_successful_observed_at_ms = Some(scheduled_at_ms);
+                    cursor.updated_at_ms = scheduled_at_ms;
+                    updated_cursors.push(cursor);
+                }
+                Some(tr) => {
+                    // Target failed or unavailable: preserves existing cursor, does not advance
+                    let reason = tr.error_message.unwrap_or_else(|| format!("Target scan returned {:?}", tr.outcome));
+                    failed_targets.push(TargetFailure {
+                        target_id: tid.clone(),
+                        reason,
+                    });
+                }
+                None => {
+                    failed_targets.push(TargetFailure {
+                        target_id: tid.clone(),
+                        reason: "Target was not scanned by runner".into(),
+                    });
+                }
             }
         }
 
-        let observations_count = if !scan.observations.is_empty() {
-            scan.observations.len()
+        // Determine aggregate outcome
+        let aggregate_outcome = if scan.outcome == MonitorRunOutcome::AuthExpired {
+            MonitorRunOutcome::AuthExpired
+        } else if successful_targets.is_empty() {
+            if failed_targets.iter().all(|f| f.reason.to_lowercase().contains("unavailable")) {
+                MonitorRunOutcome::Unavailable
+            } else {
+                MonitorRunOutcome::Failed
+            }
+        } else if !failed_targets.is_empty() {
+            MonitorRunOutcome::Partial
+        } else {
+            MonitorRunOutcome::Success
+        };
+
+        let observations_count = if !delta_observations.is_empty() {
+            delta_observations.len()
         } else {
             scan.observations_count
         };
+
+        let primary_target_id = job.targets.first().map(|t| t.target_id.clone());
 
         let report = MonitorRunReport {
             job_id: job.id.clone(),
             user_id: job.user_id.clone(),
             conversation_id: job.conversation_id.clone(),
             scheduled_at_ms,
-            outcome: scan.outcome.clone(),
+            outcome: aggregate_outcome.clone(),
             observations_count,
             error_message: scan.error_message.clone(),
             reported_observations: delta_observations,
-            target_id,
+            target_id: primary_target_id,
             query_revision: Some(query_revision),
             lookback_window_ms: Some(job.lookback.duration_ms),
+            successful_targets,
+            failed_targets,
         };
 
-        job.last_outcome = Some(scan.outcome.clone());
+        job.last_outcome = Some(aggregate_outcome.clone());
         job.updated_at_ms = job.updated_at_ms.max(scheduled_at_ms);
 
         // Check authentication expiry, checkpoint, or CAPTCHA: auto-pause without automatic retries
-        let auth_pause_reason = match scan.outcome {
+        let auth_pause_reason = match aggregate_outcome {
             MonitorRunOutcome::AuthExpired => Some(MonitorStopReason::AuthExpired),
             _ => {
                 if let Some(ref msg) = scan.error_message {
@@ -1557,7 +1807,7 @@ impl MonitorControlService {
         if let Some(reason) = auth_pause_reason {
             job.status = MonitorJobStatus::Paused;
             job.stop_reason = Some(reason.clone());
-            job.next_execution_at_ms = None; // Forbid automatic retries
+            job.next_execution_at_ms = None;
 
             if let Some(ref pid) = job.profile_ref {
                 if let Some(mut prof) = self.repo.get_profile(user_id, pid).await? {
@@ -1581,7 +1831,7 @@ impl MonitorControlService {
 
         // Durable atomic save
         self.repo
-            .save_run_completion(&report, &job, updated_cursor.as_ref())
+            .save_run_completion(&report, &job, &updated_cursors)
             .await
     }
 
