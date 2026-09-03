@@ -1101,3 +1101,234 @@ async fn test_cursor_isolation_across_users_and_conversations() {
     assert!(matches!(err, MonitorError::NotFound(_)));
 }
 
+// ---------------------------------------------------------------------------
+// Ticket 04 Tests: Query revision, lookback, and backfill
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_editing_query_bumps_revision_and_creates_isolated_cursor() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    // Run occurrence 1 under revision 1
+    let obs1 = FacebookObservation::new("post_1", "fb_group_react_tw", "hash_1")
+        .with_published_at(1500);
+    let runner1 = ObservationMonitorRunner::with_observations(vec![obs1]);
+    let report1 = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1).await.unwrap();
+    assert_eq!(report1.reported_observations.len(), 1);
+    assert_eq!(report1.reported_observations[0].delta_kind, ObservationDeltaKind::New);
+
+    // Cursor for revision 1 exists
+    let cursor_rev1 = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap()
+        .expect("revision 1 cursor exists");
+    assert_eq!(cursor_rev1.query_revision, 1);
+    assert_eq!(cursor_rev1.items.len(), 1);
+
+    // Edit query to bump to revision 2
+    let updated_job = svc
+        .update_query(
+            "user_hank",
+            "conv_1",
+            &job_id,
+            "rust distributed systems hiring",
+            None,
+            None,
+            2500,
+        )
+        .await
+        .expect("update_query should succeed");
+
+    assert_eq!(updated_job.query.revision, 2);
+    assert_eq!(updated_job.query.query_text, "rust distributed systems hiring");
+    assert_eq!(updated_job.query_revised_at_ms, Some(2500));
+    assert_eq!(updated_job.updated_at_ms, 2500);
+
+    // CRITICAL: revision 2 has NOT run yet; its cursor is empty/None and does NOT reuse rev 1 cursor
+    let cursor_rev2 = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 2)
+        .await
+        .unwrap();
+    assert!(cursor_rev2.is_none(), "Revision 2 must not reuse revision 1's cursor");
+
+    // Revision 1 cursor remains intact and isolated
+    let cursor_rev1_intact = svc
+        .get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor_rev1_intact.items.len(), 1);
+}
+
+#[tokio::test]
+async fn test_revised_query_lookback_labels_existing_as_backfill_and_recent_as_new() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    // Update query at 2500 ms -> revision 2
+    svc.update_query(
+        "user_hank",
+        "conv_1",
+        &job_id,
+        "remote eline rust engineer",
+        None,
+        Some(LookbackScope::from_days(14)),
+        2500,
+    )
+    .await
+    .unwrap();
+
+    // Run occurrence under revision 2 at 3000 ms:
+    // - post_old was published at 1500 ms (< 2500 ms revision boundary): existing in lookback window
+    // - post_fresh was published at 2800 ms (>= 2500 ms revision boundary): newly published post
+    let post_old = FacebookObservation::new("post_old", "fb_group_react_tw", "hash_old")
+        .with_published_at(1500);
+    let post_fresh = FacebookObservation::new("post_fresh", "fb_group_react_tw", "hash_fresh")
+        .with_published_at(2800);
+
+    let runner = ObservationMonitorRunner::with_observations(vec![post_old.clone(), post_fresh.clone()]);
+    let report = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner).await.unwrap();
+
+    assert_eq!(report.outcome, MonitorRunOutcome::Success);
+    assert_eq!(report.query_revision, Some(2));
+    assert_eq!(report.lookback_window_ms, Some(14 * 24 * 3600 * 1000));
+
+    // Check classification
+    let backfills = report.backfill_findings();
+    let news = report.new_findings();
+
+    assert_eq!(backfills.len(), 1);
+    assert_eq!(backfills[0].id, "post_old");
+
+    assert_eq!(news.len(), 1);
+    assert_eq!(news[0].id, "post_fresh");
+
+    // Conversation report formatting groups backfill separately with revision and lookback
+    let formatted = report.format_conversation_report();
+    assert!(formatted.contains("### Backfill Findings (Query Revision 2, Lookback 1209600000ms)"));
+    assert!(formatted.contains("post_old"));
+    assert!(formatted.contains("### New Findings"));
+    assert!(formatted.contains("post_fresh"));
+}
+
+#[tokio::test]
+async fn test_replaying_revised_query_produces_no_duplicate_backfill() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    svc.update_query(
+        "user_hank",
+        "conv_1",
+        &job_id,
+        "lead rust engineer",
+        None,
+        None,
+        2500,
+    )
+    .await
+    .unwrap();
+
+    let post_backfill = FacebookObservation::new("post_bf", "fb_group_react_tw", "hash_bf")
+        .with_published_at(1800);
+    let runner = ObservationMonitorRunner::with_observations(vec![post_backfill.clone()]);
+
+    // Initial run of revision 2: reports 1 backfill observation
+    let report1 = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner).await.unwrap();
+    assert_eq!(report1.backfill_findings().len(), 1);
+
+    // Replay on subsequent run at 4000 ms with the same observation unchanged:
+    let runner2 = ObservationMonitorRunner::with_observations(vec![post_backfill]);
+    let report2 = svc.run_occurrence("user_hank", "conv_1", &job_id, 4000, &runner2).await.unwrap();
+
+    // Idempotent delta reporting: unchanged backfill item is NOT emitted again
+    assert!(report2.reported_observations.is_empty(), "Replaying same revision produces no duplicate backfill");
+    assert!(report2.backfill_findings().is_empty());
+}
+
+#[tokio::test]
+async fn test_updating_query_validation_and_lifecycle_guards() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    // 1. Blank query text fails closed
+    let err = svc
+        .update_query("user_hank", "conv_1", &job_id, "   ", None, None, 2000)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MonitorError::InvalidQueryScope(_)));
+
+    // 2. Zero lookback duration fails closed
+    let err = svc
+        .update_query(
+            "user_hank",
+            "conv_1",
+            &job_id,
+            "valid query",
+            None,
+            Some(LookbackScope::from_millis(0)),
+            2000,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MonitorError::InvalidLookbackScope(_)));
+
+    // 3. Cross-user update rejected with NotFound
+    let err = svc
+        .update_query("user_other", "conv_1", &job_id, "valid query", None, None, 2000)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MonitorError::NotFound(_)));
+
+    // 4. Cancelled job cannot be updated
+    svc.cancel_job("user_hank", "conv_1", &job_id, MonitorStopReason::ExplicitUserCancellation, 2500)
+        .await
+        .unwrap();
+
+    let err = svc
+        .update_query("user_hank", "conv_1", &job_id, "valid query", None, None, 3000)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        MonitorError::InvalidLifecycleTransition {
+            current: MonitorJobStatus::Cancelled,
+            ..
+        }
+    ));
+}
+
+
