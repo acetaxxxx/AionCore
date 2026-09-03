@@ -11,6 +11,7 @@
 //! - Conversation termination lifecycle hook.
 //! - MonitorRunner port seam contract.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use aionui_cron::facebook_adapter::{
@@ -18,11 +19,11 @@ use aionui_cron::facebook_adapter::{
     RawTargetScanOutcome, compute_normalized_content_hash,
 };
 use aionui_cron::monitor::{
-    CreateMonitorJobOutcome, CreateMonitorJobRequest, CursorItemState, FacebookObservation, FacebookProfile,
-    FacebookTarget, IMonitorJobRepository, InMemoryMonitorJobRepository, LookbackScope, MonitorControlService,
-    MonitorCursor, MonitorError, MonitorJob, MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunReport,
-    MonitorRunner, MonitorScanResult, MonitorStopReason, ObservationDeltaKind, ProfileAuthState, ReportedObservation,
-    TargetFailure, TargetScanResult, propose_default_schedule, validate_schedule,
+    CreateMonitorJobOutcome, CreateMonitorJobRequest, FacebookObservation, FacebookProfile, FacebookTarget,
+    IMonitorJobRepository, InMemoryMonitorJobRepository, LookbackScope, MonitorControlService, MonitorCursor,
+    MonitorError, MonitorJob, MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunReport, MonitorRunner,
+    MonitorScanResult, MonitorStopReason, ObservationDeltaKind, ProfileAuthState, ReportedObservation, TargetFailure,
+    TargetScanResult, propose_default_schedule, validate_schedule,
 };
 use aionui_cron::types::CronSchedule;
 
@@ -448,6 +449,7 @@ fn test_monitor_payload_serde_uses_existing_cron_schedule_contract() {
             query: MonitorQuery::new("班表"),
             lookback: LookbackScope::from_days(7),
             schedule: decoded.schedule.expect("schedule should be present"),
+            query_revised_at_ms: None,
             profile_ref: None,
             status: MonitorJobStatus::Active,
             stop_reason: None,
@@ -1663,9 +1665,9 @@ async fn test_liveview_reauth_resumes_paused_jobs_only_for_next_scheduled_run() 
         .await
         .unwrap();
 
-    // User completes interactive LiveView re-auth at 5000 ms in conv_1
+    // User completes interactive LiveView re-auth at 5,000,000 ms in conv_1
     let resumed = svc
-        .complete_liveview_reauth("user_hank", "conv_1", "prof_shared", 5000)
+        .complete_liveview_reauth("user_hank", "conv_1", "prof_shared", 5_000_000)
         .await
         .expect("re-auth should succeed");
 
@@ -1675,7 +1677,7 @@ async fn test_liveview_reauth_resumes_paused_jobs_only_for_next_scheduled_run() 
     assert_eq!(resumed[0].status, MonitorJobStatus::Active);
     assert_eq!(resumed[0].stop_reason, None);
 
-    // CRITICAL: Next run is scheduled for the NEXT occurrence (5000 + 3600000 = 8600000), NOT immediate!
+    // CRITICAL: Next run is scheduled for the NEXT occurrence (5,000,000 + 3,600,000 = 8,600,000), NOT immediate!
     assert_eq!(
         resumed[0].next_execution_at_ms,
         Some(8600000),

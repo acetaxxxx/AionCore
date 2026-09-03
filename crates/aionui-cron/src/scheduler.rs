@@ -74,7 +74,7 @@ pub fn compute_next_run_after_occurrence(
     }
 }
 
-fn compute_cron_next_run(expr: &str, tz: Option<&str>, now: TimestampMs) -> Option<TimestampMs> {
+pub(crate) fn compute_cron_next_run(expr: &str, tz: Option<&str>, now: TimestampMs) -> Option<TimestampMs> {
     let normalized = normalize_cron_expr(expr);
     let schedule = Schedule::from_str(&normalized).ok()?;
 
