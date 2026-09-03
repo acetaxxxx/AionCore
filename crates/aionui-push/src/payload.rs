@@ -97,11 +97,11 @@ fn sanitize_target_title(value: Option<&str>) -> Option<String> {
     let mut chars = 0;
 
     for character in value.chars() {
-        if character.is_control() {
-            continue;
-        }
         if character.is_whitespace() {
             pending_space = !normalized.is_empty();
+            continue;
+        }
+        if character.is_control() {
             continue;
         }
         if pending_space {
