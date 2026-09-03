@@ -9879,6 +9879,7 @@ mod session_mentions_integration {
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].user_id, "user_1");
         assert_eq!(notices[0].target_id, conversation.id);
+        assert_eq!(notices[0].target_title.as_deref(), Some(conversation.name.as_str()));
         assert_eq!(notices[0].turn_id, "turn_recovered_push");
         assert_eq!(notices[0].status, TerminalNoticeStatus::Timeout);
 

@@ -278,8 +278,51 @@ mod terminal_delivery_tests {
         assert_eq!(payload.target_kind, "conversation");
         assert!(!encoded.contains("assistant"));
         assert!(!encoded.contains("secret"));
-        assert!(payload.title.len() <= 80);
-        assert!(payload.body.len() <= 160);
+        assert!(payload.title.chars().count() <= 30);
+        assert!(payload.body.chars().count() <= 50);
+        assert!(payload.title.chars().count() + payload.body.chars().count() <= 80);
+    }
+
+    #[test]
+    fn terminal_payload_includes_a_sanitized_target_title() {
+        let payload = build_terminal_payload(
+            &notice(TerminalNoticeStatus::Success).with_target_title("  報告\n\t已完成  "),
+        )
+        .expect("payload");
+
+        assert_eq!(payload.title, "Aion 任務已完成：報告 已完成");
+        assert_eq!(payload.body, "「報告 已完成」已完成。");
+    }
+
+    #[test]
+    fn terminal_payload_caps_target_title_without_splitting_utf8() {
+        let payload = build_terminal_payload(
+            &notice(TerminalNoticeStatus::Failed).with_target_title("任務".repeat(100)),
+        )
+        .expect("payload");
+
+        assert_eq!(payload.title.chars().count(), 30);
+        assert!(payload.title.ends_with("任務任務"));
+    }
+
+    #[test]
+    fn terminal_payload_drops_titles_with_sensitive_references() {
+        for target_title in [
+            "查看 https://example.test/private",
+            "token=abc123",
+            "Bearer abcdefghijklmnop",
+            "sk-abcdefghijklmnopqrstuvwxyz012345",
+            "api.example.test/path",
+            "AbCdEfGhIjKlMnOpQrStUvWxYz012345",
+        ] {
+            let payload = build_terminal_payload(
+                &notice(TerminalNoticeStatus::Failed).with_target_title(target_title),
+            )
+            .expect("payload");
+
+            assert_eq!(payload.title, "Aion 任務需要處理");
+            assert_eq!(payload.body, "這項任務執行失敗，請查看詳情。");
+        }
     }
 
     #[tokio::test]

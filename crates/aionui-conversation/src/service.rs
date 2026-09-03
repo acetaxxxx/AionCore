@@ -1038,6 +1038,7 @@ impl ConversationService {
             terminal_notice_status(status),
             finished_at_ms,
         )
+        .map(|notice| notice.with_target_title(row.name.clone()))
         .ok() else {
             tracing::warn!(
                 turn_id,
