@@ -11,10 +11,13 @@
 //! - Conversation termination lifecycle hook.
 //! - MonitorRunner port seam contract.
 
+use std::sync::Arc;
+
 use aionui_cron::monitor::{
-    CreateMonitorJobOutcome, CreateMonitorJobRequest, FacebookTarget, LookbackScope,
-    MonitorControlService, MonitorError, MonitorJob, MonitorJobStatus, MonitorQuery,
-    MonitorRunOutcome, MonitorRunner, MonitorScanResult, MonitorStopReason,
+    CreateMonitorJobOutcome, CreateMonitorJobRequest, FacebookTarget, IMonitorJobRepository,
+    InMemoryMonitorJobRepository, LookbackScope, MonitorControlService, MonitorError,
+    MonitorJob, MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunReport,
+    MonitorRunner, MonitorScanResult, MonitorStopReason,
     propose_default_schedule, validate_schedule,
 };
 use aionui_cron::types::CronSchedule;
@@ -32,6 +35,54 @@ impl MonitorRunner for FakeMonitorRunner {
             observations_count: 5,
             error_message: None,
         })
+    }
+}
+
+struct FailingMonitorRunner;
+
+#[async_trait::async_trait]
+impl MonitorRunner for FailingMonitorRunner {
+    async fn run_scan(&self, _job: &MonitorJob) -> Result<MonitorScanResult, String> {
+        Err("sidecar unavailable".into())
+    }
+}
+
+struct FailingCompletionRepository {
+    inner: InMemoryMonitorJobRepository,
+}
+
+#[async_trait::async_trait]
+impl IMonitorJobRepository for FailingCompletionRepository {
+    async fn save(&self, job: &MonitorJob) -> Result<(), MonitorError> {
+        self.inner.save(job).await
+    }
+
+    async fn get(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<Option<MonitorJob>, MonitorError> {
+        self.inner.get(user_id, conversation_id, job_id).await
+    }
+
+    async fn list_by_conversation(&self, user_id: &str, conversation_id: &str) -> Result<Vec<MonitorJob>, MonitorError> {
+        self.inner.list_by_conversation(user_id, conversation_id).await
+    }
+
+    async fn delete(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<bool, MonitorError> {
+        self.inner.delete(user_id, conversation_id, job_id).await
+    }
+
+    async fn get_run_report(&self, user_id: &str, conversation_id: &str, job_id: &str, scheduled_at_ms: u64) -> Result<Option<MonitorRunReport>, MonitorError> {
+        self.inner.get_run_report(user_id, conversation_id, job_id, scheduled_at_ms).await
+    }
+
+    async fn save_run_report(&self, report: &MonitorRunReport) -> Result<(), MonitorError> {
+        self.inner.save_run_report(report).await
+    }
+
+    async fn save_run_completion(&self, _report: &MonitorRunReport, _job: &MonitorJob) -> Result<MonitorRunReport, MonitorError> {
+        Err(MonitorError::Repository("transaction unavailable".into()))
+    }
+
+    async fn list_run_reports(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<Vec<MonitorRunReport>, MonitorError> {
+        self.inner.list_run_reports(user_id, conversation_id, job_id).await
     }
 }
 
@@ -403,6 +454,162 @@ async fn test_lifecycle_pause_resume_cancel_controls() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn test_scheduled_occurrence_runs_existing_monitor_job_through_runner_seam() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: Some("hourly".into()),
+    }));
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!("Expected active job"),
+    };
+
+    let runner = FakeMonitorRunner;
+    let result = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner)
+        .await
+        .expect("scheduled occurrence should run");
+
+    assert_eq!(result.outcome, MonitorRunOutcome::Success);
+    assert_eq!(result.observations_count, 5);
+
+    let repeated = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner)
+        .await
+        .expect("repeated delivery should be idempotent");
+    assert_eq!(repeated, result);
+    let reports = svc
+        .list_run_reports("user_hank", "conv_1", &job_id)
+        .await
+        .expect("report should be visible in originating conversation scope");
+    assert_eq!(reports.len(), 1);
+
+    let (first, second) = tokio::join!(
+        svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner),
+        svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner),
+    );
+    assert_eq!(first.expect("first concurrent delivery should succeed"), second.expect("second concurrent delivery should succeed"));
+    assert_eq!(
+        svc.list_run_reports("user_hank", "conv_1", &job_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let job = svc.get_job("user_hank", "conv_1", &job_id).await.unwrap();
+    assert_eq!(job.updated_at_ms, 3000);
+}
+
+#[tokio::test]
+async fn test_late_occurrence_does_not_move_job_updated_timestamp_backwards() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let outcome = svc
+        .create_job(
+            "user_hank",
+            "conv_1",
+            valid_request(Some(CronSchedule::Every {
+                every_ms: 3600000,
+                description: None,
+            })),
+            1000,
+        )
+        .await
+        .unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!("Expected active job"),
+    };
+    let runner = FakeMonitorRunner;
+    svc.run_occurrence("user_hank", "conv_1", &job_id, 5000, &runner)
+        .await
+        .unwrap();
+    svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner)
+        .await
+        .unwrap();
+
+    let job = svc.get_job("user_hank", "conv_1", &job_id).await.unwrap();
+    assert_eq!(job.updated_at_ms, 5000);
+}
+
+#[tokio::test]
+async fn test_occurrence_fail_closed_for_non_active_or_foreign_scope_and_reports_runner_error() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!("Expected active job"),
+    };
+
+    let error_report = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 3000, &FailingMonitorRunner)
+        .await
+        .expect("runner failure should be recorded as a bounded failed outcome");
+    assert_eq!(error_report.outcome, MonitorRunOutcome::Failed);
+    assert_eq!(error_report.observations_count, 0);
+    assert_eq!(error_report.error_message.as_deref(), Some("sidecar unavailable"));
+
+    let foreign = svc
+        .run_occurrence("other_user", "conv_1", &job_id, 4000, &FakeMonitorRunner)
+        .await
+        .unwrap_err();
+    assert!(matches!(foreign, MonitorError::NotFound(_)));
+
+    let paused = svc
+        .pause_job("user_hank", "conv_1", &job_id, MonitorStopReason::AuthExpired, 5000)
+        .await
+        .unwrap();
+    assert_eq!(paused.status, MonitorJobStatus::Paused);
+    let paused_err = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 6000, &FakeMonitorRunner)
+        .await
+        .unwrap_err();
+    assert!(matches!(paused_err, MonitorError::InvalidLifecycleTransition { .. }));
+}
+
+#[tokio::test]
+async fn test_completion_failure_does_not_expose_partial_report_or_job_state() {
+    let repo = Arc::new(FailingCompletionRepository {
+        inner: InMemoryMonitorJobRepository::new(),
+    });
+    let svc = MonitorControlService::new(repo);
+    let outcome = svc
+        .create_job(
+            "user_hank",
+            "conv_1",
+            valid_request(Some(CronSchedule::Every {
+                every_ms: 3600000,
+                description: None,
+            })),
+            1000,
+        )
+        .await
+        .unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!("Expected active job"),
+    };
+
+    let err = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &FakeMonitorRunner)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MonitorError::Repository(_)));
+    assert!(svc
+        .list_run_reports("user_hank", "conv_1", &job_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(svc.get_job("user_hank", "conv_1", &job_id).await.unwrap().last_outcome, None);
 }
 
 #[tokio::test]

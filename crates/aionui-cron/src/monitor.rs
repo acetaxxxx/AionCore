@@ -10,12 +10,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::scheduler::{validate_cron_expression, validate_timezone};
+use crate::scheduler::{compute_next_run_after_occurrence, validate_cron_expression, validate_timezone};
 use crate::types::CronSchedule;
 
 // ---------------------------------------------------------------------------
@@ -38,6 +38,12 @@ pub enum MonitorError {
 
     #[error("Invalid schedule scope: {0}")]
     InvalidScheduleScope(String),
+
+    #[error("Invalid monitor occurrence: {0}")]
+    InvalidOccurrence(String),
+
+    #[error("Monitor repository failure: {0}")]
+    Repository(String),
 
     #[error("Monitor job not found: {0}")]
     NotFound(String),
@@ -258,6 +264,18 @@ pub struct MonitorScanResult {
     pub error_message: Option<String>,
 }
 
+/// Durable, bounded result for one scheduled occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorRunReport {
+    pub job_id: String,
+    pub user_id: String,
+    pub conversation_id: String,
+    pub scheduled_at_ms: u64,
+    pub outcome: MonitorRunOutcome,
+    pub observations_count: usize,
+    pub error_message: Option<String>,
+}
+
 /// High-level conversation-scoped runner port.
 #[async_trait::async_trait]
 pub trait MonitorRunner: Send + Sync {
@@ -274,17 +292,40 @@ pub trait IMonitorJobRepository: Send + Sync {
     async fn get(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<Option<MonitorJob>, MonitorError>;
     async fn list_by_conversation(&self, user_id: &str, conversation_id: &str) -> Result<Vec<MonitorJob>, MonitorError>;
     async fn delete(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<bool, MonitorError>;
+    async fn get_run_report(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        scheduled_at_ms: u64,
+    ) -> Result<Option<MonitorRunReport>, MonitorError>;
+    async fn save_run_report(&self, report: &MonitorRunReport) -> Result<(), MonitorError>;
+    /// Atomically persist the canonical report and the job's post-run state.
+    /// Persistent implementations must use one transaction or equivalent.
+    async fn save_run_completion(
+        &self,
+        report: &MonitorRunReport,
+        job: &MonitorJob,
+    ) -> Result<MonitorRunReport, MonitorError>;
+    async fn list_run_reports(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+    ) -> Result<Vec<MonitorRunReport>, MonitorError>;
 }
 
 #[derive(Default)]
 pub struct InMemoryMonitorJobRepository {
     jobs: RwLock<HashMap<String, MonitorJob>>,
+    run_reports: RwLock<HashMap<String, MonitorRunReport>>,
 }
 
 impl InMemoryMonitorJobRepository {
     pub fn new() -> Self {
         Self {
             jobs: RwLock::new(HashMap::new()),
+            run_reports: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -329,6 +370,69 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         }
         Ok(false)
     }
+
+    async fn get_run_report(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        scheduled_at_ms: u64,
+    ) -> Result<Option<MonitorRunReport>, MonitorError> {
+        let key = run_report_key(user_id, conversation_id, job_id, scheduled_at_ms);
+        Ok(self.run_reports.read().await.get(&key).cloned())
+    }
+
+    async fn save_run_report(&self, report: &MonitorRunReport) -> Result<(), MonitorError> {
+        let key = run_report_key(
+            &report.user_id,
+            &report.conversation_id,
+            &report.job_id,
+            report.scheduled_at_ms,
+        );
+        self.run_reports.write().await.entry(key).or_insert_with(|| report.clone());
+        Ok(())
+    }
+
+    async fn save_run_completion(
+        &self,
+        report: &MonitorRunReport,
+        job: &MonitorJob,
+    ) -> Result<MonitorRunReport, MonitorError> {
+        let report_key = run_report_key(
+            &report.user_id,
+            &report.conversation_id,
+            &report.job_id,
+            report.scheduled_at_ms,
+        );
+        let mut reports = self.run_reports.write().await;
+        let mut jobs = self.jobs.write().await;
+        let canonical = reports.entry(report_key).or_insert_with(|| report.clone()).clone();
+        jobs.insert(job.id.clone(), job.clone());
+        Ok(canonical)
+    }
+
+    async fn list_run_reports(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+    ) -> Result<Vec<MonitorRunReport>, MonitorError> {
+        let prefix = format!("{user_id}\0{conversation_id}\0{job_id}\0");
+        let mut reports: Vec<_> = self
+            .run_reports
+            .read()
+            .await
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, report)| report.clone())
+            .collect();
+        reports.sort_by_key(|report| report.scheduled_at_ms);
+        Ok(reports)
+    }
+}
+
+fn run_report_key(user_id: &str, conversation_id: &str, job_id: &str, scheduled_at_ms: u64) -> String {
+    format!("{user_id}\0{conversation_id}\0{job_id}\0{scheduled_at_ms}")
 }
 
 // ---------------------------------------------------------------------------
@@ -378,11 +482,15 @@ pub fn validate_schedule(schedule: &CronSchedule) -> Result<(), MonitorError> {
 
 pub struct MonitorControlService {
     repo: Arc<dyn IMonitorJobRepository>,
+    occurrence_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl MonitorControlService {
     pub fn new(repo: Arc<dyn IMonitorJobRepository>) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            occurrence_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn with_in_memory_repo() -> Self {
@@ -656,6 +764,92 @@ impl MonitorControlService {
     ) -> Result<Vec<MonitorJob>, MonitorError> {
         Self::validate_ownership_scope(user_id, conversation_id)?;
         self.repo.list_by_conversation(user_id, conversation_id).await
+    }
+
+    /// Run one bounded occurrence for an existing active job and persist its
+    /// report in the originating conversation scope. Delivery is idempotent
+    /// for the same owner, job, and scheduled occurrence.
+    pub async fn run_occurrence(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        scheduled_at_ms: u64,
+        runner: &dyn MonitorRunner,
+    ) -> Result<MonitorRunReport, MonitorError> {
+        Self::validate_ownership_scope(user_id, conversation_id)?;
+        if scheduled_at_ms == 0 {
+            return Err(MonitorError::InvalidOccurrence(
+                "scheduled_at_ms must be greater than 0".into(),
+            ));
+        }
+
+        let occurrence_key = run_report_key(user_id, conversation_id, job_id, scheduled_at_ms);
+        let occurrence_lock = {
+            let mut locks = self.occurrence_locks.lock().await;
+            locks
+                .entry(occurrence_key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _occurrence_guard = occurrence_lock.lock().await;
+
+        let mut job = self
+            .repo
+            .get(user_id, conversation_id, job_id)
+            .await?
+            .ok_or_else(|| MonitorError::NotFound(job_id.to_owned()))?;
+        if job.status != MonitorJobStatus::Active {
+            return Err(MonitorError::InvalidLifecycleTransition {
+                current: job.status,
+                requested: "run_occurrence".into(),
+            });
+        }
+
+        if let Some(existing) = self
+            .repo
+            .get_run_report(user_id, conversation_id, job_id, scheduled_at_ms)
+            .await?
+        {
+            return Ok(existing);
+        }
+
+        let scan = match runner.run_scan(&job).await {
+            Ok(scan) => scan,
+            Err(error_message) => MonitorScanResult {
+                outcome: MonitorRunOutcome::Failed,
+                observations_count: 0,
+                error_message: Some(error_message),
+            },
+        };
+        let report = MonitorRunReport {
+            job_id: job.id.clone(),
+            user_id: job.user_id.clone(),
+            conversation_id: job.conversation_id.clone(),
+            scheduled_at_ms,
+            outcome: scan.outcome.clone(),
+            observations_count: scan.observations_count,
+            error_message: scan.error_message.clone(),
+        };
+        job.last_outcome = Some(scan.outcome);
+        job.updated_at_ms = job.updated_at_ms.max(scheduled_at_ms);
+        job.next_execution_at_ms = compute_next_run_after_occurrence(
+            &job.schedule,
+            scheduled_at_ms,
+            scheduled_at_ms,
+        );
+        self.repo.save_run_completion(&report, &job).await
+    }
+
+    /// List reports for a job in its originating conversation scope.
+    pub async fn list_run_reports(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+    ) -> Result<Vec<MonitorRunReport>, MonitorError> {
+        Self::validate_ownership_scope(user_id, conversation_id)?;
+        self.repo.list_run_reports(user_id, conversation_id, job_id).await
     }
 
     /// Hook invoked when originating conversation is closed, archived, or deleted.
