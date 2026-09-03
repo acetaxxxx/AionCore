@@ -284,6 +284,54 @@ async fn test_omitted_schedule_proposal_and_approval_flow() {
     assert_eq!(run_res.outcome, MonitorRunOutcome::Success);
 }
 
+#[test]
+fn test_monitor_payload_serde_uses_existing_cron_schedule_contract() {
+    let schedule = CronSchedule::Cron {
+        expr: "0 30 9 * * MON-FRI".into(),
+        tz: Some("Asia/Taipei".into()),
+        description: Some("weekday morning".into()),
+    };
+    let request = CreateMonitorJobRequest {
+        targets: vec![valid_target("group-1", "Group 1")],
+        query: MonitorQuery::new("班表"),
+        lookback: LookbackScope::from_days(7),
+        schedule: Some(schedule.clone()),
+        profile_ref: None,
+    };
+
+    let encoded = serde_json::to_value(&request).expect("request should serialize");
+    assert_eq!(encoded["schedule"]["kind"], "cron");
+    assert_eq!(encoded["schedule"]["expr"], "0 30 9 * * MON-FRI");
+    let decoded: CreateMonitorJobRequest =
+        serde_json::from_value(encoded).expect("request should deserialize");
+    assert_eq!(decoded.schedule, Some(schedule));
+
+    let outcome = CreateMonitorJobOutcome::Active {
+        job: MonitorJob {
+            id: "mon_test".into(),
+            user_id: "user_1".into(),
+            conversation_id: "conversation_1".into(),
+            targets: vec![valid_target("group-1", "Group 1")],
+            query: MonitorQuery::new("班表"),
+            lookback: LookbackScope::from_days(7),
+            schedule: decoded.schedule.expect("schedule should be present"),
+            profile_ref: None,
+            status: MonitorJobStatus::Active,
+            stop_reason: None,
+            last_outcome: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            next_execution_at_ms: Some(1),
+        },
+    };
+    let encoded = serde_json::to_value(&outcome).expect("outcome should serialize");
+    assert_eq!(encoded["type"], "active");
+    assert_eq!(encoded["job"]["schedule"]["kind"], "cron");
+    let decoded: CreateMonitorJobOutcome =
+        serde_json::from_value(encoded).expect("outcome should deserialize");
+    assert_eq!(decoded, outcome);
+}
+
 #[tokio::test]
 async fn test_lifecycle_pause_resume_cancel_controls() {
     let svc = MonitorControlService::with_in_memory_repo();
