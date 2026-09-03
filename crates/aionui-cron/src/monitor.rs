@@ -811,10 +811,11 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         job_id: &str,
     ) -> Result<Option<MonitorJob>, MonitorError> {
         let guard = self.jobs.read().await;
-        if let Some(job) = guard.get(job_id) {
-            if job.user_id == user_id && job.conversation_id == conversation_id {
-                return Ok(Some(job.clone()));
-            }
+        if let Some(job) = guard.get(job_id)
+            && job.user_id == user_id
+            && job.conversation_id == conversation_id
+        {
+            return Ok(Some(job.clone()));
         }
         Ok(None)
     }
@@ -836,11 +837,12 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
 
     async fn delete(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<bool, MonitorError> {
         let mut guard = self.jobs.write().await;
-        if let Some(job) = guard.get(job_id) {
-            if job.user_id == user_id && job.conversation_id == conversation_id {
-                guard.remove(job_id);
-                return Ok(true);
-            }
+        if let Some(job) = guard.get(job_id)
+            && job.user_id == user_id
+            && job.conversation_id == conversation_id
+        {
+            guard.remove(job_id);
+            return Ok(true);
         }
         Ok(false)
     }
@@ -959,10 +961,10 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
 
     async fn get_profile(&self, user_id: &str, profile_id: &str) -> Result<Option<FacebookProfile>, MonitorError> {
         let guard = self.profiles.read().await;
-        if let Some(prof) = guard.get(profile_id) {
-            if prof.user_id == user_id {
-                return Ok(Some(prof.clone()));
-            }
+        if let Some(prof) = guard.get(profile_id)
+            && prof.user_id == user_id
+        {
+            return Ok(Some(prof.clone()));
         }
         Ok(None)
     }
@@ -1097,10 +1099,10 @@ impl MonitorControlService {
 
     /// Begin an interactive LiveView session for a profile, taking precedence over background runs.
     pub async fn start_liveview_session(&self, user_id: &str, profile_id: &str) -> Result<(), MonitorError> {
-        if let Some(prof) = self.repo.find_profile_by_id(profile_id).await? {
-            if prof.user_id != user_id {
-                return Err(MonitorError::AccessDenied("Profile belongs to another user".into()));
-            }
+        if let Some(prof) = self.repo.find_profile_by_id(profile_id).await?
+            && prof.user_id != user_id
+        {
+            return Err(MonitorError::AccessDenied("Profile belongs to another user".into()));
         }
         let mut guard = self.liveview_sessions.lock().await;
         guard.insert(profile_id.to_string());
@@ -1130,14 +1132,13 @@ impl MonitorControlService {
         Self::validate_ownership_scope(user_id, conversation_id)?;
         Self::validate_scope(&req.targets, &req.query, &req.lookback)?;
 
-        if let Some(ref pid) = req.profile_ref {
-            if let Some(existing) = self.repo.find_profile_by_id(pid).await? {
-                if existing.user_id != user_id {
-                    return Err(MonitorError::AccessDenied(format!(
-                        "Profile '{pid}' does not belong to caller '{user_id}'"
-                    )));
-                }
-            }
+        if let Some(ref pid) = req.profile_ref
+            && let Some(existing) = self.repo.find_profile_by_id(pid).await?
+            && existing.user_id != user_id
+        {
+            return Err(MonitorError::AccessDenied(format!(
+                "Profile '{pid}' does not belong to caller '{user_id}'"
+            )));
         }
 
         match req.schedule {
@@ -1205,14 +1206,13 @@ impl MonitorControlService {
 
         Self::validate_scope(&proposal.targets, &proposal.query, &proposal.lookback)?;
 
-        if let Some(ref pid) = proposal.profile_ref {
-            if let Some(existing) = self.repo.find_profile_by_id(pid).await? {
-                if existing.user_id != user_id {
-                    return Err(MonitorError::AccessDenied(format!(
-                        "Profile '{pid}' does not belong to caller '{user_id}'"
-                    )));
-                }
-            }
+        if let Some(ref pid) = proposal.profile_ref
+            && let Some(existing) = self.repo.find_profile_by_id(pid).await?
+            && existing.user_id != user_id
+        {
+            return Err(MonitorError::AccessDenied(format!(
+                "Profile '{pid}' does not belong to caller '{user_id}'"
+            )));
         }
 
         let final_schedule = match approved_schedule {
@@ -1246,6 +1246,7 @@ impl MonitorControlService {
     }
 
     /// Update the query text, optional filters, and optional lookback for an active or paused job.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_query(
         &self,
         user_id: &str,
@@ -1263,12 +1264,12 @@ impl MonitorControlService {
             return Err(MonitorError::InvalidQueryScope("query_text must not be empty".into()));
         }
 
-        if let Some(ref lb) = lookback {
-            if lb.duration_ms == 0 {
-                return Err(MonitorError::InvalidLookbackScope(
-                    "lookback duration_ms must be greater than 0".into(),
-                ));
-            }
+        if let Some(ref lb) = lookback
+            && lb.duration_ms == 0
+        {
+            return Err(MonitorError::InvalidLookbackScope(
+                "lookback duration_ms must be greater than 0".into(),
+            ));
         }
 
         let mut job = self
@@ -1480,6 +1481,7 @@ impl MonitorControlService {
     }
 
     /// Mark an observation as acknowledged by the user.
+    #[allow(clippy::too_many_arguments)]
     pub async fn acknowledge_observation(
         &self,
         user_id: &str,
@@ -1557,12 +1559,12 @@ impl MonitorControlService {
         }
 
         // LiveView precedence: background monitor yields if LiveView is active
-        if let Some(ref pid) = job.profile_ref {
-            if self.is_liveview_active(pid).await {
-                return Err(MonitorError::ProfileBusy(format!(
-                    "LiveView session actively in progress for profile '{pid}'"
-                )));
-            }
+        if let Some(ref pid) = job.profile_ref
+            && self.is_liveview_active(pid).await
+        {
+            return Err(MonitorError::ProfileBusy(format!(
+                "LiveView session actively in progress for profile '{pid}'"
+            )));
         }
 
         // Repeated delivery is idempotent for the same occurrence
@@ -1831,17 +1833,17 @@ impl MonitorControlService {
             job.stop_reason = Some(reason.clone());
             job.next_execution_at_ms = None;
 
-            if let Some(ref pid) = job.profile_ref {
-                if let Some(mut prof) = self.repo.get_profile(user_id, pid).await? {
-                    prof.auth_state = match reason {
-                        MonitorStopReason::AuthExpired => ProfileAuthState::Expired,
-                        MonitorStopReason::CheckpointDetected => ProfileAuthState::CheckpointRequired,
-                        MonitorStopReason::CaptchaDetected => ProfileAuthState::CaptchaRequired,
-                        _ => ProfileAuthState::Expired,
-                    };
-                    prof.updated_at_ms = scheduled_at_ms;
-                    let _ = self.repo.save_profile(&prof).await;
-                }
+            if let Some(ref pid) = job.profile_ref
+                && let Some(mut prof) = self.repo.get_profile(user_id, pid).await?
+            {
+                prof.auth_state = match reason {
+                    MonitorStopReason::AuthExpired => ProfileAuthState::Expired,
+                    MonitorStopReason::CheckpointDetected => ProfileAuthState::CheckpointRequired,
+                    MonitorStopReason::CaptchaDetected => ProfileAuthState::CaptchaRequired,
+                    _ => ProfileAuthState::Expired,
+                };
+                prof.updated_at_ms = scheduled_at_ms;
+                let _ = self.repo.save_profile(&prof).await;
             }
         } else {
             job.next_execution_at_ms =
