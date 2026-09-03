@@ -36,6 +36,10 @@ pub struct TurnTerminalNotice {
     pub user_id: String,
     pub target_kind: TerminalTargetKind,
     pub target_id: String,
+    /// Best-effort display title for the notification target. This is kept on
+    /// the trusted server-side notice so delivery adapters can build useful,
+    /// bounded copy without reading conversation storage or sending content.
+    pub target_title: Option<String>,
     pub turn_id: String,
     pub status: TerminalNoticeStatus,
     pub finished_at_ms: u64,
@@ -80,10 +84,19 @@ impl TurnTerminalNotice {
             user_id: user_id.trim().to_owned(),
             target_kind,
             target_id: target_id.to_owned(),
+            target_title: None,
             turn_id: turn_id.to_owned(),
             status,
             finished_at_ms,
         })
+    }
+
+    /// Attach the trusted display title resolved by the conversation boundary.
+    /// The PushDelivery adapter remains responsible for sanitizing and
+    /// bounding this value before it reaches a browser provider.
+    pub fn with_target_title(mut self, target_title: impl Into<String>) -> Self {
+        self.target_title = Some(target_title.into());
+        self
     }
 }
 
