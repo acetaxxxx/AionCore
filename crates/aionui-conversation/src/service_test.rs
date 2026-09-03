@@ -9888,6 +9888,71 @@ mod session_mentions_integration {
     }
 
     #[tokio::test]
+    async fn team_terminal_outcome_notifies_only_the_leader_binding() {
+        use aionui_common::{OnConversationTurnTerminal, TerminalTargetKind, TurnTerminalNotice};
+
+        struct RecordingTerminalHook(Mutex<Vec<TurnTerminalNotice>>);
+
+        #[async_trait::async_trait]
+        impl OnConversationTurnTerminal for RecordingTerminalHook {
+            async fn on_turn_terminal(&self, notice: TurnTerminalNotice) {
+                self.0.lock().unwrap().push(notice);
+            }
+        }
+
+        let (svc, _broadcaster, repo, _task_mgr) = make_service();
+        let conversation = svc.create("user_1", make_create_req()).await.unwrap();
+        let hook = Arc::new(RecordingTerminalHook(Mutex::new(Vec::new())));
+        svc.with_turn_terminal_hook(hook.clone());
+
+        for role in ["teammate", "worker"] {
+            repo.update(
+                "user_1",
+                &conversation.id,
+                &ConversationRowUpdate {
+                    extra: Some(json!({ "teamId": "team-1", "role": role }).to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            svc.notify_new_terminal_outcome(
+                "user_1",
+                &conversation.id,
+                "turn_team_skip",
+                crate::turn_journal::TurnTerminalStatus::Success,
+                123,
+            )
+            .await;
+        }
+        assert!(hook.0.lock().unwrap().is_empty());
+
+        repo.update(
+            "user_1",
+            &conversation.id,
+            &ConversationRowUpdate {
+                extra: Some(json!({ "teamId": "team-1", "role": "lead" }).to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        svc.notify_new_terminal_outcome(
+            "user_1",
+            &conversation.id,
+            "turn_team_lead",
+            crate::turn_journal::TurnTerminalStatus::Success,
+            123,
+        )
+        .await;
+
+        let notices = hook.0.lock().unwrap().clone();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].target_kind, TerminalTargetKind::Team);
+        assert_eq!(notices[0].target_id, "team-1");
+    }
+
+    #[tokio::test]
     async fn test_deferred_cancel_single_terminal_outcome() {
         let (svc, _broadcaster, repo, task_mgr) = make_service();
         let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());

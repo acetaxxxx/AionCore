@@ -5,8 +5,7 @@ pub const PUSH_PAYLOAD_SCHEMA_VERSION: u8 = 1;
 const MAX_TITLE_CHARS: usize = 30;
 const MAX_BODY_CHARS: usize = 50;
 const MAX_TOTAL_COPY_CHARS: usize = 80;
-// The longest localized title prefix plus its separator occupies 12 chars.
-const MAX_TARGET_TITLE_CHARS: usize = 18;
+const MAX_TARGET_TITLE_CHARS: usize = 40;
 
 /// Bounded, allowlisted push transport payload. It is intentionally separate
 /// from `TurnTerminalNotice`: user identity and lifecycle internals stay on
@@ -23,18 +22,32 @@ pub struct PushPayload {
 
 pub fn build_terminal_payload(notice: &TurnTerminalNotice) -> Result<PushPayload, &'static str> {
     let target_title = sanitize_target_title(notice.target_title.as_deref());
-    let (title_prefix, body_suffix) = match notice.status {
-        TerminalNoticeStatus::Success => ("Aion 任務已完成", "已完成。"),
-        TerminalNoticeStatus::Failed => ("Aion 任務需要處理", "執行失敗，請查看詳情。"),
-        TerminalNoticeStatus::Cancelled => ("Aion 任務已取消", "在完成前已取消。"),
-        TerminalNoticeStatus::Timeout => ("Aion 任務逾時", "未在時限內完成。"),
-    };
-    let (title, body) = match target_title.as_deref() {
-        Some(target_title) => (
-            format!("{title_prefix}：{target_title}"),
-            format!("「{target_title}」{body_suffix}"),
+    let (title_prefix, fallback_body, body_suffix) = match notice.status {
+        TerminalNoticeStatus::Success => ("Aion turn completed", "Your task has finished.", "has completed."),
+        TerminalNoticeStatus::Failed => (
+            "Aion turn needs attention",
+            "Your task ended with an error.",
+            "ended with an error.",
         ),
-        None => (title_prefix.to_owned(), format!("這項任務{body_suffix}")),
+        TerminalNoticeStatus::Cancelled => (
+            "Aion turn cancelled",
+            "The task was cancelled before completion.",
+            "was cancelled before completion.",
+        ),
+        TerminalNoticeStatus::Timeout => (
+            "Aion turn timed out",
+            "The task did not finish in time.",
+            "did not finish in time.",
+        ),
+    };
+    let max_target_title_chars = MAX_TITLE_CHARS.saturating_sub(title_prefix.chars().count() + 2);
+    let target_title = target_title.map(|title| title.chars().take(max_target_title_chars).collect::<String>());
+    let (title, body) = match target_title.as_deref().filter(|title| !title.is_empty()) {
+        Some(target_title) => (
+            format!("{title_prefix}: {target_title}"),
+            format!("\"{target_title}\" {body_suffix}"),
+        ),
+        None => (title_prefix.to_owned(), fallback_body.to_owned()),
     };
     let (status, target_kind) = match (notice.status, notice.target_kind) {
         (TerminalNoticeStatus::Success, target) => ("success", target),

@@ -290,8 +290,8 @@ mod terminal_delivery_tests {
         )
         .expect("payload");
 
-        assert_eq!(payload.title, "Aion 任務已完成：報告 已完成");
-        assert_eq!(payload.body, "「報告 已完成」已完成。");
+        assert_eq!(payload.title, "Aion turn completed: 報告 已完成");
+        assert_eq!(payload.body, "\"報告 已完成\" has completed.");
     }
 
     #[test]
@@ -302,7 +302,7 @@ mod terminal_delivery_tests {
         .expect("payload");
 
         assert_eq!(payload.title.chars().count(), 30);
-        assert!(payload.title.ends_with("任務任務"));
+        assert!(payload.title.ends_with("任務任"));
     }
 
     #[test]
@@ -320,8 +320,8 @@ mod terminal_delivery_tests {
             )
             .expect("payload");
 
-            assert_eq!(payload.title, "Aion 任務需要處理");
-            assert_eq!(payload.body, "這項任務執行失敗，請查看詳情。");
+            assert_eq!(payload.title, "Aion turn needs attention");
+            assert_eq!(payload.body, "Your task ended with an error.");
         }
     }
 
