@@ -23,9 +23,12 @@ pub use facebook_adapter::{
     IFacebookBrowserDriver, IFacebookBrowserSession, RawPostData, RawTargetScanOutcome,
 };
 pub use liveview_transport::{
-    hash_session_token, FailClosedLiveViewTransportAdapter, ILiveViewTransportAdapter, LiveViewCapability,
+    hash_session_token, ClientRelayMessage, FailClosedLiveViewTransportAdapter, GatewayRelayMessage,
+    ILiveViewTransportAdapter, ISidecarScreencastDriver, LiveViewCapability, LiveViewScreencastRelayGateway,
     LiveViewSessionManager, LiveViewSessionScope, LiveViewSessionStatus, LiveViewTransportError,
-    LiveViewTransportSession, StartLiveViewSessionRequest, StartLiveViewSessionResponse,
+    LiveViewTransportSession, MouseButton, ScreencastFormat, ScreencastFrame, StartLiveViewSessionRequest,
+    StartLiveViewSessionResponse, UserKeyboardEvent, UserPointerEvent, MAX_FRAME_HEIGHT, MAX_FRAME_WIDTH,
+    MAX_INPUTS_PER_SECOND, MAX_SCENARIOCAST_FRAME_BYTES,
 };
 pub use monitor::{
     propose_default_schedule, validate_schedule, CreateMonitorJobOutcome, CreateMonitorJobRequest, CursorItemState,

@@ -2699,3 +2699,295 @@ async fn test_liveview_transport_zero_custody_and_untrusted_data_isolation() {
     assert!(!serialized_session.contains("secret_bearer_token"));
     assert!(serialized_session.contains(&hash_session_token("secret_bearer_token")));
 }
+
+// ---------------------------------------------------------------------------
+// Ticket 12A Tests: Controlled WebSocket Screencast Gateway / Relay Seam
+// ---------------------------------------------------------------------------
+
+use aionui_cron::liveview_transport::{
+    ClientRelayMessage, GatewayRelayMessage, ISidecarScreencastDriver, LiveViewScreencastRelayGateway,
+    MouseButton, ScreencastFormat, ScreencastFrame, UserKeyboardEvent, UserPointerEvent,
+    MAX_FRAME_HEIGHT, MAX_FRAME_WIDTH, MAX_SCENARIOCAST_FRAME_BYTES,
+};
+
+struct FakeSidecarDriver {
+    connected: bool,
+    attached_sessions: Arc<tokio::sync::Mutex<Vec<(String, LiveViewSessionScope)>>>,
+    received_pointers: Arc<tokio::sync::Mutex<Vec<(String, UserPointerEvent)>>>,
+    received_keyboards: Arc<tokio::sync::Mutex<Vec<(String, UserKeyboardEvent)>>>,
+    detached_sessions: Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+impl FakeSidecarDriver {
+    fn new(connected: bool) -> (
+        Self,
+        Arc<tokio::sync::Mutex<Vec<(String, LiveViewSessionScope)>>>,
+        Arc<tokio::sync::Mutex<Vec<(String, UserPointerEvent)>>>,
+        Arc<tokio::sync::Mutex<Vec<(String, UserKeyboardEvent)>>>,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) {
+        let attached = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let pointers = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let keyboards = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let detached = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let driver = Self {
+            connected,
+            attached_sessions: attached.clone(),
+            received_pointers: pointers.clone(),
+            received_keyboards: keyboards.clone(),
+            detached_sessions: detached.clone(),
+        };
+
+        (driver, attached, pointers, keyboards, detached)
+    }
+}
+
+#[async_trait::async_trait]
+impl ISidecarScreencastDriver for FakeSidecarDriver {
+    async fn attach_session(
+        &self,
+        session_id: &str,
+        scope: &LiveViewSessionScope,
+    ) -> Result<(), LiveViewTransportError> {
+        if !self.connected {
+            return Err(LiveViewTransportError::SidecarDisconnected("Sidecar offline".into()));
+        }
+        let mut guard = self.attached_sessions.lock().await;
+        guard.push((session_id.to_string(), scope.clone()));
+        Ok(())
+    }
+
+    async fn forward_pointer(
+        &self,
+        session_id: &str,
+        event: &UserPointerEvent,
+    ) -> Result<(), LiveViewTransportError> {
+        let mut guard = self.received_pointers.lock().await;
+        guard.push((session_id.to_string(), event.clone()));
+        Ok(())
+    }
+
+    async fn forward_keyboard(
+        &self,
+        session_id: &str,
+        event: &UserKeyboardEvent,
+    ) -> Result<(), LiveViewTransportError> {
+        let mut guard = self.received_keyboards.lock().await;
+        guard.push((session_id.to_string(), event.clone()));
+        Ok(())
+    }
+
+    async fn detach_session(&self, session_id: &str) -> Result<(), LiveViewTransportError> {
+        let mut guard = self.detached_sessions.lock().await;
+        guard.push(session_id.to_string());
+        Ok(())
+    }
+
+    async fn is_connected(&self) -> bool {
+        self.connected
+    }
+}
+
+#[tokio::test]
+async fn test_relay_handshake_authorizes_capability_token_and_binds_scope() {
+    let (transport, _, _) = MockLiveViewTransportAdapter::new(false);
+    let session_mgr = Arc::new(LiveViewSessionManager::new(Arc::new(transport), "pwa_liveview_v1"));
+
+    let (driver, attached, _, _, _) = FakeSidecarDriver::new(true);
+    let gateway = LiveViewScreencastRelayGateway::new(session_mgr.clone(), Arc::new(driver));
+
+    // 1. Create valid session
+    let scope = LiveViewSessionScope::new("user_carol", "conv_carol_1", "prof_carol_fb", "pwa_liveview_v1")
+        .with_browser_session_id("brw_sess_999")
+        .with_target_group_ids(vec!["group_target_1".into()]);
+
+    let req = StartLiveViewSessionRequest {
+        scope,
+        nonce: "nonce_carol_handshake".into(),
+        ttl_ms: 600_000,
+    };
+    let start_resp = session_mgr.start_session("user_carol", req, 1_000_000).await.unwrap();
+
+    // 2. Successful handshake matching caller & conversation scope
+    let session = gateway
+        .handle_handshake("user_carol", &start_resp.session_id, "conv_carol_1", 1_000_100)
+        .await
+        .unwrap();
+
+    assert_eq!(session.session_id, start_resp.session_id);
+    assert_eq!(session.scope.user_id, "user_carol");
+    assert_eq!(session.scope.conversation_id, "conv_carol_1");
+    assert_eq!(attached.lock().await.len(), 1);
+
+    // 3. Handshake rejected on conversation mismatch
+    let err_conv = gateway
+        .handle_handshake("user_carol", &start_resp.session_id, "conv_other_forge", 1_000_100)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_conv, LiveViewTransportError::AccessDenied(_)));
+
+    // 4. Handshake rejected on cross-user caller
+    let err_user = gateway
+        .handle_handshake("user_mallory", &start_resp.session_id, "conv_carol_1", 1_000_100)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_user, LiveViewTransportError::AccessDenied(_)));
+}
+
+#[tokio::test]
+async fn test_relay_bounded_screencast_frames_and_oversized_rejection() {
+    let (transport, _, _) = MockLiveViewTransportAdapter::new(false);
+    let session_mgr = Arc::new(LiveViewSessionManager::new(Arc::new(transport), "pwa_liveview_v1"));
+    let (driver, _, _, _, _) = FakeSidecarDriver::new(true);
+    let gateway = LiveViewScreencastRelayGateway::new(session_mgr.clone(), Arc::new(driver));
+
+    let scope = LiveViewSessionScope::new("user_carol", "conv_carol_1", "prof_carol_fb", "pwa_liveview_v1");
+    let req = StartLiveViewSessionRequest {
+        scope,
+        nonce: "nonce_frame_bounds".into(),
+        ttl_ms: 600_000,
+    };
+    let start_resp = session_mgr.start_session("user_carol", req, 1_000_000).await.unwrap();
+    let session = session_mgr.get_session("user_carol", &start_resp.session_id).await.unwrap();
+
+    // 1. Valid frame within boundaries
+    let valid_frame = ScreencastFrame::new(
+        &start_resp.session_id,
+        1_000_050,
+        1280,
+        720,
+        ScreencastFormat::Jpeg,
+        vec![0xFF, 0xD8, 0xFF, 0xE0],
+    ).unwrap();
+
+    let wrapped = gateway.validate_and_wrap_frame(&session, valid_frame).unwrap();
+    assert!(matches!(wrapped, GatewayRelayMessage::Frame { width: 1280, height: 720, .. }));
+
+    // 2. Oversized dimensions rejected fail-closed
+    let err_dim = ScreencastFrame::new(
+        &start_resp.session_id,
+        1_000_050,
+        MAX_FRAME_WIDTH + 10,
+        720,
+        ScreencastFormat::Jpeg,
+        vec![0x00],
+    ).unwrap_err();
+    assert!(matches!(err_dim, LiveViewTransportError::InvalidFrame(_)));
+
+    // 3. Oversized frame payload bytes rejected fail-closed
+    let huge_bytes = vec![0xAB; MAX_SCENARIOCAST_FRAME_BYTES + 1];
+    let err_bytes = ScreencastFrame::new(
+        &start_resp.session_id,
+        1_000_050,
+        1280,
+        720,
+        ScreencastFormat::Jpeg,
+        huge_bytes,
+    ).unwrap_err();
+    assert!(matches!(err_bytes, LiveViewTransportError::InvalidFrame(_)));
+}
+
+#[tokio::test]
+async fn test_relay_allowlisted_pointer_keyboard_inputs_and_bounds_validation() {
+    let (transport, _, _) = MockLiveViewTransportAdapter::new(false);
+    let session_mgr = Arc::new(LiveViewSessionManager::new(Arc::new(transport), "pwa_liveview_v1"));
+    let (driver, _, pointers, keyboards, _) = FakeSidecarDriver::new(true);
+    let gateway = LiveViewScreencastRelayGateway::new(session_mgr.clone(), Arc::new(driver));
+
+    let scope = LiveViewSessionScope::new("user_carol", "conv_carol_1", "prof_carol_fb", "pwa_liveview_v1");
+    let req = StartLiveViewSessionRequest {
+        scope,
+        nonce: "nonce_inputs_test".into(),
+        ttl_ms: 600_000,
+    };
+    let start_resp = session_mgr.start_session("user_carol", req, 1_000_000).await.unwrap();
+
+    // 1. Valid pointer click
+    let click_msg = ClientRelayMessage::Pointer(UserPointerEvent::Click {
+        button: MouseButton::Left,
+        x: 400,
+        y: 300,
+    });
+    gateway.process_client_message("user_carol", &start_resp.session_id, click_msg, 1_000_100).await.unwrap();
+    assert_eq!(pointers.lock().await.len(), 1);
+
+    // 2. Out-of-bounds click rejected fail-closed
+    let bad_click = ClientRelayMessage::Pointer(UserPointerEvent::Click {
+        button: MouseButton::Left,
+        x: MAX_FRAME_WIDTH + 500,
+        y: 300,
+    });
+    let err_click = gateway
+        .process_client_message("user_carol", &start_resp.session_id, bad_click, 1_000_150)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_click, LiveViewTransportError::InputRejected(_)));
+
+    // 3. Valid keyboard text input
+    let text_msg = ClientRelayMessage::Keyboard(UserKeyboardEvent::TextInput {
+        text: "auth-code-123456".into(),
+    });
+    gateway.process_client_message("user_carol", &start_resp.session_id, text_msg, 1_000_200).await.unwrap();
+    assert_eq!(keyboards.lock().await.len(), 1);
+
+    // 4. Dangerous control characters in text input rejected fail-closed
+    let dangerous_text = ClientRelayMessage::Keyboard(UserKeyboardEvent::TextInput {
+        text: "malicious\x00escape\x1b[2J".into(),
+    });
+    let err_text = gateway
+        .process_client_message("user_carol", &start_resp.session_id, dangerous_text, 1_000_250)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_text, LiveViewTransportError::InputRejected(_)));
+}
+
+#[tokio::test]
+async fn test_relay_sidecar_disconnect_fails_closed_without_retry_storm() {
+    let (transport, _, _) = MockLiveViewTransportAdapter::new(false);
+    let session_mgr = Arc::new(LiveViewSessionManager::new(Arc::new(transport), "pwa_liveview_v1"));
+
+    // Sidecar driver configured as offline / disconnected
+    let (driver, _, _, _, _) = FakeSidecarDriver::new(false);
+    let gateway = LiveViewScreencastRelayGateway::new(session_mgr.clone(), Arc::new(driver));
+
+    let scope = LiveViewSessionScope::new("user_carol", "conv_carol_1", "prof_carol_fb", "pwa_liveview_v1");
+    let req = StartLiveViewSessionRequest {
+        scope,
+        nonce: "nonce_disconnect_test".into(),
+        ttl_ms: 600_000,
+    };
+    let start_resp = session_mgr.start_session("user_carol", req, 1_000_000).await.unwrap();
+
+    let err = gateway
+        .handle_handshake("user_carol", &start_resp.session_id, "conv_carol_1", 1_000_100)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, LiveViewTransportError::SidecarDisconnected(_)),
+        "Sidecar disconnect must fail closed without attempting automated retries"
+    );
+}
+
+#[tokio::test]
+async fn test_relay_clean_termination_and_detach() {
+    let (transport, _, _) = MockLiveViewTransportAdapter::new(false);
+    let session_mgr = Arc::new(LiveViewSessionManager::new(Arc::new(transport), "pwa_liveview_v1"));
+    let (driver, _, _, _, detached) = FakeSidecarDriver::new(true);
+    let gateway = LiveViewScreencastRelayGateway::new(session_mgr.clone(), Arc::new(driver));
+
+    let scope = LiveViewSessionScope::new("user_carol", "conv_carol_1", "prof_carol_fb", "pwa_liveview_v1");
+    let req = StartLiveViewSessionRequest {
+        scope,
+        nonce: "nonce_term_test".into(),
+        ttl_ms: 600_000,
+    };
+    let start_resp = session_mgr.start_session("user_carol", req, 1_000_000).await.unwrap();
+
+    gateway.terminate_session("user_carol", &start_resp.session_id, 1_050_000).await.unwrap();
+
+    assert_eq!(detached.lock().await.len(), 1);
+    let session = session_mgr.get_session("user_carol", &start_resp.session_id).await.unwrap();
+    assert_eq!(session.status, LiveViewSessionStatus::Ended);
+}
