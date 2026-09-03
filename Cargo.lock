@@ -636,7 +636,6 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
- "uuid",
 ]
 
 [[package]]

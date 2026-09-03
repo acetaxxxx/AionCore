@@ -446,7 +446,7 @@ impl MonitorControlService {
             Some(supplied_schedule) => {
                 validate_schedule(&supplied_schedule)?;
 
-                let job_id = format!("mon_{}", uuid::Uuid::now_v7());
+                let job_id = aionui_common::generate_prefixed_id("mon");
                 let job = MonitorJob {
                     id: job_id,
                     user_id: user_id.to_owned(),
@@ -469,7 +469,7 @@ impl MonitorControlService {
             }
             None => {
                 let proposed = propose_default_schedule();
-                let proposal_id = format!("prop_{}", uuid::Uuid::now_v7());
+                let proposal_id = aionui_common::generate_prefixed_id("prop");
                 let proposal = MonitorJobProposal {
                     proposal_id,
                     user_id: user_id.to_owned(),
@@ -516,7 +516,7 @@ impl MonitorControlService {
 
         validate_schedule(&final_schedule)?;
 
-        let job_id = format!("mon_{}", uuid::Uuid::now_v7());
+        let job_id = aionui_common::generate_prefixed_id("mon");
         let job = MonitorJob {
             id: job_id,
             user_id: user_id.to_owned(),
