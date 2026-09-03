@@ -27,7 +27,7 @@ use tokio::sync::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::scheduler::{compute_cron_next_run, normalize_cron_expr, validate_cron_expression, validate_timezone};
+use crate::scheduler::{compute_cron_next_run, validate_cron_expression, validate_timezone};
 use crate::types::CronSchedule;
 
 // ---------------------------------------------------------------------------
@@ -1013,7 +1013,7 @@ pub fn validate_schedule(schedule: &CronSchedule) -> Result<(), MonitorError> {
         CronSchedule::Cron { expr, tz, .. } => {
             validate_cron_expression(expr)
                 .map_err(|e| MonitorError::InvalidScheduleScope(format!("invalid cron expr: {e}")))?;
-            if let Some(ref tz_str) = tz {
+            if let Some(tz_str) = tz {
                 validate_timezone(tz_str)
                     .map_err(|e| MonitorError::InvalidScheduleScope(format!("invalid timezone: {e}")))?;
             }
@@ -1598,6 +1598,7 @@ impl MonitorControlService {
         let mut updated_cursors = Vec::new();
         let mut successful_targets = Vec::new();
         let mut failed_targets = Vec::new();
+        let has_untrusted_target = scan.target_results.iter().any(|result| result.is_untrusted_structure);
 
         // Evaluate targets independently
         for target in &job.targets {
@@ -1751,10 +1752,9 @@ impl MonitorControlService {
                     });
                 }
                 None => {
-                    failed_targets.push(TargetFailure {
-                        target_id: tid.clone(),
-                        reason: "Target was not scanned by runner".into(),
-                    });
+                    // A runner may intentionally return a bounded subset of targets. Only
+                    // returned target results contribute to the report; an untrusted result
+                    // still fails the whole occurrence through `has_untrusted_target`.
                 }
             }
         }
@@ -1762,11 +1762,15 @@ impl MonitorControlService {
         // Determine aggregate outcome
         let aggregate_outcome = if scan.outcome == MonitorRunOutcome::AuthExpired {
             MonitorRunOutcome::AuthExpired
+        } else if has_untrusted_target {
+            MonitorRunOutcome::Failed
         } else if successful_targets.is_empty() {
-            if failed_targets
-                .iter()
-                .all(|f| f.reason.to_lowercase().contains("unavailable"))
-            {
+            let all_targets_unavailable = !scan.target_results.is_empty()
+                && scan
+                    .target_results
+                    .iter()
+                    .all(|result| result.outcome == MonitorRunOutcome::Unavailable);
+            if scan.outcome == MonitorRunOutcome::Unavailable || all_targets_unavailable {
                 MonitorRunOutcome::Unavailable
             } else {
                 MonitorRunOutcome::Failed
@@ -1805,22 +1809,21 @@ impl MonitorControlService {
         job.updated_at_ms = job.updated_at_ms.max(scheduled_at_ms);
 
         // Check authentication expiry, checkpoint, or CAPTCHA: auto-pause without automatic retries
-        let auth_pause_reason = match aggregate_outcome {
-            MonitorRunOutcome::AuthExpired => Some(MonitorStopReason::AuthExpired),
-            _ => {
-                if let Some(ref msg) = scan.error_message {
-                    let lower = msg.to_lowercase();
-                    if lower.contains("checkpoint") {
-                        Some(MonitorStopReason::CheckpointDetected)
-                    } else if lower.contains("captcha") {
-                        Some(MonitorStopReason::CaptchaDetected)
-                    } else {
-                        None
-                    }
+        let auth_pause_reason = match scan.error_message.as_deref() {
+            Some(msg) => {
+                let lower = msg.to_lowercase();
+                if lower.contains("checkpoint") {
+                    Some(MonitorStopReason::CheckpointDetected)
+                } else if lower.contains("captcha") {
+                    Some(MonitorStopReason::CaptchaDetected)
+                } else if aggregate_outcome == MonitorRunOutcome::AuthExpired {
+                    Some(MonitorStopReason::AuthExpired)
                 } else {
                     None
                 }
             }
+            None if aggregate_outcome == MonitorRunOutcome::AuthExpired => Some(MonitorStopReason::AuthExpired),
+            None => None,
         };
 
         if let Some(reason) = auth_pause_reason {

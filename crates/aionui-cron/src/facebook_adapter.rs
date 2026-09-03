@@ -192,7 +192,7 @@ impl MonitorRunner for FacebookBrowserCapabilityAdapter {
                     });
                 }
                 Ok(RawTargetScanOutcome::CheckpointDetected(reason)) => {
-                    top_auth_expired = Some(reason.clone());
+                    top_auth_expired = Some(format!("checkpoint detected: {reason}"));
                     target_results.push(TargetScanResult {
                         target_id: target.target_id.clone(),
                         outcome: MonitorRunOutcome::AuthExpired,
@@ -202,7 +202,7 @@ impl MonitorRunner for FacebookBrowserCapabilityAdapter {
                     });
                 }
                 Ok(RawTargetScanOutcome::CaptchaDetected(reason)) => {
-                    top_auth_expired = Some(reason.clone());
+                    top_auth_expired = Some(format!("captcha challenge: {reason}"));
                     target_results.push(TargetScanResult {
                         target_id: target.target_id.clone(),
                         outcome: MonitorRunOutcome::AuthExpired,
