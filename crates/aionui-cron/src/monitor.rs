@@ -1,9 +1,9 @@
 //! Conversation-bound Facebook MonitorJob control domain and public service seam.
 //!
-//! Implements Tickets 01, 02, 03, and 04:
+//! Implements Tickets 01, 02, 03, 04, and 05:
 //! - Conversation-owned `MonitorJob` domain aggregate and lifecycle.
 //! - Complete target, query, lookback, and schedule scope enforcement.
-//! - Supplied schedule acceptance vs. agent-proposed default schedule approval flow (no premature job persistence).
+//! - Supplied schedule acceptance vs. agent-proposed default schedule approval flow.
 //! - Lifecycle control semantics: create, pause, resume, cancel, get, list, and conversation termination hook.
 //! - Strict user and originating conversation scope isolation (fail-closed against cross-account/conversation access).
 //! - Bounded occurrence execution with durable report persistence and idempotency.
@@ -12,8 +12,12 @@
 //! - Distinction between monitor-seen, conversation-reported, and user-acknowledged states (`unread`/`needs_attention`).
 //! - Atomic cursor advancement upon scan & durable report success; cursor retention on failure.
 //! - Query revision, lookback rescan, and separate `Backfill` findings grouping.
+//! - `FacebookProfile` server-authorized ownership and credentials privacy.
+//! - Authentication failure (AuthExpired, Checkpoint, CAPTCHA) auto-pause without automatic retries.
+//! - Interactive LiveView re-authentication resuming eligible jobs only for their next scheduled run.
+//! - LiveView session precedence over background MonitorRun.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -54,6 +58,9 @@ pub enum MonitorError {
 
     #[error("Repository error: {0}")]
     Repository(String),
+
+    #[error("Profile busy: {0}")]
+    ProfileBusy(String),
 
     #[error("Monitor job not found: {0}")]
     NotFound(String),
@@ -118,6 +125,52 @@ pub enum ObservationDeltaKind {
     Changed,
     Unchanged,
     Backfill,
+}
+
+/// Authentication state for a user-owned Facebook profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileAuthState {
+    Authenticated,
+    Expired,
+    CheckpointRequired,
+    CaptchaRequired,
+}
+
+/// User-owned browser storage profile reference.
+/// Never stores passwords, MFA secrets, or unrestricted tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FacebookProfile {
+    pub id: String,
+    pub user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub auth_state: ProfileAuthState,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+impl FacebookProfile {
+    pub fn new(id: impl Into<String>, user_id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            user_id: user_id.into(),
+            display_name: None,
+            auth_state: ProfileAuthState::Authenticated,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = Some(name.into());
+        self
+    }
+
+    pub fn with_auth_state(mut self, auth_state: ProfileAuthState) -> Self {
+        self.auth_state = auth_state;
+        self
+    }
 }
 
 /// Raw observation item discovered during a target scan.
@@ -398,6 +451,15 @@ impl MonitorScanResult {
             observations: Vec::new(),
         }
     }
+
+    pub fn auth_expired(message: impl Into<String>) -> Self {
+        Self {
+            outcome: MonitorRunOutcome::AuthExpired,
+            observations_count: 0,
+            error_message: Some(message.into()),
+            observations: Vec::new(),
+        }
+    }
 }
 
 /// Durable, bounded result for one scheduled occurrence.
@@ -538,6 +600,9 @@ pub trait IMonitorJobRepository: Send + Sync {
         conversation_id: &str,
         cursor: &MonitorCursor,
     ) -> Result<(), MonitorError>;
+    async fn save_profile(&self, profile: &FacebookProfile) -> Result<(), MonitorError>;
+    async fn get_profile(&self, user_id: &str, profile_id: &str) -> Result<Option<FacebookProfile>, MonitorError>;
+    async fn find_profile_by_id(&self, profile_id: &str) -> Result<Option<FacebookProfile>, MonitorError>;
 }
 
 #[derive(Default)]
@@ -545,6 +610,7 @@ pub struct InMemoryMonitorJobRepository {
     jobs: RwLock<HashMap<String, MonitorJob>>,
     run_reports: RwLock<HashMap<String, MonitorRunReport>>,
     cursors: RwLock<HashMap<String, MonitorCursor>>,
+    profiles: RwLock<HashMap<String, FacebookProfile>>,
 }
 
 impl InMemoryMonitorJobRepository {
@@ -553,6 +619,7 @@ impl InMemoryMonitorJobRepository {
             jobs: RwLock::new(HashMap::new()),
             run_reports: RwLock::new(HashMap::new()),
             cursors: RwLock::new(HashMap::new()),
+            profiles: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -690,6 +757,27 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         guard.insert(key, cursor.clone());
         Ok(())
     }
+
+    async fn save_profile(&self, profile: &FacebookProfile) -> Result<(), MonitorError> {
+        let mut guard = self.profiles.write().await;
+        guard.insert(profile.id.clone(), profile.clone());
+        Ok(())
+    }
+
+    async fn get_profile(&self, user_id: &str, profile_id: &str) -> Result<Option<FacebookProfile>, MonitorError> {
+        let guard = self.profiles.read().await;
+        if let Some(prof) = guard.get(profile_id) {
+            if prof.user_id == user_id {
+                return Ok(Some(prof.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn find_profile_by_id(&self, profile_id: &str) -> Result<Option<FacebookProfile>, MonitorError> {
+        let guard = self.profiles.read().await;
+        Ok(guard.get(profile_id).cloned())
+    }
 }
 
 fn run_report_key(user_id: &str, conversation_id: &str, job_id: &str, scheduled_at_ms: u64) -> String {
@@ -748,6 +836,7 @@ pub fn validate_schedule(schedule: &CronSchedule) -> Result<(), MonitorError> {
 pub struct MonitorControlService {
     repo: Arc<dyn IMonitorJobRepository>,
     occurrence_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    liveview_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl MonitorControlService {
@@ -755,6 +844,7 @@ impl MonitorControlService {
         Self {
             repo,
             occurrence_locks: Arc::new(Mutex::new(HashMap::new())),
+            liveview_sessions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -802,6 +892,40 @@ impl MonitorControlService {
         Ok(())
     }
 
+    /// Register a server-authorized user-owned FacebookProfile.
+    pub async fn register_profile(&self, profile: FacebookProfile) -> Result<(), MonitorError> {
+        self.repo.save_profile(&profile).await
+    }
+
+    /// Retrieve a user's FacebookProfile by id.
+    pub async fn get_profile(&self, user_id: &str, profile_id: &str) -> Result<Option<FacebookProfile>, MonitorError> {
+        self.repo.get_profile(user_id, profile_id).await
+    }
+
+    /// Begin an interactive LiveView session for a profile, taking precedence over background runs.
+    pub async fn start_liveview_session(&self, user_id: &str, profile_id: &str) -> Result<(), MonitorError> {
+        if let Some(prof) = self.repo.find_profile_by_id(profile_id).await? {
+            if prof.user_id != user_id {
+                return Err(MonitorError::AccessDenied("Profile belongs to another user".into()));
+            }
+        }
+        let mut guard = self.liveview_sessions.lock().await;
+        guard.insert(profile_id.to_string());
+        Ok(())
+    }
+
+    /// Terminate an interactive LiveView session.
+    pub async fn end_liveview_session(&self, profile_id: &str) {
+        let mut guard = self.liveview_sessions.lock().await;
+        guard.remove(profile_id);
+    }
+
+    /// Check if LiveView is currently active for a profile.
+    pub async fn is_liveview_active(&self, profile_id: &str) -> bool {
+        let guard = self.liveview_sessions.lock().await;
+        guard.contains(profile_id)
+    }
+
     /// Create a new MonitorJob explicitly bound to the originating conversation.
     pub async fn create_job(
         &self,
@@ -812,6 +936,17 @@ impl MonitorControlService {
     ) -> Result<CreateMonitorJobOutcome, MonitorError> {
         Self::validate_ownership_scope(user_id, conversation_id)?;
         Self::validate_scope(&req.targets, &req.query, &req.lookback)?;
+
+        // Server-authorized user profile ownership verification: client input cannot choose another user's profile
+        if let Some(ref pid) = req.profile_ref {
+            if let Some(existing) = self.repo.find_profile_by_id(pid).await? {
+                if existing.user_id != user_id {
+                    return Err(MonitorError::AccessDenied(format!(
+                        "Profile '{pid}' does not belong to caller '{user_id}'"
+                    )));
+                }
+            }
+        }
 
         match req.schedule {
             Some(supplied_schedule) => {
@@ -878,6 +1013,16 @@ impl MonitorControlService {
 
         Self::validate_scope(&proposal.targets, &proposal.query, &proposal.lookback)?;
 
+        if let Some(ref pid) = proposal.profile_ref {
+            if let Some(existing) = self.repo.find_profile_by_id(pid).await? {
+                if existing.user_id != user_id {
+                    return Err(MonitorError::AccessDenied(format!(
+                        "Profile '{pid}' does not belong to caller '{user_id}'"
+                    )));
+                }
+            }
+        }
+
         let final_schedule = match approved_schedule {
             Some(sched) => sched,
             None => proposal.proposed_schedule,
@@ -909,8 +1054,6 @@ impl MonitorControlService {
     }
 
     /// Update the query text, optional filters, and optional lookback for an active or paused job.
-    /// Increments query revision, sets query revision timestamp, and ensures
-    /// subsequent runs rescan the lookback window without reusing the previous revision's cursor.
     pub async fn update_query(
         &self,
         user_id: &str,
@@ -963,6 +1106,66 @@ impl MonitorControlService {
 
         self.repo.save(&job).await?;
         Ok(job)
+    }
+
+    /// Complete interactive LiveView re-authentication for a profile.
+    /// Resumes eligible paused jobs in the same conversation using this profile
+    /// for their NEXT scheduled occurrence only.
+    pub async fn complete_liveview_reauth(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        profile_id: &str,
+        now_ms: u64,
+    ) -> Result<Vec<MonitorJob>, MonitorError> {
+        Self::validate_ownership_scope(user_id, conversation_id)?;
+
+        if let Some(mut prof) = self.repo.find_profile_by_id(profile_id).await? {
+            if prof.user_id != user_id {
+                return Err(MonitorError::AccessDenied(
+                    "Profile belongs to another user".into(),
+                ));
+            }
+            prof.auth_state = ProfileAuthState::Authenticated;
+            prof.updated_at_ms = now_ms;
+            self.repo.save_profile(&prof).await?;
+        }
+
+        // End LiveView session
+        self.end_liveview_session(profile_id).await;
+
+        let jobs = self.repo.list_by_conversation(user_id, conversation_id).await?;
+        let mut resumed_jobs = Vec::new();
+
+        for mut job in jobs {
+            if job.profile_ref.as_deref() == Some(profile_id)
+                && job.status == MonitorJobStatus::Paused
+            {
+                // Only resume jobs paused due to authentication / checkpoint / captcha
+                let is_auth_paused = matches!(
+                    job.stop_reason,
+                    Some(MonitorStopReason::AuthExpired)
+                        | Some(MonitorStopReason::CheckpointDetected)
+                        | Some(MonitorStopReason::CaptchaDetected)
+                );
+
+                if is_auth_paused {
+                    job.status = MonitorJobStatus::Active;
+                    job.stop_reason = None;
+                    job.updated_at_ms = now_ms;
+                    // Resumes eligible ONLY for next scheduled occurrence!
+                    job.next_execution_at_ms = compute_next_run_after_occurrence(
+                        &job.schedule,
+                        now_ms,
+                        now_ms,
+                    );
+                    self.repo.save(&job).await?;
+                    resumed_jobs.push(job);
+                }
+            }
+        }
+
+        Ok(resumed_jobs)
     }
 
     /// Pause an active monitor job with an explicit reason.
@@ -1139,8 +1342,8 @@ impl MonitorControlService {
 
     /// Run one bounded occurrence for an existing active job and persist its
     /// report in the originating conversation scope. Performs single-target delta
-    /// evaluation, query revision scoping, backfill detection, and advances the
-    /// cursor only on scan and report success.
+    /// evaluation, query revision scoping, backfill detection, auth pause handling,
+    /// and advances the cursor only on scan and report success.
     pub async fn run_occurrence(
         &self,
         user_id: &str,
@@ -1178,6 +1381,15 @@ impl MonitorControlService {
             });
         }
 
+        // LiveView precedence: background monitor yields if LiveView is active
+        if let Some(ref pid) = job.profile_ref {
+            if self.is_liveview_active(pid).await {
+                return Err(MonitorError::ProfileBusy(format!(
+                    "LiveView session actively in progress for profile '{pid}'"
+                )));
+            }
+        }
+
         // Repeated delivery is idempotent for the same occurrence
         if let Some(existing) = self
             .repo
@@ -1189,7 +1401,20 @@ impl MonitorControlService {
 
         let scan = match runner.run_scan(&job).await {
             Ok(scan) => scan,
-            Err(error_message) => MonitorScanResult::failed(error_message),
+            Err(error_message) => {
+                let lower = error_message.to_lowercase();
+                let outcome = if lower.contains("checkpoint") || lower.contains("captcha") {
+                    MonitorRunOutcome::AuthExpired
+                } else {
+                    MonitorRunOutcome::Failed
+                };
+                MonitorScanResult {
+                    outcome,
+                    observations_count: 0,
+                    error_message: Some(error_message),
+                    observations: Vec::new(),
+                }
+            }
         };
 
         let target_id = job.targets.first().map(|t| t.target_id.clone());
@@ -1209,8 +1434,6 @@ impl MonitorControlService {
                 for obs in &scan.observations {
                     let delta_kind = match cursor.items.get(&obs.id) {
                         None => {
-                            // Unseen in current revision's cursor.
-                            // If query has been revised (revision > 1) and post was published before revision:
                             if job.query.revision > 1 {
                                 let revised_at = job.query_revised_at_ms.unwrap_or(scheduled_at_ms);
                                 if obs.published_at_ms > 0 && obs.published_at_ms < revised_at {
@@ -1218,7 +1441,6 @@ impl MonitorControlService {
                                 } else if obs.published_at_ms >= revised_at {
                                     ObservationDeltaKind::New
                                 } else {
-                                    // Published time unavailable; classify as backfill on lookback rescan
                                     ObservationDeltaKind::Backfill
                                 }
                             } else {
@@ -1268,7 +1490,7 @@ impl MonitorControlService {
                                     first_seen_at_ms: first_seen,
                                     last_seen_at_ms: scheduled_at_ms,
                                     reported_at_ms: Some(scheduled_at_ms),
-                                    acknowledged_at_ms: None, // Reset acknowledgement on content change
+                                    acknowledged_at_ms: None,
                                 },
                             );
                             delta_observations.push(ReportedObservation {
@@ -1280,7 +1502,6 @@ impl MonitorControlService {
                             if let Some(existing) = cursor.items.get_mut(&obs.id) {
                                 existing.last_seen_at_ms = scheduled_at_ms;
                             }
-                            // Unchanged already-reported observations are omitted from report
                         }
                     }
                 }
@@ -1311,13 +1532,52 @@ impl MonitorControlService {
             lookback_window_ms: Some(job.lookback.duration_ms),
         };
 
-        job.last_outcome = Some(scan.outcome);
+        job.last_outcome = Some(scan.outcome.clone());
         job.updated_at_ms = job.updated_at_ms.max(scheduled_at_ms);
-        job.next_execution_at_ms = compute_next_run_after_occurrence(
-            &job.schedule,
-            scheduled_at_ms,
-            scheduled_at_ms,
-        );
+
+        // Check authentication expiry, checkpoint, or CAPTCHA: auto-pause without automatic retries
+        let auth_pause_reason = match scan.outcome {
+            MonitorRunOutcome::AuthExpired => Some(MonitorStopReason::AuthExpired),
+            _ => {
+                if let Some(ref msg) = scan.error_message {
+                    let lower = msg.to_lowercase();
+                    if lower.contains("checkpoint") {
+                        Some(MonitorStopReason::CheckpointDetected)
+                    } else if lower.contains("captcha") {
+                        Some(MonitorStopReason::CaptchaDetected)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(reason) = auth_pause_reason {
+            job.status = MonitorJobStatus::Paused;
+            job.stop_reason = Some(reason.clone());
+            job.next_execution_at_ms = None; // Forbid automatic retries
+
+            if let Some(ref pid) = job.profile_ref {
+                if let Some(mut prof) = self.repo.get_profile(user_id, pid).await? {
+                    prof.auth_state = match reason {
+                        MonitorStopReason::AuthExpired => ProfileAuthState::Expired,
+                        MonitorStopReason::CheckpointDetected => ProfileAuthState::CheckpointRequired,
+                        MonitorStopReason::CaptchaDetected => ProfileAuthState::CaptchaRequired,
+                        _ => ProfileAuthState::Expired,
+                    };
+                    prof.updated_at_ms = scheduled_at_ms;
+                    let _ = self.repo.save_profile(&prof).await;
+                }
+            }
+        } else {
+            job.next_execution_at_ms = compute_next_run_after_occurrence(
+                &job.schedule,
+                scheduled_at_ms,
+                scheduled_at_ms,
+            );
+        }
 
         // Durable atomic save
         self.repo

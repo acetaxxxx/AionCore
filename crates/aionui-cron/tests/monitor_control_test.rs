@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use aionui_cron::monitor::{
     CreateMonitorJobOutcome, CreateMonitorJobRequest, CursorItemState, FacebookObservation,
-    FacebookTarget, IMonitorJobRepository, InMemoryMonitorJobRepository, LookbackScope,
-    MonitorControlService, MonitorCursor, MonitorError, MonitorJob, MonitorJobStatus,
-    MonitorQuery, MonitorRunOutcome, MonitorRunReport, MonitorRunner, MonitorScanResult,
-    MonitorStopReason, ObservationDeltaKind, ReportedObservation, propose_default_schedule,
-    validate_schedule,
+    FacebookProfile, FacebookTarget, IMonitorJobRepository, InMemoryMonitorJobRepository,
+    LookbackScope, MonitorControlService, MonitorCursor, MonitorError, MonitorJob,
+    MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunReport, MonitorRunner,
+    MonitorScanResult, MonitorStopReason, ObservationDeltaKind, ProfileAuthState,
+    ReportedObservation, propose_default_schedule, validate_schedule,
 };
 use aionui_cron::types::CronSchedule;
 
@@ -111,7 +111,20 @@ impl IMonitorJobRepository for FailingCompletionRepository {
     ) -> Result<(), MonitorError> {
         self.inner.save_cursor(user_id, conversation_id, cursor).await
     }
+
+    async fn save_profile(&self, profile: &FacebookProfile) -> Result<(), MonitorError> {
+        self.inner.save_profile(profile).await
+    }
+
+    async fn get_profile(&self, user_id: &str, profile_id: &str) -> Result<Option<FacebookProfile>, MonitorError> {
+        self.inner.get_profile(user_id, profile_id).await
+    }
+
+    async fn find_profile_by_id(&self, profile_id: &str) -> Result<Option<FacebookProfile>, MonitorError> {
+        self.inner.find_profile_by_id(profile_id).await
+    }
 }
+
 
 
 fn valid_target(id: &str, name: &str) -> FacebookTarget {
@@ -1330,5 +1343,250 @@ async fn test_updating_query_validation_and_lifecycle_guards() {
         }
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Ticket 05 Tests: FacebookProfile authentication pause and resume
+// ---------------------------------------------------------------------------
+
+struct AuthFailingRunner {
+    kind: &'static str,
+}
+
+#[async_trait::async_trait]
+impl MonitorRunner for AuthFailingRunner {
+    async fn run_scan(&self, _job: &MonitorJob) -> Result<MonitorScanResult, String> {
+        match self.kind {
+            "expired" => Ok(MonitorScanResult::auth_expired("Facebook session cookie expired")),
+            "checkpoint" => Err("Facebook security Checkpoint detected on page load".into()),
+            "captcha" => Err("Facebook anti-bot CAPTCHA challenge presented".into()),
+            _ => Err("Unknown error".into()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_client_cannot_bind_another_users_facebook_profile_fail_closed() {
+    let svc = MonitorControlService::with_in_memory_repo();
+
+    // Alice registers her profile
+    let alice_prof = FacebookProfile::new("prof_alice_primary", "user_alice")
+        .with_display_name("Alice Facebook");
+    svc.register_profile(alice_prof).await.unwrap();
+
+    // Bob tries to create a job referencing Alice's profile
+    let mut req_bob = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    req_bob.profile_ref = Some("prof_alice_primary".into());
+
+    let err = svc
+        .create_job("user_bob", "conv_bob_1", req_bob, 1000)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, MonitorError::AccessDenied(_)),
+        "Client input choosing another user's profile must fail closed"
+    );
+
+    // Bob tries to start LiveView on Alice's profile
+    let err = svc
+        .start_liveview_session("user_bob", "prof_alice_primary")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MonitorError::AccessDenied(_)));
+}
+
+#[tokio::test]
+async fn test_auth_expiry_checkpoint_captcha_auto_pauses_without_auto_retry() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let prof = FacebookProfile::new("prof_hank", "user_hank");
+    svc.register_profile(prof).await.unwrap();
+
+    // 1. Auth Expired
+    let mut req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    req.profile_ref = Some("prof_hank".into());
+    let out = svc.create_job("user_hank", "conv_1", req.clone(), 1000).await.unwrap();
+    let job1_id = match out {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    let runner_expired = AuthFailingRunner { kind: "expired" };
+    svc.run_occurrence("user_hank", "conv_1", &job1_id, 2000, &runner_expired).await.unwrap();
+
+    let job1 = svc.get_job("user_hank", "conv_1", &job1_id).await.unwrap();
+    assert_eq!(job1.status, MonitorJobStatus::Paused);
+    assert_eq!(job1.stop_reason, Some(MonitorStopReason::AuthExpired));
+    assert_eq!(job1.next_execution_at_ms, None, "Must perform no automatic authentication retry");
+
+    let p1 = svc.get_profile("user_hank", "prof_hank").await.unwrap().unwrap();
+    assert_eq!(p1.auth_state, ProfileAuthState::Expired);
+
+    // 2. Checkpoint Detected
+    let out2 = svc.create_job("user_hank", "conv_1", req.clone(), 1000).await.unwrap();
+    let job2_id = match out2 {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    let runner_cp = AuthFailingRunner { kind: "checkpoint" };
+    svc.run_occurrence("user_hank", "conv_1", &job2_id, 3000, &runner_cp).await.unwrap();
+
+    let job2 = svc.get_job("user_hank", "conv_1", &job2_id).await.unwrap();
+    assert_eq!(job2.status, MonitorJobStatus::Paused);
+    assert_eq!(job2.stop_reason, Some(MonitorStopReason::CheckpointDetected));
+    assert_eq!(job2.next_execution_at_ms, None);
+
+    // 3. CAPTCHA Detected
+    let out3 = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job3_id = match out3 {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    let runner_captcha = AuthFailingRunner { kind: "captcha" };
+    svc.run_occurrence("user_hank", "conv_1", &job3_id, 4000, &runner_captcha).await.unwrap();
+
+    let job3 = svc.get_job("user_hank", "conv_1", &job3_id).await.unwrap();
+    assert_eq!(job3.status, MonitorJobStatus::Paused);
+    assert_eq!(job3.stop_reason, Some(MonitorStopReason::CaptchaDetected));
+    assert_eq!(job3.next_execution_at_ms, None);
+}
+
+#[tokio::test]
+async fn test_liveview_reauth_resumes_paused_jobs_only_for_next_scheduled_run() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let prof = FacebookProfile::new("prof_shared", "user_hank");
+    svc.register_profile(prof).await.unwrap();
+
+    let mut req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000, // 1 hour
+        description: None,
+    }));
+    req.profile_ref = Some("prof_shared".into());
+
+    // Job A in conv_1 (AuthExpired)
+    let out_a = svc.create_job("user_hank", "conv_1", req.clone(), 1000).await.unwrap();
+    let job_a_id = match out_a {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+    let runner_expired = AuthFailingRunner { kind: "expired" };
+    svc.run_occurrence("user_hank", "conv_1", &job_a_id, 2000, &runner_expired).await.unwrap();
+
+    // Job B in conv_1 (Explicit user pause, NOT auth failure)
+    let out_b = svc.create_job("user_hank", "conv_1", req.clone(), 1000).await.unwrap();
+    let job_b_id = match out_b {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+    svc.pause_job("user_hank", "conv_1", &job_b_id, MonitorStopReason::ExplicitUserPause, 2100).await.unwrap();
+
+    // Job C in conv_other (AuthExpired, but in different conversation)
+    let out_c = svc.create_job("user_hank", "conv_other", req.clone(), 1000).await.unwrap();
+    let job_c_id = match out_c {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+    svc.run_occurrence("user_hank", "conv_other", &job_c_id, 2200, &runner_expired).await.unwrap();
+
+    // User completes interactive LiveView re-auth at 5000 ms in conv_1
+    let resumed = svc
+        .complete_liveview_reauth("user_hank", "conv_1", "prof_shared", 5000)
+        .await
+        .expect("re-auth should succeed");
+
+    // Only Job A in conv_1 should be resumed!
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].id, job_a_id);
+    assert_eq!(resumed[0].status, MonitorJobStatus::Active);
+    assert_eq!(resumed[0].stop_reason, None);
+
+    // CRITICAL: Next run is scheduled for the NEXT occurrence (5000 + 3600000 = 8600000), NOT immediate!
+    assert_eq!(
+        resumed[0].next_execution_at_ms,
+        Some(8600000),
+        "Resumed job must be eligible ONLY for its next scheduled run"
+    );
+
+    // Job B (explicit pause) remains Paused
+    let job_b = svc.get_job("user_hank", "conv_1", &job_b_id).await.unwrap();
+    assert_eq!(job_b.status, MonitorJobStatus::Paused);
+    assert_eq!(job_b.stop_reason, Some(MonitorStopReason::ExplicitUserPause));
+
+    // Job C in conv_other remains Paused (conversation isolation)
+    let job_c = svc.get_job("user_hank", "conv_other", &job_c_id).await.unwrap();
+    assert_eq!(job_c.status, MonitorJobStatus::Paused);
+
+    // Profile auth state is now Authenticated
+    let prof_updated = svc.get_profile("user_hank", "prof_shared").await.unwrap().unwrap();
+    assert_eq!(prof_updated.auth_state, ProfileAuthState::Authenticated);
+}
+
+#[tokio::test]
+async fn test_liveview_interactive_precedence_over_background_monitor_run() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let prof = FacebookProfile::new("prof_interactive", "user_hank");
+    svc.register_profile(prof).await.unwrap();
+
+    let mut req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    req.profile_ref = Some("prof_interactive".into());
+
+    let out = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match out {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    // User starts LiveView session
+    svc.start_liveview_session("user_hank", "prof_interactive").await.unwrap();
+    assert!(svc.is_liveview_active("prof_interactive").await);
+
+    // Conflicting background MonitorRun attempts to execute
+    let runner = FakeMonitorRunner;
+    let err = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, MonitorError::ProfileBusy(_)),
+        "LiveView session must take precedence and cause background run to yield"
+    );
+
+    // User finishes LiveView session
+    svc.end_liveview_session("prof_interactive").await;
+    assert!(!svc.is_liveview_active("prof_interactive").await);
+
+    // Background run now succeeds without conflict
+    let report = svc
+        .run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner)
+        .await
+        .expect("Monitor run succeeds once LiveView ends");
+    assert_eq!(report.outcome, MonitorRunOutcome::Success);
+}
+
+#[tokio::test]
+async fn test_passwords_and_mfa_secrets_not_stored_in_domain_or_reports() {
+    let prof = FacebookProfile::new("prof_secure", "user_hank");
+    let serialized_prof = serde_json::to_string(&prof).unwrap();
+    assert!(!serialized_prof.contains("password"));
+    assert!(!serialized_prof.contains("mfa"));
+    assert!(!serialized_prof.contains("secret"));
+    assert!(!serialized_prof.contains("token"));
+
+    let req = valid_request(Some(CronSchedule::Every { every_ms: 60000, description: None }));
+    let serialized_req = serde_json::to_string(&req).unwrap();
+    assert!(!serialized_req.contains("password"));
+    assert!(!serialized_req.contains("mfa"));
+}
+
 
 
