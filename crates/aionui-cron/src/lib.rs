@@ -5,6 +5,7 @@ mod artifacts;
 pub mod error;
 pub mod events;
 pub mod executor;
+pub mod monitor;
 pub mod prompt;
 pub mod routes;
 pub mod scheduler;
@@ -15,5 +16,12 @@ pub mod state;
 pub mod types;
 
 pub use events::CronEventEmitter;
+pub use monitor::{
+    CreateMonitorJobOutcome, CreateMonitorJobRequest, FacebookTarget, IMonitorJobRepository,
+    InMemoryMonitorJobRepository, LookbackScope, MonitorControlService, MonitorError, MonitorJob,
+    MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunner, MonitorScanResult, MonitorStopReason,
+    propose_default_schedule,
+};
 pub use routes::cron_routes;
 pub use state::CronRouterState;
+
