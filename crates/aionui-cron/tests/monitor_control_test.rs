@@ -19,7 +19,8 @@ use aionui_cron::monitor::{
     LookbackScope, MonitorControlService, MonitorCursor, MonitorError, MonitorJob,
     MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunReport, MonitorRunner,
     MonitorScanResult, MonitorStopReason, ObservationDeltaKind, ProfileAuthState,
-    ReportedObservation, propose_default_schedule, validate_schedule,
+    ReportedObservation, TargetFailure, TargetScanResult, propose_default_schedule,
+    validate_schedule,
 };
 use aionui_cron::types::CronSchedule;
 
@@ -36,6 +37,7 @@ impl MonitorRunner for FakeMonitorRunner {
             observations_count: 5,
             error_message: None,
             observations: Vec::new(),
+            target_results: Vec::new(),
         })
     }
 }
@@ -83,10 +85,11 @@ impl IMonitorJobRepository for FailingCompletionRepository {
         &self,
         _report: &MonitorRunReport,
         _job: &MonitorJob,
-        _cursor: Option<&MonitorCursor>,
+        _cursors: &[MonitorCursor],
     ) -> Result<MonitorRunReport, MonitorError> {
         Err(MonitorError::Repository("transaction unavailable".into()))
     }
+
 
     async fn list_run_reports(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<Vec<MonitorRunReport>, MonitorError> {
         self.inner.list_run_reports(user_id, conversation_id, job_id).await
@@ -1587,6 +1590,238 @@ async fn test_passwords_and_mfa_secrets_not_stored_in_domain_or_reports() {
     assert!(!serialized_req.contains("password"));
     assert!(!serialized_req.contains("mfa"));
 }
+
+// ---------------------------------------------------------------------------
+// Ticket 06 Tests: Multi-target partial results and availability status
+// ---------------------------------------------------------------------------
+
+struct MultiTargetRunner {
+    results: Vec<TargetScanResult>,
+}
+
+#[async_trait::async_trait]
+impl MonitorRunner for MultiTargetRunner {
+    async fn run_scan(&self, _job: &MonitorJob) -> Result<MonitorScanResult, String> {
+        Ok(MonitorScanResult::multi_target(self.results.clone()))
+    }
+}
+
+#[tokio::test]
+async fn test_multi_target_partial_results_isolated_failure() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let targets = vec![
+        valid_target("group_a", "Group A"),
+        valid_target("group_b", "Group B"),
+        valid_target("group_c", "Group C"),
+    ];
+    let req = CreateMonitorJobRequest {
+        targets,
+        query: MonitorQuery::new("rust engineer"),
+        lookback: LookbackScope::from_days(7),
+        schedule: Some(CronSchedule::Every {
+            every_ms: 3600000,
+            description: None,
+        }),
+        profile_ref: None,
+    };
+
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    // Runner where group_a and group_c succeed, but group_b fails with rate limiting
+    let obs_a = FacebookObservation::new("post_a1", "group_a", "hash_a1");
+    let obs_c = FacebookObservation::new("post_c1", "group_c", "hash_c1");
+
+    let runner = MultiTargetRunner {
+        results: vec![
+            TargetScanResult::success("group_a", vec![obs_a]),
+            TargetScanResult::failed("group_b", "Rate limited by Facebook API (HTTP 429)"),
+            TargetScanResult::success("group_c", vec![obs_c]),
+        ],
+    };
+
+    let report = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner).await.unwrap();
+
+    // 1. Overall outcome is explicitly Partial
+    assert_eq!(report.outcome, MonitorRunOutcome::Partial);
+
+    // 2. Identifies successful and failed targets
+    assert_eq!(report.successful_targets, vec!["group_a".to_string(), "group_c".to_string()]);
+    assert_eq!(report.failed_targets.len(), 1);
+    assert_eq!(report.failed_targets[0].target_id, "group_b");
+    assert!(report.failed_targets[0].reason.contains("Rate limited"));
+
+    // 3. Healthy targets produced reports without being hidden or blocked
+    let news = report.new_findings();
+    assert_eq!(news.len(), 2);
+    let ids: Vec<_> = news.iter().map(|o| o.id.as_str()).collect();
+    assert!(ids.contains(&"post_a1"));
+    assert!(ids.contains(&"post_c1"));
+
+    // 4. Healthy target cursors advanced
+    let cursor_a = svc.get_cursor("user_hank", "conv_1", &job_id, "group_a", 1).await.unwrap().unwrap();
+    assert_eq!(cursor_a.last_successful_observed_at_ms, Some(2000));
+    assert!(cursor_a.items.contains_key("post_a1"));
+
+    let cursor_c = svc.get_cursor("user_hank", "conv_1", &job_id, "group_c", 1).await.unwrap().unwrap();
+    assert_eq!(cursor_c.last_successful_observed_at_ms, Some(2000));
+    assert!(cursor_c.items.contains_key("post_c1"));
+
+    // 5. Failed target cursor did NOT advance
+    let cursor_b = svc.get_cursor("user_hank", "conv_1", &job_id, "group_b", 1).await.unwrap();
+    assert!(cursor_b.is_none(), "Failed target cursor must not be advanced");
+}
+
+#[tokio::test]
+async fn test_confirmed_deletion_reports_removed_and_cleans_cursor() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    // Run 1 discovers post_1
+    let obs1 = FacebookObservation::new("post_1", "fb_group_react_tw", "hash_1");
+    let runner1 = ObservationMonitorRunner::with_observations(vec![obs1]);
+    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1).await.unwrap();
+
+    let cursor = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
+    assert!(cursor.items.contains_key("post_1"));
+
+    // Run 2: post_1 is confirmed deleted (platform returned 404/post removed)
+    let del_obs = FacebookObservation::confirmed_deleted("post_1", "fb_group_react_tw");
+    let runner2 = ObservationMonitorRunner::with_observations(vec![del_obs]);
+    let report2 = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2).await.unwrap();
+
+    // Reported as Removed
+    assert_eq!(report2.outcome, MonitorRunOutcome::Success);
+    let removed = report2.removed_findings();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].id, "post_1");
+
+    // Cursor removes the item but advances its timestamp
+    let cursor2 = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
+    assert!(!cursor2.items.contains_key("post_1"), "Confirmed deleted item must be removed from cursor");
+    assert_eq!(cursor2.last_successful_observed_at_ms, Some(3000));
+}
+
+#[tokio::test]
+async fn test_temporary_unavailability_preserves_content_and_last_seen_time() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    // Run 1 discovers post_transient
+    let obs1 = FacebookObservation::new("post_transient", "fb_group_react_tw", "hash_original");
+    let runner1 = ObservationMonitorRunner::with_observations(vec![obs1]);
+    svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner1).await.unwrap();
+
+    // Run 2: post is temporarily unavailable (unconfirmed deletion / access timeout)
+    let unavail_obs = FacebookObservation::temporarily_unavailable("post_transient", "fb_group_react_tw");
+    let runner2 = ObservationMonitorRunner::with_observations(vec![unavail_obs]);
+    let report2 = svc.run_occurrence("user_hank", "conv_1", &job_id, 3000, &runner2).await.unwrap();
+
+    // Reported as Unavailable, NEVER Removed
+    assert_eq!(report2.unavailable_findings().len(), 1);
+    assert_eq!(report2.unavailable_findings()[0].id, "post_transient");
+    assert!(report2.removed_findings().is_empty(), "Transient unavailability must never be reported as removed");
+
+    // Cursor PRESERVES item content hash and first seen time
+    let cursor = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap().unwrap();
+    let item = cursor.items.get("post_transient").expect("Item must be preserved in cursor");
+    assert_eq!(item.content_hash, "hash_original");
+    assert_eq!(item.first_seen_at_ms, 2000);
+}
+
+#[tokio::test]
+async fn test_untrusted_dom_structure_fails_closed_and_does_not_advance_cursor() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+    let outcome = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap();
+    let job_id = match outcome {
+        CreateMonitorJobOutcome::Active { job } => job.id,
+        _ => panic!(),
+    };
+
+    // Runner encounters changed or untrusted DOM structure
+    let runner = MultiTargetRunner {
+        results: vec![
+            TargetScanResult::untrusted_dom(
+                "fb_group_react_tw",
+                "Facebook post container layout changed or unrecognizable DOM tree",
+            ),
+        ],
+    };
+
+    let report = svc.run_occurrence("user_hank", "conv_1", &job_id, 2000, &runner).await.unwrap();
+
+    // Fails closed
+    assert_eq!(report.outcome, MonitorRunOutcome::Failed);
+    assert_eq!(report.failed_targets.len(), 1);
+    assert!(report.failed_targets[0].reason.contains("layout changed"));
+
+    // Cursor is NOT advanced
+    let cursor = svc.get_cursor("user_hank", "conv_1", &job_id, "fb_group_react_tw", 1).await.unwrap();
+    assert!(cursor.is_none(), "Untrusted DOM scan must not advance or save cursor");
+}
+
+#[tokio::test]
+async fn test_format_conversation_report_presentation() {
+    let report = MonitorRunReport {
+        job_id: "mon_test".into(),
+        user_id: "user_hank".into(),
+        conversation_id: "conv_1".into(),
+        scheduled_at_ms: 2000,
+        outcome: MonitorRunOutcome::Partial,
+        observations_count: 3,
+        error_message: None,
+        reported_observations: vec![
+            ReportedObservation {
+                delta_kind: ObservationDeltaKind::Removed,
+                observation: FacebookObservation::new("p_del", "target_1", ""),
+            },
+            ReportedObservation {
+                delta_kind: ObservationDeltaKind::Unavailable,
+                observation: FacebookObservation::new("p_unavail", "target_1", ""),
+            },
+        ],
+        target_id: Some("target_1".into()),
+        query_revision: Some(1),
+        lookback_window_ms: Some(86400000),
+        successful_targets: vec!["target_1".into()],
+        failed_targets: vec![TargetFailure {
+            target_id: "target_2".into(),
+            reason: "HTTP 503 Service Unavailable".into(),
+        }],
+    };
+
+    let formatted = report.format_conversation_report();
+    assert!(formatted.contains("### Removed Findings"));
+    assert!(formatted.contains("p_del"));
+    assert!(formatted.contains("### Unavailable Findings"));
+    assert!(formatted.contains("p_unavail"));
+    assert!(formatted.contains("### Failed Targets"));
+    assert!(formatted.contains("target_2: HTTP 503"));
+}
+
 
 
 
