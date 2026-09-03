@@ -2388,3 +2388,314 @@ async fn test_adapter_untrusted_dom_drift_fails_closed_and_closes_context() {
     // Context is closed
     assert_eq!(*closed.lock().await, 1);
 }
+
+
+// ---------------------------------------------------------------------------
+// Ticket 09 Tests: LiveView transport session contract and fail-closed adapter seam
+// ---------------------------------------------------------------------------
+
+use aionui_cron::liveview_transport::{
+    hash_session_token, FailClosedLiveViewTransportAdapter, ILiveViewTransportAdapter, LiveViewCapability,
+    LiveViewSessionManager, LiveViewSessionScope, LiveViewSessionStatus, LiveViewTransportError,
+    StartLiveViewSessionRequest,
+};
+
+struct MockLiveViewTransportAdapter {
+    should_fail: bool,
+    allocated_streams: Arc<tokio::sync::Mutex<Vec<String>>>,
+    closed_streams: Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+impl MockLiveViewTransportAdapter {
+    fn new(
+        should_fail: bool,
+    ) -> (
+        Self,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) {
+        let allocated = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let closed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let adapter = Self {
+            should_fail,
+            allocated_streams: allocated.clone(),
+            closed_streams: closed.clone(),
+        };
+        (adapter, allocated, closed)
+    }
+}
+
+#[async_trait::async_trait]
+impl ILiveViewTransportAdapter for MockLiveViewTransportAdapter {
+    async fn allocate_stream(
+        &self,
+        session_id: &str,
+        _scope: &LiveViewSessionScope,
+    ) -> Result<String, LiveViewTransportError> {
+        if self.should_fail {
+            return Err(LiveViewTransportError::TransportFailure(
+                "Mock WebRTC/VNC allocation failed".into(),
+            ));
+        }
+        let mut guard = self.allocated_streams.lock().await;
+        guard.push(session_id.to_string());
+        Ok(format!("wss://aion.local/liveview/stream/{session_id}"))
+    }
+
+    async fn close_stream(&self, session_id: &str) -> Result<(), LiveViewTransportError> {
+        let mut guard = self.closed_streams.lock().await;
+        guard.push(session_id.to_string());
+        Ok(())
+    }
+
+    async fn is_available(&self) -> bool {
+        !self.should_fail
+    }
+}
+
+#[tokio::test]
+async fn test_liveview_transport_session_happy_path_lifecycle() {
+    let (adapter, allocated, closed) = MockLiveViewTransportAdapter::new(false);
+    let mgr = LiveViewSessionManager::new(Arc::new(adapter), "pwa_liveview_v1");
+
+    let scope = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1")
+        .with_monitor_id("mon_123");
+
+    let req = StartLiveViewSessionRequest {
+        scope,
+        nonce: "nonce_unique_101".into(),
+        ttl_ms: 15 * 60 * 1000, // 15 mins
+    };
+
+    // 1. Start session
+    let resp = mgr.start_session("user_alice", req, 1_000_000).await.unwrap();
+    assert!(resp.session_id.starts_with("lvs_"));
+    assert!(resp.stream_endpoint.contains(&resp.session_id));
+    assert_eq!(resp.expires_at_ms, 1_000_000 + 15 * 60 * 1000);
+    assert_eq!(allocated.lock().await.len(), 1);
+
+    // 2. Token hash verification
+    assert!(!resp.token_hash.is_empty());
+    let expected_hash = hash_session_token(&format!("{}:{}:{}", resp.session_id, "nonce_unique_101", resp.expires_at_ms));
+    assert_eq!(resp.token_hash, expected_hash);
+
+    // 3. Renew session
+    let renewed = mgr
+        .renew_session("user_alice", &resp.session_id, 10 * 60 * 1000, 1_100_000)
+        .await
+        .unwrap();
+    assert_eq!(renewed.status, LiveViewSessionStatus::Renewed);
+    assert_eq!(renewed.expires_at_ms, 1_000_000 + 25 * 60 * 1000);
+    assert_eq!(renewed.renewed_at_ms, Some(1_100_000));
+
+    // 4. End session cleanly
+    let ended = mgr
+        .end_session("user_alice", &resp.session_id, 1_200_000)
+        .await
+        .unwrap();
+    assert_eq!(ended.status, LiveViewSessionStatus::Ended);
+    assert_eq!(ended.ended_at_ms, Some(1_200_000));
+    assert_eq!(closed.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn test_liveview_transport_unconfigured_fails_closed() {
+    let adapter = FailClosedLiveViewTransportAdapter::default();
+    let mgr = LiveViewSessionManager::new(Arc::new(adapter), "pwa_liveview_v1");
+
+    let scope = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1");
+    let req = StartLiveViewSessionRequest {
+        scope,
+        nonce: "nonce_unconf_1".into(),
+        ttl_ms: 600_000,
+    };
+
+    let err = mgr.start_session("user_alice", req, 1_000_000).await.unwrap_err();
+    assert!(
+        matches!(err, LiveViewTransportError::TransportUnavailable(_)),
+        "Unconfigured transport must fail closed without allocating browser session"
+    );
+}
+
+#[tokio::test]
+async fn test_liveview_transport_replay_nonce_detection() {
+    let (adapter, _, _) = MockLiveViewTransportAdapter::new(false);
+    let mgr = LiveViewSessionManager::new(Arc::new(adapter), "pwa_liveview_v1");
+
+    let scope1 = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1");
+    let req1 = StartLiveViewSessionRequest {
+        scope: scope1,
+        nonce: "nonce_replay_attack".into(),
+        ttl_ms: 600_000,
+    };
+
+    // First attempt succeeds
+    let _resp = mgr.start_session("user_alice", req1, 1_000_000).await.unwrap();
+
+    // Replay attempt with exact same nonce fails closed
+    let scope2 = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1");
+    let req2 = StartLiveViewSessionRequest {
+        scope: scope2,
+        nonce: "nonce_replay_attack".into(),
+        ttl_ms: 600_000,
+    };
+
+    let err = mgr.start_session("user_alice", req2, 1_000_100).await.unwrap_err();
+    assert!(
+        matches!(err, LiveViewTransportError::ReplayDetected(n) if n == "nonce_replay_attack"),
+        "Replay with identical nonce must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn test_liveview_transport_cross_user_access_denied() {
+    let (adapter, _, _) = MockLiveViewTransportAdapter::new(false);
+    let mgr = LiveViewSessionManager::new(Arc::new(adapter), "pwa_liveview_v1");
+
+    // Bob attempts to start a session for Alice
+    let scope = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1");
+    let req = StartLiveViewSessionRequest {
+        scope,
+        nonce: "nonce_bob_hack".into(),
+        ttl_ms: 600_000,
+    };
+
+    let err = mgr.start_session("user_bob", req, 1_000_000).await.unwrap_err();
+    assert!(
+        matches!(err, LiveViewTransportError::AccessDenied(_)),
+        "Cross-user session start must be rejected"
+    );
+
+    // Alice starts valid session
+    let scope_valid = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1");
+    let req_valid = StartLiveViewSessionRequest {
+        scope: scope_valid,
+        nonce: "nonce_alice_valid".into(),
+        ttl_ms: 600_000,
+    };
+    let resp = mgr.start_session("user_alice", req_valid, 1_000_000).await.unwrap();
+
+    // Bob attempts to get or renew Alice's session
+    let err_get = mgr.get_session("user_bob", &resp.session_id).await.unwrap_err();
+    assert!(matches!(err_get, LiveViewTransportError::AccessDenied(_)));
+
+    let err_renew = mgr
+        .renew_session("user_bob", &resp.session_id, 300_000, 1_050_000)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_renew, LiveViewTransportError::AccessDenied(_)));
+
+    let err_end = mgr.end_session("user_bob", &resp.session_id, 1_060_000).await.unwrap_err();
+    assert!(matches!(err_end, LiveViewTransportError::AccessDenied(_)));
+}
+
+#[tokio::test]
+async fn test_liveview_transport_scope_and_audience_validation() {
+    let (adapter, _, _) = MockLiveViewTransportAdapter::new(false);
+    let mgr = LiveViewSessionManager::new(Arc::new(adapter), "pwa_liveview_v1");
+
+    // 1. Audience mismatch
+    let scope_bad_aud = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "wrong_audience");
+    let req_bad_aud = StartLiveViewSessionRequest {
+        scope: scope_bad_aud,
+        nonce: "nonce_bad_aud".into(),
+        ttl_ms: 600_000,
+    };
+    let err_aud = mgr.start_session("user_alice", req_bad_aud, 1_000_000).await.unwrap_err();
+    assert!(matches!(err_aud, LiveViewTransportError::AudienceMismatch { .. }));
+
+    // 2. Empty profile_ref in scope
+    let scope_empty_prof = LiveViewSessionScope::new("user_alice", "conv_1", "", "pwa_liveview_v1");
+    let req_empty_prof = StartLiveViewSessionRequest {
+        scope: scope_empty_prof,
+        nonce: "nonce_empty_prof".into(),
+        ttl_ms: 600_000,
+    };
+    let err_prof = mgr.start_session("user_alice", req_empty_prof, 1_000_000).await.unwrap_err();
+    assert!(matches!(err_prof, LiveViewTransportError::InvalidScope(_)));
+
+    // 3. Empty capabilities in scope
+    let mut scope_no_caps = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1");
+    scope_no_caps.allowed_capabilities.clear();
+    let req_no_caps = StartLiveViewSessionRequest {
+        scope: scope_no_caps,
+        nonce: "nonce_no_caps".into(),
+        ttl_ms: 600_000,
+    };
+    let err_caps = mgr.start_session("user_alice", req_no_caps, 1_000_000).await.unwrap_err();
+    assert!(matches!(err_caps, LiveViewTransportError::InvalidScope(_)));
+}
+
+#[tokio::test]
+async fn test_liveview_transport_expiry_and_revocation() {
+    let (adapter, _, closed) = MockLiveViewTransportAdapter::new(false);
+    let mgr = LiveViewSessionManager::new(Arc::new(adapter), "pwa_liveview_v1");
+
+    let scope = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1");
+    let req = StartLiveViewSessionRequest {
+        scope,
+        nonce: "nonce_expiry_test".into(),
+        ttl_ms: 10_000, // 10 seconds
+    };
+
+    let resp = mgr.start_session("user_alice", req, 1_000_000).await.unwrap();
+
+    // 1. Try to renew after expiry (at 1_015_000 ms, where expires_at_ms was 1_010_000 ms)
+    let err_expired = mgr
+        .renew_session("user_alice", &resp.session_id, 5000, 1_015_000)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_expired, LiveViewTransportError::SessionExpired { .. }));
+
+    // 2. Start another session and test explicit revocation
+    let scope2 = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1");
+    let req2 = StartLiveViewSessionRequest {
+        scope: scope2,
+        nonce: "nonce_revoke_test".into(),
+        ttl_ms: 100_000,
+    };
+    let resp2 = mgr.start_session("user_alice", req2, 2_000_000).await.unwrap();
+
+    let revoked = mgr
+        .revoke_session("user_alice", &resp2.session_id, "Suspicious activity detected", 2_010_000)
+        .await
+        .unwrap();
+    assert_eq!(revoked.status, LiveViewSessionStatus::Revoked);
+    assert_eq!(revoked.revoke_reason.as_deref(), Some("Suspicious activity detected"));
+    assert_eq!(closed.lock().await.len(), 1);
+
+    // Subsequent operation on revoked session fails closed
+    let err_revoked = mgr
+        .renew_session("user_alice", &resp2.session_id, 10_000, 2_020_000)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_revoked, LiveViewTransportError::SessionClosed(LiveViewSessionStatus::Revoked)));
+}
+
+#[tokio::test]
+async fn test_liveview_transport_zero_custody_and_untrusted_data_isolation() {
+    let scope = LiveViewSessionScope::new("user_alice", "conv_1", "prof_alice_fb", "pwa_liveview_v1");
+    let serialized_scope = serde_json::to_string(&scope).unwrap();
+    assert!(!serialized_scope.contains("password"));
+    assert!(!serialized_scope.contains("mfa"));
+    assert!(!serialized_scope.contains("secret"));
+    assert!(!serialized_scope.contains("token"));
+
+    let session = LiveViewTransportSession {
+        session_id: "lvs_test".into(),
+        scope,
+        nonce: "nonce_test".into(),
+        token_hash: hash_session_token("secret_bearer_token"),
+        status: LiveViewSessionStatus::Active,
+        created_at_ms: 1000,
+        expires_at_ms: 2000,
+        renewed_at_ms: None,
+        ended_at_ms: None,
+        revoke_reason: None,
+    };
+
+    let serialized_session = serde_json::to_string(&session).unwrap();
+    // Raw bearer secret must not appear anywhere in serialized session
+    assert!(!serialized_session.contains("secret_bearer_token"));
+    assert!(serialized_session.contains(&hash_session_token("secret_bearer_token")));
+}
