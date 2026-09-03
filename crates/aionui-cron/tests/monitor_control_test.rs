@@ -2110,8 +2110,3 @@ async fn test_adapter_untrusted_dom_drift_fails_closed_and_closes_context() {
     // Context is closed
     assert_eq!(*closed.lock().await, 1);
 }
-
-
-
-
-
