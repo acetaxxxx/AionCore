@@ -1,6 +1,6 @@
 //! Conversation-bound Facebook MonitorJob control domain and public service seam.
 //!
-//! Implements Tickets 01, 02, and 03:
+//! Implements Tickets 01, 02, 03, and 04:
 //! - Conversation-owned `MonitorJob` domain aggregate and lifecycle.
 //! - Complete target, query, lookback, and schedule scope enforcement.
 //! - Supplied schedule acceptance vs. agent-proposed default schedule approval flow (no premature job persistence).
@@ -8,9 +8,10 @@
 //! - Strict user and originating conversation scope isolation (fail-closed against cross-account/conversation access).
 //! - Bounded occurrence execution with durable report persistence and idempotency.
 //! - `MonitorCursor` scoped to job, target, and query revision.
-//! - Single-target delta reporting: `New`, `Changed`, and `Unchanged` observations.
+//! - Single-target delta reporting: `New`, `Changed`, `Unchanged`, and `Backfill` observations.
 //! - Distinction between monitor-seen, conversation-reported, and user-acknowledged states (`unread`/`needs_attention`).
 //! - Atomic cursor advancement upon scan & durable report success; cursor retention on failure.
+//! - Query revision, lookback rescan, and separate `Backfill` findings grouping.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,7 +54,6 @@ pub enum MonitorError {
 
     #[error("Repository error: {0}")]
     Repository(String),
-
 
     #[error("Monitor job not found: {0}")]
     NotFound(String),
@@ -117,6 +117,7 @@ pub enum ObservationDeltaKind {
     New,
     Changed,
     Unchanged,
+    Backfill,
 }
 
 /// Raw observation item discovered during a target scan.
@@ -152,6 +153,11 @@ impl FacebookObservation {
         self.title = title;
         self.body = body;
         self.author = author;
+        self
+    }
+
+    pub fn with_published_at(mut self, published_at_ms: u64) -> Self {
+        self.published_at_ms = published_at_ms;
         self
     }
 }
@@ -314,6 +320,8 @@ pub struct MonitorJob {
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_execution_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_revised_at_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +416,75 @@ pub struct MonitorRunReport {
     pub target_id: Option<String>,
     #[serde(default)]
     pub query_revision: Option<u64>,
+    #[serde(default)]
+    pub lookback_window_ms: Option<u64>,
+}
+
+impl MonitorRunReport {
+    pub fn new_findings(&self) -> Vec<&FacebookObservation> {
+        self.reported_observations
+            .iter()
+            .filter(|r| r.delta_kind == ObservationDeltaKind::New)
+            .map(|r| &r.observation)
+            .collect()
+    }
+
+    pub fn changed_findings(&self) -> Vec<&FacebookObservation> {
+        self.reported_observations
+            .iter()
+            .filter(|r| r.delta_kind == ObservationDeltaKind::Changed)
+            .map(|r| &r.observation)
+            .collect()
+    }
+
+    pub fn backfill_findings(&self) -> Vec<&FacebookObservation> {
+        self.reported_observations
+            .iter()
+            .filter(|r| r.delta_kind == ObservationDeltaKind::Backfill)
+            .map(|r| &r.observation)
+            .collect()
+    }
+
+    /// Formatted presentation grouping backfill findings separately with
+    /// query revision and lookback window shown.
+    pub fn format_conversation_report(&self) -> String {
+        let mut out = String::new();
+        let rev = self.query_revision.unwrap_or(1);
+        let lookback_desc = self
+            .lookback_window_ms
+            .map(|ms| format!("{}ms", ms))
+            .unwrap_or_else(|| "default".into());
+
+        let backfills = self.backfill_findings();
+        let news = self.new_findings();
+        let changed = self.changed_findings();
+
+        if !backfills.is_empty() {
+            out.push_str(&format!(
+                "### Backfill Findings (Query Revision {}, Lookback {})\n",
+                rev, lookback_desc
+            ));
+            for item in backfills {
+                out.push_str(&format!("- [Backfill] {} (hash: {})\n", item.id, item.content_hash));
+            }
+        }
+
+        if !news.is_empty() {
+            out.push_str("### New Findings\n");
+            for item in news {
+                out.push_str(&format!("- [New] {} (hash: {})\n", item.id, item.content_hash));
+            }
+        }
+
+        if !changed.is_empty() {
+            out.push_str("### Changed Findings\n");
+            for item in changed {
+                out.push_str(&format!("- [Changed] {} (hash: {})\n", item.id, item.content_hash));
+            }
+        }
+
+        out
+    }
 }
 
 /// High-level conversation-scoped runner port.
@@ -756,6 +833,7 @@ impl MonitorControlService {
                     created_at_ms: now_ms,
                     updated_at_ms: now_ms,
                     next_execution_at_ms: Some(now_ms),
+                    query_revised_at_ms: None,
                 };
 
                 self.repo.save(&job).await?;
@@ -823,7 +901,65 @@ impl MonitorControlService {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             next_execution_at_ms: Some(now_ms),
+            query_revised_at_ms: None,
         };
+
+        self.repo.save(&job).await?;
+        Ok(job)
+    }
+
+    /// Update the query text, optional filters, and optional lookback for an active or paused job.
+    /// Increments query revision, sets query revision timestamp, and ensures
+    /// subsequent runs rescan the lookback window without reusing the previous revision's cursor.
+    pub async fn update_query(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        query_text: impl Into<String>,
+        filters: Option<HashMap<String, String>>,
+        lookback: Option<LookbackScope>,
+        now_ms: u64,
+    ) -> Result<MonitorJob, MonitorError> {
+        Self::validate_ownership_scope(user_id, conversation_id)?;
+
+        let text = query_text.into();
+        if text.trim().is_empty() {
+            return Err(MonitorError::InvalidQueryScope("query_text must not be empty".into()));
+        }
+
+        if let Some(ref lb) = lookback {
+            if lb.duration_ms == 0 {
+                return Err(MonitorError::InvalidLookbackScope(
+                    "lookback duration_ms must be greater than 0".into(),
+                ));
+            }
+        }
+
+        let mut job = self
+            .repo
+            .get(user_id, conversation_id, job_id)
+            .await?
+            .ok_or_else(|| MonitorError::NotFound(job_id.to_owned()))?;
+
+        if job.status == MonitorJobStatus::Cancelled {
+            return Err(MonitorError::InvalidLifecycleTransition {
+                current: job.status,
+                requested: "update_query".into(),
+            });
+        }
+
+        let new_revision = job.query.revision + 1;
+        job.query = MonitorQuery::new(text)
+            .with_filters(filters.unwrap_or_default())
+            .with_revision(new_revision);
+
+        if let Some(lb) = lookback {
+            job.lookback = lb;
+        }
+
+        job.query_revised_at_ms = Some(now_ms);
+        job.updated_at_ms = now_ms;
 
         self.repo.save(&job).await?;
         Ok(job)
@@ -1003,7 +1139,8 @@ impl MonitorControlService {
 
     /// Run one bounded occurrence for an existing active job and persist its
     /// report in the originating conversation scope. Performs single-target delta
-    /// evaluation and advances the cursor only on scan and report success.
+    /// evaluation, query revision scoping, backfill detection, and advances the
+    /// cursor only on scan and report success.
     pub async fn run_occurrence(
         &self,
         user_id: &str,
@@ -1071,7 +1208,23 @@ impl MonitorControlService {
             if scan.outcome == MonitorRunOutcome::Success {
                 for obs in &scan.observations {
                     let delta_kind = match cursor.items.get(&obs.id) {
-                        None => ObservationDeltaKind::New,
+                        None => {
+                            // Unseen in current revision's cursor.
+                            // If query has been revised (revision > 1) and post was published before revision:
+                            if job.query.revision > 1 {
+                                let revised_at = job.query_revised_at_ms.unwrap_or(scheduled_at_ms);
+                                if obs.published_at_ms > 0 && obs.published_at_ms < revised_at {
+                                    ObservationDeltaKind::Backfill
+                                } else if obs.published_at_ms >= revised_at {
+                                    ObservationDeltaKind::New
+                                } else {
+                                    // Published time unavailable; classify as backfill on lookback rescan
+                                    ObservationDeltaKind::Backfill
+                                }
+                            } else {
+                                ObservationDeltaKind::New
+                            }
+                        }
                         Some(existing) => {
                             if existing.content_hash != obs.content_hash {
                                 ObservationDeltaKind::Changed
@@ -1082,7 +1235,7 @@ impl MonitorControlService {
                     };
 
                     match delta_kind {
-                        ObservationDeltaKind::New => {
+                        ObservationDeltaKind::New | ObservationDeltaKind::Backfill => {
                             cursor.items.insert(
                                 obs.id.clone(),
                                 CursorItemState {
@@ -1155,6 +1308,7 @@ impl MonitorControlService {
             reported_observations: delta_observations,
             target_id,
             query_revision: Some(query_revision),
+            lookback_window_ms: Some(job.lookback.duration_ms),
         };
 
         job.last_outcome = Some(scan.outcome);
