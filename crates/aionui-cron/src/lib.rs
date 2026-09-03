@@ -19,9 +19,10 @@ pub use events::CronEventEmitter;
 pub use monitor::{
     CreateMonitorJobOutcome, CreateMonitorJobRequest, FacebookTarget, IMonitorJobRepository,
     InMemoryMonitorJobRepository, LookbackScope, MonitorControlService, MonitorError, MonitorJob,
-    MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunner, MonitorScanResult, MonitorStopReason,
-    propose_default_schedule,
+    MonitorJobProposal, MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunner,
+    MonitorScanResult, MonitorStopReason, propose_default_schedule, validate_schedule,
 };
+
 pub use routes::cron_routes;
 pub use state::CronRouterState;
 

@@ -2,18 +2,20 @@
 //!
 //! Verifies:
 //! - Explicit creation binds to originating conversation and user.
-//! - Complete target, query, and lookback scope requirement (incomplete rejected).
-//! - Schedule supply vs. agent proposal and approval.
+//! - Complete target, query, lookback, and schedule scope requirement (incomplete/invalid rejected).
+//! - Typed fail-closed schedule validation (Every <=0, invalid Cron expr, invalid TZ).
+//! - Schedule supply vs. agent proposal and approval (no premature persistence).
+//! - Blank user_id/conversation_id fail-closed scope rejection across all operations.
 //! - Lifecycle control semantics: inspect, pause, resume, cancel, list.
 //! - Strict user and conversation isolation (no cross-conversation or cross-user exposure).
 //! - Conversation termination lifecycle hook.
-//! - Tests verify only the public service seam and domain behavior.
+//! - MonitorRunner port seam contract.
 
 use aionui_cron::monitor::{
     CreateMonitorJobOutcome, CreateMonitorJobRequest, FacebookTarget, LookbackScope,
     MonitorControlService, MonitorError, MonitorJob, MonitorJobStatus, MonitorQuery,
     MonitorRunOutcome, MonitorRunner, MonitorScanResult, MonitorStopReason,
-    propose_default_schedule,
+    propose_default_schedule, validate_schedule,
 };
 use aionui_cron::types::CronSchedule;
 
@@ -138,7 +140,96 @@ async fn test_incomplete_scope_is_rejected_without_creating_job() {
 }
 
 #[tokio::test]
-async fn test_omitted_schedule_flow_requires_user_approval() {
+async fn test_invalid_schedule_scope_rejected() {
+    let svc = MonitorControlService::with_in_memory_repo();
+
+    // 1. Every schedule with 0 or negative interval
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 0,
+        description: None,
+    }));
+    let err = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::InvalidScheduleScope(_)));
+
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: -1000,
+        description: None,
+    }));
+    let err = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::InvalidScheduleScope(_)));
+
+    // 2. At schedule with invalid timestamp
+    let req = valid_request(Some(CronSchedule::At {
+        at_ms: -5,
+        description: None,
+    }));
+    let err = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::InvalidScheduleScope(_)));
+
+    // 3. Invalid cron expression
+    let req = valid_request(Some(CronSchedule::Cron {
+        expr: "not a valid cron expression".into(),
+        tz: None,
+        description: None,
+    }));
+    let err = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::InvalidScheduleScope(_)));
+
+    // 4. Invalid timezone
+    let req = valid_request(Some(CronSchedule::Cron {
+        expr: "0 0 9 * * *".into(),
+        tz: Some("Invalid/Timezone_Name".into()),
+        description: None,
+    }));
+    let err = svc.create_job("user_hank", "conv_1", req, 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::InvalidScheduleScope(_)));
+
+    // Direct validate_schedule helper tests
+    assert!(validate_schedule(&CronSchedule::Every { every_ms: 60000, description: None }).is_ok());
+    assert!(validate_schedule(&CronSchedule::Cron { expr: "0 */5 * * * *".into(), tz: Some("Asia/Taipei".into()), description: None }).is_ok());
+    assert!(validate_schedule(&CronSchedule::Every { every_ms: -1, description: None }).is_err());
+}
+
+#[tokio::test]
+async fn test_blank_user_or_conversation_rejected_fail_closed() {
+    let svc = MonitorControlService::with_in_memory_repo();
+    let req = valid_request(Some(CronSchedule::Every {
+        every_ms: 3600000,
+        description: None,
+    }));
+
+    // Blank user_id on create
+    let err = svc.create_job("   ", "conv_1", req.clone(), 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::IncompleteScope(_)));
+
+    // Blank conversation_id on create
+    let err = svc.create_job("user_1", "  \t ", req, 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::IncompleteScope(_)));
+
+    // Blank identifiers on get
+    let err = svc.get_job("", "conv_1", "job_1").await.unwrap_err();
+    assert!(matches!(err, MonitorError::IncompleteScope(_)));
+
+    // Blank identifiers on list
+    let err = svc.list_jobs("user_1", "   ").await.unwrap_err();
+    assert!(matches!(err, MonitorError::IncompleteScope(_)));
+
+    // Blank identifiers on pause/resume/cancel
+    let err = svc.pause_job("", "conv_1", "job_1", MonitorStopReason::ExplicitUserPause, 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::IncompleteScope(_)));
+
+    let err = svc.resume_job("user_1", "", "job_1", 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::IncompleteScope(_)));
+
+    let err = svc.cancel_job("   ", "   ", "job_1", MonitorStopReason::ExplicitUserCancellation, 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::IncompleteScope(_)));
+
+    let err = svc.on_conversation_ended("", "conv_1", MonitorStopReason::ConversationClosed, 1000).await.unwrap_err();
+    assert!(matches!(err, MonitorError::IncompleteScope(_)));
+}
+
+#[tokio::test]
+async fn test_omitted_schedule_proposal_and_approval_flow() {
     let svc = MonitorControlService::with_in_memory_repo();
     let req = valid_request(None); // Omitted schedule
 
@@ -147,38 +238,48 @@ async fn test_omitted_schedule_flow_requires_user_approval() {
         .await
         .expect("creation should yield proposal");
 
-    let (job_id, proposed) = match outcome {
-        CreateMonitorJobOutcome::RequiresApproval {
-            job,
-            proposed_schedule,
-        } => {
-            assert_eq!(job.status, MonitorJobStatus::PendingApproval);
-            assert!(job.next_execution_at_ms.is_none());
-            (job.id, proposed_schedule)
+    let proposal = match outcome {
+        CreateMonitorJobOutcome::RequiresApproval { proposal } => {
+            assert_eq!(proposal.user_id, "user_hank");
+            assert_eq!(proposal.conversation_id, "conv_1");
+            assert_eq!(proposal.proposed_schedule, propose_default_schedule());
+            proposal
         }
-        CreateMonitorJobOutcome::Active { .. } => panic!("Expected approval flow"),
+        CreateMonitorJobOutcome::Active { .. } => panic!("Expected proposal flow"),
     };
 
-    assert_eq!(proposed, propose_default_schedule());
+    // CRITICAL: verify that no MonitorJob was persisted prior to approval
+    let existing_jobs = svc.list_jobs("user_hank", "conv_1").await.unwrap();
+    assert!(existing_jobs.is_empty(), "No job should be persisted prior to approval");
 
-    // Runner cannot execute pending approval job
-    let pending_job = svc.get_job("user_hank", "conv_1", &job_id).await.unwrap();
-    let runner = FakeMonitorRunner;
-    let run_err = runner.run_scan(&pending_job).await.unwrap_err();
-    assert!(run_err.contains("Cannot run inactive monitor"));
+    // Cross-user approval attempt rejected
+    let err = svc
+        .approve_proposal("user_other", "conv_1", proposal.clone(), None, 2000)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MonitorError::AccessDenied(_)));
 
     // Approve the proposed schedule
     let approved_job = svc
-        .approve_proposal("user_hank", "conv_1", &job_id, None, 2000)
+        .approve_proposal("user_hank", "conv_1", proposal, None, 2000)
         .await
         .expect("approval should succeed");
 
+    assert_eq!(approved_job.user_id, "user_hank");
+    assert_eq!(approved_job.conversation_id, "conv_1");
     assert_eq!(approved_job.status, MonitorJobStatus::Active);
-    assert_eq!(approved_job.schedule, proposed);
+    assert_eq!(approved_job.schedule, propose_default_schedule());
+    assert_eq!(approved_job.created_at_ms, 2000);
     assert_eq!(approved_job.updated_at_ms, 2000);
     assert_eq!(approved_job.next_execution_at_ms, Some(2000));
 
-    // Runner can now execute
+    // Now exactly 1 job is persisted in the repository
+    let existing_jobs = svc.list_jobs("user_hank", "conv_1").await.unwrap();
+    assert_eq!(existing_jobs.len(), 1);
+    assert_eq!(existing_jobs[0].id, approved_job.id);
+
+    // Runner can now execute the approved job
+    let runner = FakeMonitorRunner;
     let run_res = runner.run_scan(&approved_job).await.unwrap();
     assert_eq!(run_res.outcome, MonitorRunOutcome::Success);
 }
@@ -323,15 +424,21 @@ async fn test_conversation_lifecycle_termination_ends_monitors() {
         .create_job(
             "user_hank",
             "conv_target",
-            valid_request(None), // PendingApproval
+            valid_request(Some(CronSchedule::Every {
+                every_ms: 7200000,
+                description: None,
+            })),
             1000,
         )
         .await
         .unwrap();
     let job2_id = match out2 {
-        CreateMonitorJobOutcome::RequiresApproval { job, .. } => job.id,
+        CreateMonitorJobOutcome::Active { job } => job.id,
         _ => panic!(),
     };
+
+    // Pause job2 on auth expired
+    svc.pause_job("user_hank", "conv_target", &job2_id, MonitorStopReason::AuthExpired, 1500).await.unwrap();
 
     // Create 1 job in conv_other
     let out3 = svc
