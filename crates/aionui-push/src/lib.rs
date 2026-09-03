@@ -285,10 +285,9 @@ mod terminal_delivery_tests {
 
     #[test]
     fn terminal_payload_includes_a_sanitized_target_title() {
-        let payload = build_terminal_payload(
-            &notice(TerminalNoticeStatus::Success).with_target_title("  報告\n\t已完成  "),
-        )
-        .expect("payload");
+        let payload =
+            build_terminal_payload(&notice(TerminalNoticeStatus::Success).with_target_title("  報告\n\t已完成  "))
+                .expect("payload");
 
         assert_eq!(payload.title, "Aion turn completed: 報告 已完成");
         assert_eq!(payload.body, "\"報告 已完成\" has completed.");
@@ -296,10 +295,9 @@ mod terminal_delivery_tests {
 
     #[test]
     fn terminal_payload_caps_target_title_without_splitting_utf8() {
-        let payload = build_terminal_payload(
-            &notice(TerminalNoticeStatus::Failed).with_target_title("任務".repeat(100)),
-        )
-        .expect("payload");
+        let payload =
+            build_terminal_payload(&notice(TerminalNoticeStatus::Failed).with_target_title("任務".repeat(100)))
+                .expect("payload");
 
         assert_eq!(payload.title.chars().count(), 30);
         assert!(payload.title.ends_with("任務任"));
@@ -315,10 +313,8 @@ mod terminal_delivery_tests {
             "api.example.test/path",
             "AbCdEfGhIjKlMnOpQrStUvWxYz012345",
         ] {
-            let payload = build_terminal_payload(
-                &notice(TerminalNoticeStatus::Failed).with_target_title(target_title),
-            )
-            .expect("payload");
+            let payload = build_terminal_payload(&notice(TerminalNoticeStatus::Failed).with_target_title(target_title))
+                .expect("payload");
 
             assert_eq!(payload.title, "Aion turn needs attention");
             assert_eq!(payload.body, "Your task ended with an error.");

@@ -1029,7 +1029,10 @@ impl ConversationService {
         let (target_kind, target_id) = match session_mentions::team_id_from_extra_str(&row.extra) {
             Some(team_id) => {
                 let Some(binding) = TeamSessionBinding::from_extra_str(&row.extra).ok().flatten() else {
-                    tracing::warn!(turn_id, "team terminal outcome has an invalid session binding; skipping notification");
+                    tracing::warn!(
+                        turn_id,
+                        "team terminal outcome has an invalid session binding; skipping notification"
+                    );
                     return;
                 };
                 if binding.role.as_deref() != Some("lead") {

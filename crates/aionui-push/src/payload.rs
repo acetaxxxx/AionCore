@@ -139,14 +139,9 @@ fn contains_sensitive_reference(value: &str) -> bool {
         "sk-",
     ];
 
-    BLOCKED_MARKERS
-        .iter()
-        .any(|marker| compact.contains(marker))
+    BLOCKED_MARKERS.iter().any(|marker| compact.contains(marker))
         || value
-            .split(|character: char| {
-                !(character.is_ascii_alphanumeric()
-                    || matches!(character, '.' | '_' | '-' | '='))
-            })
+            .split(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '=')))
             .any(looks_like_url_or_secret)
 }
 
@@ -154,10 +149,7 @@ fn looks_like_url_or_secret(value: &str) -> bool {
     let candidate = value.trim_matches(|character: char| {
         matches!(character, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';')
     });
-    let host = candidate
-        .split(['/', ':', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let host = candidate.split(['/', ':', '?', '#']).next().unwrap_or_default();
     let looks_like_domain = host.rsplit_once('.').is_some_and(|(prefix, suffix)| {
         !prefix.is_empty()
             && (2..=24).contains(&suffix.len())
