@@ -17,11 +17,14 @@ pub mod types;
 
 pub use events::CronEventEmitter;
 pub use monitor::{
-    CreateMonitorJobOutcome, CreateMonitorJobRequest, FacebookTarget, IMonitorJobRepository,
-    InMemoryMonitorJobRepository, LookbackScope, MonitorControlService, MonitorError, MonitorJob,
-    MonitorJobProposal, MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunner,
-    MonitorRunReport, MonitorScanResult, MonitorStopReason, propose_default_schedule, validate_schedule,
+    CreateMonitorJobOutcome, CreateMonitorJobRequest, CursorItemState, FacebookObservation,
+    FacebookTarget, IMonitorJobRepository, InMemoryMonitorJobRepository, LookbackScope,
+    MonitorControlService, MonitorCursor, MonitorError, MonitorJob, MonitorJobProposal,
+    MonitorJobStatus, MonitorQuery, MonitorRunOutcome, MonitorRunReport, MonitorRunner,
+    MonitorScanResult, MonitorStopReason, ObservationDeltaKind, ReportedObservation,
+    propose_default_schedule, validate_schedule,
 };
+
 
 pub use routes::cron_routes;
 pub use state::CronRouterState;

@@ -1,12 +1,16 @@
 //! Conversation-bound Facebook MonitorJob control domain and public service seam.
 //!
-//! This module implements Ticket 01:
+//! Implements Tickets 01, 02, and 03:
 //! - Conversation-owned `MonitorJob` domain aggregate and lifecycle.
 //! - Complete target, query, lookback, and schedule scope enforcement.
 //! - Supplied schedule acceptance vs. agent-proposed default schedule approval flow (no premature job persistence).
 //! - Lifecycle control semantics: create, pause, resume, cancel, get, list, and conversation termination hook.
 //! - Strict user and originating conversation scope isolation (fail-closed against cross-account/conversation access).
-//! - Public `MonitorRunner` seam for future execution tickets.
+//! - Bounded occurrence execution with durable report persistence and idempotency.
+//! - `MonitorCursor` scoped to job, target, and query revision.
+//! - Single-target delta reporting: `New`, `Changed`, and `Unchanged` observations.
+//! - Distinction between monitor-seen, conversation-reported, and user-acknowledged states (`unread`/`needs_attention`).
+//! - Atomic cursor advancement upon scan & durable report success; cursor retention on failure.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +19,9 @@ use tokio::sync::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::scheduler::{compute_next_run_after_occurrence, validate_cron_expression, validate_timezone};
+use crate::scheduler::{
+    compute_cron_next_run, normalize_cron_expr, validate_cron_expression, validate_timezone,
+};
 use crate::types::CronSchedule;
 
 // ---------------------------------------------------------------------------
@@ -39,11 +45,15 @@ pub enum MonitorError {
     #[error("Invalid schedule scope: {0}")]
     InvalidScheduleScope(String),
 
-    #[error("Invalid monitor occurrence: {0}")]
+    #[error("Invalid occurrence payload: {0}")]
     InvalidOccurrence(String),
 
-    #[error("Monitor repository failure: {0}")]
+    #[error("Database error: {0}")]
+    Database(String),
+
+    #[error("Repository error: {0}")]
     Repository(String),
+
 
     #[error("Monitor job not found: {0}")]
     NotFound(String),
@@ -98,6 +108,105 @@ pub enum MonitorRunOutcome {
     Unavailable,
     AuthExpired,
     Failed,
+}
+
+/// Classification of an observation compared against cursor state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationDeltaKind {
+    New,
+    Changed,
+    Unchanged,
+}
+
+/// Raw observation item discovered during a target scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FacebookObservation {
+    pub id: String,
+    pub target_id: String,
+    pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub published_at_ms: u64,
+}
+
+impl FacebookObservation {
+    pub fn new(id: impl Into<String>, target_id: impl Into<String>, content_hash: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            target_id: target_id.into(),
+            content_hash: content_hash.into(),
+            title: None,
+            body: None,
+            author: None,
+            published_at_ms: 0,
+        }
+    }
+
+    pub fn with_content(mut self, title: Option<String>, body: Option<String>, author: Option<String>) -> Self {
+        self.title = title;
+        self.body = body;
+        self.author = author;
+        self
+    }
+}
+
+/// State of an observation preserved in the MonitorCursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorItemState {
+    pub observation_id: String,
+    pub target_id: String,
+    pub content_hash: String,
+    pub first_seen_at_ms: u64,
+    pub last_seen_at_ms: u64,
+    pub reported_at_ms: Option<u64>,
+    pub acknowledged_at_ms: Option<u64>,
+}
+
+impl CursorItemState {
+    pub fn is_acknowledged(&self) -> bool {
+        self.acknowledged_at_ms.is_some()
+    }
+
+    pub fn is_unread_needs_attention(&self) -> bool {
+        self.reported_at_ms.is_some() && self.acknowledged_at_ms.is_none()
+    }
+}
+
+/// Durable observation cursor scoped to MonitorJob, Target, and Query Revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorCursor {
+    pub job_id: String,
+    pub target_id: String,
+    pub query_revision: u64,
+    pub last_successful_observed_at_ms: Option<u64>,
+    pub items: HashMap<String, CursorItemState>,
+    pub updated_at_ms: u64,
+}
+
+impl MonitorCursor {
+    pub fn new(job_id: impl Into<String>, target_id: impl Into<String>, query_revision: u64) -> Self {
+        Self {
+            job_id: job_id.into(),
+            target_id: target_id.into(),
+            query_revision,
+            last_successful_observed_at_ms: None,
+            items: HashMap::new(),
+            updated_at_ms: 0,
+        }
+    }
+}
+
+/// An observation reported in a run delta report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedObservation {
+    pub delta_kind: ObservationDeltaKind,
+    pub observation: FacebookObservation,
 }
 
 /// A validated Facebook group target.
@@ -212,8 +321,6 @@ pub struct MonitorJob {
 // ---------------------------------------------------------------------------
 
 /// Ephemeral domain proposal for an unapproved monitoring request.
-/// Produced when schedule is omitted during creation; no durable job is created
-/// until explicit user approval.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorJobProposal {
     pub proposal_id: String,
@@ -234,8 +341,6 @@ pub struct CreateMonitorJobRequest {
     pub targets: Vec<FacebookTarget>,
     pub query: MonitorQuery,
     pub lookback: LookbackScope,
-    /// If supplied, validated and accepted without redundant confirmation.
-    /// If omitted, produces an agent-proposed default requiring approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<CronSchedule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,6 +367,29 @@ pub struct MonitorScanResult {
     pub outcome: MonitorRunOutcome,
     pub observations_count: usize,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub observations: Vec<FacebookObservation>,
+}
+
+impl MonitorScanResult {
+    pub fn success(observations: Vec<FacebookObservation>) -> Self {
+        let count = observations.len();
+        Self {
+            outcome: MonitorRunOutcome::Success,
+            observations_count: count,
+            error_message: None,
+            observations,
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            outcome: MonitorRunOutcome::Failed,
+            observations_count: 0,
+            error_message: Some(message.into()),
+            observations: Vec::new(),
+        }
+    }
 }
 
 /// Durable, bounded result for one scheduled occurrence.
@@ -274,6 +402,12 @@ pub struct MonitorRunReport {
     pub outcome: MonitorRunOutcome,
     pub observations_count: usize,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub reported_observations: Vec<ReportedObservation>,
+    #[serde(default)]
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub query_revision: Option<u64>,
 }
 
 /// High-level conversation-scoped runner port.
@@ -300,12 +434,12 @@ pub trait IMonitorJobRepository: Send + Sync {
         scheduled_at_ms: u64,
     ) -> Result<Option<MonitorRunReport>, MonitorError>;
     async fn save_run_report(&self, report: &MonitorRunReport) -> Result<(), MonitorError>;
-    /// Atomically persist the canonical report and the job's post-run state.
-    /// Persistent implementations must use one transaction or equivalent.
+    /// Atomically persist the canonical report, the job's post-run state, and optionally cursor.
     async fn save_run_completion(
         &self,
         report: &MonitorRunReport,
         job: &MonitorJob,
+        cursor: Option<&MonitorCursor>,
     ) -> Result<MonitorRunReport, MonitorError>;
     async fn list_run_reports(
         &self,
@@ -313,12 +447,27 @@ pub trait IMonitorJobRepository: Send + Sync {
         conversation_id: &str,
         job_id: &str,
     ) -> Result<Vec<MonitorRunReport>, MonitorError>;
+    async fn get_cursor(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        target_id: &str,
+        query_revision: u64,
+    ) -> Result<Option<MonitorCursor>, MonitorError>;
+    async fn save_cursor(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        cursor: &MonitorCursor,
+    ) -> Result<(), MonitorError>;
 }
 
 #[derive(Default)]
 pub struct InMemoryMonitorJobRepository {
     jobs: RwLock<HashMap<String, MonitorJob>>,
     run_reports: RwLock<HashMap<String, MonitorRunReport>>,
+    cursors: RwLock<HashMap<String, MonitorCursor>>,
 }
 
 impl InMemoryMonitorJobRepository {
@@ -326,6 +475,7 @@ impl InMemoryMonitorJobRepository {
         Self {
             jobs: RwLock::new(HashMap::new()),
             run_reports: RwLock::new(HashMap::new()),
+            cursors: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -341,7 +491,6 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
     async fn get(&self, user_id: &str, conversation_id: &str, job_id: &str) -> Result<Option<MonitorJob>, MonitorError> {
         let guard = self.jobs.read().await;
         if let Some(job) = guard.get(job_id) {
-            // Strict user and conversation isolation:
             if job.user_id == user_id && job.conversation_id == conversation_id {
                 return Ok(Some(job.clone()));
             }
@@ -379,7 +528,8 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         scheduled_at_ms: u64,
     ) -> Result<Option<MonitorRunReport>, MonitorError> {
         let key = run_report_key(user_id, conversation_id, job_id, scheduled_at_ms);
-        Ok(self.run_reports.read().await.get(&key).cloned())
+        let guard = self.run_reports.read().await;
+        Ok(guard.get(&key).cloned())
     }
 
     async fn save_run_report(&self, report: &MonitorRunReport) -> Result<(), MonitorError> {
@@ -389,7 +539,8 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
             &report.job_id,
             report.scheduled_at_ms,
         );
-        self.run_reports.write().await.entry(key).or_insert_with(|| report.clone());
+        let mut guard = self.run_reports.write().await;
+        guard.insert(key, report.clone());
         Ok(())
     }
 
@@ -397,6 +548,7 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         &self,
         report: &MonitorRunReport,
         job: &MonitorJob,
+        cursor: Option<&MonitorCursor>,
     ) -> Result<MonitorRunReport, MonitorError> {
         let report_key = run_report_key(
             &report.user_id,
@@ -408,6 +560,13 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         let mut jobs = self.jobs.write().await;
         let canonical = reports.entry(report_key).or_insert_with(|| report.clone()).clone();
         jobs.insert(job.id.clone(), job.clone());
+
+        if let Some(c) = cursor {
+            let ckey = cursor_key(&job.user_id, &job.conversation_id, &c.job_id, &c.target_id, c.query_revision);
+            let mut cursors = self.cursors.write().await;
+            cursors.insert(ckey, c.clone());
+        }
+
         Ok(canonical)
     }
 
@@ -429,10 +588,39 @@ impl IMonitorJobRepository for InMemoryMonitorJobRepository {
         reports.sort_by_key(|report| report.scheduled_at_ms);
         Ok(reports)
     }
+
+    async fn get_cursor(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        target_id: &str,
+        query_revision: u64,
+    ) -> Result<Option<MonitorCursor>, MonitorError> {
+        let key = cursor_key(user_id, conversation_id, job_id, target_id, query_revision);
+        let guard = self.cursors.read().await;
+        Ok(guard.get(&key).cloned())
+    }
+
+    async fn save_cursor(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        cursor: &MonitorCursor,
+    ) -> Result<(), MonitorError> {
+        let key = cursor_key(user_id, conversation_id, &cursor.job_id, &cursor.target_id, cursor.query_revision);
+        let mut guard = self.cursors.write().await;
+        guard.insert(key, cursor.clone());
+        Ok(())
+    }
 }
 
 fn run_report_key(user_id: &str, conversation_id: &str, job_id: &str, scheduled_at_ms: u64) -> String {
     format!("{user_id}\0{conversation_id}\0{job_id}\0{scheduled_at_ms}")
+}
+
+fn cursor_key(user_id: &str, conversation_id: &str, job_id: &str, target_id: &str, query_revision: u64) -> String {
+    format!("{user_id}\0{conversation_id}\0{job_id}\0{target_id}\0{query_revision}")
 }
 
 // ---------------------------------------------------------------------------
@@ -538,8 +726,6 @@ impl MonitorControlService {
     }
 
     /// Create a new MonitorJob explicitly bound to the originating conversation.
-    /// Rejects incomplete scope. If schedule is omitted, produces an agent-proposed
-    /// default proposal without persisting a job until explicit approval.
     pub async fn create_job(
         &self,
         user_id: &str,
@@ -590,14 +776,12 @@ impl MonitorControlService {
                     created_at_ms: now_ms,
                 };
 
-                // Do not persist unapproved job to repo
                 Ok(CreateMonitorJobOutcome::RequiresApproval { proposal })
             }
         }
     }
 
     /// Approve an agent proposal to create the durable MonitorJob.
-    /// User may accept the proposed schedule or supply an approved override schedule.
     pub async fn approve_proposal(
         &self,
         user_id: &str,
@@ -608,7 +792,6 @@ impl MonitorControlService {
     ) -> Result<MonitorJob, MonitorError> {
         Self::validate_ownership_scope(user_id, conversation_id)?;
 
-        // Proposal ownership must match caller context
         if proposal.user_id != user_id || proposal.conversation_id != conversation_id {
             return Err(MonitorError::AccessDenied(
                 "Proposal ownership does not match caller context".into(),
@@ -749,7 +932,6 @@ impl MonitorControlService {
         job_id: &str,
     ) -> Result<MonitorJob, MonitorError> {
         Self::validate_ownership_scope(user_id, conversation_id)?;
-
         self.repo
             .get(user_id, conversation_id, job_id)
             .await?
@@ -766,9 +948,62 @@ impl MonitorControlService {
         self.repo.list_by_conversation(user_id, conversation_id).await
     }
 
+    /// Get cursor state for a specific job, target, and query revision.
+    pub async fn get_cursor(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        target_id: &str,
+        query_revision: u64,
+    ) -> Result<Option<MonitorCursor>, MonitorError> {
+        Self::validate_ownership_scope(user_id, conversation_id)?;
+        self.repo
+            .get_cursor(user_id, conversation_id, job_id, target_id, query_revision)
+            .await
+    }
+
+    /// Mark an observation as acknowledged by the user.
+    pub async fn acknowledge_observation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        target_id: &str,
+        query_revision: u64,
+        observation_id: &str,
+        ack_time_ms: u64,
+    ) -> Result<CursorItemState, MonitorError> {
+        Self::validate_ownership_scope(user_id, conversation_id)?;
+
+        let mut cursor = self
+            .repo
+            .get_cursor(user_id, conversation_id, job_id, target_id, query_revision)
+            .await?
+            .ok_or_else(|| {
+                MonitorError::NotFound(format!(
+                    "Cursor not found for job {job_id} target {target_id} rev {query_revision}"
+                ))
+            })?;
+
+        let item = cursor.items.get_mut(observation_id).ok_or_else(|| {
+            MonitorError::NotFound(format!(
+                "Observation {observation_id} not found in cursor"
+            ))
+        })?;
+
+        item.acknowledged_at_ms = Some(ack_time_ms);
+        let updated = item.clone();
+
+        cursor.updated_at_ms = ack_time_ms;
+        self.repo.save_cursor(user_id, conversation_id, &cursor).await?;
+
+        Ok(updated)
+    }
+
     /// Run one bounded occurrence for an existing active job and persist its
-    /// report in the originating conversation scope. Delivery is idempotent
-    /// for the same owner, job, and scheduled occurrence.
+    /// report in the originating conversation scope. Performs single-target delta
+    /// evaluation and advances the cursor only on scan and report success.
     pub async fn run_occurrence(
         &self,
         user_id: &str,
@@ -806,6 +1041,7 @@ impl MonitorControlService {
             });
         }
 
+        // Repeated delivery is idempotent for the same occurrence
         if let Some(existing) = self
             .repo
             .get_run_report(user_id, conversation_id, job_id, scheduled_at_ms)
@@ -816,21 +1052,111 @@ impl MonitorControlService {
 
         let scan = match runner.run_scan(&job).await {
             Ok(scan) => scan,
-            Err(error_message) => MonitorScanResult {
-                outcome: MonitorRunOutcome::Failed,
-                observations_count: 0,
-                error_message: Some(error_message),
-            },
+            Err(error_message) => MonitorScanResult::failed(error_message),
         };
+
+        let target_id = job.targets.first().map(|t| t.target_id.clone());
+        let query_revision = job.query.revision;
+        let mut delta_observations = Vec::new();
+        let mut updated_cursor = None;
+
+        // Perform delta evaluation and advance cursor only on success
+        if let Some(ref tid) = target_id {
+            let mut cursor = self
+                .repo
+                .get_cursor(user_id, conversation_id, job_id, tid, query_revision)
+                .await?
+                .unwrap_or_else(|| MonitorCursor::new(job_id, tid, query_revision));
+
+            if scan.outcome == MonitorRunOutcome::Success {
+                for obs in &scan.observations {
+                    let delta_kind = match cursor.items.get(&obs.id) {
+                        None => ObservationDeltaKind::New,
+                        Some(existing) => {
+                            if existing.content_hash != obs.content_hash {
+                                ObservationDeltaKind::Changed
+                            } else {
+                                ObservationDeltaKind::Unchanged
+                            }
+                        }
+                    };
+
+                    match delta_kind {
+                        ObservationDeltaKind::New => {
+                            cursor.items.insert(
+                                obs.id.clone(),
+                                CursorItemState {
+                                    observation_id: obs.id.clone(),
+                                    target_id: tid.clone(),
+                                    content_hash: obs.content_hash.clone(),
+                                    first_seen_at_ms: scheduled_at_ms,
+                                    last_seen_at_ms: scheduled_at_ms,
+                                    reported_at_ms: Some(scheduled_at_ms),
+                                    acknowledged_at_ms: None,
+                                },
+                            );
+                            delta_observations.push(ReportedObservation {
+                                delta_kind,
+                                observation: obs.clone(),
+                            });
+                        }
+                        ObservationDeltaKind::Changed => {
+                            let first_seen = cursor
+                                .items
+                                .get(&obs.id)
+                                .map(|i| i.first_seen_at_ms)
+                                .unwrap_or(scheduled_at_ms);
+                            cursor.items.insert(
+                                obs.id.clone(),
+                                CursorItemState {
+                                    observation_id: obs.id.clone(),
+                                    target_id: tid.clone(),
+                                    content_hash: obs.content_hash.clone(),
+                                    first_seen_at_ms: first_seen,
+                                    last_seen_at_ms: scheduled_at_ms,
+                                    reported_at_ms: Some(scheduled_at_ms),
+                                    acknowledged_at_ms: None, // Reset acknowledgement on content change
+                                },
+                            );
+                            delta_observations.push(ReportedObservation {
+                                delta_kind,
+                                observation: obs.clone(),
+                            });
+                        }
+                        ObservationDeltaKind::Unchanged => {
+                            if let Some(existing) = cursor.items.get_mut(&obs.id) {
+                                existing.last_seen_at_ms = scheduled_at_ms;
+                            }
+                            // Unchanged already-reported observations are omitted from report
+                        }
+                    }
+                }
+
+                cursor.last_successful_observed_at_ms = Some(scheduled_at_ms);
+                cursor.updated_at_ms = scheduled_at_ms;
+                updated_cursor = Some(cursor);
+            }
+        }
+
+        let observations_count = if !scan.observations.is_empty() {
+            scan.observations.len()
+        } else {
+            scan.observations_count
+        };
+
         let report = MonitorRunReport {
             job_id: job.id.clone(),
             user_id: job.user_id.clone(),
             conversation_id: job.conversation_id.clone(),
             scheduled_at_ms,
             outcome: scan.outcome.clone(),
-            observations_count: scan.observations_count,
+            observations_count,
             error_message: scan.error_message.clone(),
+            reported_observations: delta_observations,
+            target_id,
+            query_revision: Some(query_revision),
         };
+
         job.last_outcome = Some(scan.outcome);
         job.updated_at_ms = job.updated_at_ms.max(scheduled_at_ms);
         job.next_execution_at_ms = compute_next_run_after_occurrence(
@@ -838,7 +1164,11 @@ impl MonitorControlService {
             scheduled_at_ms,
             scheduled_at_ms,
         );
-        self.repo.save_run_completion(&report, &job).await
+
+        // Durable atomic save
+        self.repo
+            .save_run_completion(&report, &job, updated_cursor.as_ref())
+            .await
     }
 
     /// List reports for a job in its originating conversation scope.
@@ -853,7 +1183,6 @@ impl MonitorControlService {
     }
 
     /// Hook invoked when originating conversation is closed, archived, or deleted.
-    /// Automatically cancels all active or paused monitor jobs bound to that conversation.
     pub async fn on_conversation_ended(
         &self,
         user_id: &str,
@@ -878,5 +1207,41 @@ impl MonitorControlService {
         }
 
         Ok(cancelled_count)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schedule helper
+// ---------------------------------------------------------------------------
+
+fn compute_next_run_after_occurrence(
+    schedule: &CronSchedule,
+    scheduled_at_ms: u64,
+    now_ms: u64,
+) -> Option<u64> {
+    match schedule {
+        CronSchedule::At { at_ms, .. } => {
+            let at_u64 = *at_ms as u64;
+            if at_u64 > scheduled_at_ms && at_u64 > now_ms {
+                Some(at_u64)
+            } else {
+                None
+            }
+        }
+        CronSchedule::Every { every_ms, .. } => {
+            if *every_ms <= 0 {
+                return None;
+            }
+            let step = *every_ms as u64;
+            let mut next = scheduled_at_ms.saturating_add(step);
+            while next <= now_ms {
+                next = next.saturating_add(step);
+            }
+            Some(next)
+        }
+        CronSchedule::Cron { expr, tz, .. } => {
+            let base_ms = (scheduled_at_ms.max(now_ms)) as i64;
+            compute_cron_next_run(expr, tz.as_deref(), base_ms).map(|ts| ts as u64)
+        }
     }
 }
