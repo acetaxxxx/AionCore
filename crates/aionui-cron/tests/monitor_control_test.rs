@@ -2389,15 +2389,14 @@ async fn test_adapter_untrusted_dom_drift_fails_closed_and_closes_context() {
     assert_eq!(*closed.lock().await, 1);
 }
 
-
 // ---------------------------------------------------------------------------
 // Ticket 09 Tests: LiveView transport session contract and fail-closed adapter seam
 // ---------------------------------------------------------------------------
 
 use aionui_cron::liveview_transport::{
-    hash_session_token, FailClosedLiveViewTransportAdapter, ILiveViewTransportAdapter, LiveViewCapability,
-    LiveViewSessionManager, LiveViewSessionScope, LiveViewSessionStatus, LiveViewTransportError,
-    StartLiveViewSessionRequest,
+    FailClosedLiveViewTransportAdapter, ILiveViewTransportAdapter, LiveViewSessionManager, LiveViewSessionScope,
+    LiveViewSessionStatus, LiveViewTransportError, LiveViewTransportSession, StartLiveViewSessionRequest,
+    hash_session_token,
 };
 
 struct MockLiveViewTransportAdapter {
@@ -2476,7 +2475,10 @@ async fn test_liveview_transport_session_happy_path_lifecycle() {
 
     // 2. Token hash verification
     assert!(!resp.token_hash.is_empty());
-    let expected_hash = hash_session_token(&format!("{}:{}:{}", resp.session_id, "nonce_unique_101", resp.expires_at_ms));
+    let expected_hash = hash_session_token(&format!(
+        "{}:{}:{}",
+        resp.session_id, "nonce_unique_101", resp.expires_at_ms
+    ));
     assert_eq!(resp.token_hash, expected_hash);
 
     // 3. Renew session
@@ -2585,7 +2587,10 @@ async fn test_liveview_transport_cross_user_access_denied() {
         .unwrap_err();
     assert!(matches!(err_renew, LiveViewTransportError::AccessDenied(_)));
 
-    let err_end = mgr.end_session("user_bob", &resp.session_id, 1_060_000).await.unwrap_err();
+    let err_end = mgr
+        .end_session("user_bob", &resp.session_id, 1_060_000)
+        .await
+        .unwrap_err();
     assert!(matches!(err_end, LiveViewTransportError::AccessDenied(_)));
 }
 
@@ -2601,7 +2606,10 @@ async fn test_liveview_transport_scope_and_audience_validation() {
         nonce: "nonce_bad_aud".into(),
         ttl_ms: 600_000,
     };
-    let err_aud = mgr.start_session("user_alice", req_bad_aud, 1_000_000).await.unwrap_err();
+    let err_aud = mgr
+        .start_session("user_alice", req_bad_aud, 1_000_000)
+        .await
+        .unwrap_err();
     assert!(matches!(err_aud, LiveViewTransportError::AudienceMismatch { .. }));
 
     // 2. Empty profile_ref in scope
@@ -2611,7 +2619,10 @@ async fn test_liveview_transport_scope_and_audience_validation() {
         nonce: "nonce_empty_prof".into(),
         ttl_ms: 600_000,
     };
-    let err_prof = mgr.start_session("user_alice", req_empty_prof, 1_000_000).await.unwrap_err();
+    let err_prof = mgr
+        .start_session("user_alice", req_empty_prof, 1_000_000)
+        .await
+        .unwrap_err();
     assert!(matches!(err_prof, LiveViewTransportError::InvalidScope(_)));
 
     // 3. Empty capabilities in scope
@@ -2622,7 +2633,10 @@ async fn test_liveview_transport_scope_and_audience_validation() {
         nonce: "nonce_no_caps".into(),
         ttl_ms: 600_000,
     };
-    let err_caps = mgr.start_session("user_alice", req_no_caps, 1_000_000).await.unwrap_err();
+    let err_caps = mgr
+        .start_session("user_alice", req_no_caps, 1_000_000)
+        .await
+        .unwrap_err();
     assert!(matches!(err_caps, LiveViewTransportError::InvalidScope(_)));
 }
 
@@ -2657,7 +2671,12 @@ async fn test_liveview_transport_expiry_and_revocation() {
     let resp2 = mgr.start_session("user_alice", req2, 2_000_000).await.unwrap();
 
     let revoked = mgr
-        .revoke_session("user_alice", &resp2.session_id, "Suspicious activity detected", 2_010_000)
+        .revoke_session(
+            "user_alice",
+            &resp2.session_id,
+            "Suspicious activity detected",
+            2_010_000,
+        )
         .await
         .unwrap();
     assert_eq!(revoked.status, LiveViewSessionStatus::Revoked);
@@ -2669,7 +2688,10 @@ async fn test_liveview_transport_expiry_and_revocation() {
         .renew_session("user_alice", &resp2.session_id, 10_000, 2_020_000)
         .await
         .unwrap_err();
-    assert!(matches!(err_revoked, LiveViewTransportError::SessionClosed(LiveViewSessionStatus::Revoked)));
+    assert!(matches!(
+        err_revoked,
+        LiveViewTransportError::SessionClosed(LiveViewSessionStatus::Revoked)
+    ));
 }
 
 #[tokio::test]
@@ -2705,9 +2727,8 @@ async fn test_liveview_transport_zero_custody_and_untrusted_data_isolation() {
 // ---------------------------------------------------------------------------
 
 use aionui_cron::liveview_transport::{
-    ClientRelayMessage, GatewayRelayMessage, ISidecarScreencastDriver, LiveViewScreencastRelayGateway,
-    MouseButton, ScreencastFormat, ScreencastFrame, UserKeyboardEvent, UserPointerEvent,
-    MAX_FRAME_HEIGHT, MAX_FRAME_WIDTH, MAX_SCENARIOCAST_FRAME_BYTES,
+    ClientRelayMessage, GatewayRelayMessage, ISidecarScreencastDriver, LiveViewScreencastRelayGateway, MAX_FRAME_WIDTH,
+    MAX_SCENARIOCAST_FRAME_BYTES, MouseButton, ScreencastFormat, ScreencastFrame, UserKeyboardEvent, UserPointerEvent,
 };
 
 struct FakeSidecarDriver {
@@ -2719,7 +2740,9 @@ struct FakeSidecarDriver {
 }
 
 impl FakeSidecarDriver {
-    fn new(connected: bool) -> (
+    fn new(
+        connected: bool,
+    ) -> (
         Self,
         Arc<tokio::sync::Mutex<Vec<(String, LiveViewSessionScope)>>>,
         Arc<tokio::sync::Mutex<Vec<(String, UserPointerEvent)>>>,
@@ -2758,11 +2781,7 @@ impl ISidecarScreencastDriver for FakeSidecarDriver {
         Ok(())
     }
 
-    async fn forward_pointer(
-        &self,
-        session_id: &str,
-        event: &UserPointerEvent,
-    ) -> Result<(), LiveViewTransportError> {
+    async fn forward_pointer(&self, session_id: &str, event: &UserPointerEvent) -> Result<(), LiveViewTransportError> {
         let mut guard = self.received_pointers.lock().await;
         guard.push((session_id.to_string(), event.clone()));
         Ok(())
@@ -2849,7 +2868,10 @@ async fn test_relay_bounded_screencast_frames_and_oversized_rejection() {
         ttl_ms: 600_000,
     };
     let start_resp = session_mgr.start_session("user_carol", req, 1_000_000).await.unwrap();
-    let session = session_mgr.get_session("user_carol", &start_resp.session_id).await.unwrap();
+    let session = session_mgr
+        .get_session("user_carol", &start_resp.session_id)
+        .await
+        .unwrap();
 
     // 1. Valid frame within boundaries
     let valid_frame = ScreencastFrame::new(
@@ -2859,10 +2881,18 @@ async fn test_relay_bounded_screencast_frames_and_oversized_rejection() {
         720,
         ScreencastFormat::Jpeg,
         vec![0xFF, 0xD8, 0xFF, 0xE0],
-    ).unwrap();
+    )
+    .unwrap();
 
     let wrapped = gateway.validate_and_wrap_frame(&session, valid_frame).unwrap();
-    assert!(matches!(wrapped, GatewayRelayMessage::Frame { width: 1280, height: 720, .. }));
+    assert!(matches!(
+        wrapped,
+        GatewayRelayMessage::Frame {
+            width: 1280,
+            height: 720,
+            ..
+        }
+    ));
 
     // 2. Oversized dimensions rejected fail-closed
     let err_dim = ScreencastFrame::new(
@@ -2872,7 +2902,8 @@ async fn test_relay_bounded_screencast_frames_and_oversized_rejection() {
         720,
         ScreencastFormat::Jpeg,
         vec![0x00],
-    ).unwrap_err();
+    )
+    .unwrap_err();
     assert!(matches!(err_dim, LiveViewTransportError::InvalidFrame(_)));
 
     // 3. Oversized frame payload bytes rejected fail-closed
@@ -2884,7 +2915,8 @@ async fn test_relay_bounded_screencast_frames_and_oversized_rejection() {
         720,
         ScreencastFormat::Jpeg,
         huge_bytes,
-    ).unwrap_err();
+    )
+    .unwrap_err();
     assert!(matches!(err_bytes, LiveViewTransportError::InvalidFrame(_)));
 }
 
@@ -2909,7 +2941,10 @@ async fn test_relay_allowlisted_pointer_keyboard_inputs_and_bounds_validation() 
         x: 400,
         y: 300,
     });
-    gateway.process_client_message("user_carol", &start_resp.session_id, click_msg, 1_000_100).await.unwrap();
+    gateway
+        .process_client_message("user_carol", &start_resp.session_id, click_msg, 1_000_100)
+        .await
+        .unwrap();
     assert_eq!(pointers.lock().await.len(), 1);
 
     // 2. Out-of-bounds click rejected fail-closed
@@ -2928,7 +2963,10 @@ async fn test_relay_allowlisted_pointer_keyboard_inputs_and_bounds_validation() 
     let text_msg = ClientRelayMessage::Keyboard(UserKeyboardEvent::TextInput {
         text: "auth-code-123456".into(),
     });
-    gateway.process_client_message("user_carol", &start_resp.session_id, text_msg, 1_000_200).await.unwrap();
+    gateway
+        .process_client_message("user_carol", &start_resp.session_id, text_msg, 1_000_200)
+        .await
+        .unwrap();
     assert_eq!(keyboards.lock().await.len(), 1);
 
     // 4. Dangerous control characters in text input rejected fail-closed
@@ -2985,9 +3023,15 @@ async fn test_relay_clean_termination_and_detach() {
     };
     let start_resp = session_mgr.start_session("user_carol", req, 1_000_000).await.unwrap();
 
-    gateway.terminate_session("user_carol", &start_resp.session_id, 1_050_000).await.unwrap();
+    gateway
+        .terminate_session("user_carol", &start_resp.session_id, 1_050_000)
+        .await
+        .unwrap();
 
     assert_eq!(detached.lock().await.len(), 1);
-    let session = session_mgr.get_session("user_carol", &start_resp.session_id).await.unwrap();
+    let session = session_mgr
+        .get_session("user_carol", &start_resp.session_id)
+        .await
+        .unwrap();
     assert_eq!(session.status, LiveViewSessionStatus::Ended);
 }

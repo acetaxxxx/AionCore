@@ -98,10 +98,14 @@ impl LiveViewSessionScope {
             return Err(LiveViewTransportError::InvalidScope("user_id cannot be empty".into()));
         }
         if self.conversation_id.trim().is_empty() {
-            return Err(LiveViewTransportError::InvalidScope("conversation_id cannot be empty".into()));
+            return Err(LiveViewTransportError::InvalidScope(
+                "conversation_id cannot be empty".into(),
+            ));
         }
         if self.profile_ref.trim().is_empty() {
-            return Err(LiveViewTransportError::InvalidScope("profile_ref cannot be empty".into()));
+            return Err(LiveViewTransportError::InvalidScope(
+                "profile_ref cannot be empty".into(),
+            ));
         }
         if self.audience.trim().is_empty() {
             return Err(LiveViewTransportError::InvalidScope("audience cannot be empty".into()));
@@ -231,9 +235,9 @@ impl From<LiveViewTransportError> for MonitorError {
             LiveViewTransportError::ReplayDetected(nonce) => {
                 MonitorError::InvalidOccurrence(format!("Replay attack detected for nonce {nonce}"))
             }
-            LiveViewTransportError::AudienceMismatch { expected, received } => MonitorError::AccessDenied(format!(
-                "Audience mismatch: expected {expected}, received {received}"
-            )),
+            LiveViewTransportError::AudienceMismatch { expected, received } => {
+                MonitorError::AccessDenied(format!("Audience mismatch: expected {expected}, received {received}"))
+            }
             LiveViewTransportError::TransportUnavailable(msg) => MonitorError::ProfileBusy(msg),
             LiveViewTransportError::TransportFailure(msg) => MonitorError::Repository(msg),
             LiveViewTransportError::HandshakeFailed(msg) => MonitorError::AccessDenied(msg),
@@ -381,7 +385,9 @@ impl LiveViewSessionManager {
 
         // 5. TTL validation (bounded lifespan, default 15 minutes max 1 hour)
         if req.ttl_ms == 0 {
-            return Err(LiveViewTransportError::InvalidScope("ttl_ms must be greater than 0".into()));
+            return Err(LiveViewTransportError::InvalidScope(
+                "ttl_ms must be greater than 0".into(),
+            ));
         }
         let ttl_ms = req.ttl_ms.min(60 * 60 * 1000); // capped at 1h
         let expires_at_ms = now_ms.saturating_add(ttl_ms);
@@ -389,10 +395,7 @@ impl LiveViewSessionManager {
         let session_id = format!("lvs_{}", aionui_common::generate_prefixed_id("sess"));
 
         // 6. Fail-closed transport allocation
-        let stream_endpoint = self
-            .transport_adapter
-            .allocate_stream(&session_id, &req.scope)
-            .await?;
+        let stream_endpoint = self.transport_adapter.allocate_stream(&session_id, &req.scope).await?;
 
         // 7. Token hashing: never persist raw tokens
         let raw_token = format!("{session_id}:{}:{}", req.nonce, expires_at_ms);
@@ -680,18 +683,11 @@ pub trait ISidecarScreencastDriver: Send + Sync {
     ) -> Result<(), LiveViewTransportError>;
 
     /// Forward a validated and sanitized pointer event to the sidecar.
-    async fn forward_pointer(
-        &self,
-        session_id: &str,
-        event: &UserPointerEvent,
-    ) -> Result<(), LiveViewTransportError>;
+    async fn forward_pointer(&self, session_id: &str, event: &UserPointerEvent) -> Result<(), LiveViewTransportError>;
 
     /// Forward a validated and sanitized keyboard event to the sidecar.
-    async fn forward_keyboard(
-        &self,
-        session_id: &str,
-        event: &UserKeyboardEvent,
-    ) -> Result<(), LiveViewTransportError>;
+    async fn forward_keyboard(&self, session_id: &str, event: &UserKeyboardEvent)
+    -> Result<(), LiveViewTransportError>;
 
     /// Detach and close the sidecar browser session cleanly.
     async fn detach_session(&self, session_id: &str) -> Result<(), LiveViewTransportError>;
@@ -733,10 +729,7 @@ impl LiveViewScreencastRelayGateway {
         expected_conversation_id: &str,
         now_ms: u64,
     ) -> Result<LiveViewTransportSession, LiveViewTransportError> {
-        let session = self
-            .session_manager
-            .get_session(caller_user_id, session_id)
-            .await?;
+        let session = self.session_manager.get_session(caller_user_id, session_id).await?;
 
         if session.scope.conversation_id != expected_conversation_id {
             return Err(LiveViewTransportError::AccessDenied(format!(
@@ -759,9 +752,7 @@ impl LiveViewScreencastRelayGateway {
         }
 
         // Attach session to sidecar
-        self.sidecar_driver
-            .attach_session(session_id, &session.scope)
-            .await?;
+        self.sidecar_driver.attach_session(session_id, &session.scope).await?;
 
         Ok(session)
     }
@@ -776,10 +767,7 @@ impl LiveViewScreencastRelayGateway {
         now_ms: u64,
     ) -> Result<(), LiveViewTransportError> {
         // 1. Authorize session
-        let session = self
-            .session_manager
-            .get_session(caller_user_id, session_id)
-            .await?;
+        let session = self.session_manager.get_session(caller_user_id, session_id).await?;
 
         if !session.is_active_at(now_ms) {
             return Err(LiveViewTransportError::SessionExpired {
@@ -799,7 +787,9 @@ impl LiveViewScreencastRelayGateway {
             }
             ClientRelayMessage::Keyboard(keyboard_event) => {
                 self.validate_keyboard_event(&keyboard_event)?;
-                self.sidecar_driver.forward_keyboard(session_id, &keyboard_event).await?;
+                self.sidecar_driver
+                    .forward_keyboard(session_id, &keyboard_event)
+                    .await?;
             }
             ClientRelayMessage::AcknowledgeFrame { .. } => {}
             ClientRelayMessage::Heartbeat { .. } => {}
@@ -836,7 +826,9 @@ impl LiveViewScreencastRelayGateway {
         session_id: &str,
         now_ms: u64,
     ) -> Result<(), LiveViewTransportError> {
-        self.session_manager.end_session(caller_user_id, session_id, now_ms).await?;
+        self.session_manager
+            .end_session(caller_user_id, session_id, now_ms)
+            .await?;
         let _ = self.sidecar_driver.detach_session(session_id).await;
         Ok(())
     }
