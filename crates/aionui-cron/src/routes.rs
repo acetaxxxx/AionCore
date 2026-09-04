@@ -2,7 +2,7 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, Query, State};
+use axum::extract::{Extension, Json, Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post, put};
 use serde::Deserialize;
@@ -66,6 +66,12 @@ struct BrowserTakeoverRequest {
     resume: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveViewQuery {
+    session_id: String,
+}
+
 impl From<CronError> for ApiError {
     fn from(err: CronError) -> Self {
         match err {
@@ -117,6 +123,7 @@ pub fn cron_routes(state: CronRouterState) -> Router {
         .route("/api/browser/session/{id}/takeover", post(browser_session_takeover))
         .route("/api/browser/session/{id}/close", post(browser_session_close))
         .route("/api/browser/session/{id}/purge", post(browser_session_purge))
+        .route("/api/browser/live-view/stream", get(browser_live_view_stream))
         .with_state(state)
 }
 
@@ -235,6 +242,52 @@ async fn browser_session_purge(
             .revoke(&user.id, &id, "purged", browser_now())
             .await?,
     )))
+}
+
+/// Private relay gate. The actual sidecar stream is intentionally not
+/// fabricated here: until a relay adapter is injected, the handshake closes
+/// with an explicit 503. No bearer token is accepted in query or headers.
+async fn browser_live_view_stream(
+    State(state): State<CronRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Query(query): Query<LiveViewQuery>,
+    _upgrade: WebSocketUpgrade,
+) -> Result<StatusCode, ApiError> {
+    let origin = headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "BROWSER_ORIGIN_REQUIRED",
+                "Origin is required",
+                None,
+            )
+        })?;
+    if !origin.starts_with("https://") || origin.contains('@') || origin.contains(char::is_whitespace) {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "BROWSER_ORIGIN_REJECTED",
+            "Origin is not allowlisted",
+            None,
+        ));
+    }
+    if query.session_id.trim().is_empty() {
+        return Err(ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "BROWSER_SESSION_REQUIRED",
+            "session_id is required",
+            None,
+        ));
+    }
+    let _ = state;
+    Err(ApiError::coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "BROWSER_RELAY_NOT_READY",
+        "private browser relay is unavailable",
+        None,
+    ))
 }
 
 async fn create_job(
