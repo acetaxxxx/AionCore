@@ -2,6 +2,7 @@
 
 //! Scheduled job engine: cron scheduler, executor, and lifecycle event emitter.
 mod artifacts;
+pub mod browser_session;
 pub mod error;
 pub mod events;
 pub mod executor;
@@ -18,6 +19,12 @@ pub mod state;
 pub mod types;
 
 pub use events::CronEventEmitter;
+pub use browser_session::{
+    ActionConfirmation, BrowserAction, BrowserCapability, BrowserCapabilityScope, BrowserInput,
+    BrowserLease, BrowserLeaseStatus, BrowserSessionControlPlane, BrowserSessionError,
+    IBrowserOriginPolicy, IBrowserSessionAdapter, StrictBrowserOriginPolicy,
+    BROWSER_ABSOLUTE_LEASE_MS, BROWSER_IDLE_LEASE_MS,
+};
 pub use facebook_adapter::{
     FacebookBrowserCapabilityAdapter, IFacebookBrowserDriver, IFacebookBrowserSession, RawPostData,
     RawTargetScanOutcome, compute_normalized_content_hash, sanitize_observation_text,
