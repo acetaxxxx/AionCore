@@ -20,10 +20,10 @@ pub mod types;
 
 pub use browser_session::{
     ActionConfirmation, BROWSER_ABSOLUTE_LEASE_MS, BROWSER_IDLE_LEASE_MS, BrowserAction, BrowserCapability,
-    BrowserCapabilityEnvelope, BrowserCapabilityKeyProvider, BrowserCapabilityScope, BrowserInput, BrowserLease,
-    BrowserLeaseStatus, BrowserScopeAuthorizer, BrowserSessionControlPlane, BrowserSessionError,
-    BrowserSessionStartOutcome, BrowserSessionStartRequest, FailClosedBrowserScopeAuthorizer, IBrowserOriginPolicy,
-    IBrowserSessionAdapter, StrictBrowserOriginPolicy, UnavailableBrowserSessionAdapter,
+    BrowserCapabilityEnvelope, BrowserCapabilityKeyProvider, BrowserCapabilityScope, BrowserCapabilityVerifier,
+    BrowserInput, BrowserLease, BrowserLeaseStatus, BrowserScopeAuthorizer, BrowserSessionControlPlane,
+    BrowserSessionError, BrowserSessionStartOutcome, BrowserSessionStartRequest, FailClosedBrowserScopeAuthorizer,
+    IBrowserOriginPolicy, IBrowserSessionAdapter, StrictBrowserOriginPolicy, UnavailableBrowserSessionAdapter,
 };
 pub use events::CronEventEmitter;
 pub use facebook_adapter::{

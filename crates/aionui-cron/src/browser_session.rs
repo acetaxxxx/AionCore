@@ -4,7 +4,7 @@
 //! or browser-worker implementations live behind `IBrowserSessionAdapter`; the
 //! control plane owns identity, capability, lease and origin checks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -56,6 +56,57 @@ pub struct BrowserSessionStartRequest {
 pub struct BrowserSessionStartOutcome {
     pub lease: BrowserLease,
     pub capability_token: String,
+}
+
+/// Transport-neutral verifier for the private sidecar handshake. The bearer
+/// is supplied only by the internal relay, never by the PWA query/header.
+pub struct BrowserCapabilityVerifier {
+    provider: Arc<BrowserCapabilityKeyProvider>,
+    used_jti: Arc<RwLock<HashSet<String>>>,
+}
+
+impl BrowserCapabilityVerifier {
+    pub fn new(provider: Arc<BrowserCapabilityKeyProvider>) -> Self {
+        Self {
+            provider,
+            used_jti: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    pub async fn verify_for_lease(
+        &self,
+        caller_user_id: &str,
+        lease: &BrowserLease,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<BrowserCapabilityEnvelope, BrowserSessionError> {
+        if caller_user_id.trim().is_empty() || caller_user_id != lease.scope.user_id {
+            return Err(BrowserSessionError::AccessDenied(
+                "caller does not own browser lease".into(),
+            ));
+        }
+        if !lease.is_active_at(now_ms) {
+            return Err(BrowserSessionError::Expired {
+                expires_at_ms: lease.expires_at_ms,
+                now_ms,
+            });
+        }
+        let envelope = self.provider.verify(token)?;
+        if envelope.sub != lease.scope.user_id
+            || envelope.cid != lease.scope.conversation_id
+            || envelope.tid != lease.scope.task_id
+            || envelope.profile_id != lease.scope.profile_id
+            || envelope.lease_id != lease.lease_id
+            || envelope.nonce != lease.scope.nonce
+        {
+            return Err(BrowserSessionError::AccessDenied("capability scope mismatch".into()));
+        }
+        let mut used = self.used_jti.write().await;
+        if !used.insert(envelope.jti.clone()) {
+            return Err(BrowserSessionError::AccessDenied("capability replay detected".into()));
+        }
+        Ok(envelope)
+    }
 }
 
 /// Application-owned boundary for validating conversation/task/profile
@@ -847,6 +898,45 @@ mod tests {
         assert_eq!(claims.lease_id, outcome.lease.lease_id);
         assert_ne!(claims.nonce, "client_nonce");
         assert_ne!(claims.jti, "client_jti");
+    }
+
+    #[tokio::test]
+    async fn capability_verifier_rejects_replay_and_scope_mismatch() {
+        let plane = BrowserSessionControlPlane::new(Arc::new(DeterministicAdapter));
+        let keys = Arc::new(BrowserCapabilityKeyProvider::new("kid-a", [b'a'; 32]).unwrap());
+        let outcome = plane
+            .start_server_issued(
+                "usr_1",
+                BrowserSessionStartRequest {
+                    conversation_id: "conv_1".into(),
+                    task_id: "task_1".into(),
+                    profile_id: "profile_1".into(),
+                    allowed_origins: vec!["https://example.com".into()],
+                    allowed_capabilities: vec![BrowserCapability::Observe],
+                },
+                &keys,
+                60_000,
+                1_800_000_000_000,
+            )
+            .await
+            .unwrap();
+        let verifier = BrowserCapabilityVerifier::new(keys);
+        verifier
+            .verify_for_lease("usr_1", &outcome.lease, &outcome.capability_token, 1_800_000_000_001)
+            .await
+            .unwrap();
+        assert!(matches!(
+            verifier
+                .verify_for_lease("usr_1", &outcome.lease, &outcome.capability_token, 1_800_000_000_001)
+                .await,
+            Err(BrowserSessionError::AccessDenied(_))
+        ));
+        assert!(matches!(
+            verifier
+                .verify_for_lease("usr_2", &outcome.lease, "not-a-token", 1_800_000_000_001)
+                .await,
+            Err(BrowserSessionError::AccessDenied(_))
+        ));
     }
 
     #[test]
