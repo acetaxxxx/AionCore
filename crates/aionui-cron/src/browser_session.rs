@@ -14,6 +14,10 @@ use tokio::sync::RwLock;
 
 pub const BROWSER_IDLE_LEASE_MS: u64 = 30 * 60 * 1000;
 pub const BROWSER_ABSOLUTE_LEASE_MS: u64 = 4 * 60 * 60 * 1000;
+pub const BROWSER_RELAY_MAX_FRAME_BYTES: usize = 512 * 1024;
+pub const BROWSER_RELAY_MAX_FRAME_WIDTH: u32 = 1920;
+pub const BROWSER_RELAY_MAX_FRAME_HEIGHT: u32 = 1080;
+pub const BROWSER_RELAY_MAX_INPUTS_PER_SECOND: u32 = 60;
 
 /// Server-owned signing key set. Retired keys remain verifiable during rotation.
 pub struct BrowserCapabilityKeyProvider {
@@ -56,6 +60,51 @@ pub struct BrowserSessionStartRequest {
 pub struct BrowserSessionStartOutcome {
     pub lease: BrowserLease,
     pub capability_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserRelayFrame {
+    pub content_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub payload: Vec<u8>,
+}
+
+impl BrowserRelayFrame {
+    pub fn validate(&self) -> Result<(), BrowserSessionError> {
+        if self.payload.len() > BROWSER_RELAY_MAX_FRAME_BYTES {
+            return Err(BrowserSessionError::InputRejected("frame exceeds 512KB".into()));
+        }
+        if self.width == 0
+            || self.height == 0
+            || self.width > BROWSER_RELAY_MAX_FRAME_WIDTH
+            || self.height > BROWSER_RELAY_MAX_FRAME_HEIGHT
+        {
+            return Err(BrowserSessionError::InputRejected(
+                "frame dimensions exceed bounds".into(),
+            ));
+        }
+        if !matches!(
+            self.content_type.as_str(),
+            "image/jpeg" | "image/png" | "image/webp" | "image/x-aion-diff"
+        ) {
+            return Err(BrowserSessionError::InputRejected("unsupported frame format".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+pub trait BrowserPrivateRelay: Send + Sync {
+    async fn accept(
+        &self,
+        lease: &BrowserLease,
+        capability: &BrowserCapabilityEnvelope,
+    ) -> Result<(), BrowserSessionError>;
+    async fn forward_input(&self, lease: &BrowserLease, input: &BrowserInput) -> Result<(), BrowserSessionError>;
+    async fn close(&self, lease_id: &str) -> Result<(), BrowserSessionError>;
+    async fn is_ready(&self) -> bool;
 }
 
 /// Transport-neutral verifier for the private sidecar handshake. The bearer
@@ -937,6 +986,26 @@ mod tests {
                 .await,
             Err(BrowserSessionError::AccessDenied(_))
         ));
+    }
+
+    #[test]
+    fn relay_frame_bounds_and_format_fail_closed() {
+        let valid = BrowserRelayFrame {
+            content_type: "image/jpeg".into(),
+            width: 1920,
+            height: 1080,
+            payload: vec![0; 16],
+        };
+        assert!(valid.validate().is_ok());
+        let mut oversized = valid.clone();
+        oversized.payload = vec![0; BROWSER_RELAY_MAX_FRAME_BYTES + 1];
+        assert!(oversized.validate().is_err());
+        let mut bad_format = valid.clone();
+        bad_format.content_type = "text/html".into();
+        assert!(bad_format.validate().is_err());
+        let mut bad_dimensions = valid;
+        bad_dimensions.width = 1921;
+        assert!(bad_dimensions.validate().is_err());
     }
 
     #[test]
