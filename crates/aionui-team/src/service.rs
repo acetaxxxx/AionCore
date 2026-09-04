@@ -784,7 +784,7 @@ impl TeamSessionService {
 
         let provisioned = self
             .provisioner()
-            .provision_initial_agents(user_id, &team_id, &req.agents, shared_workspace.as_deref())
+            .provision_initial_agents(user_id, &team_id, &req.name, &req.agents, shared_workspace.as_deref())
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
@@ -2307,6 +2307,7 @@ impl TeamSessionService {
 
         let binding = TeamSessionBinding {
             team_id: team_id.clone(),
+            team_name: Some(team_row.name.clone()),
             slot_id: binding_lookup.slot_id,
             role: binding_lookup.role,
             runtime_seed: Default::default(),
