@@ -9910,7 +9910,7 @@ mod session_mentions_integration {
                 "user_1",
                 &conversation.id,
                 &ConversationRowUpdate {
-                    extra: Some(json!({ "teamId": "team-1", "role": role }).to_string()),
+                    extra: Some(json!({ "teamId": "team-1", "team_name": "Team Alpha", "role": role }).to_string()),
                     ..Default::default()
                 },
             )
@@ -9931,7 +9931,7 @@ mod session_mentions_integration {
             "user_1",
             &conversation.id,
             &ConversationRowUpdate {
-                extra: Some(json!({ "teamId": "team-1", "role": "lead" }).to_string()),
+                extra: Some(json!({ "teamId": "team-1", "team_name": "Team Alpha", "role": "lead" }).to_string()),
                 ..Default::default()
             },
         )
@@ -9950,6 +9950,7 @@ mod session_mentions_integration {
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].target_kind, TerminalTargetKind::Team);
         assert_eq!(notices[0].target_id, "team-1");
+        assert_eq!(notices[0].target_title.as_deref(), Some("Team Alpha"));
     }
 
     #[tokio::test]

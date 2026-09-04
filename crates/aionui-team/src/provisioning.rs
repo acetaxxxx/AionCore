@@ -44,6 +44,7 @@ struct ProvisionedConversation {
 struct NewAgentProvisioning {
     user_id: String,
     team_id: String,
+    team_name: String,
     slot_id: String,
     name: String,
     role: TeammateRole,
@@ -236,6 +237,7 @@ impl TeamAgentProvisioner {
         &self,
         user_id: &str,
         team_id: &str,
+        team_name: &str,
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
     ) -> Result<InitialProvisioningResult, TeamError> {
@@ -277,6 +279,7 @@ impl TeamAgentProvisioner {
             .create_team_conversation_for_agent(
                 user_id,
                 team_id,
+                team_name,
                 &leader_slot_id,
                 leader_role,
                 &leader_input.name,
@@ -333,6 +336,7 @@ impl TeamAgentProvisioner {
                 .create_team_conversation_for_agent(
                     user_id,
                     team_id,
+                    team_name,
                     &slot_id,
                     *role,
                     &input.name,
@@ -404,6 +408,7 @@ impl TeamAgentProvisioner {
                 NewAgentProvisioning {
                     user_id: user_id.to_owned(),
                     team_id: team.id.clone(),
+                    team_name: row.name.clone(),
                     slot_id: generate_id(),
                     name: req.name,
                     role,
@@ -464,6 +469,7 @@ impl TeamAgentProvisioner {
                 NewAgentProvisioning {
                     user_id: req.user_id,
                     team_id: req.team_id.clone(),
+                    team_name: row.name.clone(),
                     slot_id: req.slot_id,
                     name: req.name,
                     role: TeammateRole::Teammate,
@@ -705,6 +711,7 @@ impl TeamAgentProvisioner {
             .create_team_conversation_for_agent(
                 &input.user_id,
                 &input.team_id,
+                &input.team_name,
                 &input.slot_id,
                 input.role,
                 &input.name,
@@ -735,6 +742,7 @@ impl TeamAgentProvisioner {
         &self,
         user_id: &str,
         team_id: &str,
+        team_name: &str,
         slot_id: &str,
         role: TeammateRole,
         name: &str,
@@ -749,6 +757,7 @@ impl TeamAgentProvisioner {
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), backend)?;
         let extra = self.build_team_extra(
             team_id,
+            team_name,
             slot_id,
             role,
             backend,
@@ -856,6 +865,7 @@ impl TeamAgentProvisioner {
     fn build_team_extra(
         &self,
         team_id: &str,
+        team_name: &str,
         slot_id: &str,
         role: TeammateRole,
         backend: &str,
@@ -874,6 +884,7 @@ impl TeamAgentProvisioner {
             .unwrap_or_else(|| session_mode_for_backend(backend, agent_type, cli_metadata));
         let mut extra = serde_json::json!({
             "teamId": team_id,
+            "team_name": team_name,
             "slot_id": slot_id,
             "role": role.to_string(),
             "backend": backend,
@@ -1683,7 +1694,7 @@ mod tests {
         }];
 
         let error = match provisioner
-            .provision_initial_agents("user-1", "team-1", &inputs, Some("/workspace"))
+            .provision_initial_agents("user-1", "team-1", "Team", &inputs, Some("/workspace"))
             .await
         {
             Err(error) => error,
@@ -1758,6 +1769,7 @@ mod tests {
 
         let extra = provisioner.build_team_extra(
             "team-1",
+            "Team",
             "slot-1",
             TeammateRole::Teammate,
             "claude",
@@ -1771,6 +1783,7 @@ mod tests {
         );
 
         // Final snapshot inputs are explicit; no request-only fields leak in.
+        assert_eq!(extra["team_name"], serde_json::json!("Team"));
         assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-docs"]));
         assert_eq!(
             extra["session_mcp_servers"][0]["name"],
@@ -1786,6 +1799,7 @@ mod tests {
         let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
         let extra = provisioner.build_team_extra(
             "team-1",
+            "Team",
             "slot-1",
             TeammateRole::Teammate,
             "claude",

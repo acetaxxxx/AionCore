@@ -523,6 +523,7 @@ mod tests {
         let mut options = make_options(conversation_id);
         let team = aionui_api_types::TeamSessionBinding {
             team_id: "team-1".into(),
+            team_name: None,
             slot_id: Some("slot-1".into()),
             role: Some("leader".into()),
             runtime_seed: Default::default(),
