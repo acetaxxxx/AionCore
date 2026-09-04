@@ -498,6 +498,9 @@ pub struct BrowserSessionControlPlane {
     origin_policy: Arc<dyn IBrowserOriginPolicy>,
     leases: Arc<RwLock<HashMap<String, BrowserLease>>>,
     confirmations: Arc<RwLock<HashMap<String, PendingConfirmation>>>,
+    /// Server-only capability material. This is process memory, never a
+    /// persistence or client-facing store; it is removed when a lease closes.
+    server_capabilities: Arc<RwLock<HashMap<String, (String, BrowserCapabilityEnvelope)>>>,
 }
 
 impl BrowserSessionControlPlane {
@@ -514,6 +517,7 @@ impl BrowserSessionControlPlane {
             origin_policy,
             leases: Arc::new(RwLock::new(HashMap::new())),
             confirmations: Arc::new(RwLock::new(HashMap::new())),
+            server_capabilities: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -593,10 +597,31 @@ impl BrowserSessionControlPlane {
             exp: lease.expires_at_ms / 1000,
         };
         let capability_token = key_provider.sign(&envelope)?;
+        self.server_capabilities
+            .write()
+            .await
+            .insert(lease.lease_id.clone(), (capability_token.clone(), envelope));
         Ok(BrowserSessionStartOutcome {
             lease,
             capability_token,
         })
+    }
+
+    /// Resolve server-issued capability material for an internal relay only.
+    /// The caller supplies no token; ownership and lease state are authoritative.
+    pub async fn server_capability_for_relay(
+        &self,
+        caller_user_id: &str,
+        lease_id: &str,
+        now_ms: u64,
+    ) -> Result<(String, BrowserCapabilityEnvelope), BrowserSessionError> {
+        let _lease = self.owned_active(caller_user_id, lease_id, now_ms).await?;
+        self.server_capabilities
+            .read()
+            .await
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| BrowserSessionError::AccessDenied("server capability is unavailable".into()))
     }
 
     async fn owned_active(
@@ -694,6 +719,7 @@ impl BrowserSessionControlPlane {
         let current = leases.get_mut(lease_id).expect("lease checked above");
         current.status = BrowserLeaseStatus::Ended;
         current.closed_at_ms = Some(now_ms);
+        self.server_capabilities.write().await.remove(lease_id);
         Ok(current.clone())
     }
 
@@ -711,6 +737,7 @@ impl BrowserSessionControlPlane {
         current.status = BrowserLeaseStatus::Revoked;
         current.closed_at_ms = Some(now_ms);
         current.close_reason = Some(reason.into());
+        self.server_capabilities.write().await.remove(lease_id);
         let _ = lease;
         Ok(current.clone())
     }
@@ -956,6 +983,28 @@ mod tests {
         assert_eq!(claims.lease_id, outcome.lease.lease_id);
         assert_ne!(claims.nonce, "client_nonce");
         assert_ne!(claims.jti, "client_jti");
+        let (internal_token, internal_claims) = plane
+            .server_capability_for_relay("usr_1", &outcome.lease.lease_id, 1_800_000_000_001)
+            .await
+            .unwrap();
+        assert_eq!(internal_token, outcome.capability_token);
+        assert_eq!(internal_claims.lease_id, outcome.lease.lease_id);
+        assert!(matches!(
+            plane
+                .server_capability_for_relay("usr_2", &outcome.lease.lease_id, 1_800_000_000_001)
+                .await,
+            Err(BrowserSessionError::AccessDenied(_))
+        ));
+        plane
+            .end("usr_1", &outcome.lease.lease_id, 1_800_000_000_002)
+            .await
+            .unwrap();
+        assert!(
+            plane
+                .server_capability_for_relay("usr_1", &outcome.lease.lease_id, 1_800_000_000_003)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
