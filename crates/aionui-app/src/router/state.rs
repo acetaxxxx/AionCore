@@ -14,7 +14,10 @@ use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
 use aionui_common::AgentKillReason;
 use aionui_conversation::{ConversationRouterState, ConversationService};
-use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
+use aionui_cron::{
+    BrowserRouterState, BrowserSessionControlPlane, CronEventEmitter, CronRouterState,
+    UnavailableBrowserSessionAdapter, service::CronServiceDeps,
+};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
@@ -1047,6 +1050,9 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     CronRouterState {
         cron_service,
         conversation_service: conv_service,
+        browser: BrowserRouterState::fail_closed(Arc::new(BrowserSessionControlPlane::new(Arc::new(
+            UnavailableBrowserSessionAdapter,
+        )))),
     }
 }
 

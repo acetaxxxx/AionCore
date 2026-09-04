@@ -71,7 +71,33 @@ pub fn cron_routes(state: CronRouterState) -> Router {
             "/api/cron/jobs/{id}/skill",
             get(has_skill).post(save_skill).delete(delete_skill),
         )
+        // Browser routes are intentionally gated until the injected worker,
+        // relay and signing provider report ready. This preserves the app's
+        // normal operation while making the browser capability fail closed.
+        .route("/api/browser/session/start", post(browser_session_unavailable))
+        .route("/api/browser/session/{id}", get(browser_session_unavailable))
+        .route("/api/browser/session/{id}/renew", post(browser_session_unavailable))
+        .route("/api/browser/session/{id}/takeover", post(browser_session_unavailable))
+        .route("/api/browser/session/{id}/close", post(browser_session_unavailable))
+        .route("/api/browser/session/{id}/purge", post(browser_session_unavailable))
         .with_state(state)
+}
+
+async fn browser_session_unavailable(
+    State(state): State<CronRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<StatusCode, ApiError> {
+    let reason = if state.browser.is_ready() {
+        "browser relay endpoint is not enabled"
+    } else {
+        "browser capability dependencies are not ready"
+    };
+    Err(ApiError::coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "BROWSER_NOT_READY",
+        reason,
+        None,
+    ))
 }
 
 async fn create_job(

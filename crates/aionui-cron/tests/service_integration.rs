@@ -21,7 +21,9 @@ use aionui_api_types::{
 use aionui_auth::CurrentUser;
 use aionui_common::{PaginatedResult, ProviderWithModel, TimestampMs, now_ms};
 use aionui_conversation::ConversationService;
-use aionui_cron::{CronRouterState, cron_routes};
+use aionui_cron::{
+    BrowserRouterState, BrowserSessionControlPlane, CronRouterState, UnavailableBrowserSessionAdapter, cron_routes,
+};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
@@ -36,6 +38,12 @@ use aionui_realtime::EventBroadcaster;
 use axum::Extension;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
+
+fn unavailable_browser_state() -> BrowserRouterState {
+    BrowserRouterState::fail_closed(Arc::new(BrowserSessionControlPlane::new(Arc::new(
+        UnavailableBrowserSessionAdapter,
+    ))))
+}
 
 use aionui_cron::events::CronEventEmitter;
 use aionui_cron::executor::JobExecutor;
@@ -2869,6 +2877,7 @@ async fn conversation_cron_routes_create_list_and_update_claimed_job() {
     let app = cron_routes(CronRouterState {
         cron_service: Arc::new(svc),
         conversation_service: (*conv_service).clone(),
+        browser: unavailable_browser_state(),
     })
     .layer(Extension(current_user("u1")));
 
@@ -2954,6 +2963,7 @@ async fn conversation_cron_routes_reject_missing_headers_unclaimed_and_wrong_use
     let app = cron_routes(CronRouterState {
         cron_service: Arc::new(svc),
         conversation_service: (*conv_service).clone(),
+        browser: unavailable_browser_state(),
     })
     .layer(Extension(current_user("u1")));
 

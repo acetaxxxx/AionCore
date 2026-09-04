@@ -7,12 +7,120 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 pub const BROWSER_IDLE_LEASE_MS: u64 = 30 * 60 * 1000;
 pub const BROWSER_ABSOLUTE_LEASE_MS: u64 = 4 * 60 * 60 * 1000;
+
+/// Server-owned signing key set. Retired keys remain verifiable during rotation.
+pub struct BrowserCapabilityKeyProvider {
+    active_kid: String,
+    active_secret: Vec<u8>,
+    active: EncodingKey,
+    retired: HashMap<String, DecodingKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserCapabilityEnvelope {
+    pub iss: String,
+    pub aud: String,
+    pub sub: String,
+    pub cid: String,
+    pub tid: String,
+    pub profile_id: String,
+    pub allowed_origins: Vec<String>,
+    pub allowed_capabilities: Vec<BrowserCapability>,
+    pub lease_id: String,
+    pub nonce: String,
+    pub jti: String,
+    pub iat: u64,
+    pub exp: u64,
+}
+
+/// Client input for starting a browser lease. Server-issued claims (lease,
+/// nonce, jti and timestamps) are intentionally absent from this contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserSessionStartRequest {
+    pub conversation_id: String,
+    pub task_id: String,
+    pub profile_id: String,
+    pub allowed_origins: Vec<String>,
+    pub allowed_capabilities: Vec<BrowserCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserSessionStartOutcome {
+    pub lease: BrowserLease,
+    pub capability_token: String,
+}
+
+impl BrowserCapabilityKeyProvider {
+    pub fn new(active_kid: impl Into<String>, active_secret: impl AsRef<[u8]>) -> Result<Self, BrowserSessionError> {
+        let kid = active_kid.into();
+        if kid.trim().is_empty() || active_secret.as_ref().len() < 32 {
+            return Err(BrowserSessionError::InvalidScope(
+                "capability key must have non-empty kid and at least 32 bytes".into(),
+            ));
+        }
+        let secret = active_secret.as_ref().to_vec();
+        Ok(Self {
+            active_kid: kid,
+            active_secret: secret.clone(),
+            active: EncodingKey::from_secret(&secret),
+            retired: HashMap::new(),
+        })
+    }
+
+    pub fn rotate(
+        &mut self,
+        new_kid: impl Into<String>,
+        new_secret: impl AsRef<[u8]>,
+    ) -> Result<(), BrowserSessionError> {
+        let kid = new_kid.into();
+        if kid.trim().is_empty() || new_secret.as_ref().len() < 32 {
+            return Err(BrowserSessionError::InvalidScope("capability key is weak".into()));
+        }
+        let old = std::mem::replace(&mut self.active_secret, new_secret.as_ref().to_vec());
+        self.active = EncodingKey::from_secret(&self.active_secret);
+        self.retired
+            .insert(self.active_kid.clone(), DecodingKey::from_secret(&old));
+        self.active_kid = kid;
+        Ok(())
+    }
+
+    pub fn sign(&self, envelope: &BrowserCapabilityEnvelope) -> Result<String, BrowserSessionError> {
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(self.active_kid.clone());
+        encode(&header, envelope, &self.active)
+            .map_err(|e| BrowserSessionError::TransportFailure(format!("capability signing failed: {e}")))
+    }
+
+    pub fn verify(&self, token: &str) -> Result<BrowserCapabilityEnvelope, BrowserSessionError> {
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|_| BrowserSessionError::AccessDenied("invalid capability envelope".into()))?;
+        let kid = header
+            .kid
+            .ok_or_else(|| BrowserSessionError::AccessDenied("capability kid missing".into()))?;
+        let key = if kid == self.active_kid {
+            DecodingKey::from_secret(&self.active_secret)
+        } else {
+            self.retired
+                .get(&kid)
+                .cloned()
+                .ok_or_else(|| BrowserSessionError::AccessDenied("unknown capability kid".into()))?
+        };
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = true;
+        validation.set_audience(&["aion:browser-worker:sidecar"]);
+        decode::<BrowserCapabilityEnvelope>(token, &key, &validation)
+            .map(|data| data.claims)
+            .map_err(|err| BrowserSessionError::AccessDenied(format!("capability verification failed: {err}")))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,7 +168,9 @@ impl BrowserCapabilityScope {
             }
         }
         if self.allowed_origins.is_empty() {
-            return Err(BrowserSessionError::InvalidScope("allowed_origins cannot be empty".into()));
+            return Err(BrowserSessionError::InvalidScope(
+                "allowed_origins cannot be empty".into(),
+            ));
         }
         if self.capabilities.is_empty() {
             return Err(BrowserSessionError::InvalidScope("capabilities cannot be empty".into()));
@@ -91,8 +201,10 @@ pub struct BrowserLease {
 
 impl BrowserLease {
     pub fn is_active_at(&self, now_ms: u64) -> bool {
-        matches!(self.status, BrowserLeaseStatus::Active | BrowserLeaseStatus::UserTakeoverPaused)
-            && now_ms < self.expires_at_ms
+        matches!(
+            self.status,
+            BrowserLeaseStatus::Active | BrowserLeaseStatus::UserTakeoverPaused
+        ) && now_ms < self.expires_at_ms
             && now_ms.saturating_sub(self.last_activity_at_ms) <= BROWSER_IDLE_LEASE_MS
     }
 }
@@ -210,13 +322,50 @@ impl IBrowserOriginPolicy for StrictBrowserOriginPolicy {
         if allowed_origins.iter().any(|allowed| origin == allowed) {
             Ok(())
         } else {
-            Err(BrowserSessionError::OriginRejected(format!("redirect outside allowlist: {origin}")))
+            Err(BrowserSessionError::OriginRejected(format!(
+                "redirect outside allowlist: {origin}"
+            )))
         }
     }
 }
 
 struct PendingConfirmation {
     confirmation: ActionConfirmation,
+}
+
+/// Safe default adapter used until a configured browser worker is ready.
+pub struct UnavailableBrowserSessionAdapter;
+
+#[async_trait::async_trait]
+impl IBrowserSessionAdapter for UnavailableBrowserSessionAdapter {
+    async fn open(&self, _: &str, _: &BrowserCapabilityScope) -> Result<(), BrowserSessionError> {
+        Err(BrowserSessionError::TransportUnavailable(
+            "browser worker is not configured".into(),
+        ))
+    }
+    async fn close(&self, _: &str) -> Result<(), BrowserSessionError> {
+        Err(BrowserSessionError::TransportUnavailable(
+            "browser worker is not configured".into(),
+        ))
+    }
+    async fn pause(&self, _: &str) -> Result<(), BrowserSessionError> {
+        Err(BrowserSessionError::TransportUnavailable(
+            "browser worker is not configured".into(),
+        ))
+    }
+    async fn resume(&self, _: &str) -> Result<(), BrowserSessionError> {
+        Err(BrowserSessionError::TransportUnavailable(
+            "browser worker is not configured".into(),
+        ))
+    }
+    async fn relay_input(&self, _: &str, _: &BrowserInput) -> Result<(), BrowserSessionError> {
+        Err(BrowserSessionError::TransportUnavailable(
+            "browser worker is not configured".into(),
+        ))
+    }
+    async fn is_available(&self) -> bool {
+        false
+    }
 }
 
 pub struct BrowserSessionControlPlane {
@@ -252,17 +401,20 @@ impl BrowserSessionControlPlane {
     ) -> Result<BrowserLease, BrowserSessionError> {
         scope.validate()?;
         if caller_user_id.trim().is_empty() || caller_user_id != scope.user_id {
-            return Err(BrowserSessionError::AccessDenied("caller does not own browser scope".into()));
+            return Err(BrowserSessionError::AccessDenied(
+                "caller does not own browser scope".into(),
+            ));
         }
         if requested_ttl_ms == 0 {
             return Err(BrowserSessionError::InvalidScope("lease ttl must be positive".into()));
         }
         if !self.adapter.is_available().await {
-            return Err(BrowserSessionError::TransportUnavailable("browser transport is unavailable".into()));
+            return Err(BrowserSessionError::TransportUnavailable(
+                "browser transport is unavailable".into(),
+            ));
         }
         let lease_id = aionui_common::generate_prefixed_id("lease");
-        let expires_at_ms = now_ms
-            .saturating_add(requested_ttl_ms.min(BROWSER_ABSOLUTE_LEASE_MS));
+        let expires_at_ms = now_ms.saturating_add(requested_ttl_ms.min(BROWSER_ABSOLUTE_LEASE_MS));
         let lease = BrowserLease {
             lease_id: lease_id.clone(),
             scope,
@@ -279,18 +431,80 @@ impl BrowserSessionControlPlane {
         Ok(lease)
     }
 
-    async fn owned_active(&self, caller_user_id: &str, lease_id: &str, now_ms: u64) -> Result<BrowserLease, BrowserSessionError> {
-        let lease = self.leases.read().await.get(lease_id).cloned().ok_or_else(|| BrowserSessionError::NotFound(lease_id.into()))?;
+    /// Starts a lease from untrusted client input and issues all capability
+    /// claims on the server. Callers cannot provide nonce, jti, lease or time.
+    pub async fn start_server_issued(
+        &self,
+        caller_user_id: &str,
+        request: BrowserSessionStartRequest,
+        key_provider: &BrowserCapabilityKeyProvider,
+        requested_ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<BrowserSessionStartOutcome, BrowserSessionError> {
+        let scope = BrowserCapabilityScope {
+            user_id: caller_user_id.to_owned(),
+            conversation_id: request.conversation_id,
+            task_id: request.task_id,
+            profile_id: request.profile_id,
+            allowed_origins: request.allowed_origins,
+            capabilities: request.allowed_capabilities,
+            nonce: aionui_common::generate_prefixed_id("nonce"),
+            jti: aionui_common::generate_prefixed_id("jti"),
+        };
+        let lease = self.start(caller_user_id, scope, requested_ttl_ms, now_ms).await?;
+        let envelope = BrowserCapabilityEnvelope {
+            iss: "aion:core:control-plane".into(),
+            aud: "aion:browser-worker:sidecar".into(),
+            sub: lease.scope.user_id.clone(),
+            cid: lease.scope.conversation_id.clone(),
+            tid: lease.scope.task_id.clone(),
+            profile_id: lease.scope.profile_id.clone(),
+            allowed_origins: lease.scope.allowed_origins.clone(),
+            allowed_capabilities: lease.scope.capabilities.clone(),
+            lease_id: lease.lease_id.clone(),
+            nonce: lease.scope.nonce.clone(),
+            jti: lease.scope.jti.clone(),
+            iat: now_ms / 1000,
+            exp: lease.expires_at_ms / 1000,
+        };
+        let capability_token = key_provider.sign(&envelope)?;
+        Ok(BrowserSessionStartOutcome {
+            lease,
+            capability_token,
+        })
+    }
+
+    async fn owned_active(
+        &self,
+        caller_user_id: &str,
+        lease_id: &str,
+        now_ms: u64,
+    ) -> Result<BrowserLease, BrowserSessionError> {
+        let lease = self
+            .leases
+            .read()
+            .await
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| BrowserSessionError::NotFound(lease_id.into()))?;
         if caller_user_id != lease.scope.user_id {
-            return Err(BrowserSessionError::AccessDenied("caller does not own browser lease".into()));
+            return Err(BrowserSessionError::AccessDenied(
+                "caller does not own browser lease".into(),
+            ));
         }
         if now_ms >= lease.expires_at_ms {
-            return Err(BrowserSessionError::Expired { expires_at_ms: lease.expires_at_ms, now_ms });
+            return Err(BrowserSessionError::Expired {
+                expires_at_ms: lease.expires_at_ms,
+                now_ms,
+            });
         }
         if now_ms.saturating_sub(lease.last_activity_at_ms) > BROWSER_IDLE_LEASE_MS {
             return Err(BrowserSessionError::IdleTimeout);
         }
-        if !matches!(lease.status, BrowserLeaseStatus::Active | BrowserLeaseStatus::UserTakeoverPaused) {
+        if !matches!(
+            lease.status,
+            BrowserLeaseStatus::Active | BrowserLeaseStatus::UserTakeoverPaused
+        ) {
             return Err(BrowserSessionError::LeaseClosed(lease.status));
         }
         Ok(lease)
@@ -303,24 +517,53 @@ impl BrowserSessionControlPlane {
     }
 
     pub async fn get(&self, caller_user_id: &str, lease_id: &str) -> Result<BrowserLease, BrowserSessionError> {
-        let lease = self.leases.read().await.get(lease_id).cloned().ok_or_else(|| BrowserSessionError::NotFound(lease_id.into()))?;
-        if caller_user_id != lease.scope.user_id { return Err(BrowserSessionError::AccessDenied("caller does not own browser lease".into())); }
+        let lease = self
+            .leases
+            .read()
+            .await
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| BrowserSessionError::NotFound(lease_id.into()))?;
+        if caller_user_id != lease.scope.user_id {
+            return Err(BrowserSessionError::AccessDenied(
+                "caller does not own browser lease".into(),
+            ));
+        }
         Ok(lease)
     }
 
-    pub async fn renew(&self, caller_user_id: &str, lease_id: &str, requested_ttl_ms: u64, now_ms: u64) -> Result<BrowserLease, BrowserSessionError> {
+    pub async fn renew(
+        &self,
+        caller_user_id: &str,
+        lease_id: &str,
+        requested_ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<BrowserLease, BrowserSessionError> {
         let lease = self.owned_active(caller_user_id, lease_id, now_ms).await?;
-        if requested_ttl_ms == 0 { return Err(BrowserSessionError::InvalidScope("renew ttl must be positive".into())); }
+        if requested_ttl_ms == 0 {
+            return Err(BrowserSessionError::InvalidScope("renew ttl must be positive".into()));
+        }
         let mut leases = self.leases.write().await;
-        let current = leases.get_mut(lease_id).ok_or_else(|| BrowserSessionError::NotFound(lease_id.into()))?;
-        current.expires_at_ms = current.expires_at_ms.max(now_ms).saturating_add(requested_ttl_ms.min(BROWSER_IDLE_LEASE_MS)).min(current.created_at_ms.saturating_add(BROWSER_ABSOLUTE_LEASE_MS));
+        let current = leases
+            .get_mut(lease_id)
+            .ok_or_else(|| BrowserSessionError::NotFound(lease_id.into()))?;
+        current.expires_at_ms = current
+            .expires_at_ms
+            .max(now_ms)
+            .saturating_add(requested_ttl_ms.min(BROWSER_IDLE_LEASE_MS))
+            .min(current.created_at_ms.saturating_add(BROWSER_ABSOLUTE_LEASE_MS));
         current.last_activity_at_ms = current.last_activity_at_ms.max(now_ms);
         let _ = lease;
         Ok(current.clone())
     }
 
-    pub async fn end(&self, caller_user_id: &str, lease_id: &str, now_ms: u64) -> Result<BrowserLease, BrowserSessionError> {
-        let lease = self.owned_active(caller_user_id, lease_id, now_ms).await?;
+    pub async fn end(
+        &self,
+        caller_user_id: &str,
+        lease_id: &str,
+        now_ms: u64,
+    ) -> Result<BrowserLease, BrowserSessionError> {
+        let _lease = self.owned_active(caller_user_id, lease_id, now_ms).await?;
         self.adapter.close(lease_id).await?;
         let mut leases = self.leases.write().await;
         let current = leases.get_mut(lease_id).expect("lease checked above");
@@ -329,7 +572,13 @@ impl BrowserSessionControlPlane {
         Ok(current.clone())
     }
 
-    pub async fn revoke(&self, caller_user_id: &str, lease_id: &str, reason: impl Into<String>, now_ms: u64) -> Result<BrowserLease, BrowserSessionError> {
+    pub async fn revoke(
+        &self,
+        caller_user_id: &str,
+        lease_id: &str,
+        reason: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<BrowserLease, BrowserSessionError> {
         let lease = self.get(caller_user_id, lease_id).await?;
         self.adapter.close(lease_id).await?;
         let mut leases = self.leases.write().await;
@@ -341,9 +590,18 @@ impl BrowserSessionControlPlane {
         Ok(current.clone())
     }
 
-    pub async fn pause_for_user_takeover(&self, caller_user_id: &str, lease_id: &str, now_ms: u64) -> Result<BrowserLease, BrowserSessionError> {
+    pub async fn pause_for_user_takeover(
+        &self,
+        caller_user_id: &str,
+        lease_id: &str,
+        now_ms: u64,
+    ) -> Result<BrowserLease, BrowserSessionError> {
         let lease = self.owned_active(caller_user_id, lease_id, now_ms).await?;
-        if !lease.scope.has_capability(BrowserCapability::LiveViewTakeover) { return Err(BrowserSessionError::CapabilityDenied(BrowserCapability::LiveViewTakeover)); }
+        if !lease.scope.has_capability(BrowserCapability::LiveViewTakeover) {
+            return Err(BrowserSessionError::CapabilityDenied(
+                BrowserCapability::LiveViewTakeover,
+            ));
+        }
         self.adapter.pause(lease_id).await?;
         let mut leases = self.leases.write().await;
         let current = leases.get_mut(lease_id).expect("lease checked above");
@@ -352,9 +610,16 @@ impl BrowserSessionControlPlane {
         Ok(current.clone())
     }
 
-    pub async fn resume_from_user_takeover(&self, caller_user_id: &str, lease_id: &str, now_ms: u64) -> Result<BrowserLease, BrowserSessionError> {
+    pub async fn resume_from_user_takeover(
+        &self,
+        caller_user_id: &str,
+        lease_id: &str,
+        now_ms: u64,
+    ) -> Result<BrowserLease, BrowserSessionError> {
         let lease = self.owned_active(caller_user_id, lease_id, now_ms).await?;
-        if lease.status != BrowserLeaseStatus::UserTakeoverPaused { return Err(BrowserSessionError::LeaseClosed(lease.status)); }
+        if lease.status != BrowserLeaseStatus::UserTakeoverPaused {
+            return Err(BrowserSessionError::LeaseClosed(lease.status));
+        }
         self.adapter.resume(lease_id).await?;
         let mut leases = self.leases.write().await;
         let current = leases.get_mut(lease_id).expect("lease checked above");
@@ -363,12 +628,34 @@ impl BrowserSessionControlPlane {
         Ok(current.clone())
     }
 
-    pub async fn relay_input(&self, caller_user_id: &str, lease_id: &str, input: BrowserInput, now_ms: u64) -> Result<(), BrowserSessionError> {
+    pub async fn relay_input(
+        &self,
+        caller_user_id: &str,
+        lease_id: &str,
+        input: BrowserInput,
+        now_ms: u64,
+    ) -> Result<(), BrowserSessionError> {
         let lease = self.owned_active(caller_user_id, lease_id, now_ms).await?;
-        if !lease.scope.has_capability(BrowserCapability::LiveViewTakeover) || !lease.scope.has_capability(BrowserCapability::Interact) { return Err(BrowserSessionError::CapabilityDenied(BrowserCapability::Interact)); }
+        if !lease.scope.has_capability(BrowserCapability::LiveViewTakeover)
+            || !lease.scope.has_capability(BrowserCapability::Interact)
+        {
+            return Err(BrowserSessionError::CapabilityDenied(BrowserCapability::Interact));
+        }
         match &input {
-            BrowserInput::Pointer { kind, x, y } if *x > 1920 || *y > 1080 || !matches!(kind.as_str(), "move" | "down" | "up" | "click" | "wheel") => return Err(BrowserSessionError::InputRejected("pointer outside bounded allowlist".into())),
-            BrowserInput::Keyboard { kind, key, code } if key.len() > 128 || code.len() > 128 || !matches!(kind.as_str(), "down" | "up" | "text") => return Err(BrowserSessionError::InputRejected("keyboard outside bounded allowlist".into())),
+            BrowserInput::Pointer { kind, x, y }
+                if *x > 1920 || *y > 1080 || !matches!(kind.as_str(), "move" | "down" | "up" | "click" | "wheel") =>
+            {
+                return Err(BrowserSessionError::InputRejected(
+                    "pointer outside bounded allowlist".into(),
+                ));
+            }
+            BrowserInput::Keyboard { kind, key, code }
+                if key.len() > 128 || code.len() > 128 || !matches!(kind.as_str(), "down" | "up" | "text") =>
+            {
+                return Err(BrowserSessionError::InputRejected(
+                    "keyboard outside bounded allowlist".into(),
+                ));
+            }
             _ => {}
         }
         self.adapter.relay_input(lease_id, &input).await?;
@@ -376,23 +663,62 @@ impl BrowserSessionControlPlane {
         Ok(())
     }
 
-    pub fn validate_origin(&self, origin: &str) -> Result<(), BrowserSessionError> { self.origin_policy.validate(origin) }
+    pub fn validate_origin(&self, origin: &str) -> Result<(), BrowserSessionError> {
+        self.origin_policy.validate(origin)
+    }
 
-    pub fn validate_redirect(&self, origin: &str, allowed_origins: &[String]) -> Result<(), BrowserSessionError> { self.origin_policy.validate_redirect(origin, allowed_origins) }
+    pub fn validate_redirect(&self, origin: &str, allowed_origins: &[String]) -> Result<(), BrowserSessionError> {
+        self.origin_policy.validate_redirect(origin, allowed_origins)
+    }
 
-    pub async fn request_action_confirmation(&self, caller_user_id: &str, lease_id: &str, action: BrowserAction, details: impl Into<String>, now_ms: u64) -> Result<ActionConfirmation, BrowserSessionError> {
+    pub async fn request_action_confirmation(
+        &self,
+        caller_user_id: &str,
+        lease_id: &str,
+        action: BrowserAction,
+        details: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<ActionConfirmation, BrowserSessionError> {
         let lease = self.owned_active(caller_user_id, lease_id, now_ms).await?;
-        if !action.requires_confirmation() { return Err(BrowserSessionError::InvalidScope("confirmation is only for high-impact actions".into())); }
-        let confirmation = ActionConfirmation { confirmation_id: aionui_common::generate_prefixed_id("confirm"), lease_id: lease.lease_id, action, details: details.into(), approved: false };
-        self.confirmations.write().await.insert(confirmation.confirmation_id.clone(), PendingConfirmation { confirmation: confirmation.clone() });
+        if !action.requires_confirmation() {
+            return Err(BrowserSessionError::InvalidScope(
+                "confirmation is only for high-impact actions".into(),
+            ));
+        }
+        let confirmation = ActionConfirmation {
+            confirmation_id: aionui_common::generate_prefixed_id("confirm"),
+            lease_id: lease.lease_id,
+            action,
+            details: details.into(),
+            approved: false,
+        };
+        self.confirmations.write().await.insert(
+            confirmation.confirmation_id.clone(),
+            PendingConfirmation {
+                confirmation: confirmation.clone(),
+            },
+        );
         Ok(confirmation)
     }
 
-    pub async fn approve_action(&self, caller_user_id: &str, confirmation_id: &str, now_ms: u64) -> Result<ActionConfirmation, BrowserSessionError> {
-        let pending = self.confirmations.read().await.get(confirmation_id).map(|p| p.confirmation.clone()).ok_or_else(|| BrowserSessionError::ConfirmationNotFound(confirmation_id.into()))?;
+    pub async fn approve_action(
+        &self,
+        caller_user_id: &str,
+        confirmation_id: &str,
+        now_ms: u64,
+    ) -> Result<ActionConfirmation, BrowserSessionError> {
+        let pending = self
+            .confirmations
+            .read()
+            .await
+            .get(confirmation_id)
+            .map(|p| p.confirmation.clone())
+            .ok_or_else(|| BrowserSessionError::ConfirmationNotFound(confirmation_id.into()))?;
         self.owned_active(caller_user_id, &pending.lease_id, now_ms).await?;
         let mut confirmations = self.confirmations.write().await;
-        let current = confirmations.get_mut(confirmation_id).expect("confirmation checked above");
+        let current = confirmations
+            .get_mut(confirmation_id)
+            .expect("confirmation checked above");
         current.confirmation.approved = true;
         Ok(current.confirmation.clone())
     }
@@ -406,12 +732,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IBrowserSessionAdapter for DeterministicAdapter {
-        async fn open(&self, _: &str, _: &BrowserCapabilityScope) -> Result<(), BrowserSessionError> { Ok(()) }
-        async fn close(&self, _: &str) -> Result<(), BrowserSessionError> { Ok(()) }
-        async fn pause(&self, _: &str) -> Result<(), BrowserSessionError> { Ok(()) }
-        async fn resume(&self, _: &str) -> Result<(), BrowserSessionError> { Ok(()) }
-        async fn relay_input(&self, _: &str, _: &BrowserInput) -> Result<(), BrowserSessionError> { Ok(()) }
-        async fn is_available(&self) -> bool { true }
+        async fn open(&self, _: &str, _: &BrowserCapabilityScope) -> Result<(), BrowserSessionError> {
+            Ok(())
+        }
+        async fn close(&self, _: &str) -> Result<(), BrowserSessionError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &str) -> Result<(), BrowserSessionError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &str) -> Result<(), BrowserSessionError> {
+            Ok(())
+        }
+        async fn relay_input(&self, _: &str, _: &BrowserInput) -> Result<(), BrowserSessionError> {
+            Ok(())
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
     }
 
     fn scope() -> BrowserCapabilityScope {
@@ -432,27 +770,125 @@ mod tests {
         let plane = BrowserSessionControlPlane::new(Arc::new(DeterministicAdapter));
         let lease = plane.start("usr_1", scope(), 60_000, 100).await.unwrap();
         assert_eq!(lease.scope.task_id, "task_1");
-        assert_eq!(plane.pause_for_user_takeover("usr_1", &lease.lease_id, 200).await.unwrap().status, BrowserLeaseStatus::UserTakeoverPaused);
-        assert_eq!(plane.resume_from_user_takeover("usr_1", &lease.lease_id, 300).await.unwrap().status, BrowserLeaseStatus::Active);
-        assert!(matches!(plane.get("usr_2", &lease.lease_id).await, Err(BrowserSessionError::AccessDenied(_))));
+        assert_eq!(
+            plane
+                .pause_for_user_takeover("usr_1", &lease.lease_id, 200)
+                .await
+                .unwrap()
+                .status,
+            BrowserLeaseStatus::UserTakeoverPaused
+        );
+        assert_eq!(
+            plane
+                .resume_from_user_takeover("usr_1", &lease.lease_id, 300)
+                .await
+                .unwrap()
+                .status,
+            BrowserLeaseStatus::Active
+        );
+        assert!(matches!(
+            plane.get("usr_2", &lease.lease_id).await,
+            Err(BrowserSessionError::AccessDenied(_))
+        ));
     }
 
     #[tokio::test]
     async fn unavailable_transport_and_untrusted_origin_fail_closed() {
         let plane = BrowserSessionControlPlane::new(Arc::new(FailClosedAdapter));
-        assert!(matches!(plane.start("usr_1", scope(), 60_000, 0).await, Err(BrowserSessionError::TransportUnavailable(_))));
+        assert!(matches!(
+            plane.start("usr_1", scope(), 60_000, 0).await,
+            Err(BrowserSessionError::TransportUnavailable(_))
+        ));
         assert!(plane.validate_origin("http://example.com").is_err());
-        assert!(plane.validate_redirect("https://evil.example", &["https://example.com".into()]).is_err());
+        assert!(
+            plane
+                .validate_redirect("https://evil.example", &["https://example.com".into()])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_issued_start_does_not_accept_client_claims() {
+        let plane = BrowserSessionControlPlane::new(Arc::new(DeterministicAdapter));
+        let keys = BrowserCapabilityKeyProvider::new("kid-a", [b'a'; 32]).unwrap();
+        let outcome = plane
+            .start_server_issued(
+                "usr_1",
+                BrowserSessionStartRequest {
+                    conversation_id: "conv_1".into(),
+                    task_id: "task_1".into(),
+                    profile_id: "profile_1".into(),
+                    allowed_origins: vec!["https://example.com".into()],
+                    allowed_capabilities: vec![BrowserCapability::Observe],
+                },
+                &keys,
+                60_000,
+                1_800_000_000_000,
+            )
+            .await
+            .unwrap();
+        let claims = keys.verify(&outcome.capability_token).unwrap();
+        assert_eq!(claims.lease_id, outcome.lease.lease_id);
+        assert_ne!(claims.nonce, "client_nonce");
+        assert_ne!(claims.jti, "client_jti");
+    }
+
+    #[test]
+    fn start_request_rejects_unknown_claim_fields() {
+        let result = serde_json::from_str::<BrowserSessionStartRequest>(
+            r#"{"conversation_id":"c","task_id":"t","profile_id":"p","allowed_origins":["https://example.com"],"allowed_capabilities":["observe"],"nonce":"client"}"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn capability_keys_are_server_owned_and_rotate_with_retired_verification() {
+        let secret_a = [b'a'; 32];
+        let secret_b = [b'b'; 32];
+        let mut keys = BrowserCapabilityKeyProvider::new("kid-a", secret_a).unwrap();
+        let envelope = BrowserCapabilityEnvelope {
+            iss: "aion:core:control-plane".into(),
+            aud: "aion:browser-worker:sidecar".into(),
+            sub: "usr_1".into(),
+            cid: "conv_1".into(),
+            tid: "task_1".into(),
+            profile_id: "profile_1".into(),
+            allowed_origins: vec!["https://example.com".into()],
+            allowed_capabilities: vec![BrowserCapability::Observe],
+            lease_id: "lease_1".into(),
+            nonce: "nonce_server".into(),
+            jti: "jti_server".into(),
+            iat: 1,
+            exp: 4_102_444_800,
+        };
+        let token = keys.sign(&envelope).unwrap();
+        assert_eq!(keys.verify(&token).unwrap().jti, "jti_server");
+        keys.rotate("kid-b", secret_b).unwrap();
+        assert_eq!(keys.verify(&token).unwrap().sub, "usr_1");
+        let token_b = keys.sign(&envelope).unwrap();
+        assert_eq!(keys.verify(&token_b).unwrap().aud, envelope.aud);
     }
 
     struct FailClosedAdapter;
     #[async_trait::async_trait]
     impl IBrowserSessionAdapter for FailClosedAdapter {
-        async fn open(&self, _: &str, _: &BrowserCapabilityScope) -> Result<(), BrowserSessionError> { Err(BrowserSessionError::TransportUnavailable("off".into())) }
-        async fn close(&self, _: &str) -> Result<(), BrowserSessionError> { Ok(()) }
-        async fn pause(&self, _: &str) -> Result<(), BrowserSessionError> { Ok(()) }
-        async fn resume(&self, _: &str) -> Result<(), BrowserSessionError> { Ok(()) }
-        async fn relay_input(&self, _: &str, _: &BrowserInput) -> Result<(), BrowserSessionError> { Ok(()) }
-        async fn is_available(&self) -> bool { false }
+        async fn open(&self, _: &str, _: &BrowserCapabilityScope) -> Result<(), BrowserSessionError> {
+            Err(BrowserSessionError::TransportUnavailable("off".into()))
+        }
+        async fn close(&self, _: &str) -> Result<(), BrowserSessionError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &str) -> Result<(), BrowserSessionError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &str) -> Result<(), BrowserSessionError> {
+            Ok(())
+        }
+        async fn relay_input(&self, _: &str, _: &BrowserInput) -> Result<(), BrowserSessionError> {
+            Ok(())
+        }
+        async fn is_available(&self) -> bool {
+            false
+        }
     }
 }
