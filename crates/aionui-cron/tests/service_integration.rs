@@ -22,9 +22,9 @@ use aionui_auth::CurrentUser;
 use aionui_common::{PaginatedResult, ProviderWithModel, TimestampMs, now_ms};
 use aionui_conversation::ConversationService;
 use aionui_cron::{
-    BrowserCapabilityKeyProvider, BrowserCapabilityScope, BrowserInput, BrowserRouterState, BrowserScopeAuthorizer,
-    BrowserSessionControlPlane, BrowserSessionError, BrowserSessionStartRequest, CronRouterState,
-    IBrowserSessionAdapter, UnavailableBrowserSessionAdapter, cron_routes,
+    BrowserCapabilityEnvelope, BrowserCapabilityKeyProvider, BrowserCapabilityScope, BrowserInput, BrowserLease,
+    BrowserPrivateRelay, BrowserRouterState, BrowserScopeAuthorizer, BrowserSessionControlPlane, BrowserSessionError,
+    BrowserSessionStartRequest, CronRouterState, IBrowserSessionAdapter, UnavailableBrowserSessionAdapter, cron_routes,
 };
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
@@ -77,12 +77,33 @@ impl IBrowserSessionAdapter for ReadyBrowserAdapter {
     }
 }
 
+struct ReadyBrowserRelay;
+#[async_trait::async_trait]
+impl BrowserPrivateRelay for ReadyBrowserRelay {
+    async fn accept(&self, _: &BrowserLease, _: &BrowserCapabilityEnvelope) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+
+    async fn forward_input(&self, _: &BrowserLease, _: &BrowserInput) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+
+    async fn close(&self, _: &str) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+
+    async fn is_ready(&self) -> bool {
+        true
+    }
+}
+
 fn ready_browser_state() -> BrowserRouterState {
     BrowserRouterState {
         control_plane: Arc::new(BrowserSessionControlPlane::new(Arc::new(ReadyBrowserAdapter))),
         capability_keys: Some(Arc::new(
             BrowserCapabilityKeyProvider::new("test-kid", [b't'; 32]).unwrap(),
         )),
+        relay: Some(Arc::new(ReadyBrowserRelay)),
         relay_ready: true,
         scope_authorizer: Arc::new(AcceptingBrowserScopeAuthorizer),
     }
