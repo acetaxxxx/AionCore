@@ -11,6 +11,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 
 pub const BROWSER_IDLE_LEASE_MS: u64 = 30 * 60 * 1000;
 pub const BROWSER_ABSOLUTE_LEASE_MS: u64 = 4 * 60 * 60 * 1000;
@@ -97,6 +98,14 @@ impl BrowserRelayFrame {
 
 #[async_trait::async_trait]
 pub trait BrowserPrivateRelay: Send + Sync {
+    /// Attach a validated lease and return the bounded server-to-client frame
+    /// channel. The channel is intentionally transport-neutral; an Axum
+    /// WebSocket adapter owns serialization and closure policy.
+    async fn open_stream(
+        &self,
+        lease: &BrowserLease,
+        capability: &BrowserCapabilityEnvelope,
+    ) -> Result<mpsc::Receiver<Result<BrowserRelayFrame, BrowserSessionError>>, BrowserSessionError>;
     async fn accept(
         &self,
         lease: &BrowserLease,

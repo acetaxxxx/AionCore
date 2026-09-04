@@ -80,6 +80,18 @@ impl IBrowserSessionAdapter for ReadyBrowserAdapter {
 struct ReadyBrowserRelay;
 #[async_trait::async_trait]
 impl BrowserPrivateRelay for ReadyBrowserRelay {
+    async fn open_stream(
+        &self,
+        _: &BrowserLease,
+        _: &BrowserCapabilityEnvelope,
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<Result<aionui_cron::BrowserRelayFrame, BrowserSessionError>>,
+        BrowserSessionError,
+    > {
+        let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+        Ok(receiver)
+    }
+
     async fn accept(&self, _: &BrowserLease, _: &BrowserCapabilityEnvelope) -> Result<(), BrowserSessionError> {
         Ok(())
     }
