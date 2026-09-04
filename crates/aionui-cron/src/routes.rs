@@ -5,6 +5,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post, put};
+use serde::Deserialize;
 
 use aionui_api_types::{
     ApiResponse, ConversationResponse, CreateConversationCronRequest, CreateConversationCronResponse,
@@ -12,12 +13,16 @@ use aionui_api_types::{
     UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 use aionui_auth::CurrentUser;
-use aionui_common::ApiError;
+use aionui_common::{ApiError, now_ms};
 use aionui_db::DbError;
 
 use crate::error::CronError;
 use crate::service::CronService;
 use crate::state::CronRouterState;
+
+use crate::browser_session::{
+    BROWSER_IDLE_LEASE_MS, BrowserLease, BrowserSessionError, BrowserSessionStartOutcome, BrowserSessionStartRequest,
+};
 
 fn db_error_to_api_error(err: DbError) -> ApiError {
     match err {
@@ -27,6 +32,38 @@ fn db_error_to_api_error(err: DbError) -> ApiError {
         DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
         DbError::Init(msg) => ApiError::Internal(format!("Database init error: {msg}")),
     }
+}
+
+impl From<BrowserSessionError> for ApiError {
+    fn from(err: BrowserSessionError) -> Self {
+        use BrowserSessionError::*;
+        match err {
+            NotFound(msg) => ApiError::NotFound(msg),
+            InvalidScope(msg) | OriginRejected(msg) | InputRejected(msg) => ApiError::BadRequest(msg),
+            AccessDenied(msg) => ApiError::coded(StatusCode::FORBIDDEN, "BROWSER_ACCESS_DENIED", msg, None),
+            CapabilityDenied(cap) => ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "BROWSER_CAPABILITY_DENIED",
+                format!("{cap:?}"),
+                None,
+            ),
+            Expired { .. } | IdleTimeout | LeaseClosed(_) => ApiError::Conflict(err.to_string()),
+            TransportUnavailable(msg) => {
+                ApiError::coded(StatusCode::SERVICE_UNAVAILABLE, "BROWSER_NOT_READY", msg, None)
+            }
+            ConfirmationRequired | ConfirmationNotFound(_) | TransportFailure(_) => ApiError::Internal(err.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserRenewRequest {
+    requested_ttl_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserTakeoverRequest {
+    resume: bool,
 }
 
 impl From<CronError> for ApiError {
@@ -74,30 +111,129 @@ pub fn cron_routes(state: CronRouterState) -> Router {
         // Browser routes are intentionally gated until the injected worker,
         // relay and signing provider report ready. This preserves the app's
         // normal operation while making the browser capability fail closed.
-        .route("/api/browser/session/start", post(browser_session_unavailable))
-        .route("/api/browser/session/{id}", get(browser_session_unavailable))
-        .route("/api/browser/session/{id}/renew", post(browser_session_unavailable))
-        .route("/api/browser/session/{id}/takeover", post(browser_session_unavailable))
-        .route("/api/browser/session/{id}/close", post(browser_session_unavailable))
-        .route("/api/browser/session/{id}/purge", post(browser_session_unavailable))
+        .route("/api/browser/session/start", post(browser_session_start))
+        .route("/api/browser/session/{id}", get(browser_session_get))
+        .route("/api/browser/session/{id}/renew", post(browser_session_renew))
+        .route("/api/browser/session/{id}/takeover", post(browser_session_takeover))
+        .route("/api/browser/session/{id}/close", post(browser_session_close))
+        .route("/api/browser/session/{id}/purge", post(browser_session_purge))
         .with_state(state)
 }
 
-async fn browser_session_unavailable(
-    State(state): State<CronRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-) -> Result<StatusCode, ApiError> {
-    let reason = if state.browser.is_ready() {
-        "browser relay endpoint is not enabled"
+fn browser_ready(state: &CronRouterState) -> Result<(), ApiError> {
+    if state.browser.is_ready() {
+        Ok(())
     } else {
-        "browser capability dependencies are not ready"
+        Err(ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_NOT_READY",
+            "browser capability dependencies are not ready",
+            None,
+        ))
+    }
+}
+
+fn browser_now() -> u64 {
+    now_ms().max(0) as u64
+}
+
+async fn browser_session_start(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<BrowserSessionStartRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<BrowserSessionStartOutcome>>), ApiError> {
+    browser_ready(&state)?;
+    let Json(request) = body.map_err(ApiError::from)?;
+    let keys = state.browser.capability_keys.as_ref().ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_NOT_READY",
+            "capability key provider is unavailable",
+            None,
+        )
+    })?;
+    let outcome = state
+        .browser
+        .control_plane
+        .start_server_issued(&user.id, request, keys, BROWSER_IDLE_LEASE_MS, browser_now())
+        .await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(outcome))))
+}
+
+async fn browser_session_get(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    Ok(Json(ApiResponse::ok(
+        state.browser.control_plane.get(&user.id, &id).await?,
+    )))
+}
+
+async fn browser_session_renew(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(request): Json<BrowserRenewRequest>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .browser
+            .control_plane
+            .renew(&user.id, &id, request.requested_ttl_ms, browser_now())
+            .await?,
+    )))
+}
+
+async fn browser_session_takeover(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(request): Json<BrowserTakeoverRequest>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    let lease = if request.resume {
+        state
+            .browser
+            .control_plane
+            .resume_from_user_takeover(&user.id, &id, browser_now())
+            .await?
+    } else {
+        state
+            .browser
+            .control_plane
+            .pause_for_user_takeover(&user.id, &id, browser_now())
+            .await?
     };
-    Err(ApiError::coded(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "BROWSER_NOT_READY",
-        reason,
-        None,
-    ))
+    Ok(Json(ApiResponse::ok(lease)))
+}
+
+async fn browser_session_close(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    Ok(Json(ApiResponse::ok(
+        state.browser.control_plane.end(&user.id, &id, browser_now()).await?,
+    )))
+}
+
+async fn browser_session_purge(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .browser
+            .control_plane
+            .revoke(&user.id, &id, "purged", browser_now())
+            .await?,
+    )))
 }
 
 async fn create_job(
