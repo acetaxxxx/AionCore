@@ -40,7 +40,7 @@ use aionui_db::models::{
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
+    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, ITeamRepository, MessagePageCursor,
     MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
     resolve_agent_binding_from_rows,
 };
@@ -340,6 +340,7 @@ pub struct ConversationService {
     /// Hooks receive only newly durable terminal outcomes. Delivery adapters
     /// must enqueue/spawn their work and keep this lifecycle path network-free.
     turn_terminal_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnTerminal>>>>,
+    team_repo: Arc<RwLock<Option<Arc<dyn ITeamRepository>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -442,6 +443,7 @@ impl ConversationService {
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
             turn_terminal_hooks: Arc::new(RwLock::new(Vec::new())),
+            team_repo: Arc::new(RwLock::new(None)),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -777,6 +779,12 @@ impl ConversationService {
         }
     }
 
+    pub fn with_team_repo(&self, repo: Arc<dyn ITeamRepository>) {
+        if let Ok(mut guard) = self.team_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
     /// Inject the project-bind service (project-bind side branch). When unset,
     /// [`Self::bind_project_best_effort`] is a no-op.
     pub fn with_project_service(&self, project_service: Arc<ProjectService>) {
@@ -1026,7 +1034,7 @@ impl ConversationService {
             );
             return;
         };
-        let (target_kind, target_id) = match session_mentions::team_id_from_extra_str(&row.extra) {
+        let (target_kind, target_id, target_title) = match session_mentions::team_id_from_extra_str(&row.extra) {
             Some(team_id) => {
                 let Some(binding) = TeamSessionBinding::from_extra_str(&row.extra).ok().flatten() else {
                     tracing::warn!(
@@ -1038,9 +1046,27 @@ impl ConversationService {
                 if binding.role.as_deref() != Some("lead") {
                     return;
                 }
-                (TerminalTargetKind::Team, team_id)
+                let team_repo = self.team_repo.read().ok().and_then(|guard| guard.clone());
+                let team_name = match team_repo {
+                    Some(repo) => repo
+                        .get_team(user_id, &team_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|team| team.name),
+                    None => None,
+                };
+                (
+                    TerminalTargetKind::Team,
+                    team_id,
+                    team_name.or(binding.team_name).or_else(|| Some(row.name.clone())),
+                )
             }
-            None => (TerminalTargetKind::Conversation, conversation_id.to_owned()),
+            None => (
+                TerminalTargetKind::Conversation,
+                conversation_id.to_owned(),
+                Some(row.name.clone()),
+            ),
         };
         let Some(notice) = TurnTerminalNotice::new(
             user_id,
@@ -1050,7 +1076,12 @@ impl ConversationService {
             terminal_notice_status(status),
             finished_at_ms,
         )
-        .map(|notice| notice.with_target_title(row.name.clone()))
+        .map(|mut notice| {
+            if let Some(title) = target_title {
+                notice = notice.with_target_title(title);
+            }
+            notice
+        })
         .ok() else {
             tracing::warn!(
                 turn_id,

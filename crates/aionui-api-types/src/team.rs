@@ -200,6 +200,8 @@ pub struct RenameAgentRequest {
 pub struct TeamSessionBinding {
     pub team_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -229,6 +231,7 @@ impl TeamSessionBinding {
 
         Ok(Some(Self {
             team_id,
+            team_name: extra_string_field(extra, "team_name").or_else(|| extra_string_field(extra, "teamName")),
             slot_id: extra_string_field(extra, "slot_id"),
             role: extra_string_field(extra, "role"),
             runtime_seed: TeamRuntimeSeed {
@@ -1832,6 +1835,7 @@ mod tests {
     fn team_session_binding_decodes_persisted_extra_contract() {
         let extra = serde_json::json!({
             "teamId": "team-1",
+            "team_name": "Team Alpha",
             "slot_id": "lead-1",
             "role": "lead",
             "backend": "claude",
@@ -1849,6 +1853,7 @@ mod tests {
         let binding = TeamSessionBinding::from_extra_value(&extra).unwrap().unwrap();
 
         assert_eq!(binding.team_id, "team-1");
+        assert_eq!(binding.team_name.as_deref(), Some("Team Alpha"));
         assert_eq!(binding.slot_id.as_deref(), Some("lead-1"));
         assert_eq!(binding.role.as_deref(), Some("lead"));
         assert_eq!(binding.runtime_seed.backend.as_deref(), Some("claude"));
