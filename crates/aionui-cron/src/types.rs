@@ -15,19 +15,24 @@ use crate::error::CronError;
 // Domain enums
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CronSchedule {
     At {
         at_ms: TimestampMs,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
     Every {
         every_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
     Cron {
         expr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
 }
@@ -985,5 +990,30 @@ mod tests {
                 description: Some("every 5m".into()),
             }
         );
+    }
+
+    #[test]
+    fn schedule_serde_roundtrip() {
+        let schedules = vec![
+            CronSchedule::At {
+                at_ms: 1700000000000,
+                description: Some("once".into()),
+            },
+            CronSchedule::Every {
+                every_ms: 60000,
+                description: None,
+            },
+            CronSchedule::Cron {
+                expr: "0 0 9 * * *".into(),
+                tz: Some("Asia/Taipei".into()),
+                description: Some("daily".into()),
+            },
+        ];
+
+        for sched in schedules {
+            let json = serde_json::to_string(&sched).unwrap();
+            let deserialized: CronSchedule = serde_json::from_str(&json).unwrap();
+            assert_eq!(sched, deserialized);
+        }
     }
 }

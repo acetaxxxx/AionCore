@@ -21,7 +21,12 @@ use aionui_api_types::{
 use aionui_auth::CurrentUser;
 use aionui_common::{PaginatedResult, ProviderWithModel, TimestampMs, now_ms};
 use aionui_conversation::ConversationService;
-use aionui_cron::{CronRouterState, cron_routes};
+use aionui_cron::{
+    BrowserCapabilityEnvelope, BrowserCapabilityKeyProvider, BrowserCapabilityScope, BrowserCapabilityVerifier,
+    BrowserInput, BrowserLease, BrowserPrivateRelay, BrowserRouterState, BrowserScopeAuthorizer,
+    BrowserSessionControlPlane, BrowserSessionError, BrowserSessionStartRequest, CronRouterState,
+    IBrowserSessionAdapter, UnavailableBrowserSessionAdapter, cron_routes,
+};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
@@ -36,6 +41,89 @@ use aionui_realtime::EventBroadcaster;
 use axum::Extension;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
+
+fn unavailable_browser_state() -> BrowserRouterState {
+    BrowserRouterState::fail_closed(Arc::new(BrowserSessionControlPlane::new(Arc::new(
+        UnavailableBrowserSessionAdapter,
+    ))))
+}
+
+struct AcceptingBrowserScopeAuthorizer;
+impl BrowserScopeAuthorizer for AcceptingBrowserScopeAuthorizer {
+    fn authorize(&self, _: &str, _: &BrowserSessionStartRequest) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+}
+
+struct ReadyBrowserAdapter;
+#[async_trait::async_trait]
+impl IBrowserSessionAdapter for ReadyBrowserAdapter {
+    async fn open(&self, _: &str, _: &BrowserCapabilityScope) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+    async fn close(&self, _: &str) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+    async fn pause(&self, _: &str) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+    async fn resume(&self, _: &str) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+    async fn relay_input(&self, _: &str, _: &BrowserInput) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+    async fn is_available(&self) -> bool {
+        true
+    }
+}
+
+struct ReadyBrowserRelay;
+#[async_trait::async_trait]
+impl BrowserPrivateRelay for ReadyBrowserRelay {
+    async fn open_stream(
+        &self,
+        _: &BrowserLease,
+        _: &BrowserCapabilityEnvelope,
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<Result<aionui_cron::BrowserRelayFrame, BrowserSessionError>>,
+        BrowserSessionError,
+    > {
+        let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+        Ok(receiver)
+    }
+
+    async fn accept(&self, _: &BrowserLease, _: &BrowserCapabilityEnvelope) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+
+    async fn forward_input(&self, _: &BrowserLease, _: &BrowserInput) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+
+    async fn close(&self, _: &str) -> Result<(), BrowserSessionError> {
+        Ok(())
+    }
+
+    async fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+fn ready_browser_state() -> BrowserRouterState {
+    BrowserRouterState {
+        control_plane: Arc::new(BrowserSessionControlPlane::new(Arc::new(ReadyBrowserAdapter))),
+        capability_keys: Some(Arc::new(
+            BrowserCapabilityKeyProvider::new("test-kid", [b't'; 32]).unwrap(),
+        )),
+        capability_verifier: Some(Arc::new(BrowserCapabilityVerifier::new(Arc::new(
+            BrowserCapabilityKeyProvider::new("test-kid", [b't'; 32]).unwrap(),
+        )))),
+        relay: Some(Arc::new(ReadyBrowserRelay)),
+        relay_ready: true,
+        scope_authorizer: Arc::new(AcceptingBrowserScopeAuthorizer),
+    }
+}
 
 use aionui_cron::events::CronEventEmitter;
 use aionui_cron::executor::JobExecutor;
@@ -2869,6 +2957,7 @@ async fn conversation_cron_routes_create_list_and_update_claimed_job() {
     let app = cron_routes(CronRouterState {
         cron_service: Arc::new(svc),
         conversation_service: (*conv_service).clone(),
+        browser: unavailable_browser_state(),
     })
     .layer(Extension(current_user("u1")));
 
@@ -2954,6 +3043,7 @@ async fn conversation_cron_routes_reject_missing_headers_unclaimed_and_wrong_use
     let app = cron_routes(CronRouterState {
         cron_service: Arc::new(svc),
         conversation_service: (*conv_service).clone(),
+        browser: unavailable_browser_state(),
     })
     .layer(Extension(current_user("u1")));
 
@@ -3625,4 +3715,106 @@ async fn cd4_on_conversation_delete_preserves_all_cron_jobs() {
     let events = bc.take_events();
     let removed_events: Vec<_> = events.iter().filter(|e| e.name == "cron.job-removed").collect();
     assert!(removed_events.is_empty());
+}
+
+#[tokio::test]
+async fn browser_routes_require_ready_injected_dependencies() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+        browser: unavailable_browser_state(),
+    })
+    .layer(Extension(current_user("u1")));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/browser/session/start")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"conversation_id":"conv_1","task_id":"task_1","profile_id":"profile_1","allowed_origins":["https://example.com"],"allowed_capabilities":["observe"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn browser_start_rejects_fail_closed_scope_authorizer() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let mut browser = ready_browser_state();
+    browser.scope_authorizer = Arc::new(aionui_cron::FailClosedBrowserScopeAuthorizer);
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+        browser,
+    })
+    .layer(Extension(current_user("u1")));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/browser/session/start")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"conversation_id":"c","task_id":"t","profile_id":"p","allowed_origins":["https://example.com"],"allowed_capabilities":["observe"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn browser_start_is_server_issued_and_other_user_is_denied() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let browser = ready_browser_state();
+    let keys = browser.capability_keys.as_ref().unwrap().clone();
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+        browser,
+    });
+    let request = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/browser/session/start")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"conversation_id":"c","task_id":"t","profile_id":"p","allowed_origins":["https://example.com"],"allowed_capabilities":["observe"]}"#))
+            .unwrap()
+    };
+    let response = app
+        .clone()
+        .layer(Extension(current_user("u1")))
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let token = json["data"]["capability_token"].as_str().unwrap();
+    let claims = keys.verify(token).unwrap();
+    assert_eq!(claims.sub, "u1");
+    assert_eq!(claims.cid, "c");
+    assert_eq!(claims.tid, "t");
+    assert!(!claims.nonce.is_empty());
+    assert!(!claims.jti.is_empty());
+    assert!(!claims.lease_id.is_empty());
+
+    let other = app
+        .layer(Extension(current_user("u2")))
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/browser/session/{}", claims.lease_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::FORBIDDEN);
 }

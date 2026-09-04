@@ -24,6 +24,11 @@ thiserror.workspace = true
 tracing.workspace = true
 dashmap.workspace = true
 async-trait.workspace = true
+sha2.workspace = true
+hex.workspace = true
+jsonwebtoken.workspace = true
+
+
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
