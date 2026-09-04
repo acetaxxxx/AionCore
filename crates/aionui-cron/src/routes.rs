@@ -144,6 +144,7 @@ async fn browser_session_start(
 ) -> Result<(StatusCode, Json<ApiResponse<BrowserSessionStartOutcome>>), ApiError> {
     browser_ready(&state)?;
     let Json(request) = body.map_err(ApiError::from)?;
+    state.browser.scope_authorizer.authorize(&user.id, &request)?;
     let keys = state.browser.capability_keys.as_ref().ok_or_else(|| {
         ApiError::coded(
             StatusCode::SERVICE_UNAVAILABLE,

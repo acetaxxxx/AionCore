@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use aionui_conversation::ConversationService;
 
-use crate::browser_session::{BrowserCapabilityKeyProvider, BrowserSessionControlPlane};
+use crate::browser_session::{
+    BrowserCapabilityKeyProvider, BrowserScopeAuthorizer, BrowserSessionControlPlane, FailClosedBrowserScopeAuthorizer,
+};
 use crate::service::CronService;
 
 /// Browser dependencies are injected at the application boundary. The
@@ -13,6 +15,7 @@ pub struct BrowserRouterState {
     pub control_plane: Arc<BrowserSessionControlPlane>,
     pub capability_keys: Option<Arc<BrowserCapabilityKeyProvider>>,
     pub relay_ready: bool,
+    pub scope_authorizer: Arc<dyn BrowserScopeAuthorizer>,
 }
 
 impl BrowserRouterState {
@@ -21,6 +24,7 @@ impl BrowserRouterState {
             control_plane,
             capability_keys: None,
             relay_ready: false,
+            scope_authorizer: Arc::new(FailClosedBrowserScopeAuthorizer),
         }
     }
 

@@ -58,6 +58,22 @@ pub struct BrowserSessionStartOutcome {
     pub capability_token: String,
 }
 
+/// Application-owned boundary for validating conversation/task/profile
+/// ownership. Browser routes must not infer ownership from client fields.
+pub trait BrowserScopeAuthorizer: Send + Sync {
+    fn authorize(&self, user_id: &str, request: &BrowserSessionStartRequest) -> Result<(), BrowserSessionError>;
+}
+
+pub struct FailClosedBrowserScopeAuthorizer;
+
+impl BrowserScopeAuthorizer for FailClosedBrowserScopeAuthorizer {
+    fn authorize(&self, _: &str, _: &BrowserSessionStartRequest) -> Result<(), BrowserSessionError> {
+        Err(BrowserSessionError::AccessDenied(
+            "browser scope ownership is unavailable".into(),
+        ))
+    }
+}
+
 impl BrowserCapabilityKeyProvider {
     pub fn new(active_kid: impl Into<String>, active_secret: impl AsRef<[u8]>) -> Result<Self, BrowserSessionError> {
         let kid = active_kid.into();
