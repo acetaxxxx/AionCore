@@ -22,9 +22,10 @@ use aionui_auth::CurrentUser;
 use aionui_common::{PaginatedResult, ProviderWithModel, TimestampMs, now_ms};
 use aionui_conversation::ConversationService;
 use aionui_cron::{
-    BrowserCapabilityEnvelope, BrowserCapabilityKeyProvider, BrowserCapabilityScope, BrowserInput, BrowserLease,
-    BrowserPrivateRelay, BrowserRouterState, BrowserScopeAuthorizer, BrowserSessionControlPlane, BrowserSessionError,
-    BrowserSessionStartRequest, CronRouterState, IBrowserSessionAdapter, UnavailableBrowserSessionAdapter, cron_routes,
+    BrowserCapabilityEnvelope, BrowserCapabilityKeyProvider, BrowserCapabilityScope, BrowserCapabilityVerifier,
+    BrowserInput, BrowserLease, BrowserPrivateRelay, BrowserRouterState, BrowserScopeAuthorizer,
+    BrowserSessionControlPlane, BrowserSessionError, BrowserSessionStartRequest, CronRouterState,
+    IBrowserSessionAdapter, UnavailableBrowserSessionAdapter, cron_routes,
 };
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
@@ -115,6 +116,9 @@ fn ready_browser_state() -> BrowserRouterState {
         capability_keys: Some(Arc::new(
             BrowserCapabilityKeyProvider::new("test-kid", [b't'; 32]).unwrap(),
         )),
+        capability_verifier: Some(Arc::new(BrowserCapabilityVerifier::new(Arc::new(
+            BrowserCapabilityKeyProvider::new("test-kid", [b't'; 32]).unwrap(),
+        )))),
         relay: Some(Arc::new(ReadyBrowserRelay)),
         relay_ready: true,
         scope_authorizer: Arc::new(AcceptingBrowserScopeAuthorizer),

@@ -2,8 +2,10 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
+use axum::extract::ws::Message;
 use axum::extract::{Extension, Json, Path, Query, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Response, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use serde::Deserialize;
 
@@ -249,11 +251,11 @@ async fn browser_session_purge(
 /// with an explicit 503. No bearer token is accepted in query or headers.
 async fn browser_live_view_stream(
     State(state): State<CronRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     Query(query): Query<LiveViewQuery>,
-    _upgrade: WebSocketUpgrade,
-) -> Result<StatusCode, ApiError> {
+    upgrade: WebSocketUpgrade,
+) -> Result<Response<axum::body::Body>, ApiError> {
     let origin = headers
         .get("origin")
         .and_then(|value| value.to_str().ok())
@@ -281,13 +283,65 @@ async fn browser_live_view_stream(
             None,
         ));
     }
-    let _ = state;
-    Err(ApiError::coded(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "BROWSER_RELAY_NOT_READY",
-        "private browser relay is unavailable",
-        None,
-    ))
+    if !state.browser.is_ready() {
+        return Err(ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_RELAY_NOT_READY",
+            "private browser relay is unavailable",
+            None,
+        ));
+    }
+    let lease = state.browser.control_plane.get(&user.id, &query.session_id).await?;
+    state
+        .browser
+        .control_plane
+        .validate_redirect(origin, &lease.scope.allowed_origins)?;
+    let (token, _) = state
+        .browser
+        .control_plane
+        .server_capability_for_relay(&user.id, &query.session_id, browser_now())
+        .await?;
+    let verifier = state.browser.capability_verifier.clone().ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_RELAY_NOT_READY",
+            "capability verifier is unavailable",
+            None,
+        )
+    })?;
+    let capability = verifier
+        .verify_for_lease(&user.id, &lease, &token, browser_now())
+        .await?;
+    let relay = state.browser.relay.clone().ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_RELAY_NOT_READY",
+            "private browser relay is unavailable",
+            None,
+        )
+    })?;
+    let mut frames = relay.open_stream(&lease, &capability).await?;
+    Ok(upgrade.on_upgrade(move |mut socket| async move {
+        loop {
+            tokio::select! {
+                outbound = frames.recv() => match outbound {
+                    Some(Ok(frame)) if frame.validate().is_ok() => {
+                        let Ok(payload) = serde_json::to_string(&frame) else { break };
+                        if socket.send(Message::Text(payload.into())).await.is_err() { break; }
+                    }
+                    _ => break,
+                },
+                inbound = socket.recv() => match inbound {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(input) = serde_json::from_str(&text) else { break };
+                        if state.browser.control_plane.relay_input(&user.id, &lease.lease_id, input, browser_now()).await.is_err() { break; }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let _ = relay.close(&lease.lease_id).await;
+    }).into_response())
 }
 
 async fn create_job(

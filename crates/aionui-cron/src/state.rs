@@ -3,8 +3,8 @@ use std::sync::Arc;
 use aionui_conversation::ConversationService;
 
 use crate::browser_session::{
-    BrowserCapabilityKeyProvider, BrowserPrivateRelay, BrowserScopeAuthorizer, BrowserSessionControlPlane,
-    FailClosedBrowserScopeAuthorizer,
+    BrowserCapabilityKeyProvider, BrowserCapabilityVerifier, BrowserPrivateRelay, BrowserScopeAuthorizer,
+    BrowserSessionControlPlane, FailClosedBrowserScopeAuthorizer,
 };
 use crate::service::CronService;
 
@@ -15,6 +15,7 @@ use crate::service::CronService;
 pub struct BrowserRouterState {
     pub control_plane: Arc<BrowserSessionControlPlane>,
     pub capability_keys: Option<Arc<BrowserCapabilityKeyProvider>>,
+    pub capability_verifier: Option<Arc<BrowserCapabilityVerifier>>,
     /// The relay is optional at construction time so the application can
     /// remain available while browser capability is unavailable. Routes must
     /// require both this port and the readiness flag before upgrading.
@@ -28,6 +29,7 @@ impl BrowserRouterState {
         Self {
             control_plane,
             capability_keys: None,
+            capability_verifier: None,
             relay: None,
             relay_ready: false,
             scope_authorizer: Arc::new(FailClosedBrowserScopeAuthorizer),
@@ -35,7 +37,7 @@ impl BrowserRouterState {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.relay_ready && self.capability_keys.is_some() && self.relay.is_some()
+        self.relay_ready && self.capability_keys.is_some() && self.capability_verifier.is_some() && self.relay.is_some()
     }
 }
 
