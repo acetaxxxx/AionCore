@@ -3636,3 +3636,30 @@ async fn cd4_on_conversation_delete_preserves_all_cron_jobs() {
     let removed_events: Vec<_> = events.iter().filter(|e| e.name == "cron.job-removed").collect();
     assert!(removed_events.is_empty());
 }
+
+#[tokio::test]
+async fn browser_routes_require_ready_injected_dependencies() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+        browser: unavailable_browser_state(),
+    })
+    .layer(Extension(current_user("u1")));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/browser/session/start")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"conversation_id":"conv_1","task_id":"task_1","profile_id":"profile_1","allowed_origins":["https://example.com"],"allowed_capabilities":["observe"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
