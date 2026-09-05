@@ -65,6 +65,11 @@ impl CurrentUser {
             status: UserStatus::Active,
         }
     }
+
+    /// Whether this user is the local administrative user.
+    pub fn is_local_admin(&self) -> bool {
+        self.user_type == UserType::Local || self.id == "system_default_user"
+    }
 }
 
 /// Shared state for the authentication middleware.
