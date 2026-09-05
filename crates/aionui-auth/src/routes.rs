@@ -23,6 +23,7 @@ use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
 use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
 
+use crate::cloudflare::CloudflareAccessAuthenticator;
 use crate::error::AuthError;
 use crate::extract::extract_token_from_headers;
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
@@ -78,6 +79,8 @@ pub struct AuthRouterState {
     pub session_revoked_hook: Option<Arc<SessionRevokedHook>>,
     pub local: bool,
     pub aionpro_mode: bool,
+    /// Optional origin-side Cloudflare Access assertion verifier.
+    pub cloudflare_access: Option<Arc<dyn CloudflareAccessAuthenticator>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +260,9 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         // Auth endpoints manage sessions themselves; the helper CLI never
         // calls them, so the runtime-token channel stays disabled here.
         runtime_token_verifier: None,
+        cloudflare_access: state.cloudflare_access.clone(),
+        fs_adopter: state.fs_adopter.clone(),
+        cookie_config: Some(state.cookie_config.clone()),
     };
 
     // Auth rate limited routes (login, qr-login)

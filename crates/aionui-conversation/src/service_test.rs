@@ -75,6 +75,19 @@ struct StaticAssistantDispatcher {
     rules: std::collections::HashMap<String, String>,
 }
 
+#[derive(Default)]
+struct RecordingMemoryCuration {
+    evidence: Arc<Mutex<Vec<crate::MemoryEvidence>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::MemoryCuration for RecordingMemoryCuration {
+    async fn capture_candidate(&self, evidence: &crate::MemoryEvidence) -> Result<(), crate::MemoryCurationError> {
+        self.evidence.lock().unwrap().push(evidence.clone());
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl AssistantRuleDispatcher for StaticAssistantDispatcher {
     async fn read_rule(&self, _user_id: &str, id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
@@ -4374,6 +4387,7 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
             required_runtime_mode: None,
             persist_user_message: true,
             user_message_hidden: true,
+            memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
             on_started: None,
         })
         .await
@@ -4994,6 +5008,7 @@ async fn run_agent_turn_applies_required_runtime_mode_after_stream_subscription(
             required_runtime_mode: Some("yolo".to_owned()),
             persist_user_message: true,
             user_message_hidden: true,
+            memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
             on_started: None,
         })
         .await
@@ -5961,6 +5976,7 @@ async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
             required_runtime_mode: None,
             persist_user_message: true,
             user_message_hidden: true,
+            memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
             on_started: None,
         })
         .await
@@ -9083,6 +9099,7 @@ async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
             required_runtime_mode: Some("default".to_owned()),
             persist_user_message: true,
             user_message_hidden: true,
+            memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
             on_started: None,
         })
         .await
@@ -9229,6 +9246,7 @@ async fn session_not_found_clears_the_persisted_session_id() {
             code: Some(AgentErrorCode::UserAgentSessionNotFound),
             retryable: Some(true),
         },
+        assistant_message: None,
         attempt: Default::default(),
     };
 
@@ -9267,6 +9285,7 @@ async fn other_terminal_errors_keep_the_session_id_for_replay() {
                 code: Some(code),
                 retryable: Some(true),
             },
+            assistant_message: None,
             attempt: Default::default(),
         };
         svc.evict_acp_task_after_terminal_error("user-1", "conv-1", AgentType::Acp, &outcome, &task_mgr)
@@ -9295,6 +9314,7 @@ async fn a_clean_finish_leaves_the_session_id_alone() {
     let outcome = crate::stream_relay::RelayOutcome {
         system_responses: Vec::new(),
         terminal: crate::stream_relay::RelayTerminal::Finish,
+        assistant_message: None,
         attempt: Default::default(),
     };
 
@@ -10050,6 +10070,7 @@ mod session_mentions_integration {
                 required_runtime_mode: None,
                 persist_user_message: true,
                 user_message_hidden: false,
+                memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
                 on_started: Some(on_started_cb),
             })
             .await;
@@ -10094,6 +10115,7 @@ mod session_mentions_integration {
                 required_runtime_mode: None,
                 persist_user_message: true,
                 user_message_hidden: false,
+                memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
                 on_started: Some(on_started_ok),
             })
             .await
@@ -10176,12 +10198,14 @@ mod session_mentions_integration {
         match &events[1] {
             crate::turn_journal::RawJournalEvent::FinalOutcome {
                 status,
+                assistant_message,
                 attempts,
                 last_attempt_id,
                 retry_summaries,
                 ..
             } => {
                 assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Success);
+                assert_eq!(assistant_message.as_deref(), Some("replayed response"));
                 assert_eq!(*attempts, 2, "Total attempts must be 2");
                 assert_eq!(
                     last_attempt_id.as_deref(),
@@ -10216,5 +10240,116 @@ mod session_mentions_integration {
             }
             _ => panic!("Expected FinalOutcome event"),
         }
+    }
+
+    #[tokio::test]
+    async fn owner_turn_persists_final_assistant_text_in_journal_and_memory_evidence() {
+        let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+        let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+        let evidence_log = Arc::new(Mutex::new(Vec::new()));
+        let curation = Arc::new(RecordingMemoryCuration {
+            evidence: evidence_log.clone(),
+        });
+        let svc = svc.with_turn_journal(journal.clone()).with_memory_curation(curation);
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        let agent = Arc::new(ScriptedAgent::new(
+            &conv.id,
+            vec![vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "final owner response".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ]],
+        ));
+        let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(agent)]));
+        let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+
+        let sent = svc
+            .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+            .await
+            .unwrap();
+        wait_for_turn_released(&svc, &conv.id).await;
+        for _ in 0..32 {
+            if !evidence_log.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let evidence = evidence_log.lock().unwrap().clone();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].source, crate::MemoryEvidenceSource::Owner);
+        assert_eq!(evidence[0].assistant_message.as_deref(), Some("final owner response"));
+
+        let events = journal.get_turn_events("user_1", &conv.id, &sent.turn_id).await;
+        assert_eq!(events.len(), 2, "owner turn must have exactly one terminal event");
+        match &events[1] {
+            crate::turn_journal::RawJournalEvent::FinalOutcome {
+                status,
+                assistant_message,
+                ..
+            } => {
+                assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Success);
+                assert_eq!(assistant_message.as_deref(), Some("final owner response"));
+            }
+            _ => panic!("expected final outcome"),
+        }
+    }
+
+    #[tokio::test]
+    async fn background_agent_turn_remains_raw_only_at_public_service_seam() {
+        let repo = Arc::new(MockRepo::new());
+        let broadcaster = Arc::new(MockBroadcaster::new());
+        let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(Vec::new()));
+        let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+        let svc = ConversationService::new(
+            std::env::temp_dir(),
+            broadcaster,
+            Arc::new(FixedSkillResolver { names: vec![] }),
+            task_mgr_dyn,
+            repo.clone(),
+            Arc::new(StubAgentMetadataRepo),
+            Arc::new(StubAcpSessionRepo::default()),
+        );
+        let curation = Arc::new(crate::InMemoryMemoryCuration::new());
+        let svc = svc.with_memory_curation(curation.clone());
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        task_mgr
+            .agents
+            .lock()
+            .unwrap()
+            .push_back(AgentInstance::Mock(Arc::new(ScriptedAgent::new(
+                &conv.id,
+                vec![vec![
+                    AgentStreamEvent::Text(TextEventData {
+                        content: "background response".into(),
+                    }),
+                    AgentStreamEvent::Finish(FinishEventData::default()),
+                ]],
+            ))));
+
+        let outcome = svc
+            .run_agent_turn(ConversationAgentTurnRequest {
+                user_id: "user_1".into(),
+                conversation_id: conv.id.clone(),
+                content: "background prompt".into(),
+                files: vec![],
+                inject_skills: vec![],
+                required_runtime_mode: None,
+                persist_user_message: false,
+                user_message_hidden: true,
+                memory_source: ConversationAgentTurnRequest::background_memory_source(),
+                on_started: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+        for _ in 0..32 {
+            if !curation.candidates_for_user("user_1").is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(curation.candidates_for_user("user_1").is_empty());
     }
 }

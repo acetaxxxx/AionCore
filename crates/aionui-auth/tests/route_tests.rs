@@ -67,6 +67,7 @@ async fn test_app_with_options_and_hook(
         session_revoked_hook,
         local,
         aionpro_mode,
+        cloudflare_access: None,
     };
 
     let app = auth_routes(state);

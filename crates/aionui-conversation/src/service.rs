@@ -386,7 +386,20 @@ pub struct ConversationAgentTurnRequest {
     pub required_runtime_mode: Option<String>,
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
+    /// Provenance supplied by the caller. Ordinary user turns use `Owner`;
+    /// scheduled/background and team turns must use `Background` so they
+    /// remain raw-only at the Memory Curation boundary.
+    pub memory_source: MemoryEvidenceSource,
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
+}
+
+impl ConversationAgentTurnRequest {
+    /// Source marker for scheduled/background callers. Keeping this helper on
+    /// the conversation boundary lets adapters choose `Background` explicitly
+    /// without importing the concrete curation enum.
+    pub fn background_memory_source() -> MemoryEvidenceSource {
+        MemoryEvidenceSource::Background
+    }
 }
 
 pub type ConversationAgentTurnStartedCallback =
@@ -4886,7 +4899,7 @@ impl ConversationService {
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
-                memory_source: MemoryEvidenceSource::CompliantAgent,
+                memory_source: request.memory_source,
                 pre_created_at_ms,
                 pre_workspace: normalized_ws,
             })

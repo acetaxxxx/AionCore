@@ -452,6 +452,7 @@ impl ConversationTurnOrchestrator {
         let mut final_error_message: Option<String>;
         let mut auth_failure = false;
         let mut last_attempt_terminal = None;
+        let mut last_assistant_message: Option<String> = None;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -559,6 +560,7 @@ impl ConversationTurnOrchestrator {
                 .try_into()
                 .unwrap_or_default();
             last_attempt_terminal = Some(attempt_result.outcome.terminal.clone());
+            last_assistant_message = attempt_result.outcome.assistant_message.clone();
 
             // Track the final attempt's auth signal so the post-loop availability
             // write-back can reflect "needs sign-in" (last iteration wins).
@@ -766,7 +768,7 @@ impl ConversationTurnOrchestrator {
 
         let final_outcome = crate::turn_journal::TerminalOutcomeRecord {
             status: terminal_status,
-            assistant_message: None,
+            assistant_message: last_assistant_message.as_deref(),
             token_usage: None,
             attempts: attempt_count,
             last_attempt_id: Some(&last_attempt_id_str),
@@ -819,7 +821,8 @@ impl ConversationTurnOrchestrator {
                 input.memory_source,
                 final_outcome.finished_at_ms,
             )
-            .with_source_hash(source_hash);
+            .with_source_hash(source_hash)
+            .with_assistant_message(last_assistant_message.clone());
             self.service.capture_memory_candidate(evidence);
         }
 
@@ -1048,6 +1051,7 @@ mod tests {
         RelayOutcome {
             system_responses: vec![],
             terminal: RelayTerminal::Finish,
+            assistant_message: None,
             attempt: TurnAttemptSummary {
                 needs_auth,
                 ..Default::default()
@@ -1062,6 +1066,7 @@ mod tests {
                 code: Some(code),
                 retryable: None,
             },
+            assistant_message: None,
             attempt: TurnAttemptSummary::default(),
         }
     }

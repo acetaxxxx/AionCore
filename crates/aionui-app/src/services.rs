@@ -9,7 +9,10 @@ use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
-use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
+use aionui_auth::{
+    CloudflareAccessConfig, CloudflareAccessVerifier, CookieConfig, JwtService, QrTokenStore,
+    resolve_encryption_secret, resolve_jwt_secret,
+};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
@@ -85,6 +88,8 @@ pub struct AppServices {
     pub local: bool,
     pub identity_mode: IdentityMode,
     pub bootstrap_secret: Option<Arc<str>>,
+    /// Optional origin-side Cloudflare Access assertion verifier.
+    pub cloudflare_access: Option<Arc<CloudflareAccessVerifier>>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -175,6 +180,12 @@ impl AppServices {
         let work_dir = config.work_dir.clone();
         let identity_mode = config.effective_identity_mode();
         let local = identity_mode.is_local();
+        let cloudflare_access = CloudflareAccessConfig::from_env()?
+            .map(CloudflareAccessVerifier::new)
+            .transpose()?;
+        if cloudflare_access.is_some() && identity_mode == IdentityMode::Local {
+            anyhow::bail!("Cloudflare Access cannot be enabled in local identity mode; use WebUI or AionPro mode");
+        }
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
@@ -457,6 +468,7 @@ impl AppServices {
             local,
             identity_mode,
             bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
+            cloudflare_access: cloudflare_access.map(Arc::new),
             app_version,
             skill_paths,
             skill_repo,

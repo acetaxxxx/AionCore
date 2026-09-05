@@ -30,6 +30,9 @@ const MAX_AUTO_INJECT_CHARS: usize = 4_096;
 #[serde(rename_all = "snake_case")]
 pub enum MemoryEvidenceSource {
     Owner,
+    /// Reserved for a separately verified trusted-agent integration. Generic
+    /// conversation turn callers must provide their real source explicitly;
+    /// they no longer default to this variant.
     CompliantAgent,
     Untrusted,
     System,
@@ -109,6 +112,14 @@ impl MemoryEvidence {
     /// produced the complete payload.
     pub fn with_source_hash(mut self, source_hash: String) -> Self {
         self.source_hash = source_hash;
+        self
+    }
+
+    /// Attach the final post-middleware assistant response to this evidence.
+    /// The user message remains the candidate source of truth; the assistant
+    /// response is retained only as provenance and secret-screening context.
+    pub fn with_assistant_message(mut self, assistant_message: Option<String>) -> Self {
+        self.assistant_message = assistant_message;
         self
     }
 }
