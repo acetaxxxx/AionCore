@@ -31,5 +31,6 @@ dirs.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+aionui-db.workspace = true
 base64.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

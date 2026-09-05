@@ -13,9 +13,9 @@ pub mod types;
 pub use error::FileError;
 pub use path_safety::{has_traversal, validate_path, validate_path_for_write};
 pub use routes::{FileRouterState, file_routes};
-pub use tenant_guard::validate_tenant_path;
 pub use service::FileService;
 pub use snapshot_service::SnapshotService;
+pub use tenant_guard::validate_tenant_path;
 pub use traits::{
     ClipboardWriterRef, FileServiceRef, IClipboardWriter, IFileService, IItemRevealer, ISnapshotService,
     ISystemFileOpener, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef,

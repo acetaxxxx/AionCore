@@ -39,9 +39,7 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
         || lower.contains("/logs/")
         || lower.ends_with("/logs")
     {
-        return Err(FileError::Forbidden(
-            "access to system logs is forbidden".to_owned(),
-        ));
+        return Err(FileError::Forbidden("access to system logs is forbidden".to_owned()));
     }
 
     // 2. Prohibit browsing root directories directly
