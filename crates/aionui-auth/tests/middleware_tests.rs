@@ -13,8 +13,8 @@ use tower::ServiceExt;
 use aionui_auth::{
     AuthIdentityMode, AuthState, CF_ACCESS_JWT_HEADER, CloudflareAccessAuthenticator, CloudflareAccessError,
     CloudflareIdentity, CookieConfig, CurrentUser, IRuntimeTokenVerifier, JwtService, RateLimiter, TokenPayload,
-    api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware,
-    authenticated_action_rate_limit_middleware, csrf_middleware, security_headers_middleware,
+    api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
+    csrf_middleware, security_headers_middleware,
 };
 use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, UserType, init_database_memory};
 
@@ -257,7 +257,15 @@ async fn cloudflare_first_login_provisions_external_user_and_sets_aion_cookie() 
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().contains("aionui-session="));
+    assert!(
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("aionui-session=")
+    );
     let user = repo
         .find_by_external_user_id(aionui_db::UserType::Aionpro, "cf-subject-1")
         .await
@@ -418,7 +426,13 @@ async fn cloudflare_invalid_assertion_is_rejected_without_provisioning() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert!(repo.list_users().await.unwrap().iter().all(|user| user.user_type != UserType::Aionpro));
+    assert!(
+        repo.list_users()
+            .await
+            .unwrap()
+            .iter()
+            .all(|user| user.user_type != UserType::Aionpro)
+    );
 }
 
 #[tokio::test]
@@ -455,7 +469,13 @@ async fn local_mode_keeps_default_user_even_when_access_header_is_present() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(std::str::from_utf8(&body).unwrap(), "system_default_user");
-    assert!(repo.list_users().await.unwrap().iter().all(|user| user.user_type != UserType::Aionpro));
+    assert!(
+        repo.list_users()
+            .await
+            .unwrap()
+            .iter()
+            .all(|user| user.user_type != UserType::Aionpro)
+    );
 }
 
 /// Like the protected app, but echoes the injected `CurrentUser.id` so tests

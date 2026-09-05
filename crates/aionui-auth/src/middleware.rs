@@ -7,8 +7,8 @@ use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use aionui_api_types::{EnsureExternalUserRequest, ExternalUserType};
 use aionui_common::{ApiError, constants::COOKIE_NAME};
+use aionui_api_types::{EnsureExternalUserRequest, ExternalUserType};
 use aionui_db::{IUserRepository, UserStatus, UserType};
 
 use crate::cloudflare::{CF_ACCESS_JWT_HEADER, CloudflareAccessAuthenticator};

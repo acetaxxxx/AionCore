@@ -201,8 +201,8 @@ impl CloudflareAccessAuthenticator for CloudflareAccessVerifier {
             return Err(CloudflareAccessError::InvalidAssertion);
         }
 
-        let decoding_key = DecodingKey::from_rsa_components(&key.n, &key.e)
-            .map_err(|_| CloudflareAccessError::InvalidAssertion)?;
+        let decoding_key =
+            DecodingKey::from_rsa_components(&key.n, &key.e).map_err(|_| CloudflareAccessError::InvalidAssertion)?;
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[self.config.issuer.as_str()]);
         validation.set_audience(&[self.config.audience.as_str()]);
@@ -229,7 +229,10 @@ mod tests {
         let config = CloudflareAccessConfig::new("https://team.cloudflareaccess.com/", "aud").unwrap();
         assert_eq!(config.team_domain, "team.cloudflareaccess.com");
         assert_eq!(config.issuer, "https://team.cloudflareaccess.com");
-        assert_eq!(config.jwks_url, "https://team.cloudflareaccess.com/cdn-cgi/access/certs");
+        assert_eq!(
+            config.jwks_url,
+            "https://team.cloudflareaccess.com/cdn-cgi/access/certs"
+        );
     }
 
     #[test]

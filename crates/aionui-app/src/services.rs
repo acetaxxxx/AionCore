@@ -184,9 +184,7 @@ impl AppServices {
             .map(CloudflareAccessVerifier::new)
             .transpose()?;
         if cloudflare_access.is_some() && identity_mode == IdentityMode::Local {
-            anyhow::bail!(
-                "Cloudflare Access cannot be enabled in local identity mode; use WebUI or AionPro mode"
-            );
+            anyhow::bail!("Cloudflare Access cannot be enabled in local identity mode; use WebUI or AionPro mode");
         }
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
