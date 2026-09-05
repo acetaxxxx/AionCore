@@ -218,6 +218,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         qr_token_store: services.qr_token_store.clone(),
         identity_mode: auth_identity_mode(services.identity_mode),
         bootstrap_secret: services.bootstrap_secret.clone(),
+        cloudflare_access: services
+            .cloudflare_access
+            .clone()
+            .map(|verifier| verifier as Arc<dyn aionui_auth::CloudflareAccessAuthenticator>),
         session_revoked_hook: {
             let ws_manager = services.ws_manager.clone();
             let conversation_service = states.conversation.service.clone();
@@ -271,6 +275,15 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
             runtime_token_service: services.runtime_token_service.clone(),
         })),
+        cloudflare_access: services
+            .cloudflare_access
+            .clone()
+            .map(|verifier| verifier as Arc<dyn aionui_auth::CloudflareAccessAuthenticator>),
+        fs_adopter: Some(Arc::new(SkillFilesystemAdopter {
+            skill_paths: services.skill_paths.clone(),
+            skill_repo: services.skill_repo.clone(),
+        })),
+        cookie_config: Some(services.cookie_config.clone()),
     };
 
     // System routes protected by auth middleware

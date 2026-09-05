@@ -3,15 +3,17 @@
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
 
 use aionui_common::ApiError;
+use aionui_api_types::{EnsureExternalUserRequest, ExternalUserType};
 use aionui_db::{IUserRepository, UserStatus, UserType};
 
-use crate::JwtService;
+use crate::cloudflare::{CF_ACCESS_JWT_HEADER, CloudflareAccessAuthenticator};
 use crate::extract::extract_token_from_headers;
+use crate::{AuthProvisionService, CookieConfig, JwtService, SystemDefaultFilesystemAdopter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthIdentityMode {
@@ -75,6 +77,14 @@ pub struct AuthState {
     /// (`aioncore config` / `diagnose`), which cannot carry a JWT or cookies.
     /// `None` disables the channel (requests without a JWT are rejected).
     pub runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
+    /// Optional origin-side Cloudflare Access assertion verifier. When set,
+    /// JWT-less requests must present a verified assertion and are exchanged
+    /// for the normal Aion session cookie before reaching handlers.
+    pub cloudflare_access: Option<Arc<dyn CloudflareAccessAuthenticator>>,
+    /// Optional first-account default-data filesystem adopter.
+    pub fs_adopter: Option<Arc<dyn SystemDefaultFilesystemAdopter>>,
+    /// Session cookie policy shared with ordinary local/WebUI login.
+    pub cookie_config: Option<Arc<CookieConfig>>,
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -100,8 +110,66 @@ pub async fn auth_middleware(
     }
 
     let Some(token) = extract_token_from_headers(request.headers()) else {
-        // No JWT/cookie: fall back to the conversation-helper runtime-token
-        // channel used by agent subprocess CLIs.
+        if let Some(cloudflare) = state.cloudflare_access.as_ref()
+            && let Some(assertion) = request
+                .headers()
+                .get(CF_ACCESS_JWT_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            let identity = cloudflare.verify(assertion).await.map_err(|error| {
+                tracing::warn!(error = %error, "Cloudflare Access assertion rejected");
+                ApiError::Unauthorized("Invalid Cloudflare Access assertion".into())
+            })?;
+            let mut provisioner = AuthProvisionService::new(state.user_repo.clone(), state.jwt_service.clone());
+            if let Some(fs_adopter) = state.fs_adopter.clone() {
+                provisioner = provisioner.with_filesystem_adopter(fs_adopter);
+            }
+            let ensured = provisioner
+                .ensure_external_user(
+                    &identity.subject,
+                    EnsureExternalUserRequest {
+                        user_type: ExternalUserType::Aionpro,
+                        username: identity.email.clone(),
+                        email: identity.email,
+                        avatar_path: None,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    tracing::warn!(error = %error, "Cloudflare Access user provisioning rejected");
+                    ApiError::Unauthorized("Cloudflare Access user is not authorized".into())
+                })?;
+            let exchange = provisioner
+                .create_external_session(aionui_api_types::EnsureExternalSessionRequest {
+                    user_type: ensured.user_type,
+                    external_user_id: ensured.external_user_id,
+                })
+                .await
+                .map_err(|error| {
+                    tracing::error!(error = %error, "Cloudflare Access session exchange failed");
+                    ApiError::Internal("Cloudflare Access session exchange failed".into())
+                })?;
+
+            let current_user = CurrentUser {
+                id: exchange.response.user.id,
+                username: exchange.response.user.username,
+                user_type: UserType::Aionpro,
+                status: UserStatus::Active,
+            };
+            request.extensions_mut().insert(current_user);
+            let mut response = next.run(request).await;
+            if let Some(cookie_config) = state.cookie_config.as_ref() {
+                if let Ok(value) = header::HeaderValue::from_str(&cookie_config.build_session_cookie(&exchange.token)) {
+                    response.headers_mut().append(header::SET_COOKIE, value);
+                }
+            }
+            return Ok(response);
+        }
+
+        // No JWT/cookie/Cloudflare assertion: fall back to the
+        // conversation-helper runtime-token channel used by agent subprocess CLIs.
         return runtime_token_channel(&state, request, next).await;
     };
 

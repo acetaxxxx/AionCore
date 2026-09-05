@@ -2,6 +2,7 @@
 
 //! JWT authentication, password hashing, CSRF protection, rate limiting, and auth middleware.
 mod account;
+pub mod cloudflare;
 mod cookie;
 mod csrf;
 mod error;
@@ -74,3 +75,8 @@ pub use qr_token::QrTokenStore;
 pub use routes::{AuthRouterState, SessionRevokedHook, auth_routes};
 
 pub use service::{AuthProvisionService, ProvisionError, SystemDefaultFilesystemAdopter};
+
+pub use cloudflare::{
+    CF_ACCESS_JWT_HEADER, CloudflareAccessAuthenticator, CloudflareAccessConfig, CloudflareAccessError,
+    CloudflareAccessVerifier, CloudflareIdentity,
+};
