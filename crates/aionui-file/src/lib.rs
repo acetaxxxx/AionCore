@@ -6,6 +6,7 @@ pub mod path_safety;
 pub mod routes;
 pub mod service;
 pub mod snapshot_service;
+pub mod tenant_guard;
 pub mod traits;
 pub mod types;
 
@@ -14,6 +15,7 @@ pub use path_safety::{has_traversal, validate_path, validate_path_for_write};
 pub use routes::{FileRouterState, file_routes};
 pub use service::FileService;
 pub use snapshot_service::SnapshotService;
+pub use tenant_guard::validate_tenant_path;
 pub use traits::{
     ClipboardWriterRef, FileServiceRef, IClipboardWriter, IFileService, IItemRevealer, ISnapshotService,
     ISystemFileOpener, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef,

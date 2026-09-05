@@ -165,9 +165,12 @@ pub fn file_routes(state: FileRouterState) -> Router {
 
 async fn get_files_by_dir(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFilesByDirRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<DirOrFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.dir)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.root)?;
     let items = state.file_service.get_files_by_dir(&req.dir, &req.root).await?;
     let response: Vec<DirOrFileResponse> = items.into_iter().map(to_dir_or_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
@@ -175,6 +178,7 @@ async fn get_files_by_dir(
 
 async fn list_workspace_files(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ListWorkspaceFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceFlatFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -182,6 +186,7 @@ async fn list_workspace_files(
     if root.is_empty() {
         return Err(ApiError::BadRequest("root is required".to_owned()));
     }
+    crate::tenant_guard::validate_tenant_path(&user, root)?;
     let items = state
         .file_service
         .list_workspace_files_with_extra_root(root, Some(Path::new(root)))
@@ -193,9 +198,14 @@ async fn list_workspace_files(
 
 async fn get_file_metadata(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFileMetadataRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.path)?;
+    if let Some(ws) = req.workspace.as_deref() {
+        crate::tenant_guard::validate_tenant_path(&user, ws)?;
+    }
     let meta = state
         .file_service
         .get_file_metadata(&req.path, req.workspace.as_deref().map(Path::new))
@@ -205,9 +215,14 @@ async fn get_file_metadata(
 
 async fn read_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ReadFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.path)?;
+    if let Some(ws) = req.workspace.as_deref() {
+        crate::tenant_guard::validate_tenant_path(&user, ws)?;
+    }
     let content = state
         .file_service
         .read_file(&req.path, req.workspace.as_deref().map(Path::new))
@@ -221,12 +236,16 @@ async fn write_file(
     body: Result<Json<WriteFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.path)?;
     let workspace = req.workspace.unwrap_or_else(|| {
         std::path::Path::new(&req.path)
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    if !workspace.is_empty() {
+        crate::tenant_guard::validate_tenant_path(&user, &workspace)?;
+    }
     let ok = state
         .file_service
         .write_file_for_user(&user.id, &req.path, req.data.as_bytes(), &workspace)
@@ -671,9 +690,14 @@ async fn upload_file(
 
 async fn get_image_base64(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetImageBase64Request>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.path)?;
+    if let Some(ws) = req.workspace.as_deref() {
+        crate::tenant_guard::validate_tenant_path(&user, ws)?;
+    }
     let data_url = state
         .file_service
         .get_image_base64(&req.path, req.workspace.as_deref().map(Path::new))
@@ -696,36 +720,44 @@ async fn fetch_remote_image(
 
 async fn snapshot_init(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     let info = state.snapshot_service.init(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
 
 async fn snapshot_info(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     let info = state.snapshot_service.get_info(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
 
 async fn snapshot_compare(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotCompareResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     let result = state.snapshot_service.compare(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_compare_response(result))))
 }
 
 async fn snapshot_baseline(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotBaselineRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     let content = state
         .snapshot_service
         .get_baseline_content(&req.workspace, &req.file_path)
@@ -735,9 +767,11 @@ async fn snapshot_baseline(
 
 async fn snapshot_stage_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     state
         .snapshot_service
         .stage_file(&req.workspace, &req.file_path)
@@ -747,18 +781,22 @@ async fn snapshot_stage_file(
 
 async fn snapshot_stage_all(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     state.snapshot_service.stage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_unstage_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     state
         .snapshot_service
         .unstage_file(&req.workspace, &req.file_path)
@@ -768,18 +806,22 @@ async fn snapshot_unstage_file(
 
 async fn snapshot_unstage_all(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     state.snapshot_service.unstage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_discard(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     state
         .snapshot_service
         .discard_file(&req.workspace, &req.file_path, req.operation)
@@ -789,9 +831,11 @@ async fn snapshot_discard(
 
 async fn snapshot_reset(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     state
         .snapshot_service
         .reset_file(&req.workspace, &req.file_path, req.operation)
@@ -801,18 +845,22 @@ async fn snapshot_reset(
 
 async fn snapshot_branches(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     let branches = state.snapshot_service.get_branches(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(branches)))
 }
 
 async fn snapshot_dispose(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
     state.snapshot_service.dispose(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
