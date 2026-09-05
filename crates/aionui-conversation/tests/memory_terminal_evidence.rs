@@ -198,7 +198,10 @@ async fn setup_service(
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     let now = now_ms();
-    for (id, user_id) in [("owner-conv", "user-1"), ("background-conv", "user-1")] {
+    for (id, user_id) in [
+        ("owner-conv", "system_default_user"),
+        ("background-conv", "system_default_user"),
+    ] {
         repo.create(&ConversationRow {
             id: id.into(),
             user_id: user_id.into(),
@@ -271,7 +274,7 @@ async fn public_owner_send_records_final_assistant_text_in_exactly_one_terminal_
         setup_service(curation.clone(), vec![AgentInstance::Mock(agent)]).await;
     let response = service
         .send_message(
-            "user-1",
+            "system_default_user",
             "owner-conv",
             SendMessageRequest {
                 content: "remember owner preference".into(),
@@ -284,7 +287,7 @@ async fn public_owner_send_records_final_assistant_text_in_exactly_one_terminal_
         )
         .await
         .unwrap();
-    let events = wait_for_events(&journal, "user-1", "owner-conv", &response.turn_id).await;
+    let events = wait_for_events(&journal, "system_default_user", "owner-conv", &response.turn_id).await;
     assert_eq!(
         events
             .iter()
@@ -333,7 +336,7 @@ async fn public_background_run_agent_turn_remains_raw_only_without_memory_candid
         setup_service(curation.clone(), vec![AgentInstance::Mock(agent)]).await;
     let outcome = service
         .run_agent_turn(ConversationAgentTurnRequest {
-            user_id: "user-1".into(),
+            user_id: "system_default_user".into(),
             conversation_id: "background-conv".into(),
             content: "background task".into(),
             files: Vec::new(),
@@ -361,7 +364,7 @@ async fn public_background_run_agent_turn_remains_raw_only_without_memory_candid
     .await
     .unwrap();
     assert!(
-        curation.inner.candidates_for_user("user-1").is_empty(),
+        curation.inner.candidates_for_user("system_default_user").is_empty(),
         "background turns must not create candidates"
     );
     assert_eq!(

@@ -82,10 +82,7 @@ struct RecordingMemoryCuration {
 
 #[async_trait::async_trait]
 impl crate::MemoryCuration for RecordingMemoryCuration {
-    async fn capture_candidate(
-        &self,
-        evidence: &crate::MemoryEvidence,
-    ) -> Result<(), crate::MemoryCurationError> {
+    async fn capture_candidate(&self, evidence: &crate::MemoryEvidence) -> Result<(), crate::MemoryCurationError> {
         self.evidence.lock().unwrap().push(evidence.clone());
         Ok(())
     }
