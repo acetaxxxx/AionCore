@@ -7,8 +7,8 @@ use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use aionui_common::{ApiError, constants::COOKIE_NAME};
 use aionui_api_types::{EnsureExternalUserRequest, ExternalUserType};
+use aionui_common::{ApiError, constants::COOKIE_NAME};
 use aionui_db::{IUserRepository, UserStatus, UserType};
 
 use crate::cloudflare::{CF_ACCESS_JWT_HEADER, CloudflareAccessAuthenticator};
@@ -145,14 +145,10 @@ pub async fn auth_middleware(
         }
     };
 
-    let Some(user) = state
-        .user_repo
-        .find_active_by_id(&payload.user_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "auth middleware user lookup failed");
-            ApiError::Internal("Authentication service unavailable".into())
-        })?
+    let Some(user) = state.user_repo.find_active_by_id(&payload.user_id).await.map_err(|e| {
+        tracing::error!(error = %e, "auth middleware user lookup failed");
+        ApiError::Internal("Authentication service unavailable".into())
+    })?
     else {
         if cloudflare_channel_available(&state, &request) {
             return match cloudflare_session_exchange(&state, request, next).await {
@@ -172,7 +168,12 @@ pub async fn auth_middleware(
     };
 
     if state.identity_mode == AuthIdentityMode::AionPro && user.user_type != UserType::Aionpro {
-        let error = ApiError::coded(StatusCode::UNAUTHORIZED, "USER_CONTEXT_REQUIRED", "User context required.", None);
+        let error = ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "USER_CONTEXT_REQUIRED",
+            "User context required.",
+            None,
+        );
         if cloudflare_channel_available(&state, &request) {
             return match cloudflare_session_exchange(&state, request, next).await {
                 Ok(response) => Ok(response),
