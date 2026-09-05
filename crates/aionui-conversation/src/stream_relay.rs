@@ -120,6 +120,10 @@ impl TurnAttemptSummary {
 pub struct RelayOutcome {
     pub system_responses: Vec<String>,
     pub terminal: RelayTerminal,
+    /// Final assistant text after response middleware rewrites. `None` means
+    /// no visible assistant text was available (for example an error or
+    /// cancellation before a response was emitted).
+    pub assistant_message: Option<String>,
     pub attempt: TurnAttemptSummary,
 }
 
@@ -531,6 +535,7 @@ impl StreamRelay {
                                 break RelayOutcome {
                                     system_responses: Vec::new(),
                                     terminal,
+                                    assistant_message: None,
                                     attempt,
                                 };
                             }
@@ -558,6 +563,7 @@ impl StreamRelay {
                                 RelayOutcome {
                                     system_responses: Vec::new(),
                                     terminal,
+                                    assistant_message: None,
                                     attempt: attempt.clone(),
                                 }
                             } else {
@@ -752,6 +758,7 @@ impl StreamRelay {
                         RelayOutcome {
                             system_responses: Vec::new(),
                             terminal: RelayTerminal::ChannelClosed,
+                            assistant_message: None,
                             attempt: attempt.clone(),
                         }
                     } else {
@@ -889,6 +896,7 @@ impl StreamRelay {
         let mut outcome = RelayOutcome {
             system_responses: Vec::new(),
             terminal,
+            assistant_message: None,
             attempt: TurnAttemptSummary::default(),
         };
         let status = match event {
@@ -900,6 +908,10 @@ impl StreamRelay {
             let processed = self.process_final_text(text).await;
             let final_text = processed.message.trim().to_owned();
             let hidden = final_text.is_empty();
+
+            if !hidden {
+                outcome.assistant_message = Some(final_text.clone());
+            }
 
             let rewrite_segments = processed.message != text || hidden;
             let overrides = self
@@ -1207,6 +1219,7 @@ mod tests {
         let outcome = relay.consume(rx).await;
         assert!(outcome.system_responses.is_empty());
         assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert_eq!(outcome.assistant_message.as_deref(), Some("Hello World"));
 
         // Should have inserted a message with accumulated text
         let inserts = repo.take_inserts();

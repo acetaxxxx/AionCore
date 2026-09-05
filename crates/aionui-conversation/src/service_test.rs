@@ -4374,6 +4374,7 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
             required_runtime_mode: None,
             persist_user_message: true,
             user_message_hidden: true,
+            memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
             on_started: None,
         })
         .await
@@ -4994,6 +4995,7 @@ async fn run_agent_turn_applies_required_runtime_mode_after_stream_subscription(
             required_runtime_mode: Some("yolo".to_owned()),
             persist_user_message: true,
             user_message_hidden: true,
+            memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
             on_started: None,
         })
         .await
@@ -5961,6 +5963,7 @@ async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
             required_runtime_mode: None,
             persist_user_message: true,
             user_message_hidden: true,
+            memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
             on_started: None,
         })
         .await
@@ -9083,6 +9086,7 @@ async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
             required_runtime_mode: Some("default".to_owned()),
             persist_user_message: true,
             user_message_hidden: true,
+            memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
             on_started: None,
         })
         .await
@@ -9229,6 +9233,7 @@ async fn session_not_found_clears_the_persisted_session_id() {
             code: Some(AgentErrorCode::UserAgentSessionNotFound),
             retryable: Some(true),
         },
+        assistant_message: None,
         attempt: Default::default(),
     };
 
@@ -9267,6 +9272,7 @@ async fn other_terminal_errors_keep_the_session_id_for_replay() {
                 code: Some(code),
                 retryable: Some(true),
             },
+            assistant_message: None,
             attempt: Default::default(),
         };
         svc.evict_acp_task_after_terminal_error("user-1", "conv-1", AgentType::Acp, &outcome, &task_mgr)
@@ -9295,6 +9301,7 @@ async fn a_clean_finish_leaves_the_session_id_alone() {
     let outcome = crate::stream_relay::RelayOutcome {
         system_responses: Vec::new(),
         terminal: crate::stream_relay::RelayTerminal::Finish,
+        assistant_message: None,
         attempt: Default::default(),
     };
 
@@ -10050,6 +10057,7 @@ mod session_mentions_integration {
                 required_runtime_mode: None,
                 persist_user_message: true,
                 user_message_hidden: false,
+                memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
                 on_started: Some(on_started_cb),
             })
             .await;
@@ -10094,6 +10102,7 @@ mod session_mentions_integration {
                 required_runtime_mode: None,
                 persist_user_message: true,
                 user_message_hidden: false,
+                memory_source: crate::memory_curation::MemoryEvidenceSource::Background,
                 on_started: Some(on_started_ok),
             })
             .await
@@ -10176,12 +10185,14 @@ mod session_mentions_integration {
         match &events[1] {
             crate::turn_journal::RawJournalEvent::FinalOutcome {
                 status,
+                assistant_message,
                 attempts,
                 last_attempt_id,
                 retry_summaries,
                 ..
             } => {
                 assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Success);
+                assert_eq!(assistant_message.as_deref(), Some("replayed response"));
                 assert_eq!(*attempts, 2, "Total attempts must be 2");
                 assert_eq!(
                     last_attempt_id.as_deref(),
