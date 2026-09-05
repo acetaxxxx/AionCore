@@ -316,6 +316,85 @@ async fn cloudflare_repeated_login_keeps_same_internal_user_id() {
 }
 
 #[tokio::test]
+async fn expired_session_with_valid_cloudflare_assertion_recovers_session() {
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
+    let repo_trait = repo.clone() as Arc<dyn IUserRepository>;
+    let verifier = Arc::new(StubCloudflare {
+        result: Ok(CloudflareIdentity {
+            subject: "cf-recovery-subject".into(),
+            email: Some("recovery@example.com".into()),
+        }),
+    });
+    let jwt = Arc::new(JwtService::new("cloudflare_recovery_secret".into()));
+    let app = cloudflare_auth_app(jwt.clone(), repo_trait, verifier);
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::get("/protected")
+                .header(CF_ACCESS_JWT_HEADER, "assertion-first")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let user = repo
+        .find_by_external_user_id(UserType::Aionpro, "cf-recovery-subject")
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_token = expired_token(&jwt, "cloudflare_recovery_secret", &user.id, "recovery@example.com");
+
+    let response = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {stale_token}"))
+                .header(CF_ACCESS_JWT_HEADER, "assertion-recovery")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+    assert!(cookie.contains("aionui-session="));
+    assert!(!cookie.contains("Max-Age=0"));
+}
+
+#[tokio::test]
+async fn expired_session_without_cloudflare_clears_session_cookie() {
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
+    let jwt = Arc::new(JwtService::new("cloudflare_clear_secret".into()));
+    let app = cloudflare_auth_app(
+        jwt.clone(),
+        repo as Arc<dyn IUserRepository>,
+        Arc::new(StubCloudflare {
+            result: Err(CloudflareAccessError::VerificationFailed),
+        }),
+    );
+    let stale_token = expired_token(&jwt, "cloudflare_clear_secret", "stale-user", "stale@example.com");
+
+    let response = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::COOKIE, format!("aionui-session={stale_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let cookie = response.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+    assert!(cookie.contains("aionui-session="));
+    assert!(cookie.contains("Max-Age=0"));
+}
+
+#[tokio::test]
 async fn cloudflare_invalid_assertion_is_rejected_without_provisioning() {
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
