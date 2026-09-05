@@ -393,6 +393,15 @@ pub struct ConversationAgentTurnRequest {
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
 }
 
+impl ConversationAgentTurnRequest {
+    /// Source marker for scheduled/background callers. Keeping this helper on
+    /// the conversation boundary lets adapters choose `Background` explicitly
+    /// without importing the concrete curation enum.
+    pub fn background_memory_source() -> MemoryEvidenceSource {
+        MemoryEvidenceSource::Background
+    }
+}
+
 pub type ConversationAgentTurnStartedCallback =
     Arc<dyn Fn(ConversationAgentTurnStarted) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 

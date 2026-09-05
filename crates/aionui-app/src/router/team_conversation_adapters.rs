@@ -8,7 +8,7 @@ use aionui_api_types::{
 use aionui_common::AgentType;
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
-    ConversationService, MemoryEvidenceSource,
+    ConversationService,
 };
 use aionui_db::models::{AgentMetadataRow, MessageRow};
 use aionui_db::{IAgentMetadataRepository, IConversationRepository};
@@ -105,7 +105,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
                     required_runtime_mode: None,
                     persist_user_message: false,
                     user_message_hidden: false,
-                    memory_source: MemoryEvidenceSource::Background,
+                    memory_source: ConversationAgentTurnRequest::background_memory_source(),
                     on_started: on_started.clone(),
                 })
                 .await

@@ -769,7 +769,7 @@ impl JobExecutor {
             required_runtime_mode: cron_job_runtime_mode(job).map(ToOwned::to_owned),
             persist_user_message: true,
             user_message_hidden: true,
-            memory_source: aionui_conversation::MemoryEvidenceSource::Background,
+            memory_source: ConversationAgentTurnRequest::background_memory_source(),
             on_started,
         };
 

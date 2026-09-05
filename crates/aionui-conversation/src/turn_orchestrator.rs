@@ -759,20 +759,11 @@ impl ConversationTurnOrchestrator {
         }
         error_meta.insert(
             "assistant_message".to_string(),
-            serde_json::Value::String(if last_assistant_message.is_some() {
-                "recorded_in_terminal_outcome"
-            } else {
-                "unavailable"
-            }),
+            serde_json::Value::String("unavailable".to_string()),
         );
         error_meta.insert(
             "token_usage".to_string(),
-            // ACP usage is exposed as a session/context snapshot, not a
-            // reliable per-turn completion count. Keep this explicitly
-            // unavailable rather than copying or inventing a token total.
-            serde_json::Value::String(
-                "unavailable_per_turn_relay_does_not_expose_usage".to_string(),
-            ),
+            serde_json::Value::String("unavailable".to_string()),
         );
 
         let final_outcome = crate::turn_journal::TerminalOutcomeRecord {
