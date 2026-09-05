@@ -7,22 +7,16 @@ use aionui_ai_agent::{
     protocol::events::{FinishEventData, TextEventData},
     types::{BuildTaskOptions, SendMessageData},
 };
-use aionui_api_types::{AgentModeResponse, SendMessageRequest};
-use aionui_common::{
-    now_ms, AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs,
-};
+use aionui_api_types::SendMessageRequest;
+use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
 use aionui_conversation::{
-    ConversationAgentTurnRequest, ConversationService, InMemoryMemoryCuration, InMemoryTurnJournal,
-    MemoryCuration, MemoryCurationError, MemoryEvidence, MemoryEvidenceSource, RawJournalEvent,
+    ConversationAgentTurnRequest, ConversationService, InMemoryMemoryCuration, InMemoryTurnJournal, MemoryCuration,
+    MemoryCurationError, MemoryEvidence, MemoryEvidenceSource, RawJournalEvent,
     skill_resolver::{ResolvedAgentSkill, SkillResolver},
 };
 use aionui_db::{
-    init_database_memory,
-    models::ConversationRow,
-    IConversationRepository,
-    SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository,
-    SqliteConversationRepository,
+    IConversationRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteConversationRepository,
+    init_database_memory, models::ConversationRow,
 };
 use aionui_realtime::BroadcastEventBus;
 use async_trait::async_trait;
@@ -117,12 +111,7 @@ impl IAgentTask for ScriptedAgent {
     }
 
     async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
-        let script = self
-            .scripts
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_default();
+        let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
         for event in script {
             let _ = self.event_tx.send(event);
         }
@@ -141,13 +130,6 @@ impl IAgentTask for ScriptedAgent {
 impl IMockAgent for ScriptedAgent {
     fn get_confirmations(&self) -> Vec<Confirmation> {
         Vec::new()
-    }
-
-    async fn mode(&self) -> Result<AgentModeResponse, AgentError> {
-        Ok(AgentModeResponse {
-            mode: "default".into(),
-            initialized: false,
-        })
     }
 }
 
@@ -181,11 +163,7 @@ impl IWorkerTaskManager for ScriptedTaskManager {
             .ok_or_else(|| AgentError::bad_gateway("no scripted agent left"))
     }
 
-    fn kill(
-        &self,
-        _conversation_id: &str,
-        _reason: Option<AgentKillReason>,
-    ) -> Result<(), AgentError> {
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 
@@ -197,8 +175,7 @@ impl IWorkerTaskManager for ScriptedTaskManager {
         Box::pin(std::future::ready(()))
     }
 
-    async fn clear(&self) {
-    }
+    async fn clear(&self) {}
 
     fn active_count(&self) -> usize {
         0
@@ -243,8 +220,7 @@ async fn setup_service(
         .await
         .unwrap();
     }
-    let task_manager: Arc<dyn IWorkerTaskManager> =
-        Arc::new(ScriptedTaskManager::new(agents));
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(ScriptedTaskManager::new(agents));
     let journal = Arc::new(InMemoryTurnJournal::new());
     let service = ConversationService::new(
         std::env::temp_dir(),
@@ -268,9 +244,7 @@ async fn wait_for_events(
 ) -> Vec<RawJournalEvent> {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let events = journal
-                .get_turn_events(user_id, conversation_id, turn_id)
-                .await;
+            let events = journal.get_turn_events(user_id, conversation_id, turn_id).await;
             if events.len() >= 2 {
                 return events;
             }
@@ -321,9 +295,7 @@ async fn public_owner_send_records_final_assistant_text_in_exactly_one_terminal_
     let terminal = events
         .iter()
         .find_map(|event| match event {
-            RawJournalEvent::FinalOutcome {
-                assistant_message, ..
-            } => Some(assistant_message.as_deref()),
+            RawJournalEvent::FinalOutcome { assistant_message, .. } => Some(assistant_message.as_deref()),
             _ => None,
         })
         .flatten();
@@ -357,7 +329,7 @@ async fn public_background_run_agent_turn_remains_raw_only_without_memory_candid
             AgentStreamEvent::Finish(FinishEventData::default()),
         ]],
     ));
-    let (service, _repo, task_manager, _journal) =
+    let (service, _repo, _task_manager, _journal) =
         setup_service(curation.clone(), vec![AgentInstance::Mock(agent)]).await;
     let outcome = service
         .run_agent_turn(ConversationAgentTurnRequest {
