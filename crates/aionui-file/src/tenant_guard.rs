@@ -23,7 +23,7 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
     }
 
     // Normalize separators to forward slash and lowercase for pattern checks
-    let normalized = trimmed.replace('\\, "/");
+    let normalized = trimmed.replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
 
     // 1. Prohibit access to system databases and logs
@@ -45,7 +45,7 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
     }
 
     // 2. Prohibit browsing root directories directly
-    let clean_lower = lower.trim_matches('/);
+    let clean_lower = lower.trim_matches('/');
     if clean_lower == "data"
         || clean_lower == "data/users"
         || clean_lower == "data/conversations"
@@ -98,7 +98,7 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
 
     // Also check canonical path if the file exists on disk
     if let Ok(canonical) = std::fs::canonicalize(p) {
-        let canonical_str = canonical.to_string_lossy().replace('\\, "/");
+        let canonical_str = canonical.to_string_lossy().replace('\\', "/");
         let canonical_lower = canonical_str.to_ascii_lowercase();
 
         if canonical_lower.contains("aionui-backend.db") || canonical_lower.contains("aionui-memory.db") {
@@ -107,7 +107,7 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
             ));
         }
 
-        let clean_canonical = canonical_lower.trim_matches('/);
+        let clean_canonical = canonical_lower.trim_matches('/');
         if clean_canonical == "data"
             || clean_canonical == "data/users"
             || clean_canonical == "data/conversations"
