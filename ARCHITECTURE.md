@@ -471,6 +471,25 @@ CORS (local mode only, allows any origin)
 - Token extraction priority: `Authorization: Bearer` header → `aionui-session` cookie
 - Supports token blacklist (SHA-256 hash, DashMap storage)
 
+### Cloudflare Access provisioning
+
+When both `AIONUI_CF_ACCESS_TEAM_DOMAIN` and `AIONUI_CF_ACCESS_AUDIENCE` are
+set, AionPro auth middleware accepts `Cf-Access-Jwt-Assertion` only after
+verifying the RS256 signature against the team JWKS endpoint
+(`https://<team-domain>/cdn-cgi/access/certs`), issuer (`https://<team-domain>`),
+audience, and expiration. The assertion's stable `sub` is passed as
+`external_user_id`; `email` is only a username/email projection. A verified
+request reuses the existing external-user adoption path and receives the normal
+`aionui-session` cookie, so subsequent requests use the ordinary Aion JWT path.
+
+The two variables must be configured together and work in WebUI or AionPro
+identity mode; local embedded mode rejects the configuration. A partial
+configuration fails startup. Invalid,
+expired, wrong-audience, wrong-issuer, wrong-algorithm, unknown-key, or
+malformed assertions fail closed before any user row is created. Local/WebUI
+password authentication remains unchanged when Cloudflare integration is not
+configured.
+
 ### CSRF Protection
 
 Uses the Double Submit Cookie pattern:

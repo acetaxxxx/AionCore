@@ -120,6 +120,10 @@ impl TurnAttemptSummary {
 pub struct RelayOutcome {
     pub system_responses: Vec<String>,
     pub terminal: RelayTerminal,
+    /// Final assistant text after response middleware rewrites. `None` means
+    /// no visible assistant text was available (for example an error or
+    /// cancellation before a response was emitted).
+    pub assistant_message: Option<String>,
     pub attempt: TurnAttemptSummary,
 }
 
@@ -531,6 +535,7 @@ impl StreamRelay {
                                 break RelayOutcome {
                                     system_responses: Vec::new(),
                                     terminal,
+                                    assistant_message: None,
                                     attempt,
                                 };
                             }
@@ -558,6 +563,7 @@ impl StreamRelay {
                                 RelayOutcome {
                                     system_responses: Vec::new(),
                                     terminal,
+                                    assistant_message: None,
                                     attempt: attempt.clone(),
                                 }
                             } else {
@@ -752,6 +758,7 @@ impl StreamRelay {
                         RelayOutcome {
                             system_responses: Vec::new(),
                             terminal: RelayTerminal::ChannelClosed,
+                            assistant_message: None,
                             attempt: attempt.clone(),
                         }
                     } else {
@@ -889,6 +896,7 @@ impl StreamRelay {
         let mut outcome = RelayOutcome {
             system_responses: Vec::new(),
             terminal,
+            assistant_message: None,
             attempt: TurnAttemptSummary::default(),
         };
         let status = match event {
@@ -900,6 +908,16 @@ impl StreamRelay {
             let processed = self.process_final_text(text).await;
             let final_text = processed.message.trim().to_owned();
             let hidden = final_text.is_empty();
+
+            if matches!(event, AgentStreamEvent::Finish(_)) {
+                // A successful response that middleware hides is still a
+                // completed, intentionally silent response. Preserve an
+                // explicit empty value so it is not confused with an
+                // unavailable response caused by an error/cancellation.
+                outcome.assistant_message = Some(final_text.clone());
+            } else if !hidden {
+                outcome.assistant_message = Some(final_text.clone());
+            }
 
             let rewrite_segments = processed.message != text || hidden;
             let overrides = self
@@ -914,6 +932,9 @@ impl StreamRelay {
             outcome.system_responses = processed.system_responses;
         } else if let AgentStreamEvent::Error(data) = event {
             self.adapter.persist_error_tip(data).await;
+        } else {
+            // Finish with no text is a valid completed silent response.
+            outcome.assistant_message = Some(String::new());
         }
 
         outcome
@@ -1207,6 +1228,7 @@ mod tests {
         let outcome = relay.consume(rx).await;
         assert!(outcome.system_responses.is_empty());
         assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert_eq!(outcome.assistant_message.as_deref(), Some("Hello World"));
 
         // Should have inserted a message with accumulated text
         let inserts = repo.take_inserts();
@@ -1219,6 +1241,27 @@ mod tests {
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Hello World");
+    }
+
+    #[tokio::test]
+    async fn silent_finish_is_distinct_from_unavailable_response() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            bus,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert_eq!(outcome.assistant_message, Some(String::new()));
     }
 
     fn agent_title_test_row(name: &str, name_source: Option<&str>) -> aionui_db::models::ConversationRow {
