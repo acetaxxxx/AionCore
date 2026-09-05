@@ -191,10 +191,10 @@ impl CloudflareAccessAuthenticator for CloudflareAccessVerifier {
         let kid = header.kid.ok_or(CloudflareAccessError::InvalidAssertion)?;
 
         let mut keys = self.load_keys(false).await?;
-        let mut key = keys.iter().find(|candidate| candidate.kid == kid);
+        let mut key = keys.iter().find(|candidate| candidate.kid == kid).cloned();
         if key.is_none() {
             keys = self.load_keys(true).await?;
-            key = keys.iter().find(|candidate| candidate.kid == kid);
+            key = keys.iter().find(|candidate| candidate.kid == kid).cloned();
         }
         let key = key.ok_or(CloudflareAccessError::InvalidAssertion)?;
         if key.kty != "RSA" || key.alg.as_deref().is_some_and(|alg| alg != "RS256") {
