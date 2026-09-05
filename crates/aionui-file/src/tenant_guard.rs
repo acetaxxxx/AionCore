@@ -138,14 +138,15 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
                 }
             }
 
-            if can_components[i].eq_ignore_ascii_case("users") && i + 1 < can_components.len() {
-                if i == 0 || !can_components[i - 1].eq_ignore_ascii_case("conversations") {
-                    let target_user = can_components[i + 1];
-                    if target_user != user.id {
-                        return Err(FileError::Forbidden(
-                            "cross-tenant access to user path is forbidden".to_owned(),
-                        ));
-                    }
+            if can_components[i].eq_ignore_ascii_case("users")
+                && i + 1 < can_components.len()
+                && (i == 0 || !can_components[i - 1].eq_ignore_ascii_case("conversations"))
+            {
+                let target_user = can_components[i + 1];
+                if target_user != user.id {
+                    return Err(FileError::Forbidden(
+                        "cross-tenant access to user path is forbidden".to_owned(),
+                    ));
                 }
             }
         }
