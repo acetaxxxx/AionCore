@@ -2,9 +2,12 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::ws::Message;
+use axum::extract::{Extension, Json, Path, Query, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, Response, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
+use serde::Deserialize;
 
 use aionui_api_types::{
     ApiResponse, ConversationResponse, CreateConversationCronRequest, CreateConversationCronResponse,
@@ -12,12 +15,16 @@ use aionui_api_types::{
     UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 use aionui_auth::CurrentUser;
-use aionui_common::ApiError;
+use aionui_common::{ApiError, now_ms};
 use aionui_db::DbError;
 
 use crate::error::CronError;
 use crate::service::CronService;
 use crate::state::CronRouterState;
+
+use crate::browser_session::{
+    BROWSER_IDLE_LEASE_MS, BrowserLease, BrowserSessionError, BrowserSessionStartOutcome, BrowserSessionStartRequest,
+};
 
 fn db_error_to_api_error(err: DbError) -> ApiError {
     match err {
@@ -27,6 +34,44 @@ fn db_error_to_api_error(err: DbError) -> ApiError {
         DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
         DbError::Init(msg) => ApiError::Internal(format!("Database init error: {msg}")),
     }
+}
+
+impl From<BrowserSessionError> for ApiError {
+    fn from(err: BrowserSessionError) -> Self {
+        use BrowserSessionError::*;
+        match err {
+            NotFound(msg) => ApiError::NotFound(msg),
+            InvalidScope(msg) | OriginRejected(msg) | InputRejected(msg) => ApiError::BadRequest(msg),
+            AccessDenied(msg) => ApiError::coded(StatusCode::FORBIDDEN, "BROWSER_ACCESS_DENIED", msg, None),
+            CapabilityDenied(cap) => ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "BROWSER_CAPABILITY_DENIED",
+                format!("{cap:?}"),
+                None,
+            ),
+            Expired { .. } | IdleTimeout | LeaseClosed(_) => ApiError::Conflict(err.to_string()),
+            TransportUnavailable(msg) => {
+                ApiError::coded(StatusCode::SERVICE_UNAVAILABLE, "BROWSER_NOT_READY", msg, None)
+            }
+            ConfirmationRequired | ConfirmationNotFound(_) | TransportFailure(_) => ApiError::Internal(err.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserRenewRequest {
+    requested_ttl_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserTakeoverRequest {
+    resume: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveViewQuery {
+    session_id: String,
 }
 
 impl From<CronError> for ApiError {
@@ -71,7 +116,232 @@ pub fn cron_routes(state: CronRouterState) -> Router {
             "/api/cron/jobs/{id}/skill",
             get(has_skill).post(save_skill).delete(delete_skill),
         )
+        // Browser routes are intentionally gated until the injected worker,
+        // relay and signing provider report ready. This preserves the app's
+        // normal operation while making the browser capability fail closed.
+        .route("/api/browser/session/start", post(browser_session_start))
+        .route("/api/browser/session/{id}", get(browser_session_get))
+        .route("/api/browser/session/{id}/renew", post(browser_session_renew))
+        .route("/api/browser/session/{id}/takeover", post(browser_session_takeover))
+        .route("/api/browser/session/{id}/close", post(browser_session_close))
+        .route("/api/browser/session/{id}/purge", post(browser_session_purge))
+        .route("/api/browser/live-view/stream", get(browser_live_view_stream))
         .with_state(state)
+}
+
+fn browser_ready(state: &CronRouterState) -> Result<(), ApiError> {
+    if state.browser.is_ready() {
+        Ok(())
+    } else {
+        Err(ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_NOT_READY",
+            "browser capability dependencies are not ready",
+            None,
+        ))
+    }
+}
+
+fn browser_now() -> u64 {
+    now_ms().max(0) as u64
+}
+
+async fn browser_session_start(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<BrowserSessionStartRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<BrowserSessionStartOutcome>>), ApiError> {
+    browser_ready(&state)?;
+    let Json(request) = body.map_err(ApiError::from)?;
+    state.browser.scope_authorizer.authorize(&user.id, &request)?;
+    let keys = state.browser.capability_keys.as_ref().ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_NOT_READY",
+            "capability key provider is unavailable",
+            None,
+        )
+    })?;
+    let outcome = state
+        .browser
+        .control_plane
+        .start_server_issued(&user.id, request, keys, BROWSER_IDLE_LEASE_MS, browser_now())
+        .await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(outcome))))
+}
+
+async fn browser_session_get(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    Ok(Json(ApiResponse::ok(
+        state.browser.control_plane.get(&user.id, &id).await?,
+    )))
+}
+
+async fn browser_session_renew(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(request): Json<BrowserRenewRequest>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .browser
+            .control_plane
+            .renew(&user.id, &id, request.requested_ttl_ms, browser_now())
+            .await?,
+    )))
+}
+
+async fn browser_session_takeover(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(request): Json<BrowserTakeoverRequest>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    let lease = if request.resume {
+        state
+            .browser
+            .control_plane
+            .resume_from_user_takeover(&user.id, &id, browser_now())
+            .await?
+    } else {
+        state
+            .browser
+            .control_plane
+            .pause_for_user_takeover(&user.id, &id, browser_now())
+            .await?
+    };
+    Ok(Json(ApiResponse::ok(lease)))
+}
+
+async fn browser_session_close(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    Ok(Json(ApiResponse::ok(
+        state.browser.control_plane.end(&user.id, &id, browser_now()).await?,
+    )))
+}
+
+async fn browser_session_purge(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<BrowserLease>>, ApiError> {
+    browser_ready(&state)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .browser
+            .control_plane
+            .revoke(&user.id, &id, "purged", browser_now())
+            .await?,
+    )))
+}
+
+/// Private relay gate. The actual sidecar stream is intentionally not
+/// fabricated here: until a relay adapter is injected, the handshake closes
+/// with an explicit 503. No bearer token is accepted in query or headers.
+async fn browser_live_view_stream(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Query(query): Query<LiveViewQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response<axum::body::Body>, ApiError> {
+    let origin = headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "BROWSER_ORIGIN_REQUIRED",
+                "Origin is required",
+                None,
+            )
+        })?;
+    if !origin.starts_with("https://") || origin.contains('@') || origin.contains(char::is_whitespace) {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "BROWSER_ORIGIN_REJECTED",
+            "Origin is not allowlisted",
+            None,
+        ));
+    }
+    if query.session_id.trim().is_empty() {
+        return Err(ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "BROWSER_SESSION_REQUIRED",
+            "session_id is required",
+            None,
+        ));
+    }
+    if !state.browser.is_ready() {
+        return Err(ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_RELAY_NOT_READY",
+            "private browser relay is unavailable",
+            None,
+        ));
+    }
+    let lease = state.browser.control_plane.get(&user.id, &query.session_id).await?;
+    state
+        .browser
+        .control_plane
+        .validate_redirect(origin, &lease.scope.allowed_origins)?;
+    let (token, _) = state
+        .browser
+        .control_plane
+        .server_capability_for_relay(&user.id, &query.session_id, browser_now())
+        .await?;
+    let verifier = state.browser.capability_verifier.clone().ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_RELAY_NOT_READY",
+            "capability verifier is unavailable",
+            None,
+        )
+    })?;
+    let capability = verifier
+        .verify_for_lease(&user.id, &lease, &token, browser_now())
+        .await?;
+    let relay = state.browser.relay.clone().ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_RELAY_NOT_READY",
+            "private browser relay is unavailable",
+            None,
+        )
+    })?;
+    let mut frames = relay.open_stream(&lease, &capability).await?;
+    Ok(upgrade.on_upgrade(move |mut socket| async move {
+        loop {
+            tokio::select! {
+                outbound = frames.recv() => match outbound {
+                    Some(Ok(frame)) if frame.validate().is_ok() => {
+                        let Ok(payload) = serde_json::to_string(&frame) else { break };
+                        if socket.send(Message::Text(payload.into())).await.is_err() { break; }
+                    }
+                    _ => break,
+                },
+                inbound = socket.recv() => match inbound {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(input) = serde_json::from_str(&text) else { break };
+                        if state.browser.control_plane.relay_input(&user.id, &lease.lease_id, input, browser_now()).await.is_err() { break; }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let _ = relay.close(&lease.lease_id).await;
+    }).into_response())
 }
 
 async fn create_job(
