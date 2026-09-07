@@ -125,7 +125,9 @@ pub async fn auth_middleware(
         return runtime_token_channel(&state, request, next).await;
     };
 
-    let payload = match state.jwt_service.verify(&token) {
+    // Require an *access* token here: a refresh token must never authenticate an
+    // ordinary request — it is accepted only at the refresh endpoint.
+    let payload = match state.jwt_service.verify_access(&token) {
         Ok(payload) => payload,
         Err(error) => {
             tracing::debug!("Token verification failed: {error}");
