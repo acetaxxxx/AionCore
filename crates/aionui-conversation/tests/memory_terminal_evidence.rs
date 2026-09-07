@@ -34,14 +34,6 @@ impl SkillResolver for EmptySkillResolver {
         Vec::new()
     }
 
-    async fn link_workspace_skills(
-        &self,
-        _workspace: &std::path::Path,
-        _rel_dirs: &[&str],
-        _skills: &[ResolvedAgentSkill],
-    ) -> usize {
-        0
-    }
 }
 
 #[derive(Clone)]
