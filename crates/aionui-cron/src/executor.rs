@@ -2624,15 +2624,6 @@ mod tests {
             ) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
                 Vec::new()
             }
-
-            async fn link_workspace_skills(
-                &self,
-                _workspace: &std::path::Path,
-                _rel_dirs: &[&str],
-                _skills: &[aionui_conversation::skill_resolver::ResolvedAgentSkill],
-            ) -> usize {
-                0
-            }
         }
 
         let stub_broadcaster: Arc<dyn aionui_realtime::EventBroadcaster> = Arc::new(StubBroadcaster);
@@ -3383,15 +3374,6 @@ mod tests {
                 _names: &[String],
             ) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
                 Vec::new()
-            }
-
-            async fn link_workspace_skills(
-                &self,
-                _workspace: &std::path::Path,
-                _rel_dirs: &[&str],
-                _skills: &[aionui_conversation::skill_resolver::ResolvedAgentSkill],
-            ) -> usize {
-                0
             }
         }
 
