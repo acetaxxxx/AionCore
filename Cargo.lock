@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-push"
-version = "0.1.72"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "aionui-api-types",
