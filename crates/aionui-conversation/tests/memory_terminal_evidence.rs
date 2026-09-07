@@ -33,7 +33,6 @@ impl SkillResolver for EmptySkillResolver {
     async fn resolve_skills(&self, _names: &[String]) -> Vec<ResolvedAgentSkill> {
         Vec::new()
     }
-
 }
 
 #[derive(Clone)]
