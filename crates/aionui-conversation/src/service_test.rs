@@ -10556,13 +10556,23 @@ mod session_mentions_integration {
         assert_eq!(evidence[0].assistant_message.as_deref(), Some("final owner response"));
 
         let events = journal.get_turn_events("user_1", &conv.id, &sent.turn_id).await;
-        assert_eq!(events.len(), 2, "owner turn must have exactly one terminal event");
-        match &events[1] {
-            crate::turn_journal::RawJournalEvent::FinalOutcome {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, crate::turn_journal::RawJournalEvent::PreExecution { .. }))
+                .count(),
+            1,
+            "owner turn must have exactly one pre-execution event"
+        );
+        match events
+            .iter()
+            .find(|event| matches!(event, crate::turn_journal::RawJournalEvent::FinalOutcome { .. }))
+        {
+            Some(crate::turn_journal::RawJournalEvent::FinalOutcome {
                 status,
                 assistant_message,
                 ..
-            } => {
+            }) => {
                 assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Success);
                 assert_eq!(assistant_message.as_deref(), Some("final owner response"));
             }
