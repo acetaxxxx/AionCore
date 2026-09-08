@@ -565,6 +565,27 @@ impl ConversationTurnOrchestrator {
                     warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist memory context attribution");
                 }
             }
+            if !allowed_skill_names.is_empty() {
+                let skills_payload = allowed_skill_names.join("\n");
+                let skills_chars = skills_payload.chars().count();
+                let skills_record = crate::turn_journal::ContextAttributionRecord {
+                    user_id: input.user_id.clone(),
+                    conversation_id: conv_id.clone(),
+                    turn_id: turn_id.clone(),
+                    context_generation_id: format!("{turn_id}-att-{attempt_number}"),
+                    source: crate::turn_journal::ContextSource::Skills,
+                    item_count: allowed_skill_names.len(),
+                    bytes: skills_payload.as_bytes().len(),
+                    chars: skills_chars,
+                    estimated_tokens: skills_chars.div_ceil(4),
+                    item_ids: allowed_skill_names.clone(),
+                    item_hash: crate::turn_journal::digest_hex(skills_payload.as_bytes()),
+                    created_at_ms: attempt_started_at.max(0) as u64,
+                };
+                if let Err(error) = self.service.append_context_attribution(&skills_record).await {
+                    warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist skills context attribution");
+                }
+            }
 
             let attempt_result = match self
                 .run_attempt(TurnAttemptInput {
