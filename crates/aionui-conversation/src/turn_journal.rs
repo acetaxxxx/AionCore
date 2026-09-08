@@ -1310,6 +1310,13 @@ pub(crate) async fn internal_startup_recovery_with_outcomes(
                 if file_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                     continue;
                 }
+                if file_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with("_attribution"))
+                {
+                    continue;
+                }
 
                 let turn_id = match file_path.file_stem().and_then(|s| s.to_str()) {
                     Some(stem) => stem.to_string(),
