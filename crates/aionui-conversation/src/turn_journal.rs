@@ -452,6 +452,26 @@ impl FilesystemTurnJournal {
         Ok(raw_dir.join(format!("{turn_id}.jsonl")))
     }
 
+    /// Resolves the isolated attribution file, kept outside the lifecycle raw journal.
+    fn get_attribution_file_path(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<PathBuf, JournalError> {
+        validate_identifier(turn_id, "turn_id")?;
+        validate_identifier(user_id, "user_id")?;
+        validate_identifier(conversation_id, "conversation_id")?;
+        Ok(self
+            .base_dir
+            .join("users")
+            .join(user_id)
+            .join("events")
+            .join("raw")
+            .join(conversation_id)
+            .join(format!("{turn_id}_attribution.jsonl")))
+    }
+
     /// Reads turn events applying deterministic partial-tail recovery.
     ///
     /// Partial-Tail Policy:
@@ -660,9 +680,9 @@ impl FilesystemTurnJournal {
             .get_turn_lock(&record.user_id, &record.conversation_id, &record.turn_id)
             .await;
         let _guard = turn_lock.lock().await;
-        let file_path = self.get_turn_file_path(&record.user_id, &record.conversation_id, &record.turn_id)?;
-        let existing_events = Self::read_and_sanitize_turn_events(&file_path).await?;
-        if !existing_events
+        let raw_file_path = self.get_turn_file_path(&record.user_id, &record.conversation_id, &record.turn_id)?;
+        let raw_events = Self::read_and_sanitize_turn_events(&raw_file_path).await?;
+        if !raw_events
             .iter()
             .any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
         {
@@ -670,6 +690,8 @@ impl FilesystemTurnJournal {
                 turn_id: record.turn_id.clone(),
             });
         }
+        let file_path = self.get_attribution_file_path(&record.user_id, &record.conversation_id, &record.turn_id)?;
+        let existing_events = Self::read_and_sanitize_turn_events(&file_path).await?;
         if existing_events.iter().any(|event| {
             matches!(event, RawJournalEvent::ContextAttribution { record: existing }
                 if existing.context_generation_id == record.context_generation_id
@@ -3065,12 +3087,20 @@ mod tests {
             .await
             .unwrap();
 
-        let path = temp.path().join("users/user_attr/events/raw/conv_attr/turn_attr.jsonl");
-        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&path)
+        let raw_path = temp.path().join("users/user_attr/events/raw/conv_attr/turn_attr.jsonl");
+        let raw_events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_path)
             .await
             .unwrap();
-        assert_eq!(events.len(), 3);
+        assert_eq!(raw_events.len(), 1, "attribution must not alter raw lifecycle journal");
+
+        let attribution_path = temp
+            .path()
+            .join("users/user_attr/events/raw/conv_attr/turn_attr_attribution.jsonl");
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&attribution_path)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], RawJournalEvent::ContextAttribution { .. }));
         assert!(matches!(events[1], RawJournalEvent::ContextAttribution { .. }));
-        assert!(matches!(events[2], RawJournalEvent::ContextAttribution { .. }));
     }
 }
