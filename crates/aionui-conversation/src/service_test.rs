@@ -10015,6 +10015,13 @@ mod session_mentions_integration {
         ) -> Result<crate::turn_journal::TerminalReconcileResult, crate::turn_journal::JournalError> {
             Ok(crate::turn_journal::TerminalReconcileResult::CommittedNew)
         }
+
+        async fn append_context_attribution(
+            &self,
+            _record: &crate::turn_journal::ContextAttributionRecord,
+        ) -> Result<(), crate::turn_journal::JournalError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -10288,12 +10295,18 @@ mod session_mentions_integration {
         // 4. Verify exactly 1 PreExecution and exactly 1 FinalOutcome (Cancelled)
         let events = journal.get_turn_events("user_1", &conv.id, turn_id).await;
         assert_eq!(
-            events.len(),
-            2,
-            "Must record exactly one PreExecution and one FinalOutcome"
+            events
+                .iter()
+                .filter(|event| matches!(event, crate::turn_journal::RawJournalEvent::PreExecution { .. }))
+                .count(),
+            1,
+            "Must record exactly one PreExecution"
         );
-        match &events[1] {
-            crate::turn_journal::RawJournalEvent::FinalOutcome { status, .. } => {
+        match events
+            .iter()
+            .find(|event| matches!(event, crate::turn_journal::RawJournalEvent::FinalOutcome { .. }))
+        {
+            Some(crate::turn_journal::RawJournalEvent::FinalOutcome { status, .. }) => {
                 assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Cancelled);
             }
             _ => panic!("Expected FinalOutcome event"),
@@ -10446,24 +10459,25 @@ mod session_mentions_integration {
 
         let events = journal.get_turn_events("user_1", &conv.id, &send.turn_id).await;
         assert_eq!(
-            events.len(),
-            2,
-            "Must record exactly 1 PreExecution and 1 FinalOutcome for entire turn"
+            events
+                .iter()
+                .filter(|event| matches!(event, crate::turn_journal::RawJournalEvent::PreExecution { .. }))
+                .count(),
+            1
         );
-        assert!(matches!(
-            events[0],
-            crate::turn_journal::RawJournalEvent::PreExecution { .. }
-        ));
 
-        match &events[1] {
-            crate::turn_journal::RawJournalEvent::FinalOutcome {
+        match events
+            .iter()
+            .find(|event| matches!(event, crate::turn_journal::RawJournalEvent::FinalOutcome { .. }))
+        {
+            Some(crate::turn_journal::RawJournalEvent::FinalOutcome {
                 status,
                 assistant_message,
                 attempts,
                 last_attempt_id,
                 retry_summaries,
                 ..
-            } => {
+            }) => {
                 assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Success);
                 assert_eq!(assistant_message.as_deref(), Some("replayed response"));
                 assert_eq!(*attempts, 2, "Total attempts must be 2");
@@ -10542,13 +10556,23 @@ mod session_mentions_integration {
         assert_eq!(evidence[0].assistant_message.as_deref(), Some("final owner response"));
 
         let events = journal.get_turn_events("user_1", &conv.id, &sent.turn_id).await;
-        assert_eq!(events.len(), 2, "owner turn must have exactly one terminal event");
-        match &events[1] {
-            crate::turn_journal::RawJournalEvent::FinalOutcome {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, crate::turn_journal::RawJournalEvent::PreExecution { .. }))
+                .count(),
+            1,
+            "owner turn must have exactly one pre-execution event"
+        );
+        match events
+            .iter()
+            .find(|event| matches!(event, crate::turn_journal::RawJournalEvent::FinalOutcome { .. }))
+        {
+            Some(crate::turn_journal::RawJournalEvent::FinalOutcome {
                 status,
                 assistant_message,
                 ..
-            } => {
+            }) => {
                 assert_eq!(*status, crate::turn_journal::TurnTerminalStatus::Success);
                 assert_eq!(assistant_message.as_deref(), Some("final owner response"));
             }

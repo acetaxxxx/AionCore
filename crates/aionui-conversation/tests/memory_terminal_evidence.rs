@@ -239,7 +239,10 @@ async fn wait_for_events(
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let events = journal.get_turn_events(user_id, conversation_id, turn_id).await;
-            if events.len() >= 2 {
+            if events
+                .iter()
+                .any(|event| matches!(event, RawJournalEvent::FinalOutcome { .. }))
+            {
                 return events;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;

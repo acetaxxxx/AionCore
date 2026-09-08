@@ -512,6 +512,13 @@ impl ConversationService {
         Arc::clone(&self.turn_journal)
     }
 
+    pub(crate) async fn append_context_attribution(
+        &self,
+        record: &crate::turn_journal::ContextAttributionRecord,
+    ) -> Result<(), crate::turn_journal::JournalError> {
+        self.turn_journal.append_context_attribution(record).await
+    }
+
     pub(crate) fn capture_memory_candidate(&self, evidence: MemoryEvidence) {
         let memory_curation = Arc::clone(&self.memory_curation);
         tokio::spawn(async move {

@@ -112,6 +112,38 @@ pub struct MidTurnRecord {
     pub created_at_ms: u64,
 }
 
+/// Fixed source taxonomy for context attribution telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSource {
+    System,
+    AionHistoryProjection,
+    ProviderThreadHistory,
+    TeamMailbox,
+    Skills,
+    Memory,
+    UserInput,
+    ToolResult,
+    Unknown,
+}
+
+/// Sanitized, source-level context size measurement for one provider context generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextAttributionRecord {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub context_generation_id: String,
+    pub source: ContextSource,
+    pub item_count: usize,
+    pub bytes: usize,
+    pub chars: usize,
+    pub estimated_tokens: usize,
+    pub item_ids: Vec<String>,
+    pub item_hash: String,
+    pub created_at_ms: u64,
+}
+
 impl MidTurnRecord {
     /// Derive stable identity from the complete event identity and payload.
     ///
@@ -165,7 +197,7 @@ impl MidTurnRecord {
     }
 }
 
-fn digest_hex(bytes: &[u8]) -> String {
+pub(crate) fn digest_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -239,6 +271,9 @@ pub enum RawJournalEvent {
     MidTurn {
         record: MidTurnRecord,
     },
+    ContextAttribution {
+        record: ContextAttributionRecord,
+    },
 }
 
 /// Hash the canonical serialized raw event sequence used as Memory Candidate
@@ -254,6 +289,7 @@ impl RawJournalEvent {
             Self::PreExecution { user_id, .. } => user_id,
             Self::FinalOutcome { user_id, .. } => user_id,
             Self::MidTurn { record } => &record.user_id,
+            Self::ContextAttribution { record } => &record.user_id,
         }
     }
 
@@ -262,6 +298,7 @@ impl RawJournalEvent {
             Self::PreExecution { conversation_id, .. } => conversation_id,
             Self::FinalOutcome { conversation_id, .. } => conversation_id,
             Self::MidTurn { record } => &record.conversation_id,
+            Self::ContextAttribution { record } => &record.conversation_id,
         }
     }
 
@@ -270,6 +307,7 @@ impl RawJournalEvent {
             Self::PreExecution { turn_id, .. } => turn_id,
             Self::FinalOutcome { turn_id, .. } => turn_id,
             Self::MidTurn { record } => &record.turn_id,
+            Self::ContextAttribution { record } => &record.turn_id,
         }
     }
 }
@@ -329,6 +367,9 @@ pub trait TurnJournal: Send + Sync {
         turn_id: &str,
         outcome: &TerminalOutcomeRecord<'_>,
     ) -> Result<TerminalReconcileResult, JournalError>;
+
+    /// Appends sanitized source-level context attribution for one generation.
+    async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +450,26 @@ impl FilesystemTurnJournal {
         validate_identifier(turn_id, "turn_id")?;
         let raw_dir = self.get_conversation_raw_dir(user_id, conversation_id)?;
         Ok(raw_dir.join(format!("{turn_id}.jsonl")))
+    }
+
+    /// Resolves the isolated attribution file, kept outside the lifecycle raw journal.
+    fn get_attribution_file_path(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<PathBuf, JournalError> {
+        validate_identifier(turn_id, "turn_id")?;
+        validate_identifier(user_id, "user_id")?;
+        validate_identifier(conversation_id, "conversation_id")?;
+        Ok(self
+            .base_dir
+            .join("users")
+            .join(user_id)
+            .join("events")
+            .join("raw")
+            .join(conversation_id)
+            .join(format!("{turn_id}_attribution.jsonl")))
     }
 
     /// Reads turn events applying deterministic partial-tail recovery.
@@ -608,6 +669,43 @@ impl FilesystemTurnJournal {
         self.append_event_durable(&file_path, &RawJournalEvent::MidTurn { record: record.clone() })
             .await
     }
+
+    /// Appends one sanitized context attribution measurement to the turn journal.
+    pub(crate) async fn append_context_attribution(
+        &self,
+        record: &ContextAttributionRecord,
+    ) -> Result<(), JournalError> {
+        validate_context_attribution_record(record)?;
+        let turn_lock = self
+            .get_turn_lock(&record.user_id, &record.conversation_id, &record.turn_id)
+            .await;
+        let _guard = turn_lock.lock().await;
+        let raw_file_path = self.get_turn_file_path(&record.user_id, &record.conversation_id, &record.turn_id)?;
+        let raw_events = Self::read_and_sanitize_turn_events(&raw_file_path).await?;
+        if !raw_events
+            .iter()
+            .any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
+        {
+            return Err(JournalError::MissingPreExecution {
+                turn_id: record.turn_id.clone(),
+            });
+        }
+        let file_path = self.get_attribution_file_path(&record.user_id, &record.conversation_id, &record.turn_id)?;
+        let existing_events = Self::read_and_sanitize_turn_events(&file_path).await?;
+        if existing_events.iter().any(|event| {
+            matches!(event, RawJournalEvent::ContextAttribution { record: existing }
+                if existing.context_generation_id == record.context_generation_id
+                    && existing.source == record.source
+                    && existing.item_hash == record.item_hash)
+        }) {
+            return Ok(());
+        }
+        self.append_event_durable(
+            &file_path,
+            &RawJournalEvent::ContextAttribution { record: record.clone() },
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -784,6 +882,10 @@ impl TurnJournal for FilesystemTurnJournal {
             .await
             .map(|_| TerminalReconcileResult::CommittedNew)
     }
+
+    async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError> {
+        FilesystemTurnJournal::append_context_attribution(self, record).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +948,38 @@ impl InMemoryTurnJournal {
         entry.push(RawJournalEvent::MidTurn { record: record.clone() });
         Ok(())
     }
+
+    pub(crate) async fn append_context_attribution(
+        &self,
+        record: &ContextAttributionRecord,
+    ) -> Result<(), JournalError> {
+        validate_context_attribution_record(record)?;
+        let canonical_key = (
+            record.user_id.clone(),
+            record.conversation_id.clone(),
+            record.turn_id.clone(),
+        );
+        let mut guard = self.events.write().await;
+        let entry = guard.entry(canonical_key).or_default();
+        if !entry
+            .iter()
+            .any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
+        {
+            return Err(JournalError::MissingPreExecution {
+                turn_id: record.turn_id.clone(),
+            });
+        }
+        if entry.iter().any(|event| {
+            matches!(event, RawJournalEvent::ContextAttribution { record: existing }
+                if existing.context_generation_id == record.context_generation_id
+                    && existing.source == record.source
+                    && existing.item_hash == record.item_hash)
+        }) {
+            return Ok(());
+        }
+        entry.push(RawJournalEvent::ContextAttribution { record: record.clone() });
+        Ok(())
+    }
 }
 
 fn validate_mid_turn_record(record: &MidTurnRecord) -> Result<(), JournalError> {
@@ -864,6 +998,28 @@ fn validate_mid_turn_record(record: &MidTurnRecord) -> Result<(), JournalError> 
     if record.idempotency_key.trim().is_empty() || record.content_hash.trim().is_empty() {
         return Err(JournalError::InvalidIdentifier {
             reason: "mid-turn identity and content hash must not be empty".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_context_attribution_record(record: &ContextAttributionRecord) -> Result<(), JournalError> {
+    validate_identifier(&record.user_id, "user_id")?;
+    validate_identifier(&record.conversation_id, "conversation_id")?;
+    validate_identifier(&record.turn_id, "turn_id")?;
+    validate_identifier(&record.context_generation_id, "context_generation_id")?;
+    if record.item_hash.trim().is_empty() {
+        return Err(JournalError::InvalidIdentifier {
+            reason: "context attribution item_hash must not be empty".to_string(),
+        });
+    }
+    if record
+        .item_ids
+        .iter()
+        .any(|id| validate_identifier(id, "item_id").is_err())
+    {
+        return Err(JournalError::InvalidIdentifier {
+            reason: "context attribution item_ids contain an invalid identifier".to_string(),
         });
     }
     Ok(())
@@ -1052,6 +1208,10 @@ impl TurnJournal for InMemoryTurnJournal {
         entry.push(terminal_event);
         Ok(TerminalReconcileResult::CommittedNew)
     }
+
+    async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError> {
+        InMemoryTurnJournal::append_context_attribution(self, record).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,6 +1310,13 @@ pub(crate) async fn internal_startup_recovery_with_outcomes(
                 if file_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                     continue;
                 }
+                if file_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with("_attribution"))
+                {
+                    continue;
+                }
 
                 let turn_id = match file_path.file_stem().and_then(|s| s.to_str()) {
                     Some(stem) => stem.to_string(),
@@ -1186,6 +1353,7 @@ pub(crate) async fn internal_startup_recovery_with_outcomes(
                             break;
                         }
                         RawJournalEvent::MidTurn { .. } => {}
+                        RawJournalEvent::ContextAttribution { .. } => {}
                     }
                 }
 
@@ -2882,5 +3050,64 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_context_attribution_is_persisted_and_deduplicated_per_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FilesystemTurnJournal::new(temp.path());
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user_attr",
+                conversation_id: "conv_attr",
+                turn_id: "turn_attr",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let record = ContextAttributionRecord {
+            user_id: "user_attr".to_string(),
+            conversation_id: "conv_attr".to_string(),
+            turn_id: "turn_attr".to_string(),
+            context_generation_id: "gen_1".to_string(),
+            source: ContextSource::AionHistoryProjection,
+            item_count: 2,
+            bytes: 100,
+            chars: 90,
+            estimated_tokens: 25,
+            item_ids: vec!["message_1".to_string(), "message_2".to_string()],
+            item_hash: "hash_1".to_string(),
+            created_at_ms: 2,
+        };
+
+        journal.append_context_attribution(&record).await.unwrap();
+        journal.append_context_attribution(&record).await.unwrap();
+        journal
+            .append_context_attribution(&ContextAttributionRecord {
+                context_generation_id: "gen_2".to_string(),
+                ..record.clone()
+            })
+            .await
+            .unwrap();
+
+        let raw_path = temp.path().join("users/user_attr/events/raw/conv_attr/turn_attr.jsonl");
+        let raw_events = FilesystemTurnJournal::read_and_sanitize_turn_events(&raw_path)
+            .await
+            .unwrap();
+        assert_eq!(raw_events.len(), 1, "attribution must not alter raw lifecycle journal");
+
+        let attribution_path = temp
+            .path()
+            .join("users/user_attr/events/raw/conv_attr/turn_attr_attribution.jsonl");
+        let events = FilesystemTurnJournal::read_and_sanitize_turn_events(&attribution_path)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], RawJournalEvent::ContextAttribution { .. }));
+        assert!(matches!(events[1], RawJournalEvent::ContextAttribution { .. }));
     }
 }
