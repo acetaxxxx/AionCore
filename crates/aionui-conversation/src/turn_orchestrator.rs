@@ -526,7 +526,7 @@ impl ConversationTurnOrchestrator {
             // handing the request to the provider adapter. This is metadata-only
             // and deliberately does not alter the message sent to the agent.
             let context_generation_id = format!("{turn_id}-att-{attempt_number}");
-            let user_bytes = raw_user_message.as_bytes().len();
+            let user_bytes = raw_user_message.len();
             let user_chars = raw_user_message.chars().count();
             let user_record = crate::turn_journal::ContextAttributionRecord {
                 user_id: input.user_id.clone(),
@@ -554,7 +554,7 @@ impl ConversationTurnOrchestrator {
                     context_generation_id,
                     source: crate::turn_journal::ContextSource::Memory,
                     item_count: 1,
-                    bytes: memory_context.as_bytes().len(),
+                    bytes: memory_context.len(),
                     chars: memory_chars,
                     estimated_tokens: memory_chars.div_ceil(4),
                     item_ids: vec!["auto_inject_memory".to_string()],
@@ -575,7 +575,7 @@ impl ConversationTurnOrchestrator {
                     context_generation_id: format!("{turn_id}-att-{attempt_number}"),
                     source: crate::turn_journal::ContextSource::Skills,
                     item_count: allowed_skill_names.len(),
-                    bytes: skills_payload.as_bytes().len(),
+                    bytes: skills_payload.len(),
                     chars: skills_chars,
                     estimated_tokens: skills_chars.div_ceil(4),
                     item_ids: allowed_skill_names.clone(),
