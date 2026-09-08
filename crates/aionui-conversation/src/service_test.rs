@@ -10015,6 +10015,13 @@ mod session_mentions_integration {
         ) -> Result<crate::turn_journal::TerminalReconcileResult, crate::turn_journal::JournalError> {
             Ok(crate::turn_journal::TerminalReconcileResult::CommittedNew)
         }
+
+        async fn append_context_attribution(
+            &self,
+            _record: &crate::turn_journal::ContextAttributionRecord,
+        ) -> Result<(), crate::turn_journal::JournalError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

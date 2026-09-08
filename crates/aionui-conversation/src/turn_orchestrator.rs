@@ -522,6 +522,50 @@ impl ConversationTurnOrchestrator {
             let attempt_id = format!("{turn_id}-att-{attempt_number}");
             let attempt_started_at = now_ms();
 
+            // Phase 0 attribution: record the Aion-owned input projection before
+            // handing the request to the provider adapter. This is metadata-only
+            // and deliberately does not alter the message sent to the agent.
+            let context_generation_id = format!("{turn_id}-att-{attempt_number}");
+            let user_bytes = raw_user_message.as_bytes().len();
+            let user_chars = raw_user_message.chars().count();
+            let user_record = crate::turn_journal::ContextAttributionRecord {
+                user_id: input.user_id.clone(),
+                conversation_id: conv_id.clone(),
+                turn_id: turn_id.clone(),
+                context_generation_id: context_generation_id.clone(),
+                source: crate::turn_journal::ContextSource::UserInput,
+                item_count: 1,
+                bytes: user_bytes,
+                chars: user_chars,
+                estimated_tokens: user_chars.div_ceil(4),
+                item_ids: vec![first_turn_msg_id.clone()],
+                item_hash: crate::turn_journal::digest_hex(raw_user_message.as_bytes()),
+                created_at_ms: attempt_started_at.max(0) as u64,
+            };
+            if let Err(error) = self.service.append_context_attribution(&user_record).await {
+                warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist user-input context attribution");
+            }
+            if !memory_context.is_empty() {
+                let memory_chars = memory_context.chars().count();
+                let memory_record = crate::turn_journal::ContextAttributionRecord {
+                    user_id: input.user_id.clone(),
+                    conversation_id: conv_id.clone(),
+                    turn_id: turn_id.clone(),
+                    context_generation_id,
+                    source: crate::turn_journal::ContextSource::Memory,
+                    item_count: 1,
+                    bytes: memory_context.as_bytes().len(),
+                    chars: memory_chars,
+                    estimated_tokens: memory_chars.div_ceil(4),
+                    item_ids: vec!["auto_inject_memory".to_string()],
+                    item_hash: crate::turn_journal::digest_hex(memory_context.as_bytes()),
+                    created_at_ms: attempt_started_at.max(0) as u64,
+                };
+                if let Err(error) = self.service.append_context_attribution(&memory_record).await {
+                    warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist memory context attribution");
+                }
+            }
+
             let attempt_result = match self
                 .run_attempt(TurnAttemptInput {
                     conv_id: conv_id.clone(),

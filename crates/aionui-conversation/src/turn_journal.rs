@@ -197,7 +197,7 @@ impl MidTurnRecord {
     }
 }
 
-fn digest_hex(bytes: &[u8]) -> String {
+pub(crate) fn digest_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -367,6 +367,9 @@ pub trait TurnJournal: Send + Sync {
         turn_id: &str,
         outcome: &TerminalOutcomeRecord<'_>,
     ) -> Result<TerminalReconcileResult, JournalError>;
+
+    /// Appends sanitized source-level context attribution for one generation.
+    async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +860,10 @@ impl TurnJournal for FilesystemTurnJournal {
             .await
             .map(|_| TerminalReconcileResult::CommittedNew)
     }
+
+    async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError> {
+        FilesystemTurnJournal::append_context_attribution(self, record).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,6 +1185,10 @@ impl TurnJournal for InMemoryTurnJournal {
         };
         entry.push(terminal_event);
         Ok(TerminalReconcileResult::CommittedNew)
+    }
+
+    async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError> {
+        InMemoryTurnJournal::append_context_attribution(self, record).await
     }
 }
 
