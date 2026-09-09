@@ -263,6 +263,7 @@ impl ConversationTurnOrchestrator {
             .with_allowed_skill_names(input.allowed_skill_names.clone())
             .with_runtime_state(Arc::clone(&runtime_state))
             .with_persistence(persistence.clone())
+            .with_context_journal(self.service.turn_journal())
             .with_turn_completion(false)
             .with_defer_clean_terminal_errors(defer_clean_terminal_errors)
             // A replay spawns a fresh CLI whose own retry counter starts at one,
