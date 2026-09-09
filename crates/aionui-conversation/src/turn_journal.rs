@@ -800,6 +800,20 @@ impl FilesystemTurnJournal {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        let event_value = serde_json::to_value(envelope)?;
+        if let Ok(existing) = tokio::fs::read_to_string(&path).await {
+            for line in existing.lines().filter(|line| !line.trim().is_empty()) {
+                let value: serde_json::Value = serde_json::from_str(line)?;
+                if value.get("event_id") == event_value.get("event_id") {
+                    if value == event_value {
+                        return Ok(());
+                    }
+                    return Err(JournalError::InvalidIdentifier {
+                        reason: format!("diagnostic event_id {} has a conflicting payload", envelope.event_id),
+                    });
+                }
+            }
+        }
         let mut line = serde_json::to_vec(envelope)?;
         line.push(b'\n');
         let mut file = tokio::fs::OpenOptions::new()
@@ -3361,5 +3375,44 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(value["event_id"], "evt_diag_1");
         assert_eq!(value["event_type"], "context_generation");
+    }
+
+    #[tokio::test]
+    async fn identical_diagnostic_event_is_append_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FilesystemTurnJournal::new(temp.path());
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user_diag_dup",
+                conversation_id: "conv_diag_dup",
+                turn_id: "turn_diag_dup",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        let event = DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: "evt_diag_dup".to_string(),
+            event_type: "context_generation".to_string(),
+            record: serde_json::json!({"attempt_id": "turn_diag_dup-att-1"}),
+        };
+
+        journal
+            .append_diagnostic_event("user_diag_dup", "conv_diag_dup", "turn_diag_dup", &event)
+            .await
+            .unwrap();
+        journal
+            .append_diagnostic_event("user_diag_dup", "conv_diag_dup", "turn_diag_dup", &event)
+            .await
+            .unwrap();
+
+        let path = temp
+            .path()
+            .join("users/user_diag_dup/events/raw/conv_diag_dup/turn_diag_dup_diagnostics.jsonl");
+        let content = tokio::fs::read_to_string(path).await.unwrap();
+        assert_eq!(content.lines().count(), 1);
     }
 }
