@@ -178,6 +178,19 @@ pub struct ContextAttributionRecord {
     pub provenance_source: Option<String>,
 }
 
+/// Versioned, append-only envelope for machine-readable diagnostics records.
+///
+/// The payload remains deliberately generic at this boundary so new event
+/// types can be added without changing the lifecycle journal enum or forcing
+/// legacy readers to understand every future record shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticEventEnvelope<T> {
+    pub schema_version: u32,
+    pub event_id: String,
+    pub event_type: String,
+    pub record: T,
+}
+
 impl MidTurnRecord {
     /// Derive stable identity from the complete event identity and payload.
     ///
@@ -3231,5 +3244,20 @@ mod tests {
         assert!(parsed.schema_version.is_none());
         assert!(parsed.event_id.is_none());
         assert!(parsed.delivery_id.is_none());
+
+    #[test]
+    fn diagnostic_event_envelope_is_versioned_and_machine_readable() {
+        let envelope = DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: "evt_1".to_string(),
+            event_type: "context_attribution".to_string(),
+            record: serde_json::json!({"source": "memory", "estimated_tokens": 12}),
+        };
+
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["event_id"], "evt_1");
+        assert_eq!(value["event_type"], "context_attribution");
+        assert_eq!(value["record"]["source"], "memory");
     }
 }
