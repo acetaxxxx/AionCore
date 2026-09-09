@@ -270,12 +270,7 @@ impl StreamRelay {
         let chars = String::from_utf8_lossy(payload).chars().count();
         let item_ids = item_ids
             .iter()
-            .map(|item_id| {
-                format!(
-                    "tool_{}",
-                    &crate::turn_journal::digest_hex(item_id.as_bytes())[..24]
-                )
-            })
+            .map(|item_id| format!("tool_{}", &crate::turn_journal::digest_hex(item_id.as_bytes())[..24]))
             .collect::<Vec<_>>();
         let record = ContextAttributionRecord {
             user_id: self.user_id.clone(),

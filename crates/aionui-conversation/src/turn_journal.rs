@@ -735,7 +735,8 @@ impl FilesystemTurnJournal {
         }) {
             return Ok(());
         }
-        self.append_event_durable(&file_path, &RawJournalEvent::ContextAttribution { record }).await
+        self.append_event_durable(&file_path, &RawJournalEvent::ContextAttribution { record })
+            .await
     }
 }
 

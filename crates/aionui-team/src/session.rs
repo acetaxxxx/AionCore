@@ -481,9 +481,7 @@ impl TeamSession {
                         .sum::<usize>();
                     let mailbox_bytes = claimed_unread
                         .iter()
-                        .map(|message| {
-                            message.content.len() + message.summary.as_deref().map_or(0, str::len)
-                        })
+                        .map(|message| message.content.len() + message.summary.as_deref().map_or(0, str::len))
                         .sum::<usize>();
                     let mut entries = vec![AgentTurnAttribution {
                         source: AgentTurnAttributionSource::Mailbox,
@@ -503,14 +501,15 @@ impl TeamSession {
                             .iter()
                             .map(|task| {
                                 task.subject.chars().count()
-                                + task.description.as_deref().map_or(0, |description| description.chars().count())
+                                    + task
+                                        .description
+                                        .as_deref()
+                                        .map_or(0, |description| description.chars().count())
                             })
                             .sum::<usize>();
                         let task_bytes = tasks
                             .iter()
-                            .map(|task| {
-                                task.subject.len() + task.description.as_deref().map_or(0, str::len)
-                            })
+                            .map(|task| task.subject.len() + task.description.as_deref().map_or(0, str::len))
                             .sum::<usize>();
                         entries.push(AgentTurnAttribution {
                             source: AgentTurnAttributionSource::TaskSummary,

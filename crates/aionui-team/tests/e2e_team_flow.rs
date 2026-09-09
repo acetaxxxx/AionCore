@@ -39,8 +39,7 @@ use aionui_team::mcp::protocol::{read_frame, write_frame};
 use aionui_team::ports::{
     AgentTurnAttributionSource, AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort,
     AgentTurnOutcome, AgentTurnRequest, AgentTurnSource, AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort,
-    NoopNativeSlashCommandPort,
-    SlashCatalogSource, SlashCommandRecognition,
+    NoopNativeSlashCommandPort, SlashCatalogSource, SlashCommandRecognition,
 };
 use aionui_team::service::TeamSessionService;
 use aionui_team::{TeamAgent, TeamProjectionMessageStore, TeamSession, TeammateRole};

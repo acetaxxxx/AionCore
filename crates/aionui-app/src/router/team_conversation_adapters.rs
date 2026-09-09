@@ -14,11 +14,10 @@ use aionui_db::models::{AgentMetadataRow, MessageRow};
 use aionui_db::{IAgentMetadataRepository, IConversationRepository};
 use aionui_team::{
     AgentTurnAttributionSource, AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort,
-    AgentTurnOutcome, AgentTurnRequest, AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort,
-    SlashCatalogSource, SlashCommandRecognition,
-    TeamConversationBindingLookup, TeamConversationCreateRequest, TeamConversationCreateResult,
-    TeamConversationLookupPort, TeamConversationModelFacts, TeamConversationProvisioningPort, TeamError,
-    TeamMcpSnapshotResolution, TeamProjectionMessageStore,
+    AgentTurnOutcome, AgentTurnRequest, AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort, SlashCatalogSource,
+    SlashCommandRecognition, TeamConversationBindingLookup, TeamConversationCreateRequest,
+    TeamConversationCreateResult, TeamConversationLookupPort, TeamConversationModelFacts,
+    TeamConversationProvisioningPort, TeamError, TeamMcpSnapshotResolution, TeamProjectionMessageStore,
 };
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
