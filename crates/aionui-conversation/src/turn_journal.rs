@@ -3415,4 +3415,48 @@ mod tests {
         let content = tokio::fs::read_to_string(path).await.unwrap();
         assert_eq!(content.lines().count(), 1);
     }
+
+    #[tokio::test]
+    async fn conflicting_diagnostic_event_id_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FilesystemTurnJournal::new(temp.path());
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user_diag_conflict",
+                conversation_id: "conv_diag_conflict",
+                turn_id: "turn_diag_conflict",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let first = DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: "evt_diag_conflict".to_string(),
+            event_type: "context_generation".to_string(),
+            record: serde_json::json!({"attempt_id": "attempt_1"}),
+        };
+        let conflicting = DiagnosticEventEnvelope {
+            record: serde_json::json!({"attempt_id": "attempt_2"}),
+            ..first.clone()
+        };
+        journal
+            .append_diagnostic_event("user_diag_conflict", "conv_diag_conflict", "turn_diag_conflict", &first)
+            .await
+            .unwrap();
+
+        let error = journal
+            .append_diagnostic_event(
+                "user_diag_conflict",
+                "conv_diag_conflict",
+                "turn_diag_conflict",
+                &conflicting,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicting payload"));
+    }
 }
