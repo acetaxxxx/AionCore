@@ -191,6 +191,31 @@ pub struct DiagnosticEventEnvelope<T> {
     pub record: T,
 }
 
+/// Quality of the correlation between Aion lifecycle IDs and backend IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrelationQuality {
+    Exact,
+    Inferred,
+    Ambiguous,
+    Unmatched,
+}
+
+/// Sanitized mapping between one Aion attempt and provider runtime identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCorrelationRecord {
+    pub conversation_id: String,
+    pub aion_turn_id: String,
+    pub attempt_id: String,
+    pub context_generation_id: Option<String>,
+    pub backend_kind: String,
+    pub backend_version: Option<String>,
+    pub session_epoch: Option<u64>,
+    pub provider_thread_id: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub correlation_quality: CorrelationQuality,
+}
+
 impl MidTurnRecord {
     /// Derive stable identity from the complete event identity and payload.
     ///
@@ -3458,5 +3483,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("conflicting payload"));
+    }
+
+    #[test]
+    fn provider_correlation_record_preserves_quality_and_optional_ids() {
+        let record = ProviderCorrelationRecord {
+            conversation_id: "conv_corr".to_string(),
+            aion_turn_id: "turn_corr".to_string(),
+            attempt_id: "turn_corr-att-1".to_string(),
+            context_generation_id: Some("turn_corr-att-1".to_string()),
+            backend_kind: "codex".to_string(),
+            backend_version: Some("0.153.4".to_string()),
+            session_epoch: Some(2),
+            provider_thread_id: Some("thread_1".to_string()),
+            provider_turn_id: None,
+            correlation_quality: CorrelationQuality::Ambiguous,
+        };
+
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["correlation_quality"], "ambiguous");
+        assert_eq!(value["provider_thread_id"], "thread_1");
+        assert!(value["provider_turn_id"].is_null());
     }
 }
