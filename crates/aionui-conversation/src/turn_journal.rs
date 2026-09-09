@@ -1172,6 +1172,19 @@ impl InMemoryTurnJournal {
             .unwrap_or_default()
     }
 
+    pub async fn get_diagnostic_events(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Vec<DiagnosticEventEnvelope<serde_json::Value>> {
+        let guard = self.diagnostics.read().await;
+        guard
+            .get(&(user_id.to_string(), conversation_id.to_string(), turn_id.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn append_mid_turn_event(&self, record: &MidTurnRecord) -> Result<(), JournalError> {
         validate_mid_turn_record(record)?;

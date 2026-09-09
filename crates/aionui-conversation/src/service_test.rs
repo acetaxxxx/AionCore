@@ -10096,6 +10096,45 @@ mod session_mentions_integration {
     }
 
     #[tokio::test]
+    async fn service_appends_diagnostic_event_through_its_journal_seam() {
+        let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+        let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+        let svc = svc.with_turn_journal(journal.clone());
+        journal
+            .capture_pre_turn(&crate::turn_journal::PreTurnRecord {
+                user_id: "user_1",
+                conversation_id: "conv_diagnostics",
+                turn_id: "turn_diagnostics",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        svc.append_diagnostic_event(
+            "user_1",
+            "conv_diagnostics",
+            "turn_diagnostics",
+            &crate::turn_journal::DiagnosticEventEnvelope {
+                schema_version: 1,
+                event_id: "evt_service".to_string(),
+                event_type: "context_generation".to_string(),
+                record: serde_json::json!({"attempt_id": "turn_diagnostics-att-1"}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let events = journal
+            .get_diagnostic_events("user_1", "conv_diagnostics", "turn_diagnostics")
+            .await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "evt_service");
+    }
+
+    #[tokio::test]
     async fn test_startup_recovery_scans_journal_and_reconciles_timeouts() {
         let temp = tempfile::tempdir().unwrap();
         let journal = Arc::new(crate::turn_journal::FilesystemTurnJournal::new(temp.path()));
