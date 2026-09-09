@@ -52,8 +52,9 @@ pub use state::ConversationRouterState;
 pub use turn_journal::{
     AttemptSummary, ContextAttributionRecord, ContextSource, CorrelationQuality, DiagnosticEventEnvelope,
     FilesystemTurnJournal, InMemoryTurnJournal, JournalError, PreTurnRecord, ProviderCorrelationRecord,
-    RawJournalEvent, StartupRecoveryOptions, TerminalOutcomeRecord, TerminalReconcileResult, TokenUsageRecord,
-    TurnJournal, TurnTerminalStatus, digest_hex, validate_identifier,
+    ProviderUsageSnapshot, RawJournalEvent, StartupRecoveryOptions, TerminalOutcomeRecord,
+    TerminalReconcileResult, TokenUsageRecord, TurnJournal, TurnTerminalStatus, UsageSnapshotState, digest_hex,
+    validate_identifier,
 };
 
 #[cfg(test)]

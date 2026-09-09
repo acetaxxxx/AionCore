@@ -216,6 +216,34 @@ pub struct ProviderCorrelationRecord {
     pub correlation_quality: CorrelationQuality,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSnapshotState {
+    New,
+    Duplicate,
+    Stale,
+}
+
+/// Raw provider usage snapshot. Optional fields retain provider capability gaps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsageSnapshot {
+    pub usage_event_id: String,
+    pub provider_thread_id: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub sequence: Option<u64>,
+    pub timestamp_ms: u64,
+    pub last_input_tokens: Option<u64>,
+    pub last_cached_input_tokens: Option<u64>,
+    pub last_output_tokens: Option<u64>,
+    pub last_reasoning_output_tokens: Option<u64>,
+    pub total_input_tokens: Option<u64>,
+    pub total_cached_input_tokens: Option<u64>,
+    pub total_output_tokens: Option<u64>,
+    pub model_context_window: Option<u64>,
+    pub snapshot_fingerprint: String,
+    pub state: UsageSnapshotState,
+}
+
 impl MidTurnRecord {
     /// Derive stable identity from the complete event identity and payload.
     ///
@@ -3504,5 +3532,31 @@ mod tests {
         assert_eq!(value["correlation_quality"], "ambiguous");
         assert_eq!(value["provider_thread_id"], "thread_1");
         assert!(value["provider_turn_id"].is_null());
+    }
+
+    #[test]
+    fn provider_usage_snapshot_preserves_unknown_fields_and_state() {
+        let snapshot = ProviderUsageSnapshot {
+            usage_event_id: "usage_1".to_string(),
+            provider_thread_id: Some("thread_1".to_string()),
+            provider_turn_id: None,
+            sequence: Some(4),
+            timestamp_ms: 10,
+            last_input_tokens: Some(100),
+            last_cached_input_tokens: None,
+            last_output_tokens: Some(8),
+            last_reasoning_output_tokens: None,
+            total_input_tokens: None,
+            total_cached_input_tokens: None,
+            total_output_tokens: None,
+            model_context_window: Some(258_400),
+            snapshot_fingerprint: "fp_1".to_string(),
+            state: UsageSnapshotState::New,
+        };
+
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["state"], "new");
+        assert!(value["last_cached_input_tokens"].is_null());
+        assert!(value["total_input_tokens"].is_null());
     }
 }
