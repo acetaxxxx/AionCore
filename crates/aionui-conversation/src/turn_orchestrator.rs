@@ -541,6 +541,13 @@ impl ConversationTurnOrchestrator {
                 item_ids: vec![first_turn_msg_id.clone()],
                 item_hash: crate::turn_journal::digest_hex(raw_user_message.as_bytes()),
                 created_at_ms: attempt_started_at.max(0) as u64,
+                schema_version: Some(1),
+                event_id: None,
+                delivery_id: None,
+                delivery_kind: None,
+                render_mode: None,
+                measurement_kind: Some("assembled".to_string()),
+                provenance_source: Some("conversation_orchestrator".to_string()),
             };
             if let Err(error) = self.service.append_context_attribution(&user_record).await {
                 warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist user-input context attribution");
@@ -560,6 +567,13 @@ impl ConversationTurnOrchestrator {
                     item_ids: vec!["auto_inject_memory".to_string()],
                     item_hash: crate::turn_journal::digest_hex(memory_context.as_bytes()),
                     created_at_ms: attempt_started_at.max(0) as u64,
+                    schema_version: Some(1),
+                    event_id: None,
+                    delivery_id: None,
+                    delivery_kind: None,
+                    render_mode: None,
+                    measurement_kind: Some("assembled".to_string()),
+                    provenance_source: Some("conversation_orchestrator".to_string()),
                 };
                 if let Err(error) = self.service.append_context_attribution(&memory_record).await {
                     warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist memory context attribution");
@@ -581,6 +595,13 @@ impl ConversationTurnOrchestrator {
                     item_ids: allowed_skill_names.clone(),
                     item_hash: crate::turn_journal::digest_hex(skills_payload.as_bytes()),
                     created_at_ms: attempt_started_at.max(0) as u64,
+                    schema_version: Some(1),
+                    event_id: None,
+                    delivery_id: None,
+                    delivery_kind: None,
+                    render_mode: None,
+                    measurement_kind: Some("inventory".to_string()),
+                    provenance_source: Some("conversation_orchestrator".to_string()),
                 };
                 if let Err(error) = self.service.append_context_attribution(&skills_record).await {
                     warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist skills context attribution");
