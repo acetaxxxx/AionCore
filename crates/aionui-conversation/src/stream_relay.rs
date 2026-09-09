@@ -386,6 +386,8 @@ impl StreamRelay {
         let mut send_error_done = send_error_rx.is_none();
         let mut pending_send_error: Option<AgentSendError> = None;
         let mut attempt = TurnAttemptSummary::default();
+        let mut usage_sequence = 0_u64;
+        let mut previous_usage = None;
 
         loop {
             let recv_result = if send_error_done {
@@ -478,6 +480,15 @@ impl StreamRelay {
                             // event itself.
                             self.adapter.set_backend_turn_id(backend_turn_id.clone());
                             self.record_provider_turn_binding(backend_turn_id).await;
+                        }
+                        AgentStreamEvent::AcpContextUsage(raw_usage) => {
+                            usage_sequence += 1;
+                            if let Some(snapshot) = self
+                                .record_provider_usage(raw_usage, usage_sequence, previous_usage.as_ref())
+                                .await
+                            {
+                                previous_usage = Some(snapshot);
+                            }
                         }
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
@@ -1099,6 +1110,60 @@ impl StreamRelay {
             "hidden": hidden,
             "replace": true,
         }));
+    }
+
+    async fn record_provider_usage(
+        &self,
+        raw_usage: &serde_json::Value,
+        sequence: u64,
+        previous: Option<&crate::turn_journal::ProviderUsageSnapshot>,
+    ) -> Option<crate::turn_journal::ProviderUsageSnapshot> {
+        let correlation = self.diagnostic_correlation.as_ref()?;
+        let meta = raw_usage.get("_meta").and_then(serde_json::Value::as_object);
+        let number = |key: &str| {
+            meta.and_then(|fields| fields.get(key))
+                .and_then(serde_json::Value::as_u64)
+        };
+        let serialized = match serde_json::to_vec(raw_usage) {
+            Ok(serialized) => serialized,
+            Err(error) => {
+                warn!(turn_id = %self.turn_id, error = %ErrorChain(&error), "Failed to serialize provider usage snapshot");
+                return None;
+            }
+        };
+        let mut snapshot = crate::turn_journal::ProviderUsageSnapshot {
+            usage_event_id: format!("{}:usage:{sequence}", correlation.context_generation_id),
+            provider_thread_id: None,
+            provider_turn_id: self.adapter.current_backend_turn_id(),
+            sequence: Some(sequence),
+            timestamp_ms: now_ms().max(0) as u64,
+            last_input_tokens: number("input_tokens"),
+            last_cached_input_tokens: number("cached_read_tokens"),
+            last_output_tokens: number("output_tokens"),
+            last_reasoning_output_tokens: number("reasoning_output_tokens"),
+            total_input_tokens: None,
+            total_cached_input_tokens: None,
+            total_output_tokens: None,
+            model_context_window: raw_usage.get("size").and_then(serde_json::Value::as_u64),
+            snapshot_fingerprint: crate::turn_journal::digest_hex(&serialized),
+            state: crate::turn_journal::UsageSnapshotState::New,
+        };
+        snapshot.state = crate::turn_journal::classify_usage_snapshot(previous, &snapshot);
+        let event = crate::turn_journal::DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: snapshot.usage_event_id.clone(),
+            event_type: "provider_usage".to_string(),
+            record: json!({ "snapshot": snapshot.clone() }),
+        };
+        if let Err(error) = correlation
+            .service
+            .append_diagnostic_event(&self.user_id, &self.conversation_id, &self.turn_id, &event)
+            .await
+        {
+            warn!(turn_id = %self.turn_id, error = %ErrorChain(&error), "Failed to persist provider-usage diagnostic");
+            return None;
+        }
+        Some(snapshot)
     }
 
     async fn record_provider_turn_binding(&self, provider_turn_id: &str) {

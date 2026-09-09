@@ -438,6 +438,14 @@ pub enum RawJournalEvent {
     ContextAttribution {
         record: ContextAttributionRecord,
     },
+    /// Versioned, privacy-safe evidence that shares the attribution sidecar
+    /// with the existing source measurements.
+    AttributionDiagnostic {
+        user_id: String,
+        conversation_id: String,
+        turn_id: String,
+        envelope: DiagnosticEventEnvelope<serde_json::Value>,
+    },
 }
 
 /// Hash the canonical serialized raw event sequence used as Memory Candidate
@@ -454,6 +462,7 @@ impl RawJournalEvent {
             Self::FinalOutcome { user_id, .. } => user_id,
             Self::MidTurn { record } => &record.user_id,
             Self::ContextAttribution { record } => &record.user_id,
+            Self::AttributionDiagnostic { user_id, .. } => user_id,
         }
     }
 
@@ -463,6 +472,7 @@ impl RawJournalEvent {
             Self::FinalOutcome { conversation_id, .. } => conversation_id,
             Self::MidTurn { record } => &record.conversation_id,
             Self::ContextAttribution { record } => &record.conversation_id,
+            Self::AttributionDiagnostic { conversation_id, .. } => conversation_id,
         }
     }
 
@@ -472,6 +482,7 @@ impl RawJournalEvent {
             Self::FinalOutcome { turn_id, .. } => turn_id,
             Self::MidTurn { record } => &record.turn_id,
             Self::ContextAttribution { record } => &record.turn_id,
+            Self::AttributionDiagnostic { turn_id, .. } => turn_id,
         }
     }
 }
@@ -645,17 +656,6 @@ impl FilesystemTurnJournal {
             .join("raw")
             .join(conversation_id)
             .join(format!("{turn_id}_attribution.jsonl")))
-    }
-
-    fn get_diagnostics_file_path(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        turn_id: &str,
-    ) -> Result<PathBuf, JournalError> {
-        validate_identifier(turn_id, "turn_id")?;
-        let raw_dir = self.get_conversation_raw_dir(user_id, conversation_id)?;
-        Ok(raw_dir.join(format!("{turn_id}_diagnostics.jsonl")))
     }
 
     /// Reads turn events applying deterministic partial-tail recovery.
@@ -891,8 +891,8 @@ impl FilesystemTurnJournal {
             .await
     }
 
-    /// Appends a versioned diagnostic envelope without touching lifecycle or
-    /// attribution sidecars. This is intentionally additive for legacy readers.
+    /// Appends a versioned, sanitized diagnostics envelope to the per-turn
+    /// attribution sidecar without touching the lifecycle journal.
     pub(crate) async fn append_diagnostic_event<T: Serialize>(
         &self,
         user_id: &str,
@@ -924,35 +924,33 @@ impl FilesystemTurnJournal {
             });
         }
 
-        let path = self.get_diagnostics_file_path(user_id, conversation_id, turn_id)?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let event_value = serde_json::to_value(envelope)?;
-        if let Ok(existing) = tokio::fs::read_to_string(&path).await {
-            for line in existing.lines().filter(|line| !line.trim().is_empty()) {
-                let value: serde_json::Value = serde_json::from_str(line)?;
-                if value.get("event_id") == event_value.get("event_id") {
-                    if value == event_value {
-                        return Ok(());
-                    }
-                    return Err(JournalError::InvalidIdentifier {
-                        reason: format!("diagnostic event_id {} has a conflicting payload", envelope.event_id),
-                    });
-                }
+        let path = self.get_attribution_file_path(user_id, conversation_id, turn_id)?;
+        let envelope = DiagnosticEventEnvelope {
+            schema_version: envelope.schema_version,
+            event_id: envelope.event_id.clone(),
+            event_type: envelope.event_type.clone(),
+            record: serde_json::to_value(&envelope.record)?,
+        };
+        let diagnostic_event_id = envelope.event_id.clone();
+        let event = RawJournalEvent::AttributionDiagnostic {
+            user_id: user_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            turn_id: turn_id.to_string(),
+            envelope,
+        };
+        let existing = Self::read_and_sanitize_turn_events(&path).await?;
+        if let Some(existing) = existing.iter().find(|existing| {
+            matches!(existing, RawJournalEvent::AttributionDiagnostic { envelope: existing, .. }
+                if existing.event_id == diagnostic_event_id)
+        }) {
+            if existing == &event {
+                return Ok(());
             }
+            return Err(JournalError::InvalidIdentifier {
+                reason: format!("diagnostic event_id {diagnostic_event_id} has a conflicting payload"),
+            });
         }
-        let mut line = serde_json::to_vec(envelope)?;
-        line.push(b'\n');
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        file.write_all(&line).await?;
-        file.flush().await?;
-        file.sync_all().await?;
-        Ok(())
+        self.append_event_durable(&path, &event).await
     }
 }
 
@@ -1702,6 +1700,7 @@ pub(crate) async fn internal_startup_recovery_with_outcomes(
                         }
                         RawJournalEvent::MidTurn { .. } => {}
                         RawJournalEvent::ContextAttribution { .. } => {}
+                        RawJournalEvent::AttributionDiagnostic { .. } => {}
                     }
                 }
 
@@ -3540,7 +3539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diagnostic_event_is_appended_to_an_isolated_file() {
+    async fn diagnostic_event_is_appended_to_the_turn_attribution_sidecar() {
         let temp = tempfile::tempdir().unwrap();
         let journal = FilesystemTurnJournal::new(temp.path());
         journal
@@ -3573,11 +3572,18 @@ mod tests {
 
         let path = temp
             .path()
-            .join("users/user_diag/events/raw/conv_diag/turn_diag_diagnostics.jsonl");
+            .join("users/user_diag/events/raw/conv_diag/turn_diag_attribution.jsonl");
         let content = tokio::fs::read_to_string(path).await.unwrap();
         let value: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
-        assert_eq!(value["event_id"], "evt_diag_1");
-        assert_eq!(value["event_type"], "context_generation");
+        assert_eq!(value["event_type"], "attribution_diagnostic");
+        assert_eq!(value["envelope"]["event_id"], "evt_diag_1");
+        assert_eq!(value["envelope"]["event_type"], "context_generation");
+        assert!(
+            !temp
+                .path()
+                .join("users/user_diag/events/raw/conv_diag/turn_diag_diagnostics.jsonl")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -3614,7 +3620,7 @@ mod tests {
 
         let path = temp
             .path()
-            .join("users/user_diag_dup/events/raw/conv_diag_dup/turn_diag_dup_diagnostics.jsonl");
+            .join("users/user_diag_dup/events/raw/conv_diag_dup/turn_diag_dup_attribution.jsonl");
         let content = tokio::fs::read_to_string(path).await.unwrap();
         assert_eq!(content.lines().count(), 1);
     }
