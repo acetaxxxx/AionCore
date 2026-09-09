@@ -244,6 +244,26 @@ pub struct ProviderUsageSnapshot {
     pub state: UsageSnapshotState,
 }
 
+pub fn classify_usage_snapshot(
+    previous: Option<&ProviderUsageSnapshot>,
+    current: &ProviderUsageSnapshot,
+) -> UsageSnapshotState {
+    let Some(previous) = previous else {
+        return UsageSnapshotState::New;
+    };
+    if previous.snapshot_fingerprint == current.snapshot_fingerprint {
+        return UsageSnapshotState::Duplicate;
+    }
+    if previous
+        .sequence
+        .zip(current.sequence)
+        .is_some_and(|(old, new)| new <= old)
+    {
+        return UsageSnapshotState::Stale;
+    }
+    UsageSnapshotState::New
+}
+
 impl MidTurnRecord {
     /// Derive stable identity from the complete event identity and payload.
     ///
@@ -3558,5 +3578,44 @@ mod tests {
         assert_eq!(value["state"], "new");
         assert!(value["last_cached_input_tokens"].is_null());
         assert!(value["total_input_tokens"].is_null());
+    }
+
+    #[test]
+    fn usage_snapshot_classification_distinguishes_new_duplicate_and_stale() {
+        let base = ProviderUsageSnapshot {
+            usage_event_id: "usage_1".to_string(),
+            provider_thread_id: Some("thread_1".to_string()),
+            provider_turn_id: None,
+            sequence: Some(4),
+            timestamp_ms: 10,
+            last_input_tokens: Some(100),
+            last_cached_input_tokens: None,
+            last_output_tokens: Some(8),
+            last_reasoning_output_tokens: None,
+            total_input_tokens: Some(100),
+            total_cached_input_tokens: None,
+            total_output_tokens: Some(8),
+            model_context_window: Some(258_400),
+            snapshot_fingerprint: "fp_1".to_string(),
+            state: UsageSnapshotState::New,
+        };
+        assert_eq!(classify_usage_snapshot(None, &base), UsageSnapshotState::New);
+        assert_eq!(classify_usage_snapshot(Some(&base), &base), UsageSnapshotState::Duplicate);
+
+        let stale = ProviderUsageSnapshot {
+            usage_event_id: "usage_0".to_string(),
+            sequence: Some(3),
+            snapshot_fingerprint: "fp_0".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(classify_usage_snapshot(Some(&base), &stale), UsageSnapshotState::Stale);
+
+        let next = ProviderUsageSnapshot {
+            usage_event_id: "usage_2".to_string(),
+            sequence: Some(5),
+            snapshot_fingerprint: "fp_2".to_string(),
+            ..base
+        };
+        assert_eq!(classify_usage_snapshot(Some(&stale), &next), UsageSnapshotState::New);
     }
 }

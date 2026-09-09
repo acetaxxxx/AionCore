@@ -50,7 +50,7 @@ pub use service::{
 };
 pub use state::ConversationRouterState;
 pub use turn_journal::{
-    AttemptSummary, ContextAttributionRecord, ContextSource, CorrelationQuality, DiagnosticEventEnvelope,
+    classify_usage_snapshot, AttemptSummary, ContextAttributionRecord, ContextSource, CorrelationQuality, DiagnosticEventEnvelope,
     FilesystemTurnJournal, InMemoryTurnJournal, JournalError, PreTurnRecord, ProviderCorrelationRecord,
     ProviderUsageSnapshot, RawJournalEvent, StartupRecoveryOptions, TerminalOutcomeRecord,
     TerminalReconcileResult, TokenUsageRecord, TurnJournal, TurnTerminalStatus, UsageSnapshotState, digest_hex,
