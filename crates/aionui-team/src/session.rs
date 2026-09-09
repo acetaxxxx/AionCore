@@ -27,8 +27,8 @@ use crate::message_projection::{
     TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
 use crate::ports::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
-    SlashCommandRecognition,
+    AgentTurnAttribution, AgentTurnAttributionSource, AgentTurnCancellationPort, AgentTurnExecutionPort,
+    NativeSlashCommandPort, NoopNativeSlashCommandPort, SlashCommandRecognition,
 };
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
 use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
@@ -58,6 +58,10 @@ pub struct WakeInput {
     /// **not** yet marked as read — the caller must call
     /// `mailbox.mark_read_batch` after successful delivery.
     pub unread: Vec<crate::types::MailboxMessage>,
+    /// Source-only accounting for the material delivered in `first_message`.
+    /// Bodies are intentionally excluded; the conversation boundary persists
+    /// only these bounded identifiers and size estimates.
+    pub attributions: Vec<AgentTurnAttribution>,
     /// Role of the wake target.
     pub agent_role: TeammateRole,
 }
@@ -465,6 +469,66 @@ impl TeamSession {
                     (first_message, needs_role_prompt)
                 };
 
+                let attributions = if batch.is_command {
+                    Vec::new()
+                } else {
+                    let mailbox_chars = claimed_unread
+                        .iter()
+                        .map(|message| {
+                            message.content.chars().count()
+                                + message.summary.as_deref().map_or(0, |summary| summary.chars().count())
+                        })
+                        .sum::<usize>();
+                    let mailbox_bytes = claimed_unread
+                        .iter()
+                        .map(|message| {
+                            message.content.len() + message.summary.as_deref().map_or(0, str::len)
+                        })
+                        .sum::<usize>();
+                    let mut entries = vec![AgentTurnAttribution {
+                        source: AgentTurnAttributionSource::Mailbox,
+                        item_count: claimed_unread.len(),
+                        item_ids: claimed_unread.iter().map(|message| message.id.clone()).collect(),
+                        bytes: mailbox_bytes,
+                        chars: mailbox_chars,
+                        estimated_tokens: mailbox_chars.div_ceil(4),
+                        delivery_id: Some(batch.batch_id.clone()),
+                        delivery_kind: Some("team_wake".to_owned()),
+                        render_mode: Some("wake_payload".to_owned()),
+                        measurement_kind: Some("assembled".to_owned()),
+                        provenance_source: Some("team_session".to_owned()),
+                    }];
+                    if !tasks.is_empty() {
+                        let task_chars = tasks
+                            .iter()
+                            .map(|task| {
+                                task.subject.chars().count()
+                                + task.description.as_deref().map_or(0, |description| description.chars().count())
+                            })
+                            .sum::<usize>();
+                        let task_bytes = tasks
+                            .iter()
+                            .map(|task| {
+                                task.subject.len() + task.description.as_deref().map_or(0, str::len)
+                            })
+                            .sum::<usize>();
+                        entries.push(AgentTurnAttribution {
+                            source: AgentTurnAttributionSource::TaskSummary,
+                            item_count: tasks.len(),
+                            item_ids: tasks.iter().map(|task| task.id.clone()).collect(),
+                            bytes: task_bytes,
+                            chars: task_chars,
+                            estimated_tokens: task_chars.div_ceil(4),
+                            delivery_id: Some(batch.batch_id.clone()),
+                            delivery_kind: Some("team_wake".to_owned()),
+                            render_mode: Some("wake_payload".to_owned()),
+                            measurement_kind: Some("assembled".to_owned()),
+                            provenance_source: Some("team_session".to_owned()),
+                        });
+                    }
+                    entries
+                };
+
                 match dump_team_wake_prompt(
                     &self.prompt_dump,
                     TeamWakePromptDump {
@@ -498,6 +562,7 @@ impl TeamSession {
                         conversation_id: agent.conversation_id,
                         first_message,
                         unread: claimed_unread,
+                        attributions,
                         agent_role: agent.role,
                     },
                 })

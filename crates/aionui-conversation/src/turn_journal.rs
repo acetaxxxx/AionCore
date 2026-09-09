@@ -231,7 +231,7 @@ impl MidTurnRecord {
     }
 }
 
-pub(crate) fn digest_hex(bytes: &[u8]) -> String {
+pub fn digest_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }

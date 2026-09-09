@@ -42,7 +42,8 @@ pub use message_projection::{
 };
 pub use ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback, AgentTurnStatus, NativeSlashCommandPort,
+    AgentTurnAttribution, AgentTurnAttributionSource, AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback,
+    AgentTurnStatus, NativeSlashCommandPort,
     NoopNativeSlashCommandPort, SlashCatalogSource, SlashCommandRecognition, TeamAssistantCatalogEntry,
     TeamAssistantCatalogPort, TeamConversationBindingLookup, TeamConversationLookupPort, TeamToolCapabilityPort,
     UnknownTeamToolCapabilityPort,

@@ -512,7 +512,7 @@ impl ConversationService {
         Arc::clone(&self.turn_journal)
     }
 
-    pub(crate) async fn append_context_attribution(
+    pub async fn append_context_attribution(
         &self,
         record: &crate::turn_journal::ContextAttributionRecord,
     ) -> Result<(), crate::turn_journal::JournalError> {

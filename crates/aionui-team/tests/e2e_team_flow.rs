@@ -37,8 +37,9 @@ use aionui_realtime::EventBroadcaster;
 use aionui_team::event_loop::AgentLoopContext;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use aionui_team::ports::{
-    AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnSource, AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort, NoopNativeSlashCommandPort,
+    AgentTurnAttributionSource, AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort,
+    AgentTurnOutcome, AgentTurnRequest, AgentTurnSource, AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort,
+    NoopNativeSlashCommandPort,
     SlashCatalogSource, SlashCommandRecognition,
 };
 use aionui_team::service::TeamSessionService;
@@ -1636,6 +1637,14 @@ async fn turn_completion_reconciles_without_another_notify() {
             assert_eq!(unread_message_ids, vec![ack.message_id, user_ack.message_id]);
         }
     }
+    let mailbox_attribution = first
+        .attributions
+        .iter()
+        .find(|attribution| attribution.source == AgentTurnAttributionSource::Mailbox)
+        .expect("mailbox attribution must accompany a mailbox wake");
+    assert_eq!(mailbox_attribution.item_count, 2);
+    assert_eq!(mailbox_attribution.delivery_kind.as_deref(), Some("team_wake"));
+    assert_eq!(mailbox_attribution.render_mode.as_deref(), Some("wake_payload"));
 
     wait_until_turn_count(&turn_requests, 2).await;
     let second = turn_requests.lock().unwrap()[1].clone();
