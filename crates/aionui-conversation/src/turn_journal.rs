@@ -120,11 +120,29 @@ pub enum ContextSource {
     AionHistoryProjection,
     ProviderThreadHistory,
     TeamMailbox,
+    TaskSummary,
     Skills,
     Memory,
     UserInput,
     ToolResult,
     Unknown,
+}
+
+impl ContextSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::AionHistoryProjection => "aion_history_projection",
+            Self::ProviderThreadHistory => "provider_thread_history",
+            Self::TeamMailbox => "team_mailbox",
+            Self::TaskSummary => "task_summary",
+            Self::Skills => "skills",
+            Self::Memory => "memory",
+            Self::UserInput => "user_input",
+            Self::ToolResult => "tool_result",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Sanitized, source-level context size measurement for one provider context generation.
@@ -142,6 +160,22 @@ pub struct ContextAttributionRecord {
     pub item_ids: Vec<String>,
     pub item_hash: String,
     pub created_at_ms: u64,
+    /// Version of the attribution record fields. Missing values are legacy records.
+    #[serde(default)]
+    pub schema_version: Option<u16>,
+    /// Optional for backward-compatible reads of pre-versioned sidecars.
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub delivery_id: Option<String>,
+    #[serde(default)]
+    pub delivery_kind: Option<String>,
+    #[serde(default)]
+    pub render_mode: Option<String>,
+    #[serde(default)]
+    pub measurement_kind: Option<String>,
+    #[serde(default)]
+    pub provenance_source: Option<String>,
 }
 
 impl MidTurnRecord {
@@ -197,7 +231,7 @@ impl MidTurnRecord {
     }
 }
 
-pub(crate) fn digest_hex(bytes: &[u8]) -> String {
+pub fn digest_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -676,6 +710,7 @@ impl FilesystemTurnJournal {
         record: &ContextAttributionRecord,
     ) -> Result<(), JournalError> {
         validate_context_attribution_record(record)?;
+        let record = materialize_attribution_event_id(record);
         let turn_lock = self
             .get_turn_lock(&record.user_id, &record.conversation_id, &record.turn_id)
             .await;
@@ -700,11 +735,8 @@ impl FilesystemTurnJournal {
         }) {
             return Ok(());
         }
-        self.append_event_durable(
-            &file_path,
-            &RawJournalEvent::ContextAttribution { record: record.clone() },
-        )
-        .await
+        self.append_event_durable(&file_path, &RawJournalEvent::ContextAttribution { record })
+            .await
     }
 }
 
@@ -954,6 +986,7 @@ impl InMemoryTurnJournal {
         record: &ContextAttributionRecord,
     ) -> Result<(), JournalError> {
         validate_context_attribution_record(record)?;
+        let record = materialize_attribution_event_id(record);
         let canonical_key = (
             record.user_id.clone(),
             record.conversation_id.clone(),
@@ -977,9 +1010,33 @@ impl InMemoryTurnJournal {
         }) {
             return Ok(());
         }
-        entry.push(RawJournalEvent::ContextAttribution { record: record.clone() });
+        entry.push(RawJournalEvent::ContextAttribution { record });
         Ok(())
     }
+}
+
+fn materialize_attribution_event_id(record: &ContextAttributionRecord) -> ContextAttributionRecord {
+    if record.event_id.is_some() {
+        return record.clone();
+    }
+
+    let mut identity = String::new();
+    for part in [
+        record.user_id.as_str(),
+        record.conversation_id.as_str(),
+        record.turn_id.as_str(),
+        record.context_generation_id.as_str(),
+        record.source.as_str(),
+        record.item_hash.as_str(),
+        record.delivery_id.as_deref().unwrap_or_default(),
+    ] {
+        identity.push_str(part);
+        identity.push('\0');
+    }
+
+    let mut materialized = record.clone();
+    materialized.event_id = Some(format!("event_{}", &digest_hex(identity.as_bytes())[..24]));
+    materialized
 }
 
 fn validate_mid_turn_record(record: &MidTurnRecord) -> Result<(), JournalError> {
@@ -3082,6 +3139,13 @@ mod tests {
             item_ids: vec!["message_1".to_string(), "message_2".to_string()],
             item_hash: "hash_1".to_string(),
             created_at_ms: 2,
+            schema_version: Some(1),
+            event_id: None,
+            delivery_id: None,
+            delivery_kind: None,
+            render_mode: None,
+            measurement_kind: Some("assembled".to_string()),
+            provenance_source: Some("test".to_string()),
         };
 
         journal.append_context_attribution(&record).await.unwrap();
@@ -3107,7 +3171,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], RawJournalEvent::ContextAttribution { .. }));
+        assert!(matches!(
+            &events[0],
+            RawJournalEvent::ContextAttribution { record } if record.event_id.as_deref().is_some_and(|id| id.starts_with("event_"))
+        ));
         assert!(matches!(events[1], RawJournalEvent::ContextAttribution { .. }));
+    }
+
+    #[test]
+    fn context_attribution_supports_versioned_delivery_metadata() {
+        let record = ContextAttributionRecord {
+            user_id: "user_attr".to_string(),
+            conversation_id: "conv_attr".to_string(),
+            turn_id: "turn_attr".to_string(),
+            context_generation_id: "gen_1".to_string(),
+            source: ContextSource::TaskSummary,
+            item_count: 1,
+            bytes: 12,
+            chars: 12,
+            estimated_tokens: 3,
+            item_ids: vec!["task_1".to_string()],
+            item_hash: "hash_1".to_string(),
+            created_at_ms: 2,
+            schema_version: Some(1),
+            event_id: Some("event_1".to_string()),
+            delivery_id: Some("delivery_1".to_string()),
+            delivery_kind: Some("wake".to_string()),
+            render_mode: Some("full".to_string()),
+            measurement_kind: Some("delivered".to_string()),
+            provenance_source: Some("team_mailbox".to_string()),
+        };
+
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["event_id"], "event_1");
+        assert_eq!(value["source"], "task_summary");
+        assert_eq!(value["delivery_kind"], "wake");
+        assert_eq!(value["measurement_kind"], "delivered");
+    }
+
+    #[test]
+    fn context_attribution_reads_legacy_records_without_inventing_event_identity() {
+        let legacy = serde_json::json!({
+            "user_id": "user_attr",
+            "conversation_id": "conv_attr",
+            "turn_id": "turn_attr",
+            "context_generation_id": "gen_legacy",
+            "source": "user_input",
+            "item_count": 1,
+            "bytes": 4,
+            "chars": 4,
+            "estimated_tokens": 1,
+            "item_ids": ["message_1"],
+            "item_hash": "hash_legacy",
+            "created_at_ms": 2
+        });
+
+        let parsed: ContextAttributionRecord = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.schema_version.is_none());
+        assert!(parsed.event_id.is_none());
+        assert!(parsed.delivery_id.is_none());
     }
 }

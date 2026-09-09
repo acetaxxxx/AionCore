@@ -14,6 +14,7 @@ use crate::service::ConversationService;
 use crate::stream_persistence::{
     PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState,
 };
+use crate::turn_journal::{ContextAttributionRecord, ContextSource, TurnJournal};
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -177,6 +178,7 @@ pub struct StreamRelay {
     complete_turn: bool,
     defer_clean_terminal_errors: bool,
     superseding_tips: SupersedingTipTotals,
+    context_journal: Option<Arc<dyn TurnJournal>>,
 }
 
 impl StreamRelay {
@@ -210,6 +212,7 @@ impl StreamRelay {
             complete_turn: true,
             defer_clean_terminal_errors: false,
             superseding_tips: SupersedingTipTotals::default(),
+            context_journal: None,
         }
     }
 
@@ -250,6 +253,53 @@ impl StreamRelay {
     pub fn with_defer_clean_terminal_errors(mut self, enabled: bool) -> Self {
         self.defer_clean_terminal_errors = enabled;
         self
+    }
+
+    pub fn with_context_journal(mut self, journal: Arc<dyn TurnJournal>) -> Self {
+        self.context_journal = Some(journal);
+        self
+    }
+
+    /// Persist only bounded tool-event metadata. The serialized event is used
+    /// transiently to calculate size/hash and is never written to the journal.
+    async fn append_tool_attribution(&self, item_ids: Vec<String>, payload: &[u8]) {
+        let Some(journal) = &self.context_journal else {
+            return;
+        };
+        let digest = crate::turn_journal::digest_hex(payload);
+        let chars = String::from_utf8_lossy(payload).chars().count();
+        let item_ids = item_ids
+            .iter()
+            .map(|item_id| format!("tool_{}", &crate::turn_journal::digest_hex(item_id.as_bytes())[..24]))
+            .collect::<Vec<_>>();
+        let record = ContextAttributionRecord {
+            user_id: self.user_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            turn_id: self.turn_id.clone(),
+            context_generation_id: format!("{}-tool-{}", self.turn_id, &digest[..24]),
+            source: ContextSource::ToolResult,
+            item_count: item_ids.len(),
+            bytes: payload.len(),
+            chars,
+            estimated_tokens: chars.div_ceil(4),
+            item_ids,
+            item_hash: digest,
+            created_at_ms: now_ms().try_into().unwrap_or_default(),
+            schema_version: Some(1),
+            event_id: None,
+            delivery_id: Some(self.turn_id.clone()),
+            delivery_kind: Some("agent_stream_tool".to_owned()),
+            render_mode: Some("tool_event".to_owned()),
+            measurement_kind: Some("serialized_event".to_owned()),
+            provenance_source: Some("stream_relay".to_owned()),
+        };
+        if let Err(error) = journal.append_context_attribution(&record).await {
+            warn!(
+                turn_id = %self.turn_id,
+                error = %ErrorChain(&error),
+                "Failed to persist tool context attribution"
+            );
+        }
     }
 
     /// Run the relay loop. Consumes `self` and runs until the agent stream ends.
@@ -587,6 +637,9 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_tool_call(data).await;
+                            if let Ok(payload) = serde_json::to_vec(data) {
+                                self.append_tool_attribution(vec![data.call_id.clone()], &payload).await;
+                            }
                         }
                         AgentStreamEvent::AcpToolCall(data) => {
                             attempt.saw_tool_or_side_effect = true;
@@ -595,6 +648,10 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_acp_tool_call(data).await;
+                            if let Ok(payload) = serde_json::to_vec(data) {
+                                self.append_tool_attribution(vec![data.update.tool_call_id.clone()], &payload)
+                                    .await;
+                            }
                         }
                         AgentStreamEvent::ToolGroup(entries) => {
                             attempt.saw_tool_or_side_effect = true;
@@ -603,6 +660,13 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_tool_group(entries).await;
+                            if let Ok(payload) = serde_json::to_vec(entries) {
+                                let item_ids = entries
+                                    .iter()
+                                    .map(|entry| entry.call_id.clone())
+                                    .collect::<Vec<_>>();
+                                self.append_tool_attribution(item_ids, &payload).await;
+                            }
                         }
                         AgentStreamEvent::WorkflowProgress(data) if data.settle_only => {
                             // Update-only settle for a card this pump never
@@ -612,6 +676,9 @@ impl StreamRelay {
                             // ref that never had one.
                             if self.adapter.settle_tool_call_if_present(&data.card).await {
                                 self.forward_workflow_progress(data);
+                                if let Ok(payload) = serde_json::to_vec(data) {
+                                    self.append_tool_attribution(vec![data.card.call_id.clone()], &payload).await;
+                                }
                             }
                         }
                         AgentStreamEvent::WorkflowProgress(data) => {
@@ -631,6 +698,11 @@ impl StreamRelay {
                             self.adapter.persist_tool_call(&data.card).await;
                             if !data.agents.is_empty() {
                                 self.adapter.persist_tool_group(&data.agents).await;
+                            }
+                            if let Ok(payload) = serde_json::to_vec(data) {
+                                let mut item_ids = vec![data.card.call_id.clone()];
+                                item_ids.extend(data.agents.iter().map(|entry| entry.call_id.clone()));
+                                self.append_tool_attribution(item_ids, &payload).await;
                             }
                         }
                         AgentStreamEvent::Tips(data) => {
@@ -2578,6 +2650,54 @@ mod tests {
     }
 
     // ── Tool persistence tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn tool_attribution_records_metadata_without_tool_body() {
+        use crate::turn_journal::{InMemoryTurnJournal, PreTurnRecord, RawJournalEvent};
+
+        let journal = Arc::new(InMemoryTurnJournal::new());
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user-1",
+                conversation_id: "conv-1",
+                turn_id: "turn-1",
+                parent_turn_id: None,
+                user_message: "wake",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            bus,
+        )
+        .with_context_journal(journal.clone());
+
+        relay
+            .append_tool_attribution(vec!["tool/call with body".into()], br#"{"output":"secret"}"#)
+            .await;
+
+        let events = journal.get_turn_events("user-1", "conv-1", "turn-1").await;
+        let RawJournalEvent::ContextAttribution { record } = events
+            .iter()
+            .find(|event| matches!(event, RawJournalEvent::ContextAttribution { .. }))
+            .expect("tool attribution must be journaled")
+        else {
+            unreachable!();
+        };
+        assert_eq!(record.source, ContextSource::ToolResult);
+        assert_eq!(record.bytes, br#"{"output":"secret"}"#.len());
+        assert!(record.item_ids[0].starts_with("tool_"));
+        assert_eq!(record.delivery_kind.as_deref(), Some("agent_stream_tool"));
+        assert_eq!(record.render_mode.as_deref(), Some("tool_event"));
+    }
 
     /// A plan snapshot must reach the DB, not just the WebSocket: a turn that
     /// keeps running in the background has to rehydrate its plan bar when the

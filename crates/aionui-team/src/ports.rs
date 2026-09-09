@@ -169,6 +169,33 @@ pub enum AgentTurnSource {
     },
 }
 
+/// Source-only accounting carried across the Team → Conversation boundary.
+///
+/// This deliberately contains no source body. It lets the conversation journal
+/// distinguish mailbox/task/tool-shaped deliveries without coupling Team to the
+/// journal implementation or persisting sensitive prompt text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTurnAttributionSource {
+    Mailbox,
+    TaskSummary,
+    ToolResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTurnAttribution {
+    pub source: AgentTurnAttributionSource,
+    pub item_count: usize,
+    pub item_ids: Vec<String>,
+    pub bytes: usize,
+    pub chars: usize,
+    pub estimated_tokens: usize,
+    pub delivery_id: Option<String>,
+    pub delivery_kind: Option<String>,
+    pub render_mode: Option<String>,
+    pub measurement_kind: Option<String>,
+    pub provenance_source: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AgentTurnRequest {
     pub team_run_id: Option<String>,
@@ -180,6 +207,7 @@ pub struct AgentTurnRequest {
     pub content: String,
     pub files: Vec<String>,
     pub source: AgentTurnSource,
+    pub attributions: Vec<AgentTurnAttribution>,
     pub on_started: Option<AgentTurnStartedCallback>,
 }
 
@@ -194,6 +222,7 @@ impl fmt::Debug for AgentTurnRequest {
             .field("user_id", &self.user_id)
             .field("files", &self.files)
             .field("source", &self.source)
+            .field("attributions", &self.attributions)
             .field("has_on_started", &self.on_started.is_some())
             .finish_non_exhaustive()
     }

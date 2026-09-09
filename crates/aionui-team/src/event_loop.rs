@@ -292,6 +292,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             unread_count: unread_message_ids.len(),
             unread_message_ids,
         },
+        attributions: input.attributions,
         on_started: Some(on_started),
     };
 
