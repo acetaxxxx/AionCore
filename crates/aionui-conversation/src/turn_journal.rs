@@ -264,6 +264,17 @@ pub fn classify_usage_snapshot(
     UsageSnapshotState::New
 }
 
+/// Returns a cumulative input delta only when both totals share a monotonic
+/// baseline. A reset/regression is deliberately represented as `None`.
+pub fn cumulative_input_delta(
+    previous: Option<&ProviderUsageSnapshot>,
+    current: &ProviderUsageSnapshot,
+) -> Option<u64> {
+    let previous_total = previous?.total_input_tokens?;
+    let current_total = current.total_input_tokens?;
+    current_total.checked_sub(previous_total)
+}
+
 impl MidTurnRecord {
     /// Derive stable identity from the complete event identity and payload.
     ///
@@ -3617,5 +3628,47 @@ mod tests {
             ..base
         };
         assert_eq!(classify_usage_snapshot(Some(&stale), &next), UsageSnapshotState::New);
+    }
+
+    #[test]
+    fn cumulative_input_delta_requires_a_monotonic_total_baseline() {
+        let previous = ProviderUsageSnapshot {
+            usage_event_id: "usage_prev".to_string(),
+            provider_thread_id: None,
+            provider_turn_id: None,
+            sequence: Some(1),
+            timestamp_ms: 1,
+            last_input_tokens: Some(100),
+            last_cached_input_tokens: None,
+            last_output_tokens: None,
+            last_reasoning_output_tokens: None,
+            total_input_tokens: Some(1000),
+            total_cached_input_tokens: None,
+            total_output_tokens: None,
+            model_context_window: None,
+            snapshot_fingerprint: "prev".to_string(),
+            state: UsageSnapshotState::New,
+        };
+        let next = ProviderUsageSnapshot {
+            usage_event_id: "usage_next".to_string(),
+            sequence: Some(2),
+            timestamp_ms: 2,
+            total_input_tokens: Some(1300),
+            snapshot_fingerprint: "next".to_string(),
+            ..previous.clone()
+        };
+        assert_eq!(cumulative_input_delta(Some(&previous), &next), Some(300));
+
+        let reset = ProviderUsageSnapshot {
+            total_input_tokens: Some(20),
+            ..next.clone()
+        };
+        assert_eq!(cumulative_input_delta(Some(&next), &reset), None);
+
+        let unknown = ProviderUsageSnapshot {
+            total_input_tokens: None,
+            ..next
+        };
+        assert_eq!(cumulative_input_delta(Some(&previous), &unknown), None);
     }
 }
