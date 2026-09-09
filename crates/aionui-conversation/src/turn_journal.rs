@@ -519,6 +519,17 @@ impl FilesystemTurnJournal {
             .join(format!("{turn_id}_attribution.jsonl")))
     }
 
+    fn get_diagnostics_file_path(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<PathBuf, JournalError> {
+        validate_identifier(turn_id, "turn_id")?;
+        let raw_dir = self.get_conversation_raw_dir(user_id, conversation_id)?;
+        Ok(raw_dir.join(format!("{turn_id}_diagnostics.jsonl")))
+    }
+
     /// Reads turn events applying deterministic partial-tail recovery.
     ///
     /// Partial-Tail Policy:
@@ -750,6 +761,56 @@ impl FilesystemTurnJournal {
         }
         self.append_event_durable(&file_path, &RawJournalEvent::ContextAttribution { record })
             .await
+    }
+
+    /// Appends a versioned diagnostic envelope without touching lifecycle or
+    /// attribution sidecars. This is intentionally additive for legacy readers.
+    pub(crate) async fn append_diagnostic_event<T: Serialize>(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<T>,
+    ) -> Result<(), JournalError> {
+        validate_identifier(user_id, "user_id")?;
+        validate_identifier(conversation_id, "conversation_id")?;
+        validate_identifier(turn_id, "turn_id")?;
+        validate_identifier(&envelope.event_id, "event_id")?;
+        validate_identifier(&envelope.event_type, "event_type")?;
+        if envelope.schema_version == 0 {
+            return Err(JournalError::InvalidIdentifier {
+                reason: "diagnostic schema_version must be greater than zero".to_string(),
+            });
+        }
+
+        let turn_lock = self.get_turn_lock(user_id, conversation_id, turn_id).await;
+        let _guard = turn_lock.lock().await;
+        let raw_path = self.get_turn_file_path(user_id, conversation_id, turn_id)?;
+        let raw_events = Self::read_and_sanitize_turn_events(&raw_path).await?;
+        if !raw_events
+            .iter()
+            .any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
+        {
+            return Err(JournalError::MissingPreExecution {
+                turn_id: turn_id.to_string(),
+            });
+        }
+
+        let path = self.get_diagnostics_file_path(user_id, conversation_id, turn_id)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut line = serde_json::to_vec(envelope)?;
+        line.push(b'\n');
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        file.write_all(&line).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok(())
     }
 }
 
@@ -3259,5 +3320,46 @@ mod tests {
         assert_eq!(value["event_id"], "evt_1");
         assert_eq!(value["event_type"], "context_attribution");
         assert_eq!(value["record"]["source"], "memory");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_event_is_appended_to_an_isolated_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FilesystemTurnJournal::new(temp.path());
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user_diag",
+                conversation_id: "conv_diag",
+                turn_id: "turn_diag",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        journal
+            .append_diagnostic_event(
+                "user_diag",
+                "conv_diag",
+                "turn_diag",
+                &DiagnosticEventEnvelope {
+                    schema_version: 1,
+                    event_id: "evt_diag_1".to_string(),
+                    event_type: "context_generation".to_string(),
+                    record: serde_json::json!({"attempt_id": "turn_diag-att-1"}),
+                },
+            )
+            .await
+            .unwrap();
+
+        let path = temp
+            .path()
+            .join("users/user_diag/events/raw/conv_diag/turn_diag_diagnostics.jsonl");
+        let content = tokio::fs::read_to_string(path).await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(value["event_id"], "evt_diag_1");
+        assert_eq!(value["event_type"], "context_generation");
     }
 }
