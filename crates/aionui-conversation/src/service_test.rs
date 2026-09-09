@@ -10022,6 +10022,16 @@ mod session_mentions_integration {
         ) -> Result<(), crate::turn_journal::JournalError> {
             Ok(())
         }
+
+        async fn append_diagnostic_event(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _turn_id: &str,
+            _envelope: &crate::turn_journal::DiagnosticEventEnvelope<serde_json::Value>,
+        ) -> Result<(), crate::turn_journal::JournalError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

@@ -534,6 +534,16 @@ pub trait TurnJournal: Send + Sync {
 
     /// Appends sanitized source-level context attribution for one generation.
     async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError>;
+
+    /// Appends an additive, versioned diagnostics record without changing
+    /// lifecycle, retry, or mailbox semantics.
+    async fn append_diagnostic_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<serde_json::Value>,
+    ) -> Result<(), JournalError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +557,7 @@ pub type FaultInjector = Arc<dyn Fn(&Path, usize, &str, &RawJournalEvent) -> Opt
 type CanonicalTurnKey = (String, String, String);
 type TurnLocks = Arc<RwLock<HashMap<CanonicalTurnKey, Arc<Mutex<()>>>>>;
 type TurnEvents = Arc<RwLock<HashMap<CanonicalTurnKey, Vec<RawJournalEvent>>>>;
+type DiagnosticEvents = Arc<RwLock<HashMap<CanonicalTurnKey, Vec<DiagnosticEventEnvelope<serde_json::Value>>>>>;
 
 /// Production filesystem-backed implementation of [`TurnJournal`].
 ///
@@ -1123,6 +1134,16 @@ impl TurnJournal for FilesystemTurnJournal {
     async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError> {
         FilesystemTurnJournal::append_context_attribution(self, record).await
     }
+
+    async fn append_diagnostic_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<serde_json::Value>,
+    ) -> Result<(), JournalError> {
+        FilesystemTurnJournal::append_diagnostic_event(self, user_id, conversation_id, turn_id, envelope).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,6 +1156,7 @@ impl TurnJournal for FilesystemTurnJournal {
 #[derive(Default, Clone)]
 pub struct InMemoryTurnJournal {
     events: TurnEvents,
+    diagnostics: DiagnosticEvents,
 }
 
 impl InMemoryTurnJournal {
@@ -1216,6 +1238,45 @@ impl InMemoryTurnJournal {
             return Ok(());
         }
         entry.push(RawJournalEvent::ContextAttribution { record });
+        Ok(())
+    }
+
+    pub(crate) async fn append_diagnostic_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<serde_json::Value>,
+    ) -> Result<(), JournalError> {
+        validate_identifier(user_id, "user_id")?;
+        validate_identifier(conversation_id, "conversation_id")?;
+        validate_identifier(turn_id, "turn_id")?;
+        validate_identifier(&envelope.event_id, "event_id")?;
+        validate_identifier(&envelope.event_type, "event_type")?;
+        if envelope.schema_version == 0 {
+            return Err(JournalError::InvalidIdentifier {
+                reason: "diagnostic schema_version must be greater than zero".to_string(),
+            });
+        }
+        let key = (user_id.to_string(), conversation_id.to_string(), turn_id.to_string());
+        if !self.events.read().await.get(&key).is_some_and(|events| {
+            events.iter().any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
+        }) {
+            return Err(JournalError::MissingPreExecution {
+                turn_id: turn_id.to_string(),
+            });
+        }
+        let mut diagnostics = self.diagnostics.write().await;
+        let events = diagnostics.entry(key).or_default();
+        if let Some(existing) = events.iter().find(|existing| existing.event_id == envelope.event_id) {
+            if existing == envelope {
+                return Ok(());
+            }
+            return Err(JournalError::InvalidIdentifier {
+                reason: format!("diagnostic event_id {} has a conflicting payload", envelope.event_id),
+            });
+        }
+        events.push(envelope.clone());
         Ok(())
     }
 }
@@ -1473,6 +1534,16 @@ impl TurnJournal for InMemoryTurnJournal {
 
     async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError> {
         InMemoryTurnJournal::append_context_attribution(self, record).await
+    }
+
+    async fn append_diagnostic_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<serde_json::Value>,
+    ) -> Result<(), JournalError> {
+        InMemoryTurnJournal::append_diagnostic_event(self, user_id, conversation_id, turn_id, envelope).await
     }
 }
 
@@ -3575,6 +3646,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("conflicting payload"));
+    }
+
+    #[tokio::test]
+    async fn turn_journal_trait_appends_diagnostic_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal: Arc<dyn TurnJournal> = Arc::new(FilesystemTurnJournal::new(temp.path()));
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user_diag_trait",
+                conversation_id: "conv_diag_trait",
+                turn_id: "turn_diag_trait",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        journal
+            .append_diagnostic_event(
+                "user_diag_trait",
+                "conv_diag_trait",
+                "turn_diag_trait",
+                &DiagnosticEventEnvelope {
+                    schema_version: 1,
+                    event_id: "evt_diag_trait".to_string(),
+                    event_type: "context_generation".to_string(),
+                    record: serde_json::json!({"attempt_id": "turn_diag_trait-att-1"}),
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[test]
