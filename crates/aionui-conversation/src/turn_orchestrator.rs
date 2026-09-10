@@ -527,6 +527,24 @@ impl ConversationTurnOrchestrator {
             // handing the request to the provider adapter. This is metadata-only
             // and deliberately does not alter the message sent to the agent.
             let context_generation_id = format!("{turn_id}-att-{attempt_number}");
+            let context_generation_event = crate::turn_journal::DiagnosticEventEnvelope {
+                schema_version: 1,
+                event_id: format!("{context_generation_id}:context_generation"),
+                event_type: "context_generation".to_string(),
+                record: serde_json::json!({
+                    "attempt_id": attempt_id.as_str(),
+                    "context_generation_id": context_generation_id.as_str(),
+                    "assembly_status": "started",
+                    "delivery_reason": if replayed { "retry" } else { "initial" },
+                }),
+            };
+            if let Err(error) = self
+                .service
+                .append_diagnostic_event(&input.user_id, &conv_id, &turn_id, &context_generation_event)
+                .await
+            {
+                warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist context-generation diagnostic");
+            }
             let user_bytes = raw_user_message.len();
             let user_chars = raw_user_message.chars().count();
             let user_record = crate::turn_journal::ContextAttributionRecord {

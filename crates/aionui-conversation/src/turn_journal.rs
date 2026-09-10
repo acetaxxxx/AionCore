@@ -1273,7 +1273,9 @@ impl InMemoryTurnJournal {
         }
         let key = (user_id.to_string(), conversation_id.to_string(), turn_id.to_string());
         if !self.events.read().await.get(&key).is_some_and(|events| {
-            events.iter().any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
+            events
+                .iter()
+                .any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
         }) {
             return Err(JournalError::MissingPreExecution {
                 turn_id: turn_id.to_string(),
@@ -3760,7 +3762,10 @@ mod tests {
             state: UsageSnapshotState::New,
         };
         assert_eq!(classify_usage_snapshot(None, &base), UsageSnapshotState::New);
-        assert_eq!(classify_usage_snapshot(Some(&base), &base), UsageSnapshotState::Duplicate);
+        assert_eq!(
+            classify_usage_snapshot(Some(&base), &base),
+            UsageSnapshotState::Duplicate
+        );
 
         let stale = ProviderUsageSnapshot {
             usage_event_id: "usage_0".to_string(),

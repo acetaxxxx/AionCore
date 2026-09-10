@@ -281,6 +281,24 @@ async fn public_owner_send_records_final_assistant_text_in_exactly_one_terminal_
         )
         .await
         .unwrap();
+    let diagnostics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let diagnostics = journal
+                .get_diagnostic_events("system_default_user", "owner-conv", &response.turn_id)
+                .await;
+            if !diagnostics.is_empty() {
+                break diagnostics;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("owner turn should record a context-generation diagnostic");
+    assert_eq!(diagnostics[0].event_type, "context_generation");
+    assert_eq!(
+        diagnostics[0].record["attempt_id"],
+        format!("{}-att-1", response.turn_id)
+    );
     let events = wait_for_events(&journal, "system_default_user", "owner-conv", &response.turn_id).await;
     assert_eq!(
         events
