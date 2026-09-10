@@ -258,6 +258,7 @@ async fn public_owner_send_records_final_assistant_text_in_exactly_one_terminal_
     let agent = Arc::new(ScriptedAgent::new(
         "owner-conv",
         vec![vec![
+            AgentStreamEvent::BackendTurnBound("provider-turn-123".into()),
             AgentStreamEvent::Text(TextEventData {
                 content: "owner final reply".into(),
             }),
@@ -281,25 +282,21 @@ async fn public_owner_send_records_final_assistant_text_in_exactly_one_terminal_
         )
         .await
         .unwrap();
-    let diagnostics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let diagnostics = journal
-                .get_diagnostic_events("system_default_user", "owner-conv", &response.turn_id)
-                .await;
-            if !diagnostics.is_empty() {
-                break diagnostics;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("owner turn should record a context-generation diagnostic");
+    let events = wait_for_events(&journal, "system_default_user", "owner-conv", &response.turn_id).await;
+    let diagnostics = journal
+        .get_diagnostic_events("system_default_user", "owner-conv", &response.turn_id)
+        .await;
     assert_eq!(diagnostics[0].event_type, "context_generation");
     assert_eq!(
         diagnostics[0].record["attempt_id"],
         format!("{}-att-1", response.turn_id)
     );
-    let events = wait_for_events(&journal, "system_default_user", "owner-conv", &response.turn_id).await;
+    let provider_correlation = diagnostics
+        .iter()
+        .find(|event| event.event_type == "provider_correlation")
+        .unwrap_or_else(|| panic!("provider turn binding was not recorded: {diagnostics:#?}"));
+    assert_eq!(provider_correlation.record["provider_turn_id"], "provider-turn-123");
+    assert_eq!(provider_correlation.record["correlation_quality"], "exact");
     assert_eq!(
         events
             .iter()

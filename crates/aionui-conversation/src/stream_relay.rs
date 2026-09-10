@@ -179,6 +179,15 @@ pub struct StreamRelay {
     defer_clean_terminal_errors: bool,
     superseding_tips: SupersedingTipTotals,
     context_journal: Option<Arc<dyn TurnJournal>>,
+    diagnostic_correlation: Option<RelayDiagnosticCorrelation>,
+}
+
+#[derive(Clone)]
+struct RelayDiagnosticCorrelation {
+    service: ConversationService,
+    attempt_id: String,
+    context_generation_id: String,
+    backend_kind: String,
 }
 
 impl StreamRelay {
@@ -213,6 +222,7 @@ impl StreamRelay {
             defer_clean_terminal_errors: false,
             superseding_tips: SupersedingTipTotals::default(),
             context_journal: None,
+            diagnostic_correlation: None,
         }
     }
 
@@ -300,6 +310,24 @@ impl StreamRelay {
                 "Failed to persist tool context attribution"
             );
         }
+    }
+
+    /// Enables append-only diagnostics for an attempt created by the turn
+    /// orchestrator. Standalone relays deliberately leave this unset.
+    pub(crate) fn with_diagnostic_correlation(
+        mut self,
+        service: ConversationService,
+        attempt_id: String,
+        context_generation_id: String,
+        backend_kind: String,
+    ) -> Self {
+        self.diagnostic_correlation = Some(RelayDiagnosticCorrelation {
+            service,
+            attempt_id,
+            context_generation_id,
+            backend_kind,
+        });
+        self
     }
 
     /// Run the relay loop. Consumes `self` and runs until the agent stream ends.
@@ -449,6 +477,7 @@ impl StreamRelay {
                             // lookup key. Never forwarded to the WS, never persisted as an
                             // event itself.
                             self.adapter.set_backend_turn_id(backend_turn_id.clone());
+                            self.record_provider_turn_binding(backend_turn_id).await;
                         }
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
@@ -1070,6 +1099,56 @@ impl StreamRelay {
             "hidden": hidden,
             "replace": true,
         }));
+    }
+
+    async fn record_provider_turn_binding(&self, provider_turn_id: &str) {
+        let Some(correlation) = &self.diagnostic_correlation else {
+            return;
+        };
+
+        let record = crate::turn_journal::ProviderCorrelationRecord {
+            conversation_id: self.conversation_id.clone(),
+            aion_turn_id: self.turn_id.clone(),
+            attempt_id: correlation.attempt_id.clone(),
+            context_generation_id: Some(correlation.context_generation_id.clone()),
+            backend_kind: correlation.backend_kind.clone(),
+            backend_version: None,
+            session_epoch: None,
+            provider_thread_id: None,
+            provider_turn_id: Some(provider_turn_id.to_string()),
+            correlation_quality: crate::turn_journal::CorrelationQuality::Exact,
+        };
+        let event = crate::turn_journal::DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: format!(
+                "{}:provider_turn:{}",
+                correlation.context_generation_id,
+                crate::turn_journal::digest_hex(provider_turn_id.as_bytes())
+            ),
+            event_type: "provider_correlation".to_string(),
+            record: match serde_json::to_value(record) {
+                Ok(record) => record,
+                Err(error) => {
+                    warn!(
+                        turn_id = %self.turn_id,
+                        error = %ErrorChain(&error),
+                        "Failed to serialize provider-correlation diagnostic"
+                    );
+                    return;
+                }
+            },
+        };
+        if let Err(error) = correlation
+            .service
+            .append_diagnostic_event(&self.user_id, &self.conversation_id, &self.turn_id, &event)
+            .await
+        {
+            warn!(
+                turn_id = %self.turn_id,
+                error = %ErrorChain(&error),
+                "Failed to persist provider-correlation diagnostic"
+            );
+        }
     }
 
     fn send_system_responses(&self, responses: &[String]) {

@@ -69,6 +69,8 @@ struct TurnAttemptInput {
     conv_id: String,
     turn_id: String,
     user_id: String,
+    attempt_id: String,
+    context_generation_id: String,
     build_options: BuildTaskOptions,
     stored_workspace: String,
     send: SendMessageData,
@@ -264,6 +266,12 @@ impl ConversationTurnOrchestrator {
             .with_runtime_state(Arc::clone(&runtime_state))
             .with_persistence(persistence.clone())
             .with_context_journal(self.service.turn_journal())
+            .with_diagnostic_correlation(
+                self.service.clone(),
+                input.attempt_id.clone(),
+                input.context_generation_id.clone(),
+                backend.clone().unwrap_or_else(|| "unknown".to_string()),
+            )
             .with_turn_completion(false)
             .with_defer_clean_terminal_errors(defer_clean_terminal_errors)
             // A replay spawns a fresh CLI whose own retry counter starts at one,
@@ -577,7 +585,7 @@ impl ConversationTurnOrchestrator {
                     user_id: input.user_id.clone(),
                     conversation_id: conv_id.clone(),
                     turn_id: turn_id.clone(),
-                    context_generation_id,
+                    context_generation_id: context_generation_id.clone(),
                     source: crate::turn_journal::ContextSource::Memory,
                     item_count: 1,
                     bytes: memory_context.len(),
@@ -632,6 +640,8 @@ impl ConversationTurnOrchestrator {
                     conv_id: conv_id.clone(),
                     turn_id: turn_id.clone(),
                     user_id: input.user_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    context_generation_id: context_generation_id.clone(),
                     build_options: input.build_options.clone(),
                     stored_workspace: input.stored_workspace.clone(),
                     send: initial_send.clone(),
