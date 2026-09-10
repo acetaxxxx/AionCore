@@ -3521,6 +3521,7 @@ mod tests {
         assert!(parsed.schema_version.is_none());
         assert!(parsed.event_id.is_none());
         assert!(parsed.delivery_id.is_none());
+    }
 
     #[test]
     fn diagnostic_event_envelope_is_versioned_and_machine_readable() {
