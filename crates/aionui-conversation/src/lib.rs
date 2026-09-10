@@ -52,7 +52,7 @@ pub use state::ConversationRouterState;
 pub use turn_journal::{
     classify_usage_snapshot, cumulative_input_delta, AttemptSummary, ContextAttributionRecord, ContextSource, CorrelationQuality, DiagnosticEventEnvelope,
     FilesystemTurnJournal, InMemoryTurnJournal, JournalError, PreTurnRecord, ProviderCorrelationRecord,
-    ProviderUsageSnapshot, RawJournalEvent, StartupRecoveryOptions, TerminalOutcomeRecord,
+    ProviderErrorRecord, ProviderFailureCategory, ProviderUsageSnapshot, RawJournalEvent, StartupRecoveryOptions, TerminalOutcomeRecord,
     TerminalReconcileResult, TokenUsageRecord, TurnJournal, TurnTerminalStatus, UsageSnapshotState, digest_hex,
     validate_identifier,
 };

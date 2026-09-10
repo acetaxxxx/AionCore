@@ -275,6 +275,39 @@ pub fn cumulative_input_delta(
     current_total.checked_sub(previous_total)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureCategory {
+    ProviderUsageLimit,
+    ProviderAuth,
+    ProviderTimeout,
+    ContextLimit,
+    Cancelled,
+    ToolError,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderErrorRecord {
+    pub event_id: String,
+    pub provider_thread_id: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub aion_turn_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub timestamp_ms: u64,
+    pub provider_error_code: Option<String>,
+    pub provider_error_message: Option<String>,
+    pub will_retry: Option<bool>,
+    pub failure_category: ProviderFailureCategory,
+    pub rate_limit_plan: Option<String>,
+    pub primary_used_percent: Option<f64>,
+    pub secondary_used_percent: Option<f64>,
+    pub reset_epoch: Option<u64>,
+    pub reset_display_text: Option<String>,
+    pub credits_available: Option<f64>,
+    pub credits_balance: Option<f64>,
+}
+
 impl MidTurnRecord {
     /// Derive stable identity from the complete event identity and payload.
     ///
@@ -3670,5 +3703,33 @@ mod tests {
             ..next
         };
         assert_eq!(cumulative_input_delta(Some(&previous), &unknown), None);
+    }
+
+    #[test]
+    fn provider_error_record_preserves_rate_limit_metadata_and_category() {
+        let error = ProviderErrorRecord {
+            event_id: "err_1".to_string(),
+            provider_thread_id: Some("thread_1".to_string()),
+            provider_turn_id: None,
+            aion_turn_id: Some("turn_1".to_string()),
+            attempt_id: Some("turn_1-att-1".to_string()),
+            timestamp_ms: 42,
+            provider_error_code: Some("usageLimitExceeded".to_string()),
+            provider_error_message: Some("limit reached".to_string()),
+            will_retry: Some(false),
+            failure_category: ProviderFailureCategory::ProviderUsageLimit,
+            rate_limit_plan: Some("pro".to_string()),
+            primary_used_percent: Some(100.0),
+            secondary_used_percent: None,
+            reset_epoch: Some(1_700_000_000),
+            reset_display_text: Some("in 1h".to_string()),
+            credits_available: None,
+            credits_balance: Some(0.0),
+        };
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["failure_category"], "provider_usage_limit");
+        assert_eq!(value["will_retry"], false);
+        assert_eq!(value["reset_epoch"], 1_700_000_000u64);
+        assert!(value["secondary_used_percent"].is_null());
     }
 }
