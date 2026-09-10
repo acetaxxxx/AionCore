@@ -179,6 +179,15 @@ pub struct StreamRelay {
     defer_clean_terminal_errors: bool,
     superseding_tips: SupersedingTipTotals,
     context_journal: Option<Arc<dyn TurnJournal>>,
+    diagnostic_correlation: Option<RelayDiagnosticCorrelation>,
+}
+
+#[derive(Clone)]
+struct RelayDiagnosticCorrelation {
+    service: ConversationService,
+    attempt_id: String,
+    context_generation_id: String,
+    backend_kind: String,
 }
 
 impl StreamRelay {
@@ -213,6 +222,7 @@ impl StreamRelay {
             defer_clean_terminal_errors: false,
             superseding_tips: SupersedingTipTotals::default(),
             context_journal: None,
+            diagnostic_correlation: None,
         }
     }
 
@@ -302,6 +312,24 @@ impl StreamRelay {
         }
     }
 
+    /// Enables append-only diagnostics for an attempt created by the turn
+    /// orchestrator. Standalone relays deliberately leave this unset.
+    pub(crate) fn with_diagnostic_correlation(
+        mut self,
+        service: ConversationService,
+        attempt_id: String,
+        context_generation_id: String,
+        backend_kind: String,
+    ) -> Self {
+        self.diagnostic_correlation = Some(RelayDiagnosticCorrelation {
+            service,
+            attempt_id,
+            context_generation_id,
+            backend_kind,
+        });
+        self
+    }
+
     /// Run the relay loop. Consumes `self` and runs until the agent stream ends.
     #[tracing::instrument(
         skip_all,
@@ -358,6 +386,8 @@ impl StreamRelay {
         let mut send_error_done = send_error_rx.is_none();
         let mut pending_send_error: Option<AgentSendError> = None;
         let mut attempt = TurnAttemptSummary::default();
+        let mut usage_sequence = 0_u64;
+        let mut previous_usage = None;
 
         loop {
             let recv_result = if send_error_done {
@@ -449,6 +479,16 @@ impl StreamRelay {
                             // lookup key. Never forwarded to the WS, never persisted as an
                             // event itself.
                             self.adapter.set_backend_turn_id(backend_turn_id.clone());
+                            self.record_provider_turn_binding(backend_turn_id).await;
+                        }
+                        AgentStreamEvent::AcpContextUsage(raw_usage) => {
+                            usage_sequence += 1;
+                            if let Some(snapshot) = self
+                                .record_provider_usage(raw_usage, usage_sequence, previous_usage.as_ref())
+                                .await
+                            {
+                                previous_usage = Some(snapshot);
+                            }
                         }
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
@@ -1070,6 +1110,110 @@ impl StreamRelay {
             "hidden": hidden,
             "replace": true,
         }));
+    }
+
+    async fn record_provider_usage(
+        &self,
+        raw_usage: &serde_json::Value,
+        sequence: u64,
+        previous: Option<&crate::turn_journal::ProviderUsageSnapshot>,
+    ) -> Option<crate::turn_journal::ProviderUsageSnapshot> {
+        let correlation = self.diagnostic_correlation.as_ref()?;
+        let meta = raw_usage.get("_meta").and_then(serde_json::Value::as_object);
+        let number = |key: &str| {
+            meta.and_then(|fields| fields.get(key))
+                .and_then(serde_json::Value::as_u64)
+        };
+        let serialized = match serde_json::to_vec(raw_usage) {
+            Ok(serialized) => serialized,
+            Err(error) => {
+                warn!(turn_id = %self.turn_id, error = %ErrorChain(&error), "Failed to serialize provider usage snapshot");
+                return None;
+            }
+        };
+        let mut snapshot = crate::turn_journal::ProviderUsageSnapshot {
+            usage_event_id: format!("{}:usage:{sequence}", correlation.context_generation_id),
+            provider_thread_id: None,
+            provider_turn_id: self.adapter.current_backend_turn_id(),
+            sequence: Some(sequence),
+            timestamp_ms: now_ms().max(0) as u64,
+            last_input_tokens: number("input_tokens"),
+            last_cached_input_tokens: number("cached_read_tokens"),
+            last_output_tokens: number("output_tokens"),
+            last_reasoning_output_tokens: number("reasoning_output_tokens"),
+            total_input_tokens: None,
+            total_cached_input_tokens: None,
+            total_output_tokens: None,
+            model_context_window: raw_usage.get("size").and_then(serde_json::Value::as_u64),
+            snapshot_fingerprint: crate::turn_journal::digest_hex(&serialized),
+            state: crate::turn_journal::UsageSnapshotState::New,
+        };
+        snapshot.state = crate::turn_journal::classify_usage_snapshot(previous, &snapshot);
+        let event = crate::turn_journal::DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: snapshot.usage_event_id.clone(),
+            event_type: "provider_usage".to_string(),
+            record: json!({ "snapshot": snapshot.clone() }),
+        };
+        if let Err(error) = correlation
+            .service
+            .append_diagnostic_event(&self.user_id, &self.conversation_id, &self.turn_id, &event)
+            .await
+        {
+            warn!(turn_id = %self.turn_id, error = %ErrorChain(&error), "Failed to persist provider-usage diagnostic");
+            return None;
+        }
+        Some(snapshot)
+    }
+
+    async fn record_provider_turn_binding(&self, provider_turn_id: &str) {
+        let Some(correlation) = &self.diagnostic_correlation else {
+            return;
+        };
+
+        let record = crate::turn_journal::ProviderCorrelationRecord {
+            conversation_id: self.conversation_id.clone(),
+            aion_turn_id: self.turn_id.clone(),
+            attempt_id: correlation.attempt_id.clone(),
+            context_generation_id: Some(correlation.context_generation_id.clone()),
+            backend_kind: correlation.backend_kind.clone(),
+            backend_version: None,
+            session_epoch: None,
+            provider_thread_id: None,
+            provider_turn_id: Some(provider_turn_id.to_string()),
+            correlation_quality: crate::turn_journal::CorrelationQuality::Exact,
+        };
+        let event = crate::turn_journal::DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: format!(
+                "{}:provider_turn:{}",
+                correlation.context_generation_id,
+                crate::turn_journal::digest_hex(provider_turn_id.as_bytes())
+            ),
+            event_type: "provider_correlation".to_string(),
+            record: match serde_json::to_value(record) {
+                Ok(record) => record,
+                Err(error) => {
+                    warn!(
+                        turn_id = %self.turn_id,
+                        error = %ErrorChain(&error),
+                        "Failed to serialize provider-correlation diagnostic"
+                    );
+                    return;
+                }
+            },
+        };
+        if let Err(error) = correlation
+            .service
+            .append_diagnostic_event(&self.user_id, &self.conversation_id, &self.turn_id, &event)
+            .await
+        {
+            warn!(
+                turn_id = %self.turn_id,
+                error = %ErrorChain(&error),
+                "Failed to persist provider-correlation diagnostic"
+            );
+        }
     }
 
     fn send_system_responses(&self, responses: &[String]) {

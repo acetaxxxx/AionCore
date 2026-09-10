@@ -69,6 +69,8 @@ struct TurnAttemptInput {
     conv_id: String,
     turn_id: String,
     user_id: String,
+    attempt_id: String,
+    context_generation_id: String,
     build_options: BuildTaskOptions,
     stored_workspace: String,
     send: SendMessageData,
@@ -264,6 +266,12 @@ impl ConversationTurnOrchestrator {
             .with_runtime_state(Arc::clone(&runtime_state))
             .with_persistence(persistence.clone())
             .with_context_journal(self.service.turn_journal())
+            .with_diagnostic_correlation(
+                self.service.clone(),
+                input.attempt_id.clone(),
+                input.context_generation_id.clone(),
+                backend.clone().unwrap_or_else(|| "unknown".to_string()),
+            )
             .with_turn_completion(false)
             .with_defer_clean_terminal_errors(defer_clean_terminal_errors)
             // A replay spawns a fresh CLI whose own retry counter starts at one,
@@ -527,6 +535,24 @@ impl ConversationTurnOrchestrator {
             // handing the request to the provider adapter. This is metadata-only
             // and deliberately does not alter the message sent to the agent.
             let context_generation_id = format!("{turn_id}-att-{attempt_number}");
+            let context_generation_event = crate::turn_journal::DiagnosticEventEnvelope {
+                schema_version: 1,
+                event_id: format!("{context_generation_id}:context_generation"),
+                event_type: "context_generation".to_string(),
+                record: serde_json::json!({
+                    "attempt_id": attempt_id.as_str(),
+                    "context_generation_id": context_generation_id.as_str(),
+                    "assembly_status": "started",
+                    "delivery_reason": if replayed { "retry" } else { "initial" },
+                }),
+            };
+            if let Err(error) = self
+                .service
+                .append_diagnostic_event(&input.user_id, &conv_id, &turn_id, &context_generation_event)
+                .await
+            {
+                warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist context-generation diagnostic");
+            }
             let user_bytes = raw_user_message.len();
             let user_chars = raw_user_message.chars().count();
             let user_record = crate::turn_journal::ContextAttributionRecord {
@@ -559,7 +585,7 @@ impl ConversationTurnOrchestrator {
                     user_id: input.user_id.clone(),
                     conversation_id: conv_id.clone(),
                     turn_id: turn_id.clone(),
-                    context_generation_id,
+                    context_generation_id: context_generation_id.clone(),
                     source: crate::turn_journal::ContextSource::Memory,
                     item_count: 1,
                     bytes: memory_context.len(),
@@ -614,6 +640,8 @@ impl ConversationTurnOrchestrator {
                     conv_id: conv_id.clone(),
                     turn_id: turn_id.clone(),
                     user_id: input.user_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    context_generation_id: context_generation_id.clone(),
                     build_options: input.build_options.clone(),
                     stored_workspace: input.stored_workspace.clone(),
                     send: initial_send.clone(),

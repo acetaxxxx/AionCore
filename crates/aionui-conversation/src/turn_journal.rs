@@ -178,6 +178,136 @@ pub struct ContextAttributionRecord {
     pub provenance_source: Option<String>,
 }
 
+/// Versioned, append-only envelope for machine-readable diagnostics records.
+///
+/// The payload remains deliberately generic at this boundary so new event
+/// types can be added without changing the lifecycle journal enum or forcing
+/// legacy readers to understand every future record shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticEventEnvelope<T> {
+    pub schema_version: u32,
+    pub event_id: String,
+    pub event_type: String,
+    pub record: T,
+}
+
+/// Quality of the correlation between Aion lifecycle IDs and backend IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrelationQuality {
+    Exact,
+    Inferred,
+    Ambiguous,
+    Unmatched,
+}
+
+/// Sanitized mapping between one Aion attempt and provider runtime identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCorrelationRecord {
+    pub conversation_id: String,
+    pub aion_turn_id: String,
+    pub attempt_id: String,
+    pub context_generation_id: Option<String>,
+    pub backend_kind: String,
+    pub backend_version: Option<String>,
+    pub session_epoch: Option<u64>,
+    pub provider_thread_id: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub correlation_quality: CorrelationQuality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSnapshotState {
+    New,
+    Duplicate,
+    Stale,
+}
+
+/// Raw provider usage snapshot. Optional fields retain provider capability gaps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsageSnapshot {
+    pub usage_event_id: String,
+    pub provider_thread_id: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub sequence: Option<u64>,
+    pub timestamp_ms: u64,
+    pub last_input_tokens: Option<u64>,
+    pub last_cached_input_tokens: Option<u64>,
+    pub last_output_tokens: Option<u64>,
+    pub last_reasoning_output_tokens: Option<u64>,
+    pub total_input_tokens: Option<u64>,
+    pub total_cached_input_tokens: Option<u64>,
+    pub total_output_tokens: Option<u64>,
+    pub model_context_window: Option<u64>,
+    pub snapshot_fingerprint: String,
+    pub state: UsageSnapshotState,
+}
+
+pub fn classify_usage_snapshot(
+    previous: Option<&ProviderUsageSnapshot>,
+    current: &ProviderUsageSnapshot,
+) -> UsageSnapshotState {
+    let Some(previous) = previous else {
+        return UsageSnapshotState::New;
+    };
+    if previous.snapshot_fingerprint == current.snapshot_fingerprint {
+        return UsageSnapshotState::Duplicate;
+    }
+    if previous
+        .sequence
+        .zip(current.sequence)
+        .is_some_and(|(old, new)| new <= old)
+    {
+        return UsageSnapshotState::Stale;
+    }
+    UsageSnapshotState::New
+}
+
+/// Returns a cumulative input delta only when both totals share a monotonic
+/// baseline. A reset/regression is deliberately represented as `None`.
+pub fn cumulative_input_delta(
+    previous: Option<&ProviderUsageSnapshot>,
+    current: &ProviderUsageSnapshot,
+) -> Option<u64> {
+    let previous_total = previous?.total_input_tokens?;
+    let current_total = current.total_input_tokens?;
+    current_total.checked_sub(previous_total)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureCategory {
+    ProviderUsageLimit,
+    ProviderAuth,
+    ProviderTimeout,
+    ContextLimit,
+    Cancelled,
+    ToolError,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderErrorRecord {
+    pub event_id: String,
+    pub provider_thread_id: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub aion_turn_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub timestamp_ms: u64,
+    pub provider_error_code: Option<String>,
+    pub provider_error_message: Option<String>,
+    pub will_retry: Option<bool>,
+    pub failure_category: ProviderFailureCategory,
+    pub rate_limit_plan: Option<String>,
+    pub primary_used_percent: Option<f64>,
+    pub secondary_used_percent: Option<f64>,
+    pub reset_epoch: Option<u64>,
+    pub reset_display_text: Option<String>,
+    pub credits_available: Option<f64>,
+    pub credits_balance: Option<f64>,
+}
+
 impl MidTurnRecord {
     /// Derive stable identity from the complete event identity and payload.
     ///
@@ -308,6 +438,14 @@ pub enum RawJournalEvent {
     ContextAttribution {
         record: ContextAttributionRecord,
     },
+    /// Versioned, privacy-safe evidence that shares the attribution sidecar
+    /// with the existing source measurements.
+    AttributionDiagnostic {
+        user_id: String,
+        conversation_id: String,
+        turn_id: String,
+        envelope: DiagnosticEventEnvelope<serde_json::Value>,
+    },
 }
 
 /// Hash the canonical serialized raw event sequence used as Memory Candidate
@@ -324,6 +462,7 @@ impl RawJournalEvent {
             Self::FinalOutcome { user_id, .. } => user_id,
             Self::MidTurn { record } => &record.user_id,
             Self::ContextAttribution { record } => &record.user_id,
+            Self::AttributionDiagnostic { user_id, .. } => user_id,
         }
     }
 
@@ -333,6 +472,7 @@ impl RawJournalEvent {
             Self::FinalOutcome { conversation_id, .. } => conversation_id,
             Self::MidTurn { record } => &record.conversation_id,
             Self::ContextAttribution { record } => &record.conversation_id,
+            Self::AttributionDiagnostic { conversation_id, .. } => conversation_id,
         }
     }
 
@@ -342,6 +482,7 @@ impl RawJournalEvent {
             Self::FinalOutcome { turn_id, .. } => turn_id,
             Self::MidTurn { record } => &record.turn_id,
             Self::ContextAttribution { record } => &record.turn_id,
+            Self::AttributionDiagnostic { turn_id, .. } => turn_id,
         }
     }
 }
@@ -404,6 +545,16 @@ pub trait TurnJournal: Send + Sync {
 
     /// Appends sanitized source-level context attribution for one generation.
     async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError>;
+
+    /// Appends an additive, versioned diagnostics record without changing
+    /// lifecycle, retry, or mailbox semantics.
+    async fn append_diagnostic_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<serde_json::Value>,
+    ) -> Result<(), JournalError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +568,7 @@ pub type FaultInjector = Arc<dyn Fn(&Path, usize, &str, &RawJournalEvent) -> Opt
 type CanonicalTurnKey = (String, String, String);
 type TurnLocks = Arc<RwLock<HashMap<CanonicalTurnKey, Arc<Mutex<()>>>>>;
 type TurnEvents = Arc<RwLock<HashMap<CanonicalTurnKey, Vec<RawJournalEvent>>>>;
+type DiagnosticEvents = Arc<RwLock<HashMap<CanonicalTurnKey, Vec<DiagnosticEventEnvelope<serde_json::Value>>>>>;
 
 /// Production filesystem-backed implementation of [`TurnJournal`].
 ///
@@ -738,6 +890,68 @@ impl FilesystemTurnJournal {
         self.append_event_durable(&file_path, &RawJournalEvent::ContextAttribution { record })
             .await
     }
+
+    /// Appends a versioned, sanitized diagnostics envelope to the per-turn
+    /// attribution sidecar without touching the lifecycle journal.
+    pub(crate) async fn append_diagnostic_event<T: Serialize>(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<T>,
+    ) -> Result<(), JournalError> {
+        validate_identifier(user_id, "user_id")?;
+        validate_identifier(conversation_id, "conversation_id")?;
+        validate_identifier(turn_id, "turn_id")?;
+        validate_identifier(&envelope.event_id, "event_id")?;
+        validate_identifier(&envelope.event_type, "event_type")?;
+        if envelope.schema_version == 0 {
+            return Err(JournalError::InvalidIdentifier {
+                reason: "diagnostic schema_version must be greater than zero".to_string(),
+            });
+        }
+
+        let turn_lock = self.get_turn_lock(user_id, conversation_id, turn_id).await;
+        let _guard = turn_lock.lock().await;
+        let raw_path = self.get_turn_file_path(user_id, conversation_id, turn_id)?;
+        let raw_events = Self::read_and_sanitize_turn_events(&raw_path).await?;
+        if !raw_events
+            .iter()
+            .any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
+        {
+            return Err(JournalError::MissingPreExecution {
+                turn_id: turn_id.to_string(),
+            });
+        }
+
+        let path = self.get_attribution_file_path(user_id, conversation_id, turn_id)?;
+        let envelope = DiagnosticEventEnvelope {
+            schema_version: envelope.schema_version,
+            event_id: envelope.event_id.clone(),
+            event_type: envelope.event_type.clone(),
+            record: serde_json::to_value(&envelope.record)?,
+        };
+        let diagnostic_event_id = envelope.event_id.clone();
+        let event = RawJournalEvent::AttributionDiagnostic {
+            user_id: user_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            turn_id: turn_id.to_string(),
+            envelope,
+        };
+        let existing = Self::read_and_sanitize_turn_events(&path).await?;
+        if let Some(existing) = existing.iter().find(|existing| {
+            matches!(existing, RawJournalEvent::AttributionDiagnostic { envelope: existing, .. }
+                if existing.event_id == diagnostic_event_id)
+        }) {
+            if existing == &event {
+                return Ok(());
+            }
+            return Err(JournalError::InvalidIdentifier {
+                reason: format!("diagnostic event_id {diagnostic_event_id} has a conflicting payload"),
+            });
+        }
+        self.append_event_durable(&path, &event).await
+    }
 }
 
 #[async_trait]
@@ -918,6 +1132,16 @@ impl TurnJournal for FilesystemTurnJournal {
     async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError> {
         FilesystemTurnJournal::append_context_attribution(self, record).await
     }
+
+    async fn append_diagnostic_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<serde_json::Value>,
+    ) -> Result<(), JournalError> {
+        FilesystemTurnJournal::append_diagnostic_event(self, user_id, conversation_id, turn_id, envelope).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +1154,7 @@ impl TurnJournal for FilesystemTurnJournal {
 #[derive(Default, Clone)]
 pub struct InMemoryTurnJournal {
     events: TurnEvents,
+    diagnostics: DiagnosticEvents,
 }
 
 impl InMemoryTurnJournal {
@@ -939,6 +1164,19 @@ impl InMemoryTurnJournal {
 
     pub async fn get_turn_events(&self, user_id: &str, conversation_id: &str, turn_id: &str) -> Vec<RawJournalEvent> {
         let guard = self.events.read().await;
+        guard
+            .get(&(user_id.to_string(), conversation_id.to_string(), turn_id.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub async fn get_diagnostic_events(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Vec<DiagnosticEventEnvelope<serde_json::Value>> {
+        let guard = self.diagnostics.read().await;
         guard
             .get(&(user_id.to_string(), conversation_id.to_string(), turn_id.to_string()))
             .cloned()
@@ -1011,6 +1249,47 @@ impl InMemoryTurnJournal {
             return Ok(());
         }
         entry.push(RawJournalEvent::ContextAttribution { record });
+        Ok(())
+    }
+
+    pub(crate) async fn append_diagnostic_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<serde_json::Value>,
+    ) -> Result<(), JournalError> {
+        validate_identifier(user_id, "user_id")?;
+        validate_identifier(conversation_id, "conversation_id")?;
+        validate_identifier(turn_id, "turn_id")?;
+        validate_identifier(&envelope.event_id, "event_id")?;
+        validate_identifier(&envelope.event_type, "event_type")?;
+        if envelope.schema_version == 0 {
+            return Err(JournalError::InvalidIdentifier {
+                reason: "diagnostic schema_version must be greater than zero".to_string(),
+            });
+        }
+        let key = (user_id.to_string(), conversation_id.to_string(), turn_id.to_string());
+        if !self.events.read().await.get(&key).is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RawJournalEvent::PreExecution { .. }))
+        }) {
+            return Err(JournalError::MissingPreExecution {
+                turn_id: turn_id.to_string(),
+            });
+        }
+        let mut diagnostics = self.diagnostics.write().await;
+        let events = diagnostics.entry(key).or_default();
+        if let Some(existing) = events.iter().find(|existing| existing.event_id == envelope.event_id) {
+            if existing == envelope {
+                return Ok(());
+            }
+            return Err(JournalError::InvalidIdentifier {
+                reason: format!("diagnostic event_id {} has a conflicting payload", envelope.event_id),
+            });
+        }
+        events.push(envelope.clone());
         Ok(())
     }
 }
@@ -1269,6 +1548,16 @@ impl TurnJournal for InMemoryTurnJournal {
     async fn append_context_attribution(&self, record: &ContextAttributionRecord) -> Result<(), JournalError> {
         InMemoryTurnJournal::append_context_attribution(self, record).await
     }
+
+    async fn append_diagnostic_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &DiagnosticEventEnvelope<serde_json::Value>,
+    ) -> Result<(), JournalError> {
+        InMemoryTurnJournal::append_diagnostic_event(self, user_id, conversation_id, turn_id, envelope).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,6 +1700,7 @@ pub(crate) async fn internal_startup_recovery_with_outcomes(
                         }
                         RawJournalEvent::MidTurn { .. } => {}
                         RawJournalEvent::ContextAttribution { .. } => {}
+                        RawJournalEvent::AttributionDiagnostic { .. } => {}
                     }
                 }
 
@@ -3231,5 +3521,343 @@ mod tests {
         assert!(parsed.schema_version.is_none());
         assert!(parsed.event_id.is_none());
         assert!(parsed.delivery_id.is_none());
+    }
+
+    #[test]
+    fn diagnostic_event_envelope_is_versioned_and_machine_readable() {
+        let envelope = DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: "evt_1".to_string(),
+            event_type: "context_attribution".to_string(),
+            record: serde_json::json!({"source": "memory", "estimated_tokens": 12}),
+        };
+
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["event_id"], "evt_1");
+        assert_eq!(value["event_type"], "context_attribution");
+        assert_eq!(value["record"]["source"], "memory");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_event_is_appended_to_the_turn_attribution_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FilesystemTurnJournal::new(temp.path());
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user_diag",
+                conversation_id: "conv_diag",
+                turn_id: "turn_diag",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        journal
+            .append_diagnostic_event(
+                "user_diag",
+                "conv_diag",
+                "turn_diag",
+                &DiagnosticEventEnvelope {
+                    schema_version: 1,
+                    event_id: "evt_diag_1".to_string(),
+                    event_type: "context_generation".to_string(),
+                    record: serde_json::json!({"attempt_id": "turn_diag-att-1"}),
+                },
+            )
+            .await
+            .unwrap();
+
+        let path = temp
+            .path()
+            .join("users/user_diag/events/raw/conv_diag/turn_diag_attribution.jsonl");
+        let content = tokio::fs::read_to_string(path).await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(value["event_type"], "attribution_diagnostic");
+        assert_eq!(value["envelope"]["event_id"], "evt_diag_1");
+        assert_eq!(value["envelope"]["event_type"], "context_generation");
+        assert!(
+            !temp
+                .path()
+                .join("users/user_diag/events/raw/conv_diag/turn_diag_diagnostics.jsonl")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_diagnostic_event_is_append_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FilesystemTurnJournal::new(temp.path());
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user_diag_dup",
+                conversation_id: "conv_diag_dup",
+                turn_id: "turn_diag_dup",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        let event = DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: "evt_diag_dup".to_string(),
+            event_type: "context_generation".to_string(),
+            record: serde_json::json!({"attempt_id": "turn_diag_dup-att-1"}),
+        };
+
+        journal
+            .append_diagnostic_event("user_diag_dup", "conv_diag_dup", "turn_diag_dup", &event)
+            .await
+            .unwrap();
+        journal
+            .append_diagnostic_event("user_diag_dup", "conv_diag_dup", "turn_diag_dup", &event)
+            .await
+            .unwrap();
+
+        let path = temp
+            .path()
+            .join("users/user_diag_dup/events/raw/conv_diag_dup/turn_diag_dup_attribution.jsonl");
+        let content = tokio::fs::read_to_string(path).await.unwrap();
+        assert_eq!(content.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn conflicting_diagnostic_event_id_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FilesystemTurnJournal::new(temp.path());
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user_diag_conflict",
+                conversation_id: "conv_diag_conflict",
+                turn_id: "turn_diag_conflict",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let first = DiagnosticEventEnvelope {
+            schema_version: 1,
+            event_id: "evt_diag_conflict".to_string(),
+            event_type: "context_generation".to_string(),
+            record: serde_json::json!({"attempt_id": "attempt_1"}),
+        };
+        let conflicting = DiagnosticEventEnvelope {
+            record: serde_json::json!({"attempt_id": "attempt_2"}),
+            ..first.clone()
+        };
+        journal
+            .append_diagnostic_event("user_diag_conflict", "conv_diag_conflict", "turn_diag_conflict", &first)
+            .await
+            .unwrap();
+
+        let error = journal
+            .append_diagnostic_event(
+                "user_diag_conflict",
+                "conv_diag_conflict",
+                "turn_diag_conflict",
+                &conflicting,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicting payload"));
+    }
+
+    #[tokio::test]
+    async fn turn_journal_trait_appends_diagnostic_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal: Arc<dyn TurnJournal> = Arc::new(FilesystemTurnJournal::new(temp.path()));
+        journal
+            .capture_pre_turn(&PreTurnRecord {
+                user_id: "user_diag_trait",
+                conversation_id: "conv_diag_trait",
+                turn_id: "turn_diag_trait",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        journal
+            .append_diagnostic_event(
+                "user_diag_trait",
+                "conv_diag_trait",
+                "turn_diag_trait",
+                &DiagnosticEventEnvelope {
+                    schema_version: 1,
+                    event_id: "evt_diag_trait".to_string(),
+                    event_type: "context_generation".to_string(),
+                    record: serde_json::json!({"attempt_id": "turn_diag_trait-att-1"}),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn provider_correlation_record_preserves_quality_and_optional_ids() {
+        let record = ProviderCorrelationRecord {
+            conversation_id: "conv_corr".to_string(),
+            aion_turn_id: "turn_corr".to_string(),
+            attempt_id: "turn_corr-att-1".to_string(),
+            context_generation_id: Some("turn_corr-att-1".to_string()),
+            backend_kind: "codex".to_string(),
+            backend_version: Some("0.153.4".to_string()),
+            session_epoch: Some(2),
+            provider_thread_id: Some("thread_1".to_string()),
+            provider_turn_id: None,
+            correlation_quality: CorrelationQuality::Ambiguous,
+        };
+
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["correlation_quality"], "ambiguous");
+        assert_eq!(value["provider_thread_id"], "thread_1");
+        assert!(value["provider_turn_id"].is_null());
+    }
+
+    #[test]
+    fn provider_usage_snapshot_preserves_unknown_fields_and_state() {
+        let snapshot = ProviderUsageSnapshot {
+            usage_event_id: "usage_1".to_string(),
+            provider_thread_id: Some("thread_1".to_string()),
+            provider_turn_id: None,
+            sequence: Some(4),
+            timestamp_ms: 10,
+            last_input_tokens: Some(100),
+            last_cached_input_tokens: None,
+            last_output_tokens: Some(8),
+            last_reasoning_output_tokens: None,
+            total_input_tokens: None,
+            total_cached_input_tokens: None,
+            total_output_tokens: None,
+            model_context_window: Some(258_400),
+            snapshot_fingerprint: "fp_1".to_string(),
+            state: UsageSnapshotState::New,
+        };
+
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["state"], "new");
+        assert!(value["last_cached_input_tokens"].is_null());
+        assert!(value["total_input_tokens"].is_null());
+    }
+
+    #[test]
+    fn usage_snapshot_classification_distinguishes_new_duplicate_and_stale() {
+        let base = ProviderUsageSnapshot {
+            usage_event_id: "usage_1".to_string(),
+            provider_thread_id: Some("thread_1".to_string()),
+            provider_turn_id: None,
+            sequence: Some(4),
+            timestamp_ms: 10,
+            last_input_tokens: Some(100),
+            last_cached_input_tokens: None,
+            last_output_tokens: Some(8),
+            last_reasoning_output_tokens: None,
+            total_input_tokens: Some(100),
+            total_cached_input_tokens: None,
+            total_output_tokens: Some(8),
+            model_context_window: Some(258_400),
+            snapshot_fingerprint: "fp_1".to_string(),
+            state: UsageSnapshotState::New,
+        };
+        assert_eq!(classify_usage_snapshot(None, &base), UsageSnapshotState::New);
+        assert_eq!(
+            classify_usage_snapshot(Some(&base), &base),
+            UsageSnapshotState::Duplicate
+        );
+
+        let stale = ProviderUsageSnapshot {
+            usage_event_id: "usage_0".to_string(),
+            sequence: Some(3),
+            snapshot_fingerprint: "fp_0".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(classify_usage_snapshot(Some(&base), &stale), UsageSnapshotState::Stale);
+
+        let next = ProviderUsageSnapshot {
+            usage_event_id: "usage_2".to_string(),
+            sequence: Some(5),
+            snapshot_fingerprint: "fp_2".to_string(),
+            ..base
+        };
+        assert_eq!(classify_usage_snapshot(Some(&stale), &next), UsageSnapshotState::New);
+    }
+
+    #[test]
+    fn cumulative_input_delta_requires_a_monotonic_total_baseline() {
+        let previous = ProviderUsageSnapshot {
+            usage_event_id: "usage_prev".to_string(),
+            provider_thread_id: None,
+            provider_turn_id: None,
+            sequence: Some(1),
+            timestamp_ms: 1,
+            last_input_tokens: Some(100),
+            last_cached_input_tokens: None,
+            last_output_tokens: None,
+            last_reasoning_output_tokens: None,
+            total_input_tokens: Some(1000),
+            total_cached_input_tokens: None,
+            total_output_tokens: None,
+            model_context_window: None,
+            snapshot_fingerprint: "prev".to_string(),
+            state: UsageSnapshotState::New,
+        };
+        let next = ProviderUsageSnapshot {
+            usage_event_id: "usage_next".to_string(),
+            sequence: Some(2),
+            timestamp_ms: 2,
+            total_input_tokens: Some(1300),
+            snapshot_fingerprint: "next".to_string(),
+            ..previous.clone()
+        };
+        assert_eq!(cumulative_input_delta(Some(&previous), &next), Some(300));
+
+        let reset = ProviderUsageSnapshot {
+            total_input_tokens: Some(20),
+            ..next.clone()
+        };
+        assert_eq!(cumulative_input_delta(Some(&next), &reset), None);
+
+        let unknown = ProviderUsageSnapshot {
+            total_input_tokens: None,
+            ..next
+        };
+        assert_eq!(cumulative_input_delta(Some(&previous), &unknown), None);
+    }
+
+    #[test]
+    fn provider_error_record_preserves_rate_limit_metadata_and_category() {
+        let error = ProviderErrorRecord {
+            event_id: "err_1".to_string(),
+            provider_thread_id: Some("thread_1".to_string()),
+            provider_turn_id: None,
+            aion_turn_id: Some("turn_1".to_string()),
+            attempt_id: Some("turn_1-att-1".to_string()),
+            timestamp_ms: 42,
+            provider_error_code: Some("usageLimitExceeded".to_string()),
+            provider_error_message: Some("limit reached".to_string()),
+            will_retry: Some(false),
+            failure_category: ProviderFailureCategory::ProviderUsageLimit,
+            rate_limit_plan: Some("pro".to_string()),
+            primary_used_percent: Some(100.0),
+            secondary_used_percent: None,
+            reset_epoch: Some(1_700_000_000),
+            reset_display_text: Some("in 1h".to_string()),
+            credits_available: None,
+            credits_balance: Some(0.0),
+        };
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["failure_category"], "provider_usage_limit");
+        assert_eq!(value["will_retry"], false);
+        assert_eq!(value["reset_epoch"], 1_700_000_000u64);
+        assert!(value["secondary_used_percent"].is_null());
     }
 }

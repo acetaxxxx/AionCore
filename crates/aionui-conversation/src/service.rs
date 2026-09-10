@@ -519,6 +519,18 @@ impl ConversationService {
         self.turn_journal.append_context_attribution(record).await
     }
 
+    pub(crate) async fn append_diagnostic_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        envelope: &crate::turn_journal::DiagnosticEventEnvelope<serde_json::Value>,
+    ) -> Result<(), crate::turn_journal::JournalError> {
+        self.turn_journal
+            .append_diagnostic_event(user_id, conversation_id, turn_id, envelope)
+            .await
+    }
+
     pub(crate) fn capture_memory_candidate(&self, evidence: MemoryEvidence) {
         let memory_curation = Arc::clone(&self.memory_curation);
         tokio::spawn(async move {

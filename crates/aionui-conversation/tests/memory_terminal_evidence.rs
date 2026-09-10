@@ -258,6 +258,16 @@ async fn public_owner_send_records_final_assistant_text_in_exactly_one_terminal_
     let agent = Arc::new(ScriptedAgent::new(
         "owner-conv",
         vec![vec![
+            AgentStreamEvent::BackendTurnBound("provider-turn-123".into()),
+            AgentStreamEvent::AcpContextUsage(serde_json::json!({
+                "used": 150,
+                "size": 200,
+                "_meta": {
+                    "input_tokens": 100,
+                    "output_tokens": 25,
+                    "cached_read_tokens": 40,
+                },
+            })),
             AgentStreamEvent::Text(TextEventData {
                 content: "owner final reply".into(),
             }),
@@ -282,6 +292,29 @@ async fn public_owner_send_records_final_assistant_text_in_exactly_one_terminal_
         .await
         .unwrap();
     let events = wait_for_events(&journal, "system_default_user", "owner-conv", &response.turn_id).await;
+    let diagnostics = journal
+        .get_diagnostic_events("system_default_user", "owner-conv", &response.turn_id)
+        .await;
+    assert_eq!(diagnostics[0].event_type, "context_generation");
+    assert_eq!(
+        diagnostics[0].record["attempt_id"],
+        format!("{}-att-1", response.turn_id)
+    );
+    let provider_correlation = diagnostics
+        .iter()
+        .find(|event| event.event_type == "provider_correlation")
+        .unwrap_or_else(|| panic!("provider turn binding was not recorded: {diagnostics:#?}"));
+    assert_eq!(provider_correlation.record["provider_turn_id"], "provider-turn-123");
+    assert_eq!(provider_correlation.record["correlation_quality"], "exact");
+    let provider_usage = diagnostics
+        .iter()
+        .find(|event| event.event_type == "provider_usage")
+        .unwrap_or_else(|| panic!("provider usage snapshot was not recorded: {diagnostics:#?}"));
+    assert_eq!(provider_usage.record["snapshot"]["last_input_tokens"], 100);
+    assert_eq!(provider_usage.record["snapshot"]["last_cached_input_tokens"], 40);
+    assert_eq!(provider_usage.record["snapshot"]["last_output_tokens"], 25);
+    assert_eq!(provider_usage.record["snapshot"]["model_context_window"], 200);
+    assert!(provider_usage.record["snapshot"]["total_input_tokens"].is_null());
     assert_eq!(
         events
             .iter()

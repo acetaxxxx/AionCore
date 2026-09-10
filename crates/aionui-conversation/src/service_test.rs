@@ -10022,6 +10022,16 @@ mod session_mentions_integration {
         ) -> Result<(), crate::turn_journal::JournalError> {
             Ok(())
         }
+
+        async fn append_diagnostic_event(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _turn_id: &str,
+            _envelope: &crate::turn_journal::DiagnosticEventEnvelope<serde_json::Value>,
+        ) -> Result<(), crate::turn_journal::JournalError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -10083,6 +10093,45 @@ mod session_mentions_integration {
         } else {
             panic!("First journal event must be PreExecution");
         }
+    }
+
+    #[tokio::test]
+    async fn service_appends_diagnostic_event_through_its_journal_seam() {
+        let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+        let journal = Arc::new(crate::turn_journal::InMemoryTurnJournal::new());
+        let svc = svc.with_turn_journal(journal.clone());
+        journal
+            .capture_pre_turn(&crate::turn_journal::PreTurnRecord {
+                user_id: "user_1",
+                conversation_id: "conv_diagnostics",
+                turn_id: "turn_diagnostics",
+                parent_turn_id: None,
+                user_message: "hello",
+                workspace: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        svc.append_diagnostic_event(
+            "user_1",
+            "conv_diagnostics",
+            "turn_diagnostics",
+            &crate::turn_journal::DiagnosticEventEnvelope {
+                schema_version: 1,
+                event_id: "evt_service".to_string(),
+                event_type: "context_generation".to_string(),
+                record: serde_json::json!({"attempt_id": "turn_diagnostics-att-1"}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let events = journal
+            .get_diagnostic_events("user_1", "conv_diagnostics", "turn_diagnostics")
+            .await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "evt_service");
     }
 
     #[tokio::test]

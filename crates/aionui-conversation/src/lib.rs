@@ -50,9 +50,11 @@ pub use service::{
 };
 pub use state::ConversationRouterState;
 pub use turn_journal::{
-    AttemptSummary, ContextAttributionRecord, ContextSource, FilesystemTurnJournal, InMemoryTurnJournal, JournalError,
-    PreTurnRecord, RawJournalEvent, StartupRecoveryOptions, TerminalOutcomeRecord, TerminalReconcileResult,
-    TokenUsageRecord, TurnJournal, TurnTerminalStatus, digest_hex, validate_identifier,
+    AttemptSummary, ContextAttributionRecord, ContextSource, CorrelationQuality, DiagnosticEventEnvelope,
+    FilesystemTurnJournal, InMemoryTurnJournal, JournalError, PreTurnRecord, ProviderCorrelationRecord,
+    ProviderErrorRecord, ProviderFailureCategory, ProviderUsageSnapshot, RawJournalEvent, StartupRecoveryOptions,
+    TerminalOutcomeRecord, TerminalReconcileResult, TokenUsageRecord, TurnJournal, TurnTerminalStatus,
+    UsageSnapshotState, classify_usage_snapshot, cumulative_input_delta, digest_hex, validate_identifier,
 };
 
 #[cfg(test)]
