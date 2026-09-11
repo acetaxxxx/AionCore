@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::protocol::events::{ErrorEventData, TipType, TipsEventData};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
-use crate::diagnostics::{context_attribution_enabled, provider_usage_diagnostics_enabled};
+use crate::diagnostics::provider_usage_diagnostics_enabled;
 use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
@@ -274,7 +274,7 @@ impl StreamRelay {
     /// Persist only bounded tool-event metadata. The serialized event is used
     /// transiently to calculate size/hash and is never written to the journal.
     async fn append_tool_attribution(&self, item_ids: Vec<String>, payload: &[u8]) {
-        if !context_attribution_enabled() {
+        if !provider_usage_diagnostics_enabled() {
             return;
         }
         let Some(journal) = &self.context_journal else {

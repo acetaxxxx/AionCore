@@ -33,7 +33,7 @@ mod turn_orchestrator;
 mod turn_recovery_policy;
 
 pub use convert::row_to_response_with_extra;
-pub use diagnostics::{CONTEXT_ATTRIBUTION_ENV, context_attribution_enabled};
+pub use diagnostics::provider_usage_diagnostics_enabled;
 pub use error::ConversationError;
 pub use memory_curation::{
     AgentMemory, FilesystemMemoryCuration, InMemoryMemoryCuration, MemoryCandidate, MemoryCandidateLifecycleEvent,

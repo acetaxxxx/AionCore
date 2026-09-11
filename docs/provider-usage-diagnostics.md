@@ -1,4 +1,4 @@
-# Provider usage diagnostics
+# Provider usage and context attribution diagnostics
 
 AionCore has two token usage paths:
 
@@ -8,28 +8,21 @@ AionCore has two token usage paths:
   measurements in the turn attribution sidecar. It is additive telemetry and
   is independent of the UI snapshot.
 
-The per-turn diagnostic path is disabled by default. Enable it explicitly for
-an AionCore process with:
+The per-turn diagnostic and context attribution paths are disabled by default.
+Enable both explicitly for an AionCore process with:
 
 ```text
 AIONUI_ENABLE_PROVIDER_USAGE_DIAGNOSTICS=1
 ```
 
-`1`, `true`, `yes`, and `on` (case-insensitive) enable the path. Any other
-value, including an unset variable, leaves it disabled. The toggle controls
-only persisted per-turn provider usage diagnostics; it does not disable the
-existing UI usage indicator.
+`1`, `true`, `yes`, and `on` (case-insensitive) enable both paths. Any other
+value, including an unset variable, leaves them disabled. The toggle controls
+only persisted diagnostics; it does not disable the existing UI usage
+indicator.
 
 ## Context attribution
 
-PR16 source attribution records are a separate opt-in persistent telemetry
-path. They are disabled by default and can be enabled with:
-
-```text
-AIONUI_ENABLE_CONTEXT_ATTRIBUTION=1
-```
-
-This controls attribution records emitted by the conversation orchestrator,
-Team adapter, and streaming tool-event relay. It does not disable lifecycle
-pre-turn, mid-turn, or terminal records, and it does not enable provider usage
-diagnostics; each path remains independently controlled.
+PR16 source attribution records use the same toggle. This controls attribution
+records emitted by the conversation orchestrator, Team adapter, and streaming
+tool-event relay. It does not disable lifecycle pre-turn, mid-turn, or
+terminal records.

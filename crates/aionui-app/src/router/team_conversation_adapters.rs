@@ -7,7 +7,7 @@ use aionui_api_types::{
 };
 use aionui_common::{AgentType, now_ms};
 use aionui_conversation::{
-    context_attribution_enabled, ContextAttributionRecord, ContextSource, ConversationAgentTurnRequest,
+    provider_usage_diagnostics_enabled, ContextAttributionRecord, ContextSource, ConversationAgentTurnRequest,
     ConversationAgentTurnStarted,
     ConversationAgentTurnStatus, ConversationError, ConversationService,
 };
@@ -134,7 +134,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
             }
         };
 
-        if context_attribution_enabled() {
+        if provider_usage_diagnostics_enabled() {
             for (index, attribution) in request.attributions.iter().enumerate() {
                 let source = match attribution.source {
                     AgentTurnAttributionSource::Mailbox => ContextSource::TeamMailbox,
