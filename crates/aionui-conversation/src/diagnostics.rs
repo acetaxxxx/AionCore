@@ -28,5 +28,4 @@ mod tests {
         assert!(provider_usage_diagnostics_enabled_value(Some("1")));
         assert!(provider_usage_diagnostics_enabled_value(Some(" TRUE ")));
     }
-
 }
