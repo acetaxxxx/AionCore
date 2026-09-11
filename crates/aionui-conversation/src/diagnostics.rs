@@ -9,18 +9,11 @@
 pub(crate) const PROVIDER_USAGE_DIAGNOSTICS_ENV: &str = "AIONUI_ENABLE_PROVIDER_USAGE_DIAGNOSTICS";
 
 pub(crate) fn provider_usage_diagnostics_enabled() -> bool {
-    provider_usage_diagnostics_enabled_value(
-        std::env::var(PROVIDER_USAGE_DIAGNOSTICS_ENV).ok().as_deref(),
-    )
+    provider_usage_diagnostics_enabled_value(std::env::var(PROVIDER_USAGE_DIAGNOSTICS_ENV).ok().as_deref())
 }
 
 fn provider_usage_diagnostics_enabled_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 #[cfg(test)]

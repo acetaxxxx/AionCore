@@ -307,9 +307,7 @@ async fn public_owner_send_records_final_assistant_text_in_exactly_one_terminal_
     assert_eq!(provider_correlation.record["provider_turn_id"], "provider-turn-123");
     assert_eq!(provider_correlation.record["correlation_quality"], "exact");
     assert!(
-        diagnostics
-            .iter()
-            .all(|event| event.event_type != "provider_usage"),
+        diagnostics.iter().all(|event| event.event_type != "provider_usage"),
         "provider usage diagnostics must be disabled by default: {diagnostics:#?}"
     );
     assert_eq!(
