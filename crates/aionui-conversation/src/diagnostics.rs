@@ -7,6 +7,7 @@
 /// the common explicit true values; every other value, including an unset
 /// variable, keeps the feature disabled.
 pub(crate) const PROVIDER_USAGE_DIAGNOSTICS_ENV: &str = "AIONUI_ENABLE_PROVIDER_USAGE_DIAGNOSTICS";
+
 pub fn provider_usage_diagnostics_enabled() -> bool {
     provider_usage_diagnostics_enabled_value(std::env::var(PROVIDER_USAGE_DIAGNOSTICS_ENV).ok().as_deref())
 }

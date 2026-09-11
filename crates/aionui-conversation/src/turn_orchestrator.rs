@@ -577,10 +577,10 @@ impl ConversationTurnOrchestrator {
                 measurement_kind: Some("assembled".to_string()),
                 provenance_source: Some("conversation_orchestrator".to_string()),
             };
-            if provider_usage_diagnostics_enabled() {
-                if let Err(error) = self.service.append_context_attribution(&user_record).await {
-                    warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist user-input context attribution");
-                }
+            if provider_usage_diagnostics_enabled()
+                && let Err(error) = self.service.append_context_attribution(&user_record).await
+            {
+                warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist user-input context attribution");
             }
             if !memory_context.is_empty() {
                 let memory_chars = memory_context.chars().count();
@@ -605,10 +605,10 @@ impl ConversationTurnOrchestrator {
                     measurement_kind: Some("assembled".to_string()),
                     provenance_source: Some("conversation_orchestrator".to_string()),
                 };
-                if provider_usage_diagnostics_enabled() {
-                    if let Err(error) = self.service.append_context_attribution(&memory_record).await {
-                        warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist memory context attribution");
-                    }
+                if provider_usage_diagnostics_enabled()
+                    && let Err(error) = self.service.append_context_attribution(&memory_record).await
+                {
+                    warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist memory context attribution");
                 }
             }
             if !allowed_skill_names.is_empty() {
@@ -635,10 +635,10 @@ impl ConversationTurnOrchestrator {
                     measurement_kind: Some("inventory".to_string()),
                     provenance_source: Some("conversation_orchestrator".to_string()),
                 };
-                if provider_usage_diagnostics_enabled() {
-                    if let Err(error) = self.service.append_context_attribution(&skills_record).await {
-                        warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist skills context attribution");
-                    }
+                if provider_usage_diagnostics_enabled()
+                    && let Err(error) = self.service.append_context_attribution(&skills_record).await
+                {
+                    warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist skills context attribution");
                 }
             }
 
