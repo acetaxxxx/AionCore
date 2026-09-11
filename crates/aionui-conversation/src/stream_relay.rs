@@ -3,6 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::protocol::events::{ErrorEventData, TipType, TipsEventData};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
+use crate::diagnostics::provider_usage_diagnostics_enabled;
 use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
@@ -482,12 +483,14 @@ impl StreamRelay {
                             self.record_provider_turn_binding(backend_turn_id).await;
                         }
                         AgentStreamEvent::AcpContextUsage(raw_usage) => {
-                            usage_sequence += 1;
-                            if let Some(snapshot) = self
-                                .record_provider_usage(raw_usage, usage_sequence, previous_usage.as_ref())
-                                .await
-                            {
-                                previous_usage = Some(snapshot);
+                            if provider_usage_diagnostics_enabled() {
+                                usage_sequence += 1;
+                                if let Some(snapshot) = self
+                                    .record_provider_usage(raw_usage, usage_sequence, previous_usage.as_ref())
+                                    .await
+                                {
+                                    previous_usage = Some(snapshot);
+                                }
                             }
                         }
                         AgentStreamEvent::Thinking(data) => {
@@ -677,7 +680,9 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_tool_call(data).await;
-                            if let Ok(payload) = serde_json::to_vec(data) {
+                            if let Ok(payload) = serde_json::to_vec(data)
+                                && provider_usage_diagnostics_enabled()
+                            {
                                 self.append_tool_attribution(vec![data.call_id.clone()], &payload).await;
                             }
                         }
@@ -688,7 +693,9 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_acp_tool_call(data).await;
-                            if let Ok(payload) = serde_json::to_vec(data) {
+                            if let Ok(payload) = serde_json::to_vec(data)
+                                && provider_usage_diagnostics_enabled()
+                            {
                                 self.append_tool_attribution(vec![data.update.tool_call_id.clone()], &payload)
                                     .await;
                             }
@@ -705,7 +712,9 @@ impl StreamRelay {
                                     .iter()
                                     .map(|entry| entry.call_id.clone())
                                     .collect::<Vec<_>>();
-                                self.append_tool_attribution(item_ids, &payload).await;
+                                if provider_usage_diagnostics_enabled() {
+                                    self.append_tool_attribution(item_ids, &payload).await;
+                                }
                             }
                         }
                         AgentStreamEvent::WorkflowProgress(data) if data.settle_only => {
@@ -716,7 +725,9 @@ impl StreamRelay {
                             // ref that never had one.
                             if self.adapter.settle_tool_call_if_present(&data.card).await {
                                 self.forward_workflow_progress(data);
-                                if let Ok(payload) = serde_json::to_vec(data) {
+                                if let Ok(payload) = serde_json::to_vec(data)
+                                    && provider_usage_diagnostics_enabled()
+                                {
                                     self.append_tool_attribution(vec![data.card.call_id.clone()], &payload).await;
                                 }
                             }
@@ -742,7 +753,9 @@ impl StreamRelay {
                             if let Ok(payload) = serde_json::to_vec(data) {
                                 let mut item_ids = vec![data.card.call_id.clone()];
                                 item_ids.extend(data.agents.iter().map(|entry| entry.call_id.clone()));
-                                self.append_tool_attribution(item_ids, &payload).await;
+                                if provider_usage_diagnostics_enabled() {
+                                    self.append_tool_attribution(item_ids, &payload).await;
+                                }
                             }
                         }
                         AgentStreamEvent::Tips(data) => {

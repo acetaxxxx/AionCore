@@ -5,6 +5,7 @@ mod acp_error_recovery;
 mod agent_health_policy;
 mod background_stream;
 mod convert;
+mod diagnostics;
 pub mod error;
 mod memory_curation;
 pub(crate) mod message_cursor;
@@ -32,6 +33,7 @@ mod turn_orchestrator;
 mod turn_recovery_policy;
 
 pub use convert::row_to_response_with_extra;
+pub use diagnostics::provider_usage_diagnostics_enabled;
 pub use error::ConversationError;
 pub use memory_curation::{
     AgentMemory, FilesystemMemoryCuration, InMemoryMemoryCuration, MemoryCandidate, MemoryCandidateLifecycleEvent,

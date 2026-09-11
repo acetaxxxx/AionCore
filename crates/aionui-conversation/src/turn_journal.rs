@@ -879,13 +879,24 @@ impl FilesystemTurnJournal {
         }
         let file_path = self.get_attribution_file_path(&record.user_id, &record.conversation_id, &record.turn_id)?;
         let existing_events = Self::read_and_sanitize_turn_events(&file_path).await?;
-        if existing_events.iter().any(|event| {
-            matches!(event, RawJournalEvent::ContextAttribution { record: existing }
-                if existing.context_generation_id == record.context_generation_id
-                    && existing.source == record.source
-                    && existing.item_hash == record.item_hash)
+        if let Some(existing) = existing_events.iter().find_map(|event| {
+            let RawJournalEvent::ContextAttribution { record: existing } = event else {
+                return None;
+            };
+            (existing.context_generation_id == record.context_generation_id
+                && existing.source == record.source
+                && existing.item_hash == record.item_hash)
+                .then_some(existing)
         }) {
-            return Ok(());
+            if existing == &record {
+                return Ok(());
+            }
+            return Err(JournalError::InvalidIdentifier {
+                reason: format!(
+                    "context attribution identity {} has a conflicting payload",
+                    record.context_generation_id
+                ),
+            });
         }
         self.append_event_durable(&file_path, &RawJournalEvent::ContextAttribution { record })
             .await
@@ -1240,13 +1251,24 @@ impl InMemoryTurnJournal {
                 turn_id: record.turn_id.clone(),
             });
         }
-        if entry.iter().any(|event| {
-            matches!(event, RawJournalEvent::ContextAttribution { record: existing }
-                if existing.context_generation_id == record.context_generation_id
-                    && existing.source == record.source
-                    && existing.item_hash == record.item_hash)
+        if let Some(existing) = entry.iter().find_map(|event| {
+            let RawJournalEvent::ContextAttribution { record: existing } = event else {
+                return None;
+            };
+            (existing.context_generation_id == record.context_generation_id
+                && existing.source == record.source
+                && existing.item_hash == record.item_hash)
+                .then_some(existing)
         }) {
-            return Ok(());
+            if existing == &record {
+                return Ok(());
+            }
+            return Err(JournalError::InvalidIdentifier {
+                reason: format!(
+                    "context attribution identity {} has a conflicting payload",
+                    record.context_generation_id
+                ),
+            });
         }
         entry.push(RawJournalEvent::ContextAttribution { record });
         Ok(())
@@ -3440,6 +3462,11 @@ mod tests {
 
         journal.append_context_attribution(&record).await.unwrap();
         journal.append_context_attribution(&record).await.unwrap();
+        let conflicting = ContextAttributionRecord {
+            delivery_kind: Some("changed".to_string()),
+            ..record.clone()
+        };
+        assert!(journal.append_context_attribution(&conflicting).await.is_err());
         journal
             .append_context_attribution(&ContextAttributionRecord {
                 context_generation_id: "gen_2".to_string(),

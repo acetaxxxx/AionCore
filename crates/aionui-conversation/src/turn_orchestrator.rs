@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
+use crate::diagnostics::provider_usage_diagnostics_enabled;
 use crate::memory_curation::MemoryEvidence;
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
@@ -576,7 +577,9 @@ impl ConversationTurnOrchestrator {
                 measurement_kind: Some("assembled".to_string()),
                 provenance_source: Some("conversation_orchestrator".to_string()),
             };
-            if let Err(error) = self.service.append_context_attribution(&user_record).await {
+            if provider_usage_diagnostics_enabled()
+                && let Err(error) = self.service.append_context_attribution(&user_record).await
+            {
                 warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist user-input context attribution");
             }
             if !memory_context.is_empty() {
@@ -602,7 +605,9 @@ impl ConversationTurnOrchestrator {
                     measurement_kind: Some("assembled".to_string()),
                     provenance_source: Some("conversation_orchestrator".to_string()),
                 };
-                if let Err(error) = self.service.append_context_attribution(&memory_record).await {
+                if provider_usage_diagnostics_enabled()
+                    && let Err(error) = self.service.append_context_attribution(&memory_record).await
+                {
                     warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist memory context attribution");
                 }
             }
@@ -630,7 +635,9 @@ impl ConversationTurnOrchestrator {
                     measurement_kind: Some("inventory".to_string()),
                     provenance_source: Some("conversation_orchestrator".to_string()),
                 };
-                if let Err(error) = self.service.append_context_attribution(&skills_record).await {
+                if provider_usage_diagnostics_enabled()
+                    && let Err(error) = self.service.append_context_attribution(&skills_record).await
+                {
                     warn!(turn_id = %turn_id, error = %ErrorChain(&error), "Failed to persist skills context attribution");
                 }
             }
