@@ -5,6 +5,7 @@ mod acp_error_recovery;
 mod agent_health_policy;
 mod background_stream;
 mod convert;
+mod diagnostics;
 pub mod error;
 mod memory_curation;
 pub(crate) mod message_cursor;

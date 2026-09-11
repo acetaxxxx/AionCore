@@ -3,6 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::protocol::events::{ErrorEventData, TipType, TipsEventData};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
+use crate::diagnostics::provider_usage_diagnostics_enabled;
 use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
@@ -482,12 +483,14 @@ impl StreamRelay {
                             self.record_provider_turn_binding(backend_turn_id).await;
                         }
                         AgentStreamEvent::AcpContextUsage(raw_usage) => {
-                            usage_sequence += 1;
-                            if let Some(snapshot) = self
-                                .record_provider_usage(raw_usage, usage_sequence, previous_usage.as_ref())
-                                .await
-                            {
-                                previous_usage = Some(snapshot);
+                            if provider_usage_diagnostics_enabled() {
+                                usage_sequence += 1;
+                                if let Some(snapshot) = self
+                                    .record_provider_usage(raw_usage, usage_sequence, previous_usage.as_ref())
+                                    .await
+                                {
+                                    previous_usage = Some(snapshot);
+                                }
                             }
                         }
                         AgentStreamEvent::Thinking(data) => {
