@@ -680,10 +680,10 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_tool_call(data).await;
-                            if let Ok(payload) = serde_json::to_vec(data) {
-                                if provider_usage_diagnostics_enabled() {
-                                    self.append_tool_attribution(vec![data.call_id.clone()], &payload).await;
-                                }
+                            if let Ok(payload) = serde_json::to_vec(data)
+                                && provider_usage_diagnostics_enabled()
+                            {
+                                self.append_tool_attribution(vec![data.call_id.clone()], &payload).await;
                             }
                         }
                         AgentStreamEvent::AcpToolCall(data) => {
@@ -693,11 +693,11 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_acp_tool_call(data).await;
-                            if let Ok(payload) = serde_json::to_vec(data) {
-                                if provider_usage_diagnostics_enabled() {
-                                    self.append_tool_attribution(vec![data.update.tool_call_id.clone()], &payload)
-                                        .await;
-                                }
+                            if let Ok(payload) = serde_json::to_vec(data)
+                                && provider_usage_diagnostics_enabled()
+                            {
+                                self.append_tool_attribution(vec![data.update.tool_call_id.clone()], &payload)
+                                    .await;
                             }
                         }
                         AgentStreamEvent::ToolGroup(entries) => {
@@ -725,10 +725,10 @@ impl StreamRelay {
                             // ref that never had one.
                             if self.adapter.settle_tool_call_if_present(&data.card).await {
                                 self.forward_workflow_progress(data);
-                                if let Ok(payload) = serde_json::to_vec(data) {
-                                    if provider_usage_diagnostics_enabled() {
-                                        self.append_tool_attribution(vec![data.card.call_id.clone()], &payload).await;
-                                    }
+                                if let Ok(payload) = serde_json::to_vec(data)
+                                    && provider_usage_diagnostics_enabled()
+                                {
+                                    self.append_tool_attribution(vec![data.card.call_id.clone()], &payload).await;
                                 }
                             }
                         }
