@@ -19,3 +19,17 @@ AIONUI_ENABLE_PROVIDER_USAGE_DIAGNOSTICS=1
 value, including an unset variable, leaves it disabled. The toggle controls
 only persisted per-turn provider usage diagnostics; it does not disable the
 existing UI usage indicator.
+
+## Context attribution
+
+PR16 source attribution records are a separate opt-in persistent telemetry
+path. They are disabled by default and can be enabled with:
+
+```text
+AIONUI_ENABLE_CONTEXT_ATTRIBUTION=1
+```
+
+This controls attribution records emitted by the conversation orchestrator,
+Team adapter, and streaming tool-event relay. It does not disable lifecycle
+pre-turn, mid-turn, or terminal records, and it does not enable provider usage
+diagnostics; each path remains independently controlled.

@@ -7,7 +7,8 @@ use aionui_api_types::{
 };
 use aionui_common::{AgentType, now_ms};
 use aionui_conversation::{
-    ContextAttributionRecord, ContextSource, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
+    context_attribution_enabled, ContextAttributionRecord, ContextSource, ConversationAgentTurnRequest,
+    ConversationAgentTurnStarted,
     ConversationAgentTurnStatus, ConversationError, ConversationService,
 };
 use aionui_db::models::{AgentMetadataRow, MessageRow};
@@ -133,49 +134,51 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
             }
         };
 
-        for (index, attribution) in request.attributions.iter().enumerate() {
-            let source = match attribution.source {
-                AgentTurnAttributionSource::Mailbox => ContextSource::TeamMailbox,
-                AgentTurnAttributionSource::TaskSummary => ContextSource::TaskSummary,
-                AgentTurnAttributionSource::ToolResult => ContextSource::ToolResult,
-            };
-            let identity = format!(
-                "{}|{}|{}|{}|{}|{}",
-                source.as_str(),
-                attribution.item_ids.join(","),
-                attribution.item_count,
-                attribution.bytes,
-                attribution.chars,
-                attribution.delivery_id.as_deref().unwrap_or_default(),
-            );
-            let record = ContextAttributionRecord {
-                user_id: request.user_id.clone(),
-                conversation_id: outcome.conversation_id.clone(),
-                turn_id: outcome.turn_id.clone(),
-                context_generation_id: format!("{}-att-{}", outcome.turn_id, index + 1),
-                source,
-                item_count: attribution.item_count,
-                bytes: attribution.bytes,
-                chars: attribution.chars,
-                estimated_tokens: attribution.estimated_tokens,
-                item_ids: attribution.item_ids.clone(),
-                item_hash: aionui_conversation::digest_hex(identity.as_bytes()),
-                created_at_ms: now_ms().try_into().unwrap_or_default(),
-                schema_version: Some(1),
-                event_id: None,
-                delivery_id: attribution.delivery_id.clone(),
-                delivery_kind: attribution.delivery_kind.clone(),
-                render_mode: attribution.render_mode.clone(),
-                measurement_kind: attribution.measurement_kind.clone(),
-                provenance_source: attribution.provenance_source.clone(),
-            };
-            if let Err(error) = self.conversation_service.append_context_attribution(&record).await {
-                warn!(
-                    turn_id = %outcome.turn_id,
-                    source = source.as_str(),
-                    error = %error,
-                    "Failed to persist team context attribution"
+        if context_attribution_enabled() {
+            for (index, attribution) in request.attributions.iter().enumerate() {
+                let source = match attribution.source {
+                    AgentTurnAttributionSource::Mailbox => ContextSource::TeamMailbox,
+                    AgentTurnAttributionSource::TaskSummary => ContextSource::TaskSummary,
+                    AgentTurnAttributionSource::ToolResult => ContextSource::ToolResult,
+                };
+                let identity = format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    source.as_str(),
+                    attribution.item_ids.join(","),
+                    attribution.item_count,
+                    attribution.bytes,
+                    attribution.chars,
+                    attribution.delivery_id.as_deref().unwrap_or_default(),
                 );
+                let record = ContextAttributionRecord {
+                    user_id: request.user_id.clone(),
+                    conversation_id: outcome.conversation_id.clone(),
+                    turn_id: outcome.turn_id.clone(),
+                    context_generation_id: format!("{}-att-{}", outcome.turn_id, index + 1),
+                    source,
+                    item_count: attribution.item_count,
+                    bytes: attribution.bytes,
+                    chars: attribution.chars,
+                    estimated_tokens: attribution.estimated_tokens,
+                    item_ids: attribution.item_ids.clone(),
+                    item_hash: aionui_conversation::digest_hex(identity.as_bytes()),
+                    created_at_ms: now_ms().try_into().unwrap_or_default(),
+                    schema_version: Some(1),
+                    event_id: None,
+                    delivery_id: attribution.delivery_id.clone(),
+                    delivery_kind: attribution.delivery_kind.clone(),
+                    render_mode: attribution.render_mode.clone(),
+                    measurement_kind: attribution.measurement_kind.clone(),
+                    provenance_source: attribution.provenance_source.clone(),
+                };
+                if let Err(error) = self.conversation_service.append_context_attribution(&record).await {
+                    warn!(
+                        turn_id = %outcome.turn_id,
+                        source = source.as_str(),
+                        error = %error,
+                        "Failed to persist team context attribution"
+                    );
+                }
             }
         }
 
