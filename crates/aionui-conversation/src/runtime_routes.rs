@@ -12,7 +12,7 @@ use aionui_api_types::{
     ConversationCliEnvelope, ConversationCreateRequest, ConversationCreateResponse, ConversationToolErrorCode,
     ConversationToolErrorPayload,
 };
-use axum::body::{to_bytes, Body};
+use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
@@ -79,10 +79,7 @@ fn required_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
 
 type Reply = (StatusCode, Json<ConversationCliEnvelope<ConversationCreateResponse>>);
 
-async fn create(
-    State(state): State<ConversationRuntimeRouterState>,
-    request: axum::http::Request<Body>,
-) -> Reply {
+async fn create(State(state): State<ConversationRuntimeRouterState>, request: axum::http::Request<Body>) -> Reply {
     let Some(caller) = runtime_caller(&state, request.headers()) else {
         // No header values are logged — the token must never reach the logs.
         warn!(

@@ -260,11 +260,7 @@ async fn a_token_bound_to_another_conversation_is_401() {
     ctx.caller("conv_b").await;
     let token = ctx.mint(USER, "conv_a");
 
-    assert_runtime_auth_failed(
-        &ctx,
-        create_request(USER, "conv_b", Some(&token), r#"{"name":"x"}"#),
-    )
-    .await;
+    assert_runtime_auth_failed(&ctx, create_request(USER, "conv_b", Some(&token), r#"{"name":"x"}"#)).await;
 }
 
 #[tokio::test]
@@ -281,11 +277,7 @@ async fn a_token_without_conversation_helper_scope_is_401() {
         )
         .token;
 
-    assert_runtime_auth_failed(
-        &ctx,
-        create_request(USER, "conv_a", Some(&token), r#"{"name":"x"}"#),
-    )
-    .await;
+    assert_runtime_auth_failed(&ctx, create_request(USER, "conv_a", Some(&token), r#"{"name":"x"}"#)).await;
 }
 
 #[tokio::test]
@@ -294,14 +286,15 @@ async fn a_token_from_another_session_generation_is_401() {
     ctx.caller("conv_a").await;
     let token = ctx
         .tokens
-        .issue(USER, "conv_a", "previous-generation", [RuntimeTokenScope::ConversationHelper])
+        .issue(
+            USER,
+            "conv_a",
+            "previous-generation",
+            [RuntimeTokenScope::ConversationHelper],
+        )
         .token;
 
-    assert_runtime_auth_failed(
-        &ctx,
-        create_request(USER, "conv_a", Some(&token), r#"{"name":"x"}"#),
-    )
-    .await;
+    assert_runtime_auth_failed(&ctx, create_request(USER, "conv_a", Some(&token), r#"{"name":"x"}"#)).await;
 }
 
 #[tokio::test]
@@ -396,10 +389,7 @@ async fn a_caller_cannot_select_another_users_workspace() {
     let (status, envelope) = call(&ctx, create_request(USER, "conv_a", Some(&token), &body)).await;
 
     assert_eq!(status, StatusCode::FORBIDDEN, "{envelope}");
-    assert_eq!(
-        envelope["error"]["code"],
-        serde_json::json!("workspace_not_authorized")
-    );
+    assert_eq!(envelope["error"]["code"], serde_json::json!("workspace_not_authorized"));
     assert_eq!(
         ctx.repo.list_all_conversation_ids().await.unwrap().len(),
         2,
@@ -429,17 +419,10 @@ async fn an_explicit_workspace_cannot_traverse_outside_the_callers_root() {
     })
     .to_string();
 
-    let (status, envelope) = call(
-        &ctx,
-        create_request(USER, "conv_traversal", Some(&token), &body),
-    )
-    .await;
+    let (status, envelope) = call(&ctx, create_request(USER, "conv_traversal", Some(&token), &body)).await;
 
     assert_eq!(status, StatusCode::FORBIDDEN, "{envelope}");
-    assert_eq!(
-        envelope["error"]["code"],
-        serde_json::json!("workspace_not_authorized")
-    );
+    assert_eq!(envelope["error"]["code"], serde_json::json!("workspace_not_authorized"));
     assert_eq!(ctx.repo.list_all_conversation_ids().await.unwrap().len(), 1);
 }
 
@@ -484,17 +467,10 @@ async fn an_explicit_workspace_cannot_escape_through_a_symlink() {
         })
         .to_string();
 
-        let (status, envelope) = call(
-            &ctx,
-            create_request(USER, "conv_symlink", Some(&token), &body),
-        )
-        .await;
+        let (status, envelope) = call(&ctx, create_request(USER, "conv_symlink", Some(&token), &body)).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{envelope}");
-        assert_eq!(
-            envelope["error"]["code"],
-            serde_json::json!("workspace_not_authorized")
-        );
+        assert_eq!(envelope["error"]["code"], serde_json::json!("workspace_not_authorized"));
         assert_eq!(ctx.repo.list_all_conversation_ids().await.unwrap().len(), 1);
         std::fs::remove_file(&link).unwrap();
     }

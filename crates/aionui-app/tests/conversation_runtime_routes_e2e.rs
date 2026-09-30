@@ -158,10 +158,7 @@ async fn runtime_create_keeps_the_global_body_limit() {
         "x".repeat(aionui_common::constants::BODY_LIMIT + 1)
     );
 
-    let response = app
-        .oneshot(create_request(CALLER, &token, &oversized))
-        .await
-        .unwrap();
+    let response = app.oneshot(create_request(CALLER, &token, &oversized)).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(

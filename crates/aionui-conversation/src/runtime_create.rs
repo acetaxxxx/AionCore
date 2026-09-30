@@ -232,30 +232,26 @@ impl ConversationService {
                         path: caller_workspace.clone(),
                     });
                 }
-                let authorized_root = caller_workspace_path
-                    .canonicalize()
-                    .map_err(|error| {
-                        error!(
-                            operation = "resolve caller workspace",
-                            error_type = std::any::type_name_of_val(&error),
-                            "workspace path resolution failed"
-                        );
-                        ConversationCreateError::WorkspaceUnavailable {
-                            path: caller_workspace.clone(),
-                        }
-                    })?;
-                let requested_workspace = Path::new(explicit)
-                    .canonicalize()
-                    .map_err(|error| {
-                        error!(
-                            operation = "resolve requested workspace",
-                            error_type = std::any::type_name_of_val(&error),
-                            "workspace path resolution failed"
-                        );
-                        ConversationCreateError::WorkspaceUnavailable {
-                            path: explicit.to_owned(),
-                        }
-                    })?;
+                let authorized_root = caller_workspace_path.canonicalize().map_err(|error| {
+                    error!(
+                        operation = "resolve caller workspace",
+                        error_type = std::any::type_name_of_val(&error),
+                        "workspace path resolution failed"
+                    );
+                    ConversationCreateError::WorkspaceUnavailable {
+                        path: caller_workspace.clone(),
+                    }
+                })?;
+                let requested_workspace = Path::new(explicit).canonicalize().map_err(|error| {
+                    error!(
+                        operation = "resolve requested workspace",
+                        error_type = std::any::type_name_of_val(&error),
+                        "workspace path resolution failed"
+                    );
+                    ConversationCreateError::WorkspaceUnavailable {
+                        path: explicit.to_owned(),
+                    }
+                })?;
                 if !requested_workspace.starts_with(&authorized_root) {
                     return Err(ConversationCreateError::WorkspaceNotAuthorized);
                 }
@@ -413,7 +409,9 @@ impl ConversationService {
     async fn override_plan(&self, user_id: &str, assistant_id: &str) -> Result<CreatePlan, ConversationCreateError> {
         let (Some(definition_repo), Some(state_repo)) = (self.assistant_definition_repo(), self.assistant_state_repo())
         else {
-            return Err(ConversationCreateError::unavailable("assistant repositories are not configured"));
+            return Err(ConversationCreateError::unavailable(
+                "assistant repositories are not configured",
+            ));
         };
 
         let definition = definition_repo
@@ -503,7 +501,9 @@ impl ConversationService {
         model_id: &str,
     ) -> Result<Option<String>, ConversationCreateError> {
         let Some(provider_repo) = self.provider_repo() else {
-            return Err(ConversationCreateError::unavailable("provider repository is not configured"));
+            return Err(ConversationCreateError::unavailable(
+                "provider repository is not configured",
+            ));
         };
         let providers = provider_repo
             .list(user_id)
@@ -615,8 +615,7 @@ mod tests {
 
     #[test]
     fn transport_errors_have_a_stable_public_message() {
-        let error =
-            ConversationCreateError::transport("provider lookup", "secret path /private/provider.db");
+        let error = ConversationCreateError::transport("provider lookup", "secret path /private/provider.db");
         assert_eq!(error.to_string(), "conversation service unavailable");
         assert!(!error.to_string().contains("/private/provider.db"));
     }
