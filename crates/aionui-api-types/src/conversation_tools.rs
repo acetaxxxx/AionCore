@@ -55,15 +55,16 @@ fn tool_specs() -> Vec<ConversationToolSpec> {
     vec![ConversationToolSpec {
         name: ConversationToolName::ConversationCreate,
         description: "Create a new conversation for this user. By default it inherits this \
-                       conversation's working directory and assistant; pass `workspace` or \
-                       `assistant_id` to choose another. Creating does not send a message, \
+                       conversation's working directory and assistant; `workspace` may select \
+                       an existing directory within that workspace, and `assistant_id` may select \
+                       another enabled assistant. Creating does not send a message, \
                        does not open the new conversation, and does not switch the user's \
                        current conversation.",
         input_schema: json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Short name describing the task, in the user's language. Required; must not be blank." },
-                "workspace": { "type": "string", "description": "Absolute path of an existing directory. Omit to reuse this conversation's workspace." },
+                "workspace": { "type": "string", "description": "Absolute path of an existing directory within this conversation's workspace. Omit to reuse this conversation's workspace." },
                 "assistant_id": { "type": "string", "description": "Id of an enabled assistant. Omit to reuse this conversation's assistant." }
             },
             "required": ["name"],
@@ -106,6 +107,7 @@ pub enum ConversationToolErrorCode {
     CallerIsTeam,
     WorkspaceNotAbsolute,
     WorkspaceUnavailable,
+    WorkspaceNotAuthorized,
     AssistantNotFound,
     AssistantDisabled,
     AssistantModelUnresolved,
@@ -122,6 +124,7 @@ impl ConversationToolErrorCode {
             Self::CallerIsTeam => "caller_is_team",
             Self::WorkspaceNotAbsolute => "workspace_not_absolute",
             Self::WorkspaceUnavailable => "workspace_unavailable",
+            Self::WorkspaceNotAuthorized => "workspace_not_authorized",
             Self::AssistantNotFound => "assistant_not_found",
             Self::AssistantDisabled => "assistant_disabled",
             Self::AssistantModelUnresolved => "assistant_model_unresolved",
@@ -273,6 +276,7 @@ mod tests {
             ConversationToolErrorCode::CallerIsTeam,
             ConversationToolErrorCode::WorkspaceNotAbsolute,
             ConversationToolErrorCode::WorkspaceUnavailable,
+            ConversationToolErrorCode::WorkspaceNotAuthorized,
             ConversationToolErrorCode::AssistantNotFound,
             ConversationToolErrorCode::AssistantDisabled,
             ConversationToolErrorCode::AssistantModelUnresolved,

@@ -170,17 +170,19 @@ async fn inherits_the_assistant_snapshot_and_the_aionrs_model_verbatim() {
 }
 
 #[tokio::test]
-async fn an_explicit_workspace_is_used_instead_of_the_callers() {
+async fn an_explicit_workspace_within_the_callers_root_is_used() {
+    let caller_workspace = ensure_test_workspace_path();
+    let other = Path::new(&caller_workspace).join("runtime-create-explicit");
+    std::fs::create_dir_all(&other).unwrap();
     let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(Arc::new(MockTaskManager::new()));
     insert_caller(
         &repo,
         "caller-ws",
         "acp",
-        json!({ "workspace": ensure_test_workspace_path(), "backend": "claude" }),
+        json!({ "workspace": caller_workspace, "backend": "claude" }),
         None,
     )
     .await;
-    let other = unique_test_workspace_path("runtime-create-explicit");
     let other_str = other.to_string_lossy().to_string();
 
     let created = svc

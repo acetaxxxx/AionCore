@@ -373,6 +373,40 @@ async fn a_forged_user_header_cannot_create_for_another_user() {
     );
 }
 
+#[tokio::test]
+async fn a_caller_cannot_select_another_users_workspace() {
+    let ctx = setup().await;
+    ctx.caller("conv_a").await;
+    let other_workspace = std::env::temp_dir().join("aionui-runtime-create-routes-other-user");
+    std::fs::create_dir_all(&other_workspace).unwrap();
+    let other_workspace = other_workspace.to_string_lossy().into_owned();
+    ctx.insert_row(
+        OTHER_USER,
+        "conv_other",
+        serde_json::json!({ "workspace": other_workspace.clone(), "backend": "claude" }),
+    )
+    .await;
+    let token = ctx.mint(USER, "conv_a");
+    let body = serde_json::json!({
+        "name": "x",
+        "workspace": other_workspace.clone(),
+    })
+    .to_string();
+
+    let (status, envelope) = call(&ctx, create_request(USER, "conv_a", Some(&token), &body)).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{envelope}");
+    assert_eq!(
+        envelope["error"]["code"],
+        serde_json::json!("workspace_not_authorized")
+    );
+    assert_eq!(
+        ctx.repo.list_all_conversation_ids().await.unwrap().len(),
+        2,
+        "nothing created"
+    );
+}
+
 // ── Happy path ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -412,11 +446,11 @@ async fn create_inherits_the_callers_workspace_and_broadcasts_once() {
 }
 
 #[tokio::test]
-async fn create_with_an_explicit_workspace_persists_that_path() {
+async fn create_with_an_explicit_workspace_inside_the_caller_root_persists_that_path() {
     let ctx = setup().await;
     ctx.caller("conv_a").await;
     let token = ctx.mint(USER, "conv_a");
-    let other = std::env::temp_dir().join("aionui-runtime-create-routes-other");
+    let other = std::path::Path::new(&ctx.workspace).join("nested");
     std::fs::create_dir_all(&other).unwrap();
     let other = other.to_string_lossy().into_owned();
     let body = serde_json::json!({ "name": "x", "workspace": other }).to_string();

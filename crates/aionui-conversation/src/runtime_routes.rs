@@ -12,8 +12,8 @@ use aionui_api_types::{
     ConversationCliEnvelope, ConversationCreateRequest, ConversationCreateResponse, ConversationToolErrorCode,
     ConversationToolErrorPayload,
 };
+use axum::body::{to_bytes, Body};
 use axum::extract::State;
-use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -81,10 +81,9 @@ type Reply = (StatusCode, Json<ConversationCliEnvelope<ConversationCreateRespons
 
 async fn create(
     State(state): State<ConversationRuntimeRouterState>,
-    headers: HeaderMap,
-    body: Result<Json<ConversationCreateRequest>, JsonRejection>,
+    request: axum::http::Request<Body>,
 ) -> Reply {
-    let Some(caller) = runtime_caller(&state, &headers) else {
+    let Some(caller) = runtime_caller(&state, request.headers()) else {
         // No header values are logged — the token must never reach the logs.
         warn!(
             outcome = "rejected",
@@ -96,17 +95,29 @@ async fn create(
             ConversationToolErrorPayload::new(ConversationToolErrorCode::RuntimeAuthFailed, "runtime auth failed"),
         );
     };
-    // Body parsing is deliberately AFTER auth so an unauthenticated caller
-    // learns nothing about the schema; `deny_unknown_fields` on the request
-    // type turns stray fields into this same 400.
-    let request = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
+    // Read and deserialize only after token validation. Request-body parsing
+    // here is explicit because Json<T> is extracted before the handler runs.
+    // Keep the same global cap for this raw-body path.
+    let bytes = match to_bytes(request.into_body(), aionui_common::constants::BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return failure(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ConversationToolErrorPayload::new(
+                    ConversationToolErrorCode::SchemaValidationFailed,
+                    "request body exceeds the allowed size",
+                ),
+            );
+        }
+    };
+    let request: ConversationCreateRequest = match serde_json::from_slice(&bytes) {
+        Ok(request) => request,
+        Err(_) => {
             return failure(
                 StatusCode::BAD_REQUEST,
                 ConversationToolErrorPayload::new(
                     ConversationToolErrorCode::SchemaValidationFailed,
-                    format!("request body does not match the schema: {}", rejection.body_text()),
+                    "request body does not match the schema",
                 ),
             );
         }

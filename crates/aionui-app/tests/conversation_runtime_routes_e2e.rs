@@ -120,7 +120,7 @@ async fn runtime_create_without_a_token_is_401_not_a_redirect_into_user_auth() {
                 .method("POST")
                 .uri("/api/runtime/conversations/create")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"name":"x"}"#))
+                .body(Body::from("not json"))
                 .unwrap(),
         )
         .await
@@ -129,6 +129,44 @@ async fn runtime_create_without_a_token_is_401_not_a_redirect_into_user_auth() {
     assert_eq!(
         body_json(response).await["error"]["code"],
         serde_json::json!("runtime_auth_failed")
+    );
+    services.database.close().await;
+}
+
+#[tokio::test]
+async fn runtime_create_keeps_the_global_body_limit() {
+    let (app, services) = build_app().await;
+    let workspace = std::env::temp_dir().join("aionui-app-runtime-create-body-limit");
+    std::fs::create_dir_all(&workspace).unwrap();
+    insert_caller(
+        &services,
+        CALLER,
+        &serde_json::json!({ "workspace": workspace, "backend": "claude" }).to_string(),
+    )
+    .await;
+    let token = services
+        .runtime_token_service
+        .issue(
+            USER,
+            CALLER,
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::ConversationHelper],
+        )
+        .token;
+    let oversized = format!(
+        r#"{{"name":"{}"}}"#,
+        "x".repeat(aionui_common::constants::BODY_LIMIT + 1)
+    );
+
+    let response = app
+        .oneshot(create_request(CALLER, &token, &oversized))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        body_json(response).await["error"]["code"],
+        serde_json::json!("schema_validation_failed")
     );
     services.database.close().await;
 }

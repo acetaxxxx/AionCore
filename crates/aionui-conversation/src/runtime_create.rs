@@ -15,7 +15,7 @@ use aionui_api_types::{
 use aionui_common::{AgentType, ConversationSource, ProviderWithModel};
 use aionui_db::models::ConversationRow;
 use serde_json::{Map, Value};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::convert::string_to_enum;
 use crate::error::ConversationError;
@@ -37,6 +37,9 @@ pub enum ConversationCreateError {
     #[error("workspace is not an existing directory: {path}")]
     WorkspaceUnavailable { path: String },
 
+    #[error("workspace is not authorized for the caller")]
+    WorkspaceNotAuthorized,
+
     #[error("assistant not found: {id}")]
     AssistantNotFound { id: String },
 
@@ -55,8 +58,8 @@ pub enum ConversationCreateError {
     #[error("request does not match the schema: {reason}")]
     SchemaValidation { reason: String },
 
-    #[error("conversation service unavailable: {reason}")]
-    TransportUnavailable { reason: String },
+    #[error("conversation service unavailable")]
+    TransportUnavailable,
 }
 
 impl ConversationCreateError {
@@ -65,11 +68,12 @@ impl ConversationCreateError {
             Self::CallerIsTeam { .. } => ConversationToolErrorCode::CallerIsTeam,
             Self::WorkspaceNotAbsolute { .. } => ConversationToolErrorCode::WorkspaceNotAbsolute,
             Self::WorkspaceUnavailable { .. } => ConversationToolErrorCode::WorkspaceUnavailable,
+            Self::WorkspaceNotAuthorized => ConversationToolErrorCode::WorkspaceNotAuthorized,
             Self::AssistantNotFound { .. } => ConversationToolErrorCode::AssistantNotFound,
             Self::AssistantDisabled { .. } => ConversationToolErrorCode::AssistantDisabled,
             Self::AssistantModelUnresolved { .. } => ConversationToolErrorCode::AssistantModelUnresolved,
             Self::SchemaValidation { .. } => ConversationToolErrorCode::SchemaValidationFailed,
-            Self::TransportUnavailable { .. } => ConversationToolErrorCode::TransportUnavailable,
+            Self::TransportUnavailable => ConversationToolErrorCode::TransportUnavailable,
         }
     }
 
@@ -81,16 +85,25 @@ impl ConversationCreateError {
             | Self::WorkspaceUnavailable { .. }
             | Self::AssistantDisabled { .. }
             | Self::AssistantModelUnresolved { .. } => 422,
+            Self::WorkspaceNotAuthorized => 403,
             Self::AssistantNotFound { .. } => 404,
             Self::SchemaValidation { .. } => 400,
-            Self::TransportUnavailable { .. } => 503,
+            Self::TransportUnavailable => 503,
         }
     }
 
-    fn transport(error: impl std::fmt::Display) -> Self {
-        Self::TransportUnavailable {
-            reason: error.to_string(),
-        }
+    fn transport<E>(operation: &'static str, _error: E) -> Self {
+        error!(
+            operation,
+            error_type = std::any::type_name::<E>(),
+            "conversation create dependency failed"
+        );
+        Self::TransportUnavailable
+    }
+
+    fn unavailable(operation: &'static str) -> Self {
+        error!(operation, "conversation create dependency unavailable");
+        Self::TransportUnavailable
     }
 }
 
@@ -180,10 +193,8 @@ impl ConversationService {
             .conversation_repo()
             .get(user_id, caller_conversation_id)
             .await
-            .map_err(ConversationCreateError::transport)?
-            .ok_or_else(|| ConversationCreateError::TransportUnavailable {
-                reason: format!("caller conversation missing: {caller_conversation_id}"),
-            })?;
+            .map_err(|error| ConversationCreateError::transport("load caller conversation", error))?
+            .ok_or_else(|| ConversationCreateError::unavailable("caller conversation missing"))?;
 
         // 2. Team callers get no ordinary-conversation surface.
         if team_id_from_extra_str(&caller.extra).is_some() {
@@ -201,6 +212,8 @@ impl ConversationService {
         }
 
         // 4. workspace — absolute-ness here, existence inside `create`.
+        let caller_workspace = workspace_from_extra(&caller.extra)
+            .ok_or_else(|| ConversationCreateError::unavailable("caller workspace missing"))?;
         let (workspace, workspace_inherited) = match req
             .workspace
             .as_deref()
@@ -213,16 +226,42 @@ impl ConversationService {
                         path: explicit.to_owned(),
                     });
                 }
-                (explicit.to_owned(), false)
+                let caller_workspace_path = Path::new(&caller_workspace);
+                if !caller_workspace_path.is_absolute() {
+                    return Err(ConversationCreateError::WorkspaceUnavailable {
+                        path: caller_workspace.clone(),
+                    });
+                }
+                let authorized_root = caller_workspace_path
+                    .canonicalize()
+                    .map_err(|error| {
+                        error!(
+                            operation = "resolve caller workspace",
+                            error_type = std::any::type_name_of_val(&error),
+                            "workspace path resolution failed"
+                        );
+                        ConversationCreateError::WorkspaceUnavailable {
+                            path: caller_workspace.clone(),
+                        }
+                    })?;
+                let requested_workspace = Path::new(explicit)
+                    .canonicalize()
+                    .map_err(|error| {
+                        error!(
+                            operation = "resolve requested workspace",
+                            error_type = std::any::type_name_of_val(&error),
+                            "workspace path resolution failed"
+                        );
+                        ConversationCreateError::WorkspaceUnavailable {
+                            path: explicit.to_owned(),
+                        }
+                    })?;
+                if !requested_workspace.starts_with(&authorized_root) {
+                    return Err(ConversationCreateError::WorkspaceNotAuthorized);
+                }
+                (requested_workspace.to_string_lossy().into_owned(), false)
             }
-            None => (
-                // `create` always persists `extra.workspace`, so a caller
-                // without one is a broken row, not a user error.
-                workspace_from_extra(&caller.extra).ok_or_else(|| ConversationCreateError::TransportUnavailable {
-                    reason: "caller conversation has no workspace".to_owned(),
-                })?,
-                true,
-            ),
+            None => (caller_workspace, true),
         };
 
         // 5. assistant
@@ -307,7 +346,8 @@ impl ConversationService {
         user_id: &str,
         caller: &ConversationRow,
     ) -> Result<CreatePlan, ConversationCreateError> {
-        let caller_type: AgentType = string_to_enum(&caller.r#type).map_err(ConversationCreateError::transport)?;
+        let caller_type: AgentType = string_to_enum(&caller.r#type)
+            .map_err(|error| ConversationCreateError::transport("resolve caller agent type", error))?;
         let (model, model_resolution) = if caller_type == AgentType::Aionrs {
             let model = provider_model_from_conversation_row(caller);
             (
@@ -322,7 +362,7 @@ impl ConversationService {
             .conversation_repo()
             .get_assistant_snapshot(user_id, &caller.id)
             .await
-            .map_err(ConversationCreateError::transport)?;
+            .map_err(|error| ConversationCreateError::transport("load caller assistant snapshot", error))?;
         // A snapshot whose definition has since been deleted would make `create`
         // fail with "Either `type` or `assistant.id` is required"; fall back to
         // the legacy triple so the new conversation still mirrors the caller.
@@ -331,7 +371,7 @@ impl ConversationService {
                 Some(definition_repo) => definition_repo
                     .get_by_assistant_id_for_user(user_id, &snapshot.assistant_id)
                     .await
-                    .map_err(ConversationCreateError::transport)?
+                    .map_err(|error| ConversationCreateError::transport("load inherited assistant", error))?
                     .map(|_| snapshot.assistant_id),
                 None => None,
             },
@@ -373,15 +413,13 @@ impl ConversationService {
     async fn override_plan(&self, user_id: &str, assistant_id: &str) -> Result<CreatePlan, ConversationCreateError> {
         let (Some(definition_repo), Some(state_repo)) = (self.assistant_definition_repo(), self.assistant_state_repo())
         else {
-            return Err(ConversationCreateError::TransportUnavailable {
-                reason: "assistant repositories are not configured".to_owned(),
-            });
+            return Err(ConversationCreateError::unavailable("assistant repositories are not configured"));
         };
 
         let definition = definition_repo
             .get_by_assistant_id_for_user(user_id, assistant_id)
             .await
-            .map_err(ConversationCreateError::transport)?
+            .map_err(|error| ConversationCreateError::transport("load requested assistant", error))?
             .ok_or_else(|| ConversationCreateError::AssistantNotFound {
                 id: assistant_id.to_owned(),
             })?;
@@ -391,7 +429,7 @@ impl ConversationService {
         let overlay = state_repo
             .get_for_user(user_id, &definition.id)
             .await
-            .map_err(ConversationCreateError::transport)?;
+            .map_err(|error| ConversationCreateError::transport("load assistant settings", error))?;
         if !overlay.as_ref().is_none_or(|row| row.enabled) {
             return Err(ConversationCreateError::AssistantDisabled {
                 id: assistant_id.to_owned(),
@@ -409,7 +447,7 @@ impl ConversationService {
                 &Value::Null,
             )
             .await
-            .map_err(ConversationCreateError::transport)?
+            .map_err(|error| ConversationCreateError::transport("resolve assistant", error))?
             .ok_or_else(|| ConversationCreateError::AssistantNotFound {
                 id: assistant_id.to_owned(),
             })?;
@@ -465,14 +503,12 @@ impl ConversationService {
         model_id: &str,
     ) -> Result<Option<String>, ConversationCreateError> {
         let Some(provider_repo) = self.provider_repo() else {
-            return Err(ConversationCreateError::TransportUnavailable {
-                reason: "provider repository is not configured".to_owned(),
-            });
+            return Err(ConversationCreateError::unavailable("provider repository is not configured"));
         };
         let providers = provider_repo
             .list(user_id)
             .await
-            .map_err(ConversationCreateError::transport)?;
+            .map_err(|error| ConversationCreateError::transport("list user providers", error))?;
         Ok(providers
             .into_iter()
             .filter(|provider| provider.enabled)
@@ -487,15 +523,29 @@ impl ConversationService {
 }
 
 /// `create`'s own workspace check is the only error we translate by kind; every
-/// other failure inside `create` is an infrastructure problem from the agent's
-/// point of view, so it surfaces as `transport_unavailable` with the message.
+/// other failure inside `create` is logged server-side and maps to the stable
+/// `transport_unavailable` public response.
 fn map_create_error(error: ConversationError, workspace: &str) -> ConversationCreateError {
     match error {
-        ConversationError::WorkspacePathUnavailable { path } => ConversationCreateError::WorkspaceUnavailable { path },
-        ConversationError::WorkspacePathRuntimeUnavailable { .. } => ConversationCreateError::WorkspaceUnavailable {
-            path: workspace.to_owned(),
-        },
-        other => ConversationCreateError::transport(other),
+        ConversationError::WorkspacePathUnavailable { path } => {
+            error!(
+                operation = "validate conversation workspace",
+                error_type = "workspace_unavailable",
+                "workspace validation failed"
+            );
+            ConversationCreateError::WorkspaceUnavailable { path }
+        }
+        ConversationError::WorkspacePathRuntimeUnavailable { .. } => {
+            error!(
+                operation = "validate conversation workspace",
+                error_type = "runtime_workspace_unavailable",
+                "workspace validation failed"
+            );
+            ConversationCreateError::WorkspaceUnavailable {
+                path: workspace.to_owned(),
+            }
+        }
+        other => ConversationCreateError::transport("persist conversation", other),
     }
 }
 
@@ -524,6 +574,11 @@ mod tests {
                 422,
             ),
             (
+                ConversationCreateError::WorkspaceNotAuthorized,
+                ConversationToolErrorCode::WorkspaceNotAuthorized,
+                403,
+            ),
+            (
                 ConversationCreateError::AssistantNotFound { id: "a".into() },
                 ConversationToolErrorCode::AssistantNotFound,
                 404,
@@ -547,7 +602,7 @@ mod tests {
                 400,
             ),
             (
-                ConversationCreateError::TransportUnavailable { reason: "r".into() },
+                ConversationCreateError::TransportUnavailable,
                 ConversationToolErrorCode::TransportUnavailable,
                 503,
             ),
@@ -556,6 +611,14 @@ mod tests {
             assert_eq!(error.code(), code, "{error}");
             assert_eq!(error.http_status(), status, "{error}");
         }
+    }
+
+    #[test]
+    fn transport_errors_have_a_stable_public_message() {
+        let error =
+            ConversationCreateError::transport("provider lookup", "secret path /private/provider.db");
+        assert_eq!(error.to_string(), "conversation service unavailable");
+        assert!(!error.to_string().contains("/private/provider.db"));
     }
 
     #[test]

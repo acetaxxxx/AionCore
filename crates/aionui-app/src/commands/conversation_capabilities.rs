@@ -38,6 +38,7 @@ pub(crate) fn data() -> Value {
             "caller_is_team",
             "workspace_not_absolute",
             "workspace_unavailable",
+            "workspace_not_authorized",
             "assistant_not_found",
             "assistant_disabled",
             "assistant_model_unresolved",
@@ -93,6 +94,7 @@ mod tests {
             Code::CallerIsTeam,
             Code::WorkspaceNotAbsolute,
             Code::WorkspaceUnavailable,
+            Code::WorkspaceNotAuthorized,
             Code::AssistantNotFound,
             Code::AssistantDisabled,
             Code::AssistantModelUnresolved,
@@ -106,6 +108,6 @@ mod tests {
                 code.as_str()
             );
         }
-        assert_eq!(documented.len(), 9, "no stray codes: {documented:?}");
+        assert_eq!(documented.len(), 10, "no stray codes: {documented:?}");
     }
 }
