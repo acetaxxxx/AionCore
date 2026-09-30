@@ -407,6 +407,99 @@ async fn a_caller_cannot_select_another_users_workspace() {
     );
 }
 
+#[tokio::test]
+async fn an_explicit_workspace_cannot_traverse_outside_the_callers_root() {
+    let ctx = setup().await;
+    ctx.caller("conv_traversal").await;
+    let token = ctx.mint(USER, "conv_traversal");
+    let caller_root = std::path::Path::new(&ctx.workspace);
+    let outside_name = format!(
+        "runtime-create-traversal-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let outside = caller_root.parent().unwrap().join(&outside_name);
+    std::fs::create_dir_all(&outside).unwrap();
+    let traversal = caller_root.join("..").join(&outside_name);
+    let body = serde_json::json!({
+        "name": "x",
+        "workspace": traversal.to_string_lossy(),
+    })
+    .to_string();
+
+    let (status, envelope) = call(
+        &ctx,
+        create_request(USER, "conv_traversal", Some(&token), &body),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{envelope}");
+    assert_eq!(
+        envelope["error"]["code"],
+        serde_json::json!("workspace_not_authorized")
+    );
+    assert_eq!(ctx.repo.list_all_conversation_ids().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_explicit_workspace_cannot_escape_through_a_symlink() {
+    let ctx = setup().await;
+    ctx.caller("conv_symlink").await;
+    let token = ctx.mint(USER, "conv_symlink");
+    let caller_root = std::path::Path::new(&ctx.workspace);
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let outside = caller_root
+        .parent()
+        .unwrap()
+        .join(format!("runtime-create-symlink-{suffix}"));
+    std::fs::create_dir_all(&outside).unwrap();
+    let link = caller_root.join(format!("symlink-escape-{suffix}"));
+
+    #[cfg(unix)]
+    let symlink_result = std::os::unix::fs::symlink(&outside, &link);
+    #[cfg(windows)]
+    let symlink_result = std::os::windows::fs::symlink_dir(&outside, &link);
+    #[cfg(not(any(unix, windows)))]
+    return;
+
+    #[cfg(any(unix, windows))]
+    match symlink_result {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+        #[cfg(windows)]
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("symlink creation failed unexpectedly: {error}"),
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        let body = serde_json::json!({
+            "name": "x",
+            "workspace": link.to_string_lossy(),
+        })
+        .to_string();
+
+        let (status, envelope) = call(
+            &ctx,
+            create_request(USER, "conv_symlink", Some(&token), &body),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"],
+            serde_json::json!("workspace_not_authorized")
+        );
+        assert_eq!(ctx.repo.list_all_conversation_ids().await.unwrap().len(), 1);
+        std::fs::remove_file(&link).unwrap();
+    }
+}
+
 // ── Happy path ──────────────────────────────────────────────────────
 
 #[tokio::test]
