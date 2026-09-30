@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-ai-agent"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "agent-client-protocol",
  "aion-agent",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-api-types"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-common",
  "serde",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-app"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aion-config",
  "aionui-ai-agent",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assets"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-common",
  "axum",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assistant"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-auth"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-channel"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-common"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-conversation"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -605,13 +605,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "aionui-cron"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -642,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-db"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-common",
  "async-trait",
@@ -660,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-extension"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -693,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-file"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -725,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-mcp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -753,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-office"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -781,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-process"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-common",
  "aionui-runtime",
@@ -801,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-project"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -828,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-push"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "aionui-api-types",
@@ -853,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-realtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "axum",
@@ -868,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "dirs",
  "flate2",
@@ -894,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-session"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-common",
  "aionui-process",
@@ -915,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-session-message"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -938,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-shell"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -971,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-sidebar"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -996,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-skill-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -1018,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-system"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -1048,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "agent-client-protocol",
  "aionui-ai-agent",
@@ -1077,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team-prompts"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "serde",
@@ -1360,9 +1361,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.0"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -1370,14 +1371,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.41.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -2697,7 +2699,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3632,7 +3634,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4999,14 +5001,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -5042,9 +5044,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -5812,7 +5814,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
