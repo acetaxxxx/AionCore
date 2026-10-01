@@ -748,13 +748,6 @@ mod tests {
         recipients.revoke("team-1", "revoked");
         recipients.wait_for_inflight_deliveries().await;
 
-        // Plain user-scoped events are not Team-tagged and retain old behavior
-        // even after the account loses membership in this Team.
-        mgr.broadcast_to_user(
-            "revoked",
-            WebSocketMessage::new("private.update", serde_json::json!({"user_id": "revoked"})),
-        );
-
         async fn scoped_text(
             mgr: &WebSocketManager,
             rx: &mut mpsc::Receiver<WsOutbound>,
@@ -784,6 +777,14 @@ mod tests {
         // The revoked account has two sockets, and each had a Team frame
         // queued before revocation. Both queued frames must be rejected.
         assert!(scoped_text(&mgr, &mut revoked_private_rx, "revoked").await.is_none());
+
+        // After draining both Team frames, ordinary user-scoped delivery still
+        // reaches both sockets and is unaffected by Team membership revocation.
+        mgr.broadcast_to_user(
+            "revoked",
+            WebSocketMessage::new("private.update", serde_json::json!({"user_id": "revoked"})),
+        );
+        assert!(matches!(revoked_rx.try_recv(), Ok(WsOutbound::Text(_))));
         assert!(matches!(revoked_private_rx.try_recv(), Ok(WsOutbound::Text(_))));
     }
 
