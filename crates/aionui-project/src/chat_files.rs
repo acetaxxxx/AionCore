@@ -160,12 +160,7 @@ impl ProjectService {
                 // touching the target, then canonicalize and check again so
                 // symlinks cannot escape that boundary. The early check ensures
                 // missing and existing foreign paths receive the same denial.
-                authorize_local_data_path_candidate(
-                    user_id,
-                    is_local_admin,
-                    self.user_data_root(),
-                    Path::new(path),
-                )?;
+                authorize_local_data_path_candidate(user_id, is_local_admin, self.user_data_root(), Path::new(path))?;
                 let canonical =
                     std::fs::canonicalize(path).map_err(|_| local_path_not_readable(path, is_local_admin))?;
                 if !canonical.is_file() {
