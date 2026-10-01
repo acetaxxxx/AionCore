@@ -925,6 +925,7 @@ struct FullMockTeamRepo {
     inner: MockTeamRepo,
     teams: std::sync::Mutex<Vec<aionui_db::models::TeamRow>>,
     sharing_modes: std::sync::Mutex<HashMap<String, aionui_db::models::TeamSharingMode>>,
+    collaborators: std::sync::Mutex<HashMap<String, HashMap<String, String>>>,
     stale_eligible_users: std::sync::Mutex<Vec<aionui_db::models::EligibleTeamUserRow>>,
     fail_workspace_update: std::sync::Mutex<bool>,
     fail_agent_update: std::sync::Mutex<bool>,
@@ -938,6 +939,7 @@ impl FullMockTeamRepo {
             inner: MockTeamRepo::new(),
             teams: std::sync::Mutex::new(Vec::new()),
             sharing_modes: std::sync::Mutex::new(HashMap::new()),
+            collaborators: std::sync::Mutex::new(HashMap::new()),
             stale_eligible_users: std::sync::Mutex::new(Vec::new()),
             fail_workspace_update: std::sync::Mutex::new(false),
             fail_agent_update: std::sync::Mutex::new(false),
@@ -960,6 +962,21 @@ impl FullMockTeamRepo {
 
     fn fail_allowlist_read_for_unpersisted_team(&self) {
         *self.fail_allowlist_read_for_unpersisted_team.lock().unwrap() = true;
+    }
+
+    fn add_test_collaborator(&self, team_id: &str, user_id: &str) {
+        self.collaborators
+            .lock()
+            .unwrap()
+            .entry(team_id.to_owned())
+            .or_default()
+            .insert(user_id.to_owned(), format!("membership-{team_id}-{user_id}"));
+    }
+
+    fn revoke_test_collaborator(&self, team_id: &str, user_id: &str) {
+        if let Some(members) = self.collaborators.lock().unwrap().get_mut(team_id) {
+            members.remove(user_id);
+        }
     }
 }
 
@@ -1057,6 +1074,68 @@ impl ITeamRepository for FullMockTeamRepo {
             return Err(DbError::Init("allowlist read before Team persistence".into()));
         }
         Ok(Vec::new())
+    }
+    async fn list_team_members(
+        &self,
+        team_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamMembershipRow>, DbError> {
+        Ok(self
+            .collaborators
+            .lock()
+            .unwrap()
+            .get(team_id)
+            .into_iter()
+            .flat_map(|members| members.iter())
+            .map(|(user_id, membership_ref)| aionui_db::models::TeamMembershipRow {
+                membership_ref: membership_ref.clone(),
+                team_id: team_id.to_owned(),
+                user_id: user_id.clone(),
+                display_name: Some(user_id.clone()),
+                created_at: aionui_common::now_ms(),
+            })
+            .collect())
+    }
+    async fn list_teams_by_member(&self, user_id: &str) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
+        let collaborators = self.collaborators.lock().unwrap();
+        let teams = self.teams.lock().unwrap();
+        Ok(teams
+            .iter()
+            .filter(|team| {
+                self.sharing_modes
+                    .lock()
+                    .unwrap()
+                    .get(&team.id)
+                    .copied()
+                    == Some(aionui_db::models::TeamSharingMode::Shared)
+                    && collaborators
+                        .get(&team.id)
+                        .is_some_and(|members| members.contains_key(user_id))
+            })
+            .cloned()
+            .collect())
+    }
+    async fn team_access_role(
+        &self,
+        team_id: &str,
+        user_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamAccessRole>, DbError> {
+        if self.get_team(user_id, team_id).await?.is_some() {
+            return Ok(Some(aionui_db::models::TeamAccessRole::Owner));
+        }
+        let is_shared = self
+            .sharing_modes
+            .lock()
+            .unwrap()
+            .get(team_id)
+            .copied()
+            == Some(aionui_db::models::TeamSharingMode::Shared);
+        let is_member = self
+            .collaborators
+            .lock()
+            .unwrap()
+            .get(team_id)
+            .is_some_and(|members| members.contains_key(user_id));
+        Ok((is_shared && is_member).then_some(aionui_db::models::TeamAccessRole::Collaborator))
     }
     async fn list_eligible_team_users(
         &self,
