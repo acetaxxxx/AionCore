@@ -93,7 +93,7 @@ impl ITeamRepository for SqliteTeamRepository {
         sqlx::query_as::<_, EligibleTeamUserRow>(
             "SELECT u.id AS user_id, u.username AS display_name FROM users u \
              WHERE u.status = 'active' AND u.username IS NOT NULL AND trim(u.username) <> '' \
-             AND u.id <> ? AND u.id <> 'system_default_user' \
+             AND u.id <> ? \
              AND EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ? AND t.sharing_mode = 'shared') \
              AND NOT EXISTS (SELECT 1 FROM team_memberships m WHERE m.team_id = ? AND m.user_id = u.id) \
              ORDER BY u.username COLLATE NOCASE, u.id",
@@ -112,7 +112,7 @@ impl ITeamRepository for SqliteTeamRepository {
             "INSERT INTO team_memberships (membership_ref, team_id, user_id, created_at) \
              SELECT ?, t.id, u.id, ? FROM teams t JOIN users u ON u.id = ? \
              WHERE t.id = ? AND t.sharing_mode = 'shared' AND u.status = 'active' \
-             AND u.id <> t.user_id AND u.id <> 'system_default_user' \
+             AND u.id <> t.user_id \
              AND NOT EXISTS (SELECT 1 FROM team_memberships m WHERE m.team_id = t.id AND m.user_id = u.id)",
         )
         .bind(&row.membership_ref)
