@@ -386,7 +386,11 @@ impl TeamSessionService {
     /// runtime: leave dormant/failed slots alone, defer while attaching or
     /// removing, and restart a ready idle runtime so it picks the new set up.
     async fn refresh_member_mcp_binding(&self, session: &Arc<TeamSession>, user_id: &str, agent: &TeamAgent) {
-        let fingerprint = match self.provisioner().refresh_agent_mcp_snapshot(user_id, agent).await {
+        let fingerprint = match self
+            .provisioner()
+            .refresh_agent_mcp_snapshot(user_id, session.team_id(), agent)
+            .await
+        {
             Ok(Some(fingerprint)) => fingerprint,
             Ok(None) => return,
             Err(error) => {
@@ -842,7 +846,14 @@ impl TeamSessionService {
 
         let provisioned = self
             .provisioner()
-            .provision_initial_agents(user_id, &team_id, &req.name, &req.agents, shared_workspace.as_deref())
+            .provision_initial_agents(
+                user_id,
+                &team_id,
+                &req.name,
+                &req.agents,
+                shared_workspace.as_deref(),
+                req.sharing_mode == aionui_api_types::TeamSharingMode::Shared,
+            )
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;

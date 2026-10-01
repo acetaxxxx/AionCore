@@ -1,6 +1,7 @@
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow, TeamSharingMode};
 use aionui_db::{ActivityCursor, DbError, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -9,6 +10,7 @@ pub struct MockState {
     pub tasks: Vec<TeamTaskRow>,
     pub fail_message_writes: bool,
     pub fail_task_lists: bool,
+    pub shared_teams: HashSet<String>,
 }
 
 pub struct MockTeamRepo {
@@ -51,6 +53,13 @@ impl ITeamRepository for MockTeamRepo {
     }
     async fn get_team(&self, _user_id: &str, _id: &str) -> Result<Option<TeamRow>, DbError> {
         Ok(None)
+    }
+    async fn get_team_sharing_mode(&self, team_id: &str) -> Result<TeamSharingMode, DbError> {
+        Ok(if self.state.lock().unwrap().shared_teams.contains(team_id) {
+            TeamSharingMode::Shared
+        } else {
+            TeamSharingMode::Private
+        })
     }
     async fn get_team_for_restore(&self, _id: &str) -> Result<Option<TeamRow>, DbError> {
         Ok(Some(TeamRow {
