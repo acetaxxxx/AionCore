@@ -563,6 +563,43 @@ async fn write_and_read_unread_messages() {
 }
 
 #[tokio::test]
+async fn mailbox_queries_preserve_actor_user_id() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+
+    let mut message = make_mailbox_msg("actor-message", "t1", "a1", "a2", "message");
+    message.actor_user_id = Some("collaborator-1".to_owned());
+    repo.write_message(DEFAULT_USER_ID, &message).await.unwrap();
+
+    let assert_actor = |rows: &[MailboxMessageRow]| {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].actor_user_id.as_deref(), Some("collaborator-1"));
+    };
+
+    assert_actor(&repo.peek_unread(DEFAULT_USER_ID, "t1", "a1").await.unwrap());
+    assert_actor(
+        &repo.peek_unread_by_ids(DEFAULT_USER_ID, "t1", "a1", &["actor-message".to_owned()])
+            .await
+            .unwrap(),
+    );
+    assert_actor(
+        &repo.read_unread_and_mark(DEFAULT_USER_ID, "t1", "a1")
+            .await
+            .unwrap(),
+    );
+    assert_actor(&repo.get_history(DEFAULT_USER_ID, "t1", "a1", Some(10)).await.unwrap());
+    assert_actor(&repo.get_history(DEFAULT_USER_ID, "t1", "a1", None).await.unwrap());
+    assert_actor(&repo.list_messages_by_team("t1", 10).await.unwrap());
+    assert_actor(
+        &repo
+            .list_messages_by_team_paged("t1", None, PageDirection::Asc, 10)
+            .await
+            .unwrap(),
+    );
+    assert_actor(&repo.list_messages_by_ids(&["actor-message".to_owned()]).await.unwrap());
+}
+
+#[tokio::test]
 async fn read_unread_no_messages() {
     let (repo, _db) = repo().await;
     repo.create_team(&make_team("t1", "Team")).await.unwrap();

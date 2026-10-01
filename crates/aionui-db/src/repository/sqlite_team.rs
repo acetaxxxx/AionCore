@@ -418,7 +418,7 @@ impl ITeamRepository for SqliteTeamRepository {
         sqlx::query("PRAGMA read_uncommitted = false").execute(&mut *tx).await?;
 
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
-            "SELECT id, team_id, to_agent_id, from_agent_id, \
+            "SELECT id, team_id, to_agent_id, from_agent_id, actor_user_id, \
                     type, content, summary, files, read, created_at \
              FROM mailbox \
              WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
@@ -455,7 +455,7 @@ impl ITeamRepository for SqliteTeamRepository {
         to_agent_id: &str,
     ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
-            "SELECT id, team_id, to_agent_id, from_agent_id, \
+            "SELECT id, team_id, to_agent_id, from_agent_id, actor_user_id, \
                     type, content, summary, files, read, created_at \
              FROM mailbox \
              WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
@@ -485,7 +485,7 @@ impl ITeamRepository for SqliteTeamRepository {
         for chunk in ids.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT id, team_id, to_agent_id, from_agent_id, \
+                "SELECT id, team_id, to_agent_id, from_agent_id, actor_user_id, \
                         type, content, summary, files, read, created_at \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
@@ -544,7 +544,7 @@ impl ITeamRepository for SqliteTeamRepository {
     ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = if let Some(limit) = limit {
             sqlx::query_as::<_, MailboxMessageRow>(
-                "SELECT id, team_id, to_agent_id, from_agent_id, \
+                "SELECT id, team_id, to_agent_id, from_agent_id, actor_user_id, \
                         type, content, summary, files, read, created_at \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? \
@@ -560,7 +560,7 @@ impl ITeamRepository for SqliteTeamRepository {
             .await?
         } else {
             sqlx::query_as::<_, MailboxMessageRow>(
-                "SELECT id, team_id, to_agent_id, from_agent_id, \
+                "SELECT id, team_id, to_agent_id, from_agent_id, actor_user_id, \
                         type, content, summary, files, read, created_at \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? \
@@ -578,7 +578,7 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
-            "SELECT id, team_id, to_agent_id, from_agent_id, \
+            "SELECT id, team_id, to_agent_id, from_agent_id, actor_user_id, \
                     type, content, summary, files, read, created_at \
              FROM mailbox \
              WHERE team_id = ? \
@@ -609,7 +609,7 @@ impl ITeamRepository for SqliteTeamRepository {
             String::new()
         };
         let sql = format!(
-            "SELECT id, team_id, to_agent_id, from_agent_id, \
+            "SELECT id, team_id, to_agent_id, from_agent_id, actor_user_id, \
                     type, content, summary, files, read, created_at \
              FROM mailbox \
              WHERE team_id = ? {cursor_clause}\
@@ -634,7 +634,7 @@ impl ITeamRepository for SqliteTeamRepository {
         for chunk in ids.chunks(500) {
             let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT id, team_id, to_agent_id, from_agent_id, \
+                "SELECT id, team_id, to_agent_id, from_agent_id, actor_user_id, \
                         type, content, summary, files, read, created_at \
                  FROM mailbox \
                  WHERE id IN ({placeholders}) \
