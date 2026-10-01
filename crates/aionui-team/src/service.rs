@@ -798,34 +798,7 @@ impl TeamSessionService {
         team_id: &str,
         active_leases: &ActiveLeaseRegistry,
     ) -> Result<(), TeamError> {
-        let team = match self.repo.get_team(user_id, team_id).await {
-            Ok(Some(row)) => Team::from_row(&row).map_err(TeamError::from),
-            Ok(None) => Err(TeamError::TeamNotFound(team_id.to_owned())),
-            Err(error) => Err(TeamError::Database(error)),
-        };
-        let team = match team {
-            Ok(team) => team,
-            Err(error @ TeamError::TeamNotFound(_)) => {
-                debug!(
-                    kind = "team",
-                    team_id,
-                    user_id,
-                    error = %error,
-                    "Team active lease renew rejected"
-                );
-                return Err(error);
-            }
-            Err(error) => {
-                warn!(
-                    kind = "team",
-                    team_id,
-                    user_id,
-                    error = %error,
-                    "Team active lease renew failed"
-                );
-                return Err(error);
-            }
-        };
+        let team = self.load_owned_team(user_id, team_id).await?;
 
         let conversation_ids = team
             .agents
@@ -1831,6 +1804,13 @@ impl TeamSessionService {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let membership_guard = membership_lock.lock().await;
+
+        // When a request supplies its authenticated actor, recheck membership
+        // under the same lock used by member removal. Startup restoration has
+        // no request actor and intentionally skips this check.
+        if let Some(actor_user_id) = requested_user_id {
+            self.authorize_team(actor_user_id, team_id).await?;
+        }
 
         let row = match self.repo.get_team_for_restore(team_id).await {
             Ok(Some(row)) => row,
@@ -2936,6 +2916,19 @@ impl TeamSessionService {
         let (content, files) = self
             .resolve_message_attachments(&access.execution_owner_id, content, files)
             .await?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        // Serialize the final membership check + enqueue with member removal.
+        // If revoke owns this lock first, the recheck rejects the send; if this
+        // send owns it first, the enqueue is accepted before revoke can return.
+        let _membership_guard = membership_lock.lock().await;
+        let current_access = self.authorize_team(user_id, team_id).await?;
+        if current_access.execution_owner_id != access.execution_owner_id {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
         let session = self.published_session(team_id)?;
         session.send_message_as_actor(user_id, &content, files).await
     }
@@ -2957,6 +2950,26 @@ impl TeamSessionService {
         let (content, files) = self
             .resolve_message_attachments(&access.execution_owner_id, content, files)
             .await?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        // Keep the final authorization and mailbox enqueue atomic with revoke.
+        let _membership_guard = membership_lock.lock().await;
+        let current_access = self.authorize_team(user_id, team_id).await?;
+        if current_access.execution_owner_id != access.execution_owner_id {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        if !can_send_direct_team_message(
+            current_access.role,
+            current_access.team.lead_agent_id.as_deref(),
+            slot_id,
+        ) {
+            return Err(TeamError::Forbidden(
+                "collaborators may only send directly to the shared Team Lead".into(),
+            ));
+        }
         let session = self.published_session(team_id)?;
         session
             .send_message_to_agent_as_actor(user_id, slot_id, &content, files)

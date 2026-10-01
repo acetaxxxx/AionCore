@@ -8796,6 +8796,14 @@ async fn shared_team_reads_use_active_membership_and_revoke_blocks_next_read() {
     team_repo.revoke_test_collaborator(&team.id, "collaborator");
     assert!(matches!(svc.get_team("collaborator", &team.id).await, Err(TeamError::TeamNotFound(_))));
     assert!(matches!(
+        svc.ensure_session("collaborator", &team.id).await,
+        Err(TeamError::TeamNotFound(_))
+    ));
+    assert!(matches!(
+        svc.send_message("collaborator", &team.id, "after revoke", None).await,
+        Err(TeamError::TeamNotFound(_))
+    ));
+    assert!(matches!(
         svc.list_team_mailbox("collaborator", &team.id, 10).await,
         Err(TeamError::TeamNotFound(_))
     ));
