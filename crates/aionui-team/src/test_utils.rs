@@ -1900,7 +1900,6 @@ pub(crate) mod workspace_harness {
     }
 
     pub(crate) fn single_agent_team_request(name: &str) -> CreateTeamRequest {
-        sharing_mode: Default::default(),
         CreateTeamRequest {
             sharing_mode: Default::default(),
             name: name.into(),
