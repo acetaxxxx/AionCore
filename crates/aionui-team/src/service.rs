@@ -586,16 +586,14 @@ impl TeamSessionService {
 
     /// Returns the most recent team-wide mailbox messages (all recipients),
     /// newest first, for the read-only activity view. `limit` is clamped to
-    /// `[1, MAX_ACTIVITY_LIMIT]`. Ownership is enforced first via a scoped
-    /// lookup: a missing team and another user's team both surface as
-    /// `TeamNotFound`, so team existence is never leaked across users.
+    /// `[1, MAX_ACTIVITY_LIMIT]`. Current membership is revalidated first.
     pub async fn list_team_mailbox(
         &self,
         user_id: &str,
         team_id: &str,
         limit: i64,
     ) -> Result<Vec<TeamMailboxMessageResponse>, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        self.authorize_team(user_id, team_id).await?;
         let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
         let rows = self.repo.list_messages_by_team(team_id, clamped).await?;
         let responses: Vec<TeamMailboxMessageResponse> = rows.iter().map(mailbox_row_to_response).collect();
@@ -606,16 +604,16 @@ impl TeamSessionService {
     /// Returns the team's tasks, newest first (`created_at` DESC, `id` as a
     /// stable secondary key), truncated to a clamped `limit`, for the
     /// read-only activity view. Reuses the existing ASC `list_tasks` and sorts
-    /// in the service. Ownership is enforced first.
+    /// in the service. Repository scoping uses the authorized execution owner.
     pub async fn list_team_tasks(
         &self,
         user_id: &str,
         team_id: &str,
         limit: i64,
     ) -> Result<Vec<TeamTaskResponse>, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
         let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
-        let rows = self.repo.list_tasks(user_id, team_id).await?;
+        let rows = self.repo.list_tasks(&access.execution_owner_id, team_id).await?;
         let mut tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
         tasks.truncate(clamped as usize);
@@ -626,7 +624,7 @@ impl TeamSessionService {
 
     /// Returns the team's tasks matching `ids` (newest first), for resolving
     /// dependency (`blocked_by`) subjects that may lie outside the loaded
-    /// activity page. Ownership is enforced first; `ids` is clamped to
+    /// activity page. Current membership is revalidated first; `ids` is clamped to
     /// `MAX_TASK_ID_LOOKUP`. An empty `ids` yields an empty result.
     pub async fn list_team_tasks_by_ids(
         &self,
@@ -634,12 +632,15 @@ impl TeamSessionService {
         team_id: &str,
         ids: &[String],
     ) -> Result<Vec<TeamTaskResponse>, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let capped = &ids[..ids.len().min(MAX_TASK_ID_LOOKUP)];
-        let rows = self.repo.list_tasks_by_ids(user_id, team_id, capped).await?;
+        let rows = self
+            .repo
+            .list_tasks_by_ids(&access.execution_owner_id, team_id, capped)
+            .await?;
         let tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
         info!(
@@ -653,7 +654,7 @@ impl TeamSessionService {
 
     /// Returns one keyset-paginated page of the unified activity feed (messages
     /// and/or tasks per `kind`), ordered by `(created_at, id)` in `direction`.
-    /// Ownership is enforced first, so another user's team is indistinguishable
+    /// Current membership is revalidated first, so unauthorized callers see
     /// from a missing one (`TeamNotFound`). For `kind = All`, each stream is
     /// fetched up to `limit` rows and merged; the global top-`limit` is
     /// mathematically complete (any item newer/older than the cursor is within
@@ -668,7 +669,7 @@ impl TeamSessionService {
         kind: ActivityKind,
         limit: i64,
     ) -> Result<TeamActivityPageResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
         let limit = limit.clamp(1, MAX_ACTIVITY_LIMIT);
 
         let (mut items, mailbox_full, tasks_full) = match kind {
@@ -687,7 +688,7 @@ impl TeamSessionService {
             ActivityKind::Task => {
                 let rows = self
                     .repo
-                    .list_tasks_paged(user_id, team_id, cursor.clone(), direction, limit)
+                    .list_tasks_paged(&access.execution_owner_id, team_id, cursor.clone(), direction, limit)
                     .await?;
                 let full = rows.len() as i64 == limit;
                 (
@@ -703,7 +704,7 @@ impl TeamSessionService {
                     .await?;
                 let tasks = self
                     .repo
-                    .list_tasks_paged(user_id, team_id, cursor.clone(), direction, limit)
+                    .list_tasks_paged(&access.execution_owner_id, team_id, cursor.clone(), direction, limit)
                     .await?;
                 let mailbox_full = msgs.len() as i64 == limit;
                 let tasks_full = tasks.len() as i64 == limit;
@@ -2450,7 +2451,7 @@ impl TeamSessionService {
     }
 
     pub async fn get_run_state(&self, user_id: &str, team_id: &str) -> Result<TeamRunStateResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        self.authorize_team(user_id, team_id).await?;
         let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
         let Some(session) = session else {
             return Ok(TeamRunStateResponse {

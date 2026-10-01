@@ -8752,6 +8752,52 @@ async fn list_team_activity_rejects_other_user() {
     assert!(matches!(tasks_err, TeamError::TeamNotFound(_)));
 }
 
+#[tokio::test]
+async fn shared_team_reads_use_active_membership_and_revoke_blocks_next_read() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let team = activity_team_row("shared-team", "owner");
+    team_repo
+        .create_team_with_sharing_mode(&team, aionui_db::models::TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    team_repo.add_test_collaborator(&team.id, "collaborator");
+    team_repo
+        .write_message("owner", &activity_message_row("shared-message", &team.id, 1000))
+        .await
+        .unwrap();
+
+    let visible = svc.list_teams("collaborator").await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].role, aionui_api_types::TeamAccessRole::Collaborator);
+    assert_eq!(svc.get_team("collaborator", &team.id).await.unwrap().role, aionui_api_types::TeamAccessRole::Collaborator);
+    assert_eq!(svc.list_team_mailbox("collaborator", &team.id, 10).await.unwrap().len(), 1);
+    assert_eq!(
+        svc.list_team_activity(
+            "collaborator",
+            &team.id,
+            None,
+            PageDirection::Desc,
+            aionui_team::ActivityKind::Message,
+            10,
+        )
+        .await
+        .unwrap()
+        .items
+        .len(),
+        1
+    );
+
+    team_repo.revoke_test_collaborator(&team.id, "collaborator");
+    assert!(matches!(svc.get_team("collaborator", &team.id).await, Err(TeamError::TeamNotFound(_))));
+    assert!(matches!(
+        svc.list_team_mailbox("collaborator", &team.id, 10).await,
+        Err(TeamError::TeamNotFound(_))
+    ));
+}
+
 // ── Unified paginated activity feed (list_team_activity) ──────────────
 
 #[tokio::test]
