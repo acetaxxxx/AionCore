@@ -1663,8 +1663,9 @@ async fn context_reset_returns_structured_success_and_projects_a_semantic_notice
         &csrf,
     );
     let resp = app.oneshot(reset).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let status = resp.status();
     let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "response body: {body}");
     assert_eq!(body["data"]["reset_status"], "completed");
     assert_eq!(body["data"]["runtime_status"], "ready");
     assert_eq!(body["data"]["preserved_unread_count"], 1);
