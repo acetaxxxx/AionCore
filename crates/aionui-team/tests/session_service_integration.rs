@@ -1075,10 +1075,7 @@ impl ITeamRepository for FullMockTeamRepo {
         }
         Ok(Vec::new())
     }
-    async fn list_team_members(
-        &self,
-        team_id: &str,
-    ) -> Result<Vec<aionui_db::models::TeamMembershipRow>, DbError> {
+    async fn list_team_members(&self, team_id: &str) -> Result<Vec<aionui_db::models::TeamMembershipRow>, DbError> {
         Ok(self
             .collaborators
             .lock()
@@ -1101,11 +1098,7 @@ impl ITeamRepository for FullMockTeamRepo {
         Ok(teams
             .iter()
             .filter(|team| {
-                self.sharing_modes
-                    .lock()
-                    .unwrap()
-                    .get(&team.id)
-                    .copied()
+                self.sharing_modes.lock().unwrap().get(&team.id).copied()
                     == Some(aionui_db::models::TeamSharingMode::Shared)
                     && collaborators
                         .get(&team.id)
@@ -1122,12 +1115,7 @@ impl ITeamRepository for FullMockTeamRepo {
         if self.get_team(user_id, team_id).await?.is_some() {
             return Ok(Some(aionui_db::models::TeamAccessRole::Owner));
         }
-        let is_shared = self
-            .sharing_modes
-            .lock()
-            .unwrap()
-            .get(team_id)
-            .copied()
+        let is_shared = self.sharing_modes.lock().unwrap().get(team_id).copied()
             == Some(aionui_db::models::TeamSharingMode::Shared);
         let is_member = self
             .collaborators
