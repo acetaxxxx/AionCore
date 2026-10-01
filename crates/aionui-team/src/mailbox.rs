@@ -63,8 +63,17 @@ impl Mailbox {
         summary: Option<&str>,
         files: Option<&[String]>,
     ) -> Result<MailboxMessage, TeamError> {
-        self.write_as_actor_with_files(team_id, to_agent_id, from_agent_id, None, msg_type, content, summary, files)
-            .await
+        self.write_as_actor_with_files(
+            team_id,
+            to_agent_id,
+            from_agent_id,
+            None,
+            msg_type,
+            content,
+            summary,
+            files,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

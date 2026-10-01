@@ -10,20 +10,20 @@ use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTas
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, EligibleTeamCollaboratorResponse,
-    GetConfigOptionsResponse,
-    InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
-    TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse,
-    TeamMailboxMessageResponse, TeamMemberResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
-    TeamSessionBinding,
-    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
-    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
+    GetConfigOptionsResponse, InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse,
+    TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
+    TeamContextResetAvailability, TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus,
+    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamMemberResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
+    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
+    TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::{TeamAccessRole, TeamRow, TeamSharingMode};
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IProviderRepository, ITeamRepository, IUserOrderStore, OrderItemRef, OrderItemType, PageDirection, UpdateTeamParams,
+    IProviderRepository, ITeamRepository, IUserOrderStore, OrderItemRef, OrderItemType, PageDirection,
+    UpdateTeamParams,
 };
 use aionui_project::{ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
@@ -809,16 +809,16 @@ impl TeamSessionService {
                 _ => None,
             },
             aionui_api_types::TeamSharingMode::Shared => {
-                if req.workspace.as_deref().is_some_and(|workspace| !workspace.trim().is_empty()) {
+                if req
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|workspace| !workspace.trim().is_empty())
+                {
                     return Err(TeamError::InvalidRequest(
                         "Shared Team workspace is provisioned by the server".into(),
                     ));
                 }
-                Some(
-                    self.conversation_port
-                        .create_shared_team_workspace(&team_id)
-                        .await?,
-                )
+                Some(self.conversation_port.create_shared_team_workspace(&team_id).await?)
             }
         };
 
@@ -1026,7 +1026,11 @@ impl TeamSessionService {
         if revocation_started {
             self.broadcaster.wait_for_scope_deliveries().await;
         }
-        if let Err(error) = self.repo.remove_team_member(owner_user_id, team_id, membership_ref).await {
+        if let Err(error) = self
+            .repo
+            .remove_team_member(owner_user_id, team_id, membership_ref)
+            .await
+        {
             self.refresh_session_event_users(team_id, owner_user_id).await;
             return Err(error.into());
         }
@@ -1034,11 +1038,7 @@ impl TeamSessionService {
         Ok(())
     }
 
-    pub async fn list_team_mcp_allowlist(
-        &self,
-        owner_user_id: &str,
-        team_id: &str,
-    ) -> Result<Vec<String>, TeamError> {
+    pub async fn list_team_mcp_allowlist(&self, owner_user_id: &str, team_id: &str) -> Result<Vec<String>, TeamError> {
         let access = self.authorize_team(owner_user_id, team_id).await?;
         if access.role != TeamAccessRole::Owner || access.sharing_mode != TeamSharingMode::Shared {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
@@ -1105,7 +1105,9 @@ impl TeamSessionService {
                     session.set_authorized_event_users(user_ids);
                 }
             }
-            Err(error) => warn!(team_id, error = %error, "team event recipient refresh failed; revoked recipients remain removed"),
+            Err(error) => {
+                warn!(team_id, error = %error, "team event recipient refresh failed; revoked recipients remain removed")
+            }
         }
     }
 
@@ -1797,7 +1799,9 @@ impl TeamSessionService {
             Ok(members) => session.set_authorized_event_users(
                 std::iter::once(user_id.clone()).chain(members.into_iter().map(|member| member.user_id)),
             ),
-            Err(error) => warn!(team_id, error = %error, "team event recipients unavailable; keeping owner-only fanout"),
+            Err(error) => {
+                warn!(team_id, error = %error, "team event recipients unavailable; keeping owner-only fanout")
+            }
         }
 
         self.broadcast_session_status(
@@ -2781,14 +2785,8 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
-        self.send_message_with_local_admin(
-            user_id,
-            user_id == "system_default_user",
-            team_id,
-            content,
-            files,
-        )
-        .await
+        self.send_message_with_local_admin(user_id, user_id == "system_default_user", team_id, content, files)
+            .await
     }
 
     pub async fn send_message_with_local_admin(
@@ -2801,7 +2799,8 @@ impl TeamSessionService {
     ) -> Result<TeamRunAckResponse, TeamError> {
         let access = self.authorize_team(user_id, team_id).await?;
         Self::reject_shared_team_attachments(&access, files.as_deref())?;
-        self.ensure_session_inner(team_id, Some(&access.execution_owner_id)).await?;
+        self.ensure_session_inner(team_id, Some(&access.execution_owner_id))
+            .await?;
         let (content, files) = self
             .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
             .await?;
@@ -2849,15 +2848,14 @@ impl TeamSessionService {
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         let access = self.authorize_team(user_id, team_id).await?;
-        if !can_send_direct_team_message(
-            access.role,
-            access.team.lead_agent_id.as_deref(),
-            slot_id,
-        ) {
-            return Err(TeamError::Forbidden("collaborators may only send directly to the shared Team Lead".into()));
+        if !can_send_direct_team_message(access.role, access.team.lead_agent_id.as_deref(), slot_id) {
+            return Err(TeamError::Forbidden(
+                "collaborators may only send directly to the shared Team Lead".into(),
+            ));
         }
         Self::reject_shared_team_attachments(&access, files.as_deref())?;
-        self.ensure_session_inner(team_id, Some(&access.execution_owner_id)).await?;
+        self.ensure_session_inner(team_id, Some(&access.execution_owner_id))
+            .await?;
         let (content, files) = self
             .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
             .await?;
@@ -2926,9 +2924,7 @@ impl TeamSessionService {
         access: &TeamAuthorizationContext,
         files: Option<&[ChatFileRef]>,
     ) -> Result<(), TeamError> {
-        if access.sharing_mode == TeamSharingMode::Shared
-            && files.is_some_and(|files| !files.is_empty())
-        {
+        if access.sharing_mode == TeamSharingMode::Shared && files.is_some_and(|files| !files.is_empty()) {
             return Err(TeamError::InvalidRequest(
                 "Shared Team file attachments are unavailable until Team-scoped upload is configured".into(),
             ));

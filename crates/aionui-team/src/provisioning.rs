@@ -87,17 +87,16 @@ pub struct TeamMcpSnapshotResolution {
     pub fingerprint: Option<String>,
 }
 
-fn restrict_mcp_selection_to_allowlist(
-    mut selection: TeamMcpSelection,
-    allowed_ids: &[String],
-) -> TeamMcpSelection {
+fn restrict_mcp_selection_to_allowlist(mut selection: TeamMcpSelection, allowed_ids: &[String]) -> TeamMcpSelection {
     let allowed_ids = allowed_ids.iter().map(String::as_str).collect::<HashSet<_>>();
     selection.selected_ids.retain(|id| allowed_ids.contains(id.as_str()));
     selection.mcp_server_ids.retain(|id| allowed_ids.contains(id.as_str()));
     selection
         .session_mcp_servers
         .retain(|server| allowed_ids.contains(server.id.as_str()));
-    selection.mcp_statuses.retain(|status| allowed_ids.contains(status.id.as_str()));
+    selection
+        .mcp_statuses
+        .retain(|status| allowed_ids.contains(status.id.as_str()));
     selection
 }
 
@@ -538,12 +537,7 @@ impl TeamAgentProvisioner {
         // Resolve the global MCP selection once for this spawned agent.
         let shared_team = self.repo.get_team_sharing_mode(&req.team_id).await? == TeamSharingMode::Shared;
         let mcp_selection = self
-            .resolve_team_assistant_mcp_selection(
-                &req.user_id,
-                &req.team_id,
-                req.assistant_id.as_deref(),
-                shared_team,
-            )
+            .resolve_team_assistant_mcp_selection(&req.user_id, &req.team_id, req.assistant_id.as_deref(), shared_team)
             .await?;
         let agent = self
             .provision_new_agent(
@@ -1189,10 +1183,7 @@ mod tests {
             ],
         };
 
-        let filtered = restrict_mcp_selection_to_allowlist(
-            selection,
-            &["allowed".into(), "allowed-builtin".into()],
-        );
+        let filtered = restrict_mcp_selection_to_allowlist(selection, &["allowed".into(), "allowed-builtin".into()]);
 
         assert_eq!(filtered.selected_ids, vec!["allowed".to_owned()]);
         assert_eq!(filtered.mcp_server_ids, vec!["allowed".to_owned()]);

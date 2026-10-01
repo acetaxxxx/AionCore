@@ -16,7 +16,7 @@ use aionui_api_types::{
     SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse,
-    TeamMemberListResponse, TeamMcpAllowlistResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    TeamMcpAllowlistResponse, TeamMemberListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
     TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
@@ -189,10 +189,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/eligible-collaborators", get(list_eligible_collaborators))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
-        .route(
-            "/api/teams/{id}/members",
-            get(list_team_members).post(add_team_member),
-        )
+        .route("/api/teams/{id}/members", get(list_team_members).post(add_team_member))
         .route(
             "/api/teams/{id}/members/{membership_ref}",
             axum::routing::delete(remove_team_member),
@@ -259,10 +256,7 @@ async fn list_eligible_collaborators(
     let team_id = query
         .team_id
         .ok_or_else(|| ApiError::BadRequest("team_id is required".into()))?;
-    let accounts = state
-        .service
-        .list_eligible_collaborators(&user.id, &team_id)
-        .await?;
+    let accounts = state.service.list_eligible_collaborators(&user.id, &team_id).await?;
     Ok(Json(ApiResponse::ok(accounts)))
 }
 
@@ -299,10 +293,7 @@ async fn remove_team_member(
     Extension(user): Extension<CurrentUser>,
     Path((id, membership_ref)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state
-        .service
-        .remove_team_member(&user.id, &id, &membership_ref)
-        .await?;
+    state.service.remove_team_member(&user.id, &id, &membership_ref).await?;
     Ok(Json(ApiResponse::success()))
 }
 

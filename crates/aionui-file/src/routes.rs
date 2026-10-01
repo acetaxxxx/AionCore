@@ -242,9 +242,7 @@ async fn authorize_local_team_file(
         return Err(ApiError::Forbidden("Team workspace access is forbidden".into()));
     }
     let canonical = std::fs::canonicalize(path).map_err(|_| {
-        chat_file_resolve_error(aionui_project::ProjectError::LocalPathNotReadable {
-            path: path.to_owned(),
-        })
+        chat_file_resolve_error(aionui_project::ProjectError::LocalPathNotReadable { path: path.to_owned() })
     })?;
     if !canonical.is_file() {
         return Err(chat_file_resolve_error(

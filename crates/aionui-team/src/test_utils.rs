@@ -1,5 +1,5 @@
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow, TeamSharingMode};
+use aionui_db::models::{MailboxMessageRow, TeamRow, TeamSharingMode, TeamTaskRow};
 use aionui_db::{ActivityCursor, DbError, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -680,10 +680,7 @@ pub(crate) mod workspace_harness {
             Ok(())
         }
 
-        async fn get_team_sharing_mode(
-            &self,
-            team_id: &str,
-        ) -> Result<aionui_db::models::TeamSharingMode, DbError> {
+        async fn get_team_sharing_mode(&self, team_id: &str) -> Result<aionui_db::models::TeamSharingMode, DbError> {
             Ok(if self.shared_teams.lock().unwrap().contains(team_id) {
                 aionui_db::models::TeamSharingMode::Shared
             } else {
@@ -691,11 +688,7 @@ pub(crate) mod workspace_harness {
             })
         }
 
-        async fn list_team_mcp_allowlist(
-            &self,
-            _owner_user_id: &str,
-            team_id: &str,
-        ) -> Result<Vec<String>, DbError> {
+        async fn list_team_mcp_allowlist(&self, _owner_user_id: &str, team_id: &str) -> Result<Vec<String>, DbError> {
             if *self.fail_allowlist_read_for_unpersisted_team.lock().unwrap()
                 && !self.teams.lock().unwrap().iter().any(|team| team.id == team_id)
             {
@@ -728,7 +721,13 @@ pub(crate) mod workspace_harness {
             team_id: &str,
             user_id: &str,
         ) -> Result<Option<aionui_db::models::TeamAccessRole>, DbError> {
-            let team = self.teams.lock().unwrap().iter().find(|team| team.id == team_id).cloned();
+            let team = self
+                .teams
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|team| team.id == team_id)
+                .cloned();
             let Some(team) = team else {
                 return Ok(None);
             };

@@ -673,7 +673,8 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
-        self.send_message_to_agent_as_actor(&self.user_id, slot_id, content, files).await
+        self.send_message_to_agent_as_actor(&self.user_id, slot_id, content, files)
+            .await
     }
 
     pub async fn send_message_to_agent_as_actor(
@@ -903,15 +904,17 @@ impl TeamSession {
         })?;
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         projection
-            .project(TeamProjectionRequest::team_system_visible(
-                &self.user_id,
-                &self.team.id,
-                slot_id,
-                &agent.conversation_id,
-                content,
-                generate_id(),
+            .project(
+                TeamProjectionRequest::team_system_visible(
+                    &self.user_id,
+                    &self.team.id,
+                    slot_id,
+                    &agent.conversation_id,
+                    content,
+                    generate_id(),
+                )
+                .with_authorized_user_ids(self.events.authorized_user_ids()),
             )
-            .with_authorized_user_ids(self.events.authorized_user_ids()))
             .await?;
         Ok(())
     }
