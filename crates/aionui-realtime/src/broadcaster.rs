@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use tokio::sync::broadcast;
 use tokio::sync::OwnedRwLockReadGuard;
+use tokio::sync::broadcast;
 use tracing::warn;
 
 /// Current recipients for scoped events, shared by the event bus and the
@@ -246,7 +246,10 @@ mod tests {
     async fn revocation_fence_waits_for_authorized_socket_write_permit() {
         let recipients = ScopedEventRecipients::default();
         recipients.replace("team-1", ["owner".into(), "collaborator".into()]);
-        let delivery_permit = recipients.authorize_delivery("team-1", "owner", "collaborator").await.unwrap();
+        let delivery_permit = recipients
+            .authorize_delivery("team-1", "owner", "collaborator")
+            .await
+            .unwrap();
         recipients.revoke("team-1", "collaborator");
 
         let waiter_registry = recipients.clone();
@@ -265,7 +268,12 @@ mod tests {
 
         drop(delivery_permit);
         waiter.await.unwrap();
-        assert!(recipients.authorize_delivery("team-1", "owner", "collaborator").await.is_none());
+        assert!(
+            recipients
+                .authorize_delivery("team-1", "owner", "collaborator")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

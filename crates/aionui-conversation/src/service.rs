@@ -841,14 +841,18 @@ impl ConversationService {
                 })?;
             }
             Err(error) => {
-                return Err(ConversationError::internal(format!("Failed to inspect Shared Team root: {error}")));
+                return Err(ConversationError::internal(format!(
+                    "Failed to inspect Shared Team root: {error}"
+                )));
             }
         }
         let canonical_team_root = team_root
             .canonicalize()
             .map_err(|error| ConversationError::internal(format!("Failed to resolve Shared Team root: {error}")))?;
         if !canonical_team_root.starts_with(&canonical_root) {
-            return Err(ConversationError::internal("Shared Team workspace escapes the configured root"));
+            return Err(ConversationError::internal(
+                "Shared Team workspace escapes the configured root",
+            ));
         }
         let workspace = team_root.join(team_id);
         match std::fs::symlink_metadata(&workspace) {
@@ -865,14 +869,18 @@ impl ConversationService {
                 })?;
             }
             Err(error) => {
-                return Err(ConversationError::internal(format!("Failed to inspect Shared Team workspace: {error}")));
+                return Err(ConversationError::internal(format!(
+                    "Failed to inspect Shared Team workspace: {error}"
+                )));
             }
         }
-        let canonical_workspace = workspace
-            .canonicalize()
-            .map_err(|error| ConversationError::internal(format!("Failed to resolve Shared Team workspace: {error}")))?;
+        let canonical_workspace = workspace.canonicalize().map_err(|error| {
+            ConversationError::internal(format!("Failed to resolve Shared Team workspace: {error}"))
+        })?;
         if !canonical_workspace.starts_with(&canonical_team_root) {
-            return Err(ConversationError::internal("Shared Team workspace escapes the configured root"));
+            return Err(ConversationError::internal(
+                "Shared Team workspace escapes the configured root",
+            ));
         }
         Ok(canonical_workspace.to_string_lossy().into_owned())
     }

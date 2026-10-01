@@ -77,7 +77,12 @@ async fn forward_event_bus_to_websocket(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         };
 
-        if event.data.get("authorized_user_ids").and_then(serde_json::Value::as_array).is_some() {
+        if event
+            .data
+            .get("authorized_user_ids")
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+        {
             ws_manager.broadcast_scoped(event);
         } else if let Some(user_id) = event
             .data

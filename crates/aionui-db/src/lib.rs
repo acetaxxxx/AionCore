@@ -27,10 +27,10 @@ pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
-    ExternalUserProjection, FolderRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
-    EligibleTeamUserRow, SkillImportRecordRow, SkillRow, TeamAccessRole, TeamMembershipRow, TeamSharingMode,
-    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
-    UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    EligibleTeamUserRow, ExternalUserProjection, FolderRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind,
+    ProjectRow, Role, SkillImportRecordRow, SkillRow, TeamAccessRole, TeamMembershipRow, TeamSharingMode,
+    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
+    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserOrderRow,
     UserStatus, UserType,
 };

@@ -929,10 +929,12 @@ mod tests {
                 .account_ref,
             "acct_opaque"
         );
-        assert!(serde_json::from_value::<AddTeamMemberRequest>(
-            json!({"account_ref":"acct_opaque", "user_id":"caller-chosen"})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<AddTeamMemberRequest>(
+                json!({"account_ref":"acct_opaque", "user_id":"caller-chosen"})
+            )
+            .is_err()
+        );
     }
 
     #[test]

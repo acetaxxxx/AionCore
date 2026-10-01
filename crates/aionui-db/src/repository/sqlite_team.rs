@@ -51,11 +51,7 @@ impl ITeamRepository for SqliteTeamRepository {
         self.insert_team(row, TeamSharingMode::Private).await
     }
 
-    async fn create_team_with_sharing_mode(
-        &self,
-        row: &TeamRow,
-        mode: TeamSharingMode,
-    ) -> Result<(), DbError> {
+    async fn create_team_with_sharing_mode(&self, row: &TeamRow, mode: TeamSharingMode) -> Result<(), DbError> {
         self.insert_team(row, mode).await
     }
 
@@ -125,7 +121,10 @@ impl ITeamRepository for SqliteTeamRepository {
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("active shared Team or account for {}", row.team_id)));
+            return Err(DbError::NotFound(format!(
+                "active shared Team or account for {}",
+                row.team_id
+            )));
         }
         Ok(())
     }
@@ -151,18 +150,13 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
-    async fn list_team_mcp_allowlist(
-        &self,
-        owner_user_id: &str,
-        team_id: &str,
-    ) -> Result<Vec<String>, DbError> {
-        let team_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM teams WHERE id = ? AND user_id = ? AND sharing_mode = 'shared'",
-        )
-        .bind(team_id)
-        .bind(owner_user_id)
-        .fetch_one(&self.pool)
-        .await?;
+    async fn list_team_mcp_allowlist(&self, owner_user_id: &str, team_id: &str) -> Result<Vec<String>, DbError> {
+        let team_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE id = ? AND user_id = ? AND sharing_mode = 'shared'")
+                .bind(team_id)
+                .bind(owner_user_id)
+                .fetch_one(&self.pool)
+                .await?;
         if team_count == 0 {
             return Err(DbError::NotFound(format!("shared Team {team_id}")));
         }
@@ -185,13 +179,12 @@ impl ITeamRepository for SqliteTeamRepository {
         mcp_server_ids: &[String],
     ) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
-        let team_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM teams WHERE id = ? AND user_id = ? AND sharing_mode = 'shared'",
-        )
-        .bind(team_id)
-        .bind(owner_user_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let team_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE id = ? AND user_id = ? AND sharing_mode = 'shared'")
+                .bind(team_id)
+                .bind(owner_user_id)
+                .fetch_one(&mut *tx)
+                .await?;
         if team_count == 0 {
             return Err(DbError::NotFound(format!("shared Team {team_id}")));
         }

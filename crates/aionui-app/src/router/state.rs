@@ -17,16 +17,16 @@ use aionui_channel::ChannelRouterState;
 use aionui_common::AgentKillReason;
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
+use aionui_db::models::TeamSharingMode;
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
-    IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    IProviderRepository, ITeamRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
     SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    ITeamRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
     SqliteSettingsRepository, SqliteTeamRepository,
 };
-use aionui_db::models::TeamSharingMode;
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
@@ -598,11 +598,7 @@ fn canonicalize_candidate(path: &Path) -> Option<PathBuf> {
 
 #[async_trait::async_trait]
 impl TeamWorkspaceAuthorizer for AppTeamWorkspaceAuthorizer {
-    async fn authorize_path(
-        &self,
-        user_id: &str,
-        path: &Path,
-    ) -> Result<TeamWorkspaceAuthorization, FileError> {
+    async fn authorize_path(&self, user_id: &str, path: &Path) -> Result<TeamWorkspaceAuthorization, FileError> {
         let Some(candidate) = normalize_absolute_path(path) else {
             let relative_team_path = path
                 .components()
@@ -687,19 +683,11 @@ impl TeamWorkspaceAuthorizer for AppTeamWorkspaceAuthorizer {
         else {
             return Ok(TeamWorkspaceAuthorization::Denied);
         };
-        let Some(team) = self
-            .team_repo
-            .get_team_for_restore(team_id)
-            .await
-            .ok()
-            .flatten()
-        else {
+        let Some(team) = self.team_repo.get_team_for_restore(team_id).await.ok().flatten() else {
             return Ok(TeamWorkspaceAuthorization::Denied);
         };
         let expected_workspace = teams_root.join(team_id);
-        if fs::symlink_metadata(&expected_workspace)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
+        if fs::symlink_metadata(&expected_workspace).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
             return Ok(TeamWorkspaceAuthorization::Denied);
         }
         let Ok(expected_workspace) = expected_workspace.canonicalize() else {
@@ -749,18 +737,17 @@ impl TeamWorkspaceAuthorizer for AppTeamWorkspaceAuthorizer {
             .await
             .map_err(|_| FileError::Forbidden("conversation access is forbidden".into()))?
             .ok_or_else(|| FileError::Forbidden("conversation access is forbidden".into()))?;
-        let binding =
-            match aionui_api_types::TeamSessionBinding::from_extra_str(&conversation.extra) {
-                Ok(Some(binding)) => binding,
-                Ok(None) => {
-                    return Ok(if execution_owner_id == user_id {
-                        TeamWorkspaceAuthorization::Allowed
-                    } else {
-                        TeamWorkspaceAuthorization::Denied
-                    });
-                }
-                Err(_) => return Ok(TeamWorkspaceAuthorization::Denied),
-            };
+        let binding = match aionui_api_types::TeamSessionBinding::from_extra_str(&conversation.extra) {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                return Ok(if execution_owner_id == user_id {
+                    TeamWorkspaceAuthorization::Allowed
+                } else {
+                    TeamWorkspaceAuthorization::Denied
+                });
+            }
+            Err(_) => return Ok(TeamWorkspaceAuthorization::Denied),
+        };
         let Some(team) = self
             .team_repo
             .get_team_for_restore(&binding.team_id)
@@ -776,21 +763,21 @@ impl TeamWorkspaceAuthorizer for AppTeamWorkspaceAuthorizer {
         if team.user_id == user_id {
             return Ok(TeamWorkspaceAuthorization::Allowed);
         }
-        if self.team_repo.get_team_sharing_mode(&binding.team_id).await.ok()
-            != Some(TeamSharingMode::Shared)
-        {
+        if self.team_repo.get_team_sharing_mode(&binding.team_id).await.ok() != Some(TeamSharingMode::Shared) {
             return Ok(TeamWorkspaceAuthorization::Denied);
         }
-        Ok(if self
-            .team_repo
-            .list_team_members(&binding.team_id)
-            .await
-            .is_ok_and(|members| members.iter().any(|member| member.user_id == user_id))
-        {
-            TeamWorkspaceAuthorization::Allowed
-        } else {
-            TeamWorkspaceAuthorization::Denied
-        })
+        Ok(
+            if self
+                .team_repo
+                .list_team_members(&binding.team_id)
+                .await
+                .is_ok_and(|members| members.iter().any(|member| member.user_id == user_id))
+            {
+                TeamWorkspaceAuthorization::Allowed
+            } else {
+                TeamWorkspaceAuthorization::Denied
+            },
+        )
     }
 
     async fn authorize_exact_workspace(
@@ -1906,8 +1893,8 @@ mod tests {
 
     #[tokio::test]
     async fn shared_team_workspace_authorizer_checks_membership_revocation_and_escape() {
-        use aionui_db::{ITeamRepository, SqliteTeamRepository};
         use aionui_db::models::{TeamMembershipRow, TeamRow, TeamSharingMode};
+        use aionui_db::{ITeamRepository, SqliteTeamRepository};
 
         let tmp = tempfile::TempDir::new().unwrap();
         let work_dir = tmp.path().join("work");
@@ -2105,8 +2092,7 @@ mod tests {
                 .unwrap(),
             TeamWorkspaceAuthorization::Denied
         );
-        let upload_path = std::env::temp_dir()
-            .join("aionui/team-conversation/attachment.txt");
+        let upload_path = std::env::temp_dir().join("aionui/team-conversation/attachment.txt");
         assert_eq!(
             authorizer.authorize_path("member", &upload_path).await.unwrap(),
             TeamWorkspaceAuthorization::Allowed
@@ -2145,8 +2131,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shared_team_workspace_authorizer_rejects_symlink_escape() {
-        use aionui_db::{ITeamRepository, SqliteTeamRepository};
         use aionui_db::models::{TeamRow, TeamSharingMode};
+        use aionui_db::{ITeamRepository, SqliteTeamRepository};
 
         let tmp = tempfile::TempDir::new().unwrap();
         let work_dir = tmp.path().join("work");

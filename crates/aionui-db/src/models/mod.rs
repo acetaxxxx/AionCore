@@ -40,6 +40,8 @@ pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRow};
 pub use system_settings::SystemSettings;
-pub use team::{EligibleTeamUserRow, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
+pub use team::{
+    EligibleTeamUserRow, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow,
+};
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};
 pub use user_order::{OrderItemType, OrderScene, UserOrderRow};

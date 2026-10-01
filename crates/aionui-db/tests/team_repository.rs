@@ -14,7 +14,7 @@ use std::sync::Arc;
 use aionui_common::now_ms;
 use aionui_db::models::{MailboxMessageRow, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
 use aionui_db::{
-    ActivityCursor, CreateMcpServerParams, DbError, ITeamRepository, IMcpServerRepository, IUserRepository,
+    ActivityCursor, CreateMcpServerParams, DbError, IMcpServerRepository, ITeamRepository, IUserRepository,
     PageDirection, SqliteMcpServerRepository, SqliteTeamRepository, SqliteUserRepository, UpdateTaskParams,
     UpdateTeamParams, init_database_memory,
 };
@@ -101,23 +101,26 @@ async fn create_and_get_team() {
     assert_eq!(fetched.id, "t1");
     assert_eq!(fetched.name, "Team Alpha");
     assert_eq!(fetched.lead_agent_id, Some("a1".into()));
-    assert_eq!(repo.get_team_sharing_mode("t1").await.unwrap(), TeamSharingMode::Private);
+    assert_eq!(
+        repo.get_team_sharing_mode("t1").await.unwrap(),
+        TeamSharingMode::Private
+    );
 }
 
 #[tokio::test]
 async fn shared_mode_and_active_membership_persist_and_revoke_by_owner() {
     let (repo, db) = repo().await;
     let users = SqliteUserRepository::new(db.pool().clone());
-    let member = users
-        .create_user("collaborator", "test-password-hash")
-        .await
-        .unwrap();
+    let member = users.create_user("collaborator", "test-password-hash").await.unwrap();
     let team = make_team("shared-team", "Shared Team");
     repo.create_team_with_sharing_mode(&team, TeamSharingMode::Shared)
         .await
         .unwrap();
 
-    assert_eq!(repo.get_team_sharing_mode(&team.id).await.unwrap(), TeamSharingMode::Shared);
+    assert_eq!(
+        repo.get_team_sharing_mode(&team.id).await.unwrap(),
+        TeamSharingMode::Shared
+    );
     assert_eq!(
         repo.team_access_role(&team.id, DEFAULT_USER_ID).await.unwrap(),
         Some(aionui_db::models::TeamAccessRole::Owner)
@@ -174,7 +177,10 @@ async fn cannot_add_member_to_private_team_or_disabled_account() {
         display_name: Some(member.username.clone()),
         created_at: now_ms(),
     };
-    assert!(matches!(repo.add_team_member(&membership).await, Err(DbError::NotFound(_))));
+    assert!(matches!(
+        repo.add_team_member(&membership).await,
+        Err(DbError::NotFound(_))
+    ));
 
     let shared_team = make_team("shared-team-disabled", "Shared Team");
     repo.create_team_with_sharing_mode(&shared_team, TeamSharingMode::Shared)
@@ -189,7 +195,10 @@ async fn cannot_add_member_to_private_team_or_disabled_account() {
     };
     repo.add_team_member(&active_membership).await.unwrap();
     let listed_members = repo.list_team_members(&shared_team.id).await.unwrap();
-    assert_eq!(listed_members[0].display_name.as_deref(), Some("Host account opaque123"));
+    assert_eq!(
+        listed_members[0].display_name.as_deref(),
+        Some("Host account opaque123")
+    );
     users
         .set_status(&member.id, aionui_db::models::UserStatus::Disabled)
         .await
@@ -286,13 +295,20 @@ async fn team_mcp_allowlist_is_shared_team_owner_scoped_and_atomic() {
     repo.replace_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id, &selected)
         .await
         .unwrap();
-    assert_eq!(repo.list_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id).await.unwrap(), selected);
+    assert_eq!(
+        repo.list_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id).await.unwrap(),
+        selected
+    );
 
     assert!(matches!(
-        repo.replace_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id, &[private_mcp.id]).await,
+        repo.replace_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id, &[private_mcp.id])
+            .await,
         Err(DbError::NotFound(_))
     ));
-    assert_eq!(repo.list_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id).await.unwrap(), vec![owner_mcp.id]);
+    assert_eq!(
+        repo.list_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id).await.unwrap(),
+        vec![owner_mcp.id]
+    );
     assert!(matches!(
         repo.list_team_mcp_allowlist(&other_owner.id, &shared.id).await,
         Err(DbError::NotFound(_))

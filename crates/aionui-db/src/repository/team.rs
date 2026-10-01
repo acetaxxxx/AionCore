@@ -58,11 +58,7 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Creates a Team with an explicit sharing policy. Repositories that have
     /// not implemented shared membership must fail closed for `Shared`.
-    async fn create_team_with_sharing_mode(
-        &self,
-        row: &TeamRow,
-        mode: TeamSharingMode,
-    ) -> Result<(), DbError> {
+    async fn create_team_with_sharing_mode(&self, row: &TeamRow, mode: TeamSharingMode) -> Result<(), DbError> {
         match mode {
             TeamSharingMode::Private => self.create_team(row).await,
             TeamSharingMode::Shared => Err(DbError::Init("shared Team persistence is unavailable".into())),
@@ -106,11 +102,7 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Reads the explicitly selected owner MCP IDs for an owned Shared Team.
     /// Private-only repository implementations have no Team MCP sharing.
-    async fn list_team_mcp_allowlist(
-        &self,
-        _owner_user_id: &str,
-        _team_id: &str,
-    ) -> Result<Vec<String>, DbError> {
+    async fn list_team_mcp_allowlist(&self, _owner_user_id: &str, _team_id: &str) -> Result<Vec<String>, DbError> {
         Ok(Vec::new())
     }
 
@@ -122,9 +114,7 @@ pub trait ITeamRepository: Send + Sync {
         _team_id: &str,
         _mcp_server_ids: &[String],
     ) -> Result<(), DbError> {
-        Err(DbError::Init(
-            "Team MCP allowlist persistence is unavailable".into(),
-        ))
+        Err(DbError::Init("Team MCP allowlist persistence is unavailable".into()))
     }
 
     /// Lists active Teams where `user_id` is a collaborator.

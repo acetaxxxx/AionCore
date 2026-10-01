@@ -56,7 +56,13 @@ impl WebSocketManager {
             .data
             .get("authorized_user_ids")
             .and_then(serde_json::Value::as_array)
-            .map(|values| values.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
         else {
             warn!(event_name = %event.name, "dropping scoped websocket event without recipient list");
             return;
@@ -98,7 +104,9 @@ impl WebSocketManager {
         recipient_user_id: &str,
     ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
         let recipients = self.scoped_recipients.read().ok().and_then(|guard| guard.clone())?;
-        recipients.authorize_delivery(scope_id, owner_user_id, recipient_user_id).await
+        recipients
+            .authorize_delivery(scope_id, owner_user_id, recipient_user_id)
+            .await
     }
 
     fn broadcast_scoped_to_user(
@@ -420,7 +428,12 @@ impl Default for WebSocketManager {
 
 impl EventBroadcaster for WebSocketManager {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
-        if event.data.get("authorized_user_ids").and_then(|value| value.as_array()).is_some() {
+        if event
+            .data
+            .get("authorized_user_ids")
+            .and_then(|value| value.as_array())
+            .is_some()
+        {
             self.broadcast_scoped(event);
             return;
         }

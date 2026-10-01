@@ -92,7 +92,13 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
 
     let (ws_sender, ws_receiver) = socket.split();
 
-    let send_handle = tokio::spawn(send_loop(conn_id, user_id.clone(), rx, ws_sender, state.manager.clone()));
+    let send_handle = tokio::spawn(send_loop(
+        conn_id,
+        user_id.clone(),
+        rx,
+        ws_sender,
+        state.manager.clone(),
+    ));
     recv_loop(conn_id, &user_id, ws_receiver, &state).await;
 
     // Recv loop exited — client disconnected or errored.

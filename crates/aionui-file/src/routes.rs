@@ -39,11 +39,7 @@ pub enum TeamWorkspaceAuthorization {
 
 #[async_trait::async_trait]
 pub trait TeamWorkspaceAuthorizer: Send + Sync {
-    async fn authorize_path(
-        &self,
-        user_id: &str,
-        path: &Path,
-    ) -> Result<TeamWorkspaceAuthorization, FileError>;
+    async fn authorize_path(&self, user_id: &str, path: &Path) -> Result<TeamWorkspaceAuthorization, FileError>;
 
     async fn authorize_conversation(
         &self,
@@ -142,11 +138,7 @@ pub struct FileRouterState {
     pub team_workspace_authorizer: Arc<dyn TeamWorkspaceAuthorizer>,
 }
 
-async fn validate_request_path(
-    state: &FileRouterState,
-    user: &CurrentUser,
-    path: &str,
-) -> Result<(), ApiError> {
+async fn validate_request_path(state: &FileRouterState, user: &CurrentUser, path: &str) -> Result<(), ApiError> {
     let tenant_result = crate::tenant_guard::validate_tenant_path(user, path);
     if user.is_local_admin() {
         return tenant_result.map_err(Into::into);
@@ -165,11 +157,7 @@ async fn validate_request_path(
     }
 }
 
-async fn validate_resolved_path(
-    state: &FileRouterState,
-    user: &CurrentUser,
-    path: &str,
-) -> Result<(), ApiError> {
+async fn validate_resolved_path(state: &FileRouterState, user: &CurrentUser, path: &str) -> Result<(), ApiError> {
     validate_request_path(state, user, path).await
 }
 
@@ -192,9 +180,7 @@ async fn validate_path_and_workspace(
             validate_request_path(state, user, path).await?;
             validate_request_path(state, user, workspace).await
         }
-        TeamWorkspaceAuthorization::Denied => {
-            Err(ApiError::Forbidden("Team workspace access is forbidden".into()))
-        }
+        TeamWorkspaceAuthorization::Denied => Err(ApiError::Forbidden("Team workspace access is forbidden".into())),
         TeamWorkspaceAuthorization::NotTeamWorkspace => {
             validate_request_path(state, user, path).await?;
             validate_request_path(state, user, workspace).await
@@ -229,12 +215,8 @@ async fn resolve_chat_file_ref_for_user(
     if let ChatFileRef::Local { path } = file
         && !user.is_local_admin()
     {
-        if let Some(team_path) = authorize_local_team_file(
-            state.team_workspace_authorizer.as_ref(),
-            &user.id,
-            path,
-        )
-        .await?
+        if let Some(team_path) =
+            authorize_local_team_file(state.team_workspace_authorizer.as_ref(), &user.id, path).await?
         {
             return Ok(team_path);
         }
@@ -242,13 +224,7 @@ async fn resolve_chat_file_ref_for_user(
 
     state
         .project
-        .resolve_chat_file_ref_with_local_admin(
-            &user.id,
-            user.is_local_admin(),
-            file,
-            &content_upload_root(),
-            op,
-        )
+        .resolve_chat_file_ref_with_local_admin(&user.id, user.is_local_admin(), file, &content_upload_root(), op)
         .await
         .map_err(chat_file_resolve_error)
 }
@@ -277,9 +253,7 @@ async fn authorize_local_team_file(
     }
     match authorizer.authorize_path(user_id, &canonical).await? {
         TeamWorkspaceAuthorization::Allowed => Ok(Some(canonical.to_string_lossy().into_owned())),
-        TeamWorkspaceAuthorization::Denied => {
-            Err(ApiError::Forbidden("Team workspace access is forbidden".into()))
-        }
+        TeamWorkspaceAuthorization::Denied => Err(ApiError::Forbidden("Team workspace access is forbidden".into())),
         TeamWorkspaceAuthorization::NotTeamWorkspace => {
             if submitted_authorization == TeamWorkspaceAuthorization::Allowed {
                 Err(ApiError::Forbidden("Team workspace access is forbidden".into()))
@@ -895,8 +869,7 @@ async fn get_image_base64(
             .await?
         {
             TeamWorkspaceAuthorization::Allowed => {
-                let canonical_path =
-                    resolve_team_image_path(Path::new(workspace), Path::new(&req.path))?;
+                let canonical_path = resolve_team_image_path(Path::new(workspace), Path::new(&req.path))?;
                 let canonical_path_text = canonical_path.to_string_lossy().into_owned();
                 validate_request_path(&state, &user, &canonical_path_text).await?;
                 (canonical_path_text, None)
@@ -911,20 +884,14 @@ async fn get_image_base64(
                 let path = resolve_chat_file_ref_for_user(
                     &state,
                     &user,
-                    &ChatFileRef::Local {
-                        path: req.path.clone(),
-                    },
+                    &ChatFileRef::Local { path: req.path.clone() },
                     aionui_project::FileOp::Read,
                 )
                 .await?;
                 validate_resolved_path(&state, &user, &path).await?;
                 let workspace = state
                     .project
-                    .authorize_local_workspace_with_local_admin(
-                        &user.id,
-                        false,
-                        Path::new(workspace),
-                    )
+                    .authorize_local_workspace_with_local_admin(&user.id, false, Path::new(workspace))
                     .map_err(chat_file_resolve_error)?;
                 (path, Some(PathBuf::from(workspace)))
             }
@@ -933,9 +900,7 @@ async fn get_image_base64(
         let path = resolve_chat_file_ref_for_user(
             &state,
             &user,
-            &ChatFileRef::Local {
-                path: req.path.clone(),
-            },
+            &ChatFileRef::Local { path: req.path.clone() },
             aionui_project::FileOp::Read,
         )
         .await?;
@@ -1192,11 +1157,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TeamWorkspaceAuthorizer for FixedTeamAuthorizer {
-        async fn authorize_path(
-            &self,
-            _user_id: &str,
-            path: &Path,
-        ) -> Result<TeamWorkspaceAuthorization, FileError> {
+        async fn authorize_path(&self, _user_id: &str, path: &Path) -> Result<TeamWorkspaceAuthorization, FileError> {
             self.paths.lock().unwrap().push(path.to_path_buf());
             Ok(self.decision)
         }
@@ -1226,7 +1187,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resolved, Some(file.canonicalize().unwrap().to_string_lossy().into_owned()));
+        assert_eq!(
+            resolved,
+            Some(file.canonicalize().unwrap().to_string_lossy().into_owned())
+        );
         assert_eq!(
             *authorizer.paths.lock().unwrap(),
             vec![file.clone(), file.canonicalize().unwrap()]
@@ -1251,7 +1215,10 @@ mod tests {
         assert_eq!(resolved, None);
         assert_eq!(
             *authorizer.paths.lock().unwrap(),
-            vec![personal_file.canonicalize().unwrap(), personal_file.canonicalize().unwrap()]
+            vec![
+                personal_file.canonicalize().unwrap(),
+                personal_file.canonicalize().unwrap()
+            ]
         );
     }
 
@@ -1605,9 +1572,7 @@ mod tests {
             .expect("routes.rs has a #[cfg(test)] module");
 
         let endpoint_calls = handlers.matches("resolve_chat_file_ref_for_user(").count() - 1;
-        let project_resolve_calls = handlers
-            .matches(".resolve_chat_file_ref_with_local_admin(")
-            .count();
+        let project_resolve_calls = handlers.matches(".resolve_chat_file_ref_with_local_admin(").count();
         let sealed = handlers.matches(".map_err(chat_file_resolve_error)").count();
 
         assert_eq!(

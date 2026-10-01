@@ -580,9 +580,7 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     }
 
     async fn is_shared_team_workspace(&self, team_id: &str, workspace: &str) -> Result<bool, TeamError> {
-        Ok(self
-            .conversation_service
-            .is_shared_team_workspace(team_id, workspace))
+        Ok(self.conversation_service.is_shared_team_workspace(team_id, workspace))
     }
 
     async fn resolve_assistant_mcp_selection(

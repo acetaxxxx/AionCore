@@ -164,15 +164,9 @@ async fn direct_conversation_owner_guard(
     let Some(user) = request.extensions().get::<CurrentUser>() else {
         return ApiError::Unauthorized("Authentication required".into()).into_response();
     };
-    match state
-        .service
-        .ensure_owned_conversation(&user.id, conversation_id)
-        .await
-    {
+    match state.service.ensure_owned_conversation(&user.id, conversation_id).await {
         Ok(()) => next.run(request).await,
-        Err(ConversationError::NotFound { .. }) => {
-            ApiError::NotFound("Conversation not found".into()).into_response()
-        }
+        Err(ConversationError::NotFound { .. }) => ApiError::NotFound("Conversation not found".into()).into_response(),
         Err(error) => ApiError::from(error).into_response(),
     }
 }

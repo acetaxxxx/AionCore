@@ -1031,10 +1031,7 @@ impl ITeamRepository for FullMockTeamRepo {
         self.sharing_modes.lock().unwrap().insert(row.id.clone(), mode);
         Ok(())
     }
-    async fn get_team_sharing_mode(
-        &self,
-        team_id: &str,
-    ) -> Result<aionui_db::models::TeamSharingMode, DbError> {
+    async fn get_team_sharing_mode(&self, team_id: &str) -> Result<aionui_db::models::TeamSharingMode, DbError> {
         Ok(self
             .sharing_modes
             .lock()
@@ -8831,8 +8828,14 @@ async fn shared_team_reads_use_active_membership_and_revoke_blocks_next_read() {
     let visible = svc.list_teams("collaborator").await.unwrap();
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].role, aionui_api_types::TeamAccessRole::Collaborator);
-    assert_eq!(svc.get_team("collaborator", &team.id).await.unwrap().role, aionui_api_types::TeamAccessRole::Collaborator);
-    assert_eq!(svc.list_team_mailbox("collaborator", &team.id, 10).await.unwrap().len(), 1);
+    assert_eq!(
+        svc.get_team("collaborator", &team.id).await.unwrap().role,
+        aionui_api_types::TeamAccessRole::Collaborator
+    );
+    assert_eq!(
+        svc.list_team_mailbox("collaborator", &team.id, 10).await.unwrap().len(),
+        1
+    );
     assert_eq!(
         svc.list_team_activity(
             "collaborator",
@@ -8850,7 +8853,10 @@ async fn shared_team_reads_use_active_membership_and_revoke_blocks_next_read() {
     );
 
     team_repo.revoke_test_collaborator(&team.id, "collaborator");
-    assert!(matches!(svc.get_team("collaborator", &team.id).await, Err(TeamError::TeamNotFound(_))));
+    assert!(matches!(
+        svc.get_team("collaborator", &team.id).await,
+        Err(TeamError::TeamNotFound(_))
+    ));
     assert!(matches!(
         svc.ensure_session("collaborator", &team.id).await,
         Err(TeamError::TeamNotFound(_))
@@ -8878,10 +8884,14 @@ async fn stale_core_user_rows_cannot_be_listed_or_added_as_collaborators() {
         .unwrap();
     // Models a Core users-table row that is still marked active but is stale or
     // was seeded independently of the host's current loginable account roster.
-    team_repo.stale_eligible_users.lock().unwrap().push(aionui_db::models::EligibleTeamUserRow {
-        user_id: "stale-core-user".into(),
-        display_name: "stale@example.invalid".into(),
-    });
+    team_repo
+        .stale_eligible_users
+        .lock()
+        .unwrap()
+        .push(aionui_db::models::EligibleTeamUserRow {
+            user_id: "stale-core-user".into(),
+            display_name: "stale@example.invalid".into(),
+        });
 
     assert!(matches!(
         svc.list_eligible_collaborators("owner", &team.id).await,
