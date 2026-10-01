@@ -44,9 +44,9 @@ impl WebSocketManager {
         }
     }
 
-    /// Delivers a scoped event only to recipients still authorized at the
-    /// final fan-out point. The shared read lock serializes this enqueue with
-    /// synchronous membership revocation.
+    /// Enqueues a scoped event only to recipients authorized at fan-out time.
+    /// Each queued frame retains its Team scope and is rechecked by the socket
+    /// send loop immediately before delivery.
     pub fn broadcast_scoped(&self, event: WebSocketMessage<serde_json::Value>) {
         let Some(scope_id) = event.data.get("team_id").and_then(serde_json::Value::as_str) else {
             warn!(event_name = %event.name, "dropping scoped websocket event without team_id");
@@ -62,12 +62,20 @@ impl WebSocketManager {
             return;
         };
         let Some(owner_user_id) = event.data.get("user_id").and_then(serde_json::Value::as_str) else {
-            warn!(event_name = %event.name, team_id = %scope_id, "dropping scoped websocket event without owner identity");
+            warn!(
+                event_name = %event.name,
+                team_id = %scope_id,
+                "dropping scoped websocket event without owner identity"
+            );
             return;
         };
         let recipients = self.scoped_recipients.read().ok().and_then(|guard| guard.clone());
         let Some(recipients) = recipients else {
-            warn!(event_name = %event.name, team_id = %scope_id, "dropping scoped websocket event without recipient authority");
+            warn!(
+                event_name = %event.name,
+                team_id = %scope_id,
+                "dropping scoped websocket event without recipient authority"
+            );
             return;
         };
 
@@ -77,8 +85,67 @@ impl WebSocketManager {
                 data.remove("authorized_user_ids");
                 data.insert("user_id".to_owned(), serde_json::Value::String(recipient.to_owned()));
             }
-            self.broadcast_to_user(recipient, scoped_event);
+            self.broadcast_scoped_to_user(recipient, scope_id, owner_user_id, scoped_event);
         });
+    }
+
+    /// Authorizes a queued Team frame immediately before socket delivery. The
+    /// returned permit must be held until the socket write completes.
+    pub async fn authorize_scoped_delivery(
+        &self,
+        scope_id: &str,
+        owner_user_id: &str,
+        recipient_user_id: &str,
+    ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let recipients = self.scoped_recipients.read().ok().and_then(|guard| guard.clone())?;
+        recipients.authorize_delivery(scope_id, owner_user_id, recipient_user_id).await
+    }
+
+    fn broadcast_scoped_to_user(
+        &self,
+        user_id: &str,
+        scope_id: &str,
+        owner_user_id: &str,
+        msg: WebSocketMessage<serde_json::Value>,
+    ) {
+        let text = match serde_json::to_string(&msg) {
+            Ok(text) => text,
+            Err(error) => {
+                warn!(user_id, error = %error, "failed to serialize scoped websocket event");
+                return;
+            }
+        };
+
+        let mut disconnected = Vec::new();
+        for entry in self.connections.iter() {
+            let conn_id = *entry.key();
+            let client = entry.value();
+            if client.user_id != user_id {
+                continue;
+            }
+
+            let outbound = WsOutbound::ScopedText {
+                text: text.clone(),
+                scope_id: scope_id.to_owned(),
+                owner_user_id: owner_user_id.to_owned(),
+                recipient_user_id: user_id.to_owned(),
+            };
+            match client.tx.try_send(outbound) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        %conn_id,
+                        user_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, scoped event dropped"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => disconnected.push(conn_id),
+            }
+        }
+        for conn_id in disconnected {
+            self.remove_client(conn_id);
+        }
     }
 
     /// Register a new client connection and return its assigned ID.
@@ -371,6 +438,15 @@ impl EventBroadcaster for WebSocketManager {
         };
         self.broadcast_to_user(&user_id, event);
     }
+
+    fn wait_for_scope_deliveries(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let recipients = self.scoped_recipients.read().ok().and_then(|guard| guard.clone());
+        Box::pin(async move {
+            if let Some(recipients) = recipients {
+                recipients.wait_for_inflight_deliveries().await;
+            }
+        })
+    }
 }
 
 /// Single heartbeat tick: check timeouts, token validity, send pings.
@@ -610,17 +686,88 @@ mod tests {
         mgr.broadcast(event);
 
         let owner_event = match owner_rx.try_recv().unwrap() {
-            WsOutbound::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            WsOutbound::ScopedText { text, .. } => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
             other => panic!("expected event text, got {other:?}"),
         };
         let collaborator_event = match collaborator_rx.try_recv().unwrap() {
-            WsOutbound::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            WsOutbound::ScopedText { text, .. } => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
             other => panic!("expected event text, got {other:?}"),
         };
         assert_eq!(owner_event["data"]["user_id"], "owner");
         assert_eq!(collaborator_event["data"]["user_id"], "collaborator");
         assert!(owner_event["data"].get("authorized_user_ids").is_none());
         assert!(unrelated_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_team_frames_are_rechecked_after_membership_revocation() {
+        let mgr = WebSocketManager::new();
+        let recipients = ScopedEventRecipients::default();
+        recipients.replace("team-1", ["owner".into(), "revoked".into(), "remaining".into()]);
+        recipients.replace("team-2", ["other-owner".into(), "other-member".into()]);
+        mgr.set_scoped_event_recipients(recipients.clone());
+
+        let (owner_tx, mut owner_rx) = new_client_tx();
+        let (revoked_tx, mut revoked_rx) = new_client_tx();
+        let (remaining_tx, mut remaining_rx) = new_client_tx();
+        let (other_owner_tx, mut other_owner_rx) = new_client_tx();
+        let (other_member_tx, mut other_member_rx) = new_client_tx();
+        let (revoked_private_tx, mut revoked_private_rx) = new_client_tx();
+        mgr.add_client_for_user("owner".into(), "owner-token".into(), owner_tx);
+        mgr.add_client_for_user("revoked".into(), "revoked-token".into(), revoked_tx);
+        mgr.add_client_for_user("remaining".into(), "remaining-token".into(), remaining_tx);
+        mgr.add_client_for_user("other-owner".into(), "other-owner-token".into(), other_owner_tx);
+        mgr.add_client_for_user("other-member".into(), "other-member-token".into(), other_member_tx);
+        mgr.add_client_for_user("revoked".into(), "revoked-private-token".into(), revoked_private_tx);
+
+        let make_event = |team_id: &str, owner: &str, users: &[&str]| {
+            WebSocketMessage::new(
+                "team.runUpdated",
+                serde_json::json!({
+                    "user_id": owner,
+                    "authorized_user_ids": users,
+                    "team_id": team_id,
+                }),
+            )
+        };
+        mgr.broadcast_scoped(make_event("team-1", "owner", &["owner", "revoked", "remaining"]));
+        mgr.broadcast_scoped(make_event("team-2", "other-owner", &["other-owner", "other-member"]));
+        // Plain user-scoped events are not Team-tagged and retain old behavior.
+        mgr.broadcast_to_user(
+            "revoked",
+            WebSocketMessage::new("private.update", serde_json::json!({"user_id": "revoked"})),
+        );
+
+        recipients.revoke("team-1", "revoked");
+        recipients.wait_for_inflight_deliveries().await;
+
+        async fn scoped_text(
+            mgr: &WebSocketManager,
+            rx: &mut mpsc::Receiver<WsOutbound>,
+            expected_user: &str,
+        ) -> Option<serde_json::Value> {
+            let WsOutbound::ScopedText {
+                text,
+                scope_id,
+                owner_user_id,
+                recipient_user_id,
+            } = rx.recv().await.unwrap()
+            else {
+                panic!("expected queued Team-scoped frame");
+            };
+            assert_eq!(recipient_user_id, expected_user);
+            let _permit = mgr
+                .authorize_scoped_delivery(&scope_id, &owner_user_id, &recipient_user_id)
+                .await?;
+            Some(serde_json::from_str(&text).unwrap())
+        }
+
+        assert!(scoped_text(&mgr, &mut owner_rx, "owner").await.is_some());
+        assert!(scoped_text(&mgr, &mut revoked_rx, "revoked").await.is_none());
+        assert!(scoped_text(&mgr, &mut remaining_rx, "remaining").await.is_some());
+        assert!(scoped_text(&mgr, &mut other_owner_rx, "other-owner").await.is_some());
+        assert!(scoped_text(&mgr, &mut other_member_rx, "other-member").await.is_some());
+        assert!(matches!(revoked_private_rx.try_recv(), Ok(WsOutbound::Text(_))));
     }
 
     #[test]

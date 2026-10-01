@@ -1012,14 +1012,20 @@ impl TeamSessionService {
             .into_iter()
             .find(|member| member.membership_ref == membership_ref)
             .map(|member| member.user_id);
-        if let Some(user_id) = member_user_id.as_deref() {
-            // Update the shared final-delivery gate before awaiting persistence.
-            // The realtime manager serializes this with socket queueing, so no
-            // stale projected event can begin delivery after this returns.
+        let revocation_started = if let Some(user_id) = member_user_id.as_deref() {
+            // Remove authorization before persistence, then wait for socket
+            // writes that passed their final check before revocation. Queued
+            // frames not yet drained will fail their send-loop check.
             self.broadcaster.revoke_scope_recipient(team_id, user_id);
-        }
-        if let (Some(user_id), Some(session)) = (member_user_id.as_deref(), self.sessions.get(team_id)) {
-            session.session.revoke_event_user(user_id);
+            if let Some(session) = self.sessions.get(team_id) {
+                session.session.revoke_event_user(user_id);
+            }
+            true
+        } else {
+            false
+        };
+        if revocation_started {
+            self.broadcaster.wait_for_scope_deliveries().await;
         }
         if let Err(error) = self.repo.remove_team_member(owner_user_id, team_id, membership_ref).await {
             self.refresh_session_event_users(team_id, owner_user_id).await;

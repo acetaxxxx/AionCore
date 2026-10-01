@@ -447,7 +447,7 @@ mod actor_tests {
         let queued_event = event_rx.recv().await.expect("projected event");
         manager.broadcast_scoped(queued_event);
 
-        assert!(matches!(owner_rx.try_recv(), Ok(WsOutbound::Text(_))));
+        assert!(matches!(owner_rx.try_recv(), Ok(WsOutbound::ScopedText { .. })));
         assert!(collaborator_rx.try_recv().is_err());
     }
 }

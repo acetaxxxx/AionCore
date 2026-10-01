@@ -1,15 +1,19 @@
 use aionui_api_types::WebSocketMessage;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
+use tokio::sync::OwnedRwLockReadGuard;
 use tracing::warn;
 
 /// Current recipients for scoped events, shared by the event bus and the
-/// final WebSocket fan-out. The lock makes recipient removal synchronous with
-/// delivery enqueueing inside the single Core process.
+/// final WebSocket delivery. The registry filters enqueueing, while a separate
+/// process-local gate fences in-flight socket writes during revocation.
 #[derive(Clone, Default)]
 pub struct ScopedEventRecipients {
     recipients: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    delivery_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl ScopedEventRecipients {
@@ -64,6 +68,33 @@ impl ScopedEventRecipients {
         }
         true
     }
+
+    /// Acquires a read permit for a final socket delivery and checks current
+    /// scope membership. The permit remains held through the actual socket
+    /// write; revocation waits for in-flight writes before returning. This gate
+    /// coordinates only this Core process, not multiple replicas.
+    pub async fn authorize_delivery(
+        &self,
+        scope_id: &str,
+        owner_user_id: &str,
+        recipient_user_id: &str,
+    ) -> Option<OwnedRwLockReadGuard<()>> {
+        let permit = self.delivery_gate.clone().read_owned().await;
+        let authorized = match self.recipients.read() {
+            Ok(current) => current
+                .get(scope_id)
+                .map(|recipients| recipients.contains(recipient_user_id))
+                .unwrap_or_else(|| recipient_user_id == owner_user_id),
+            Err(_) => false,
+        };
+        authorized.then_some(permit)
+    }
+
+    /// Waits for socket writes that passed authorization before a synchronous
+    /// recipient revocation to finish. New writes observe the revoked set.
+    pub async fn wait_for_inflight_deliveries(&self) {
+        let _permit = self.delivery_gate.clone().write_owned().await;
+    }
 }
 
 /// Trait for broadcasting WebSocket events to all connected clients.
@@ -83,6 +114,12 @@ pub trait EventBroadcaster: Send + Sync {
 
     /// Synchronously removes one user from an application-scoped event stream.
     fn revoke_scope_recipient(&self, _scope_id: &str, _user_id: &str) {}
+
+    /// Waits for already-authorized scoped socket writes to finish after
+    /// recipient revocation. Implementations without scoped delivery can no-op.
+    fn wait_for_scope_deliveries(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 
     /// Returns the current recipient snapshot for event construction. Final
     /// delivery still revalidates against the shared registry in the manager.
@@ -147,6 +184,10 @@ impl EventBroadcaster for BroadcastEventBus {
         self.scoped_recipients.revoke(scope_id, user_id);
     }
 
+    fn wait_for_scope_deliveries(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.scoped_recipients.wait_for_inflight_deliveries())
+    }
+
     fn scope_recipients(&self, scope_id: &str) -> Vec<String> {
         self.scoped_recipients.snapshot(scope_id)
     }
@@ -199,6 +240,32 @@ mod tests {
         let received = rx.recv().await.unwrap();
         assert_eq!(received.name, "chat:update");
         assert_eq!(received.data["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn revocation_fence_waits_for_authorized_socket_write_permit() {
+        let recipients = ScopedEventRecipients::default();
+        recipients.replace("team-1", ["owner".into(), "collaborator".into()]);
+        let delivery_permit = recipients.authorize_delivery("team-1", "owner", "collaborator").await.unwrap();
+        recipients.revoke("team-1", "collaborator");
+
+        let waiter_registry = recipients.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut waiter = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            waiter_registry.wait_for_inflight_deliveries().await;
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err(),
+            "revocation must fence an in-flight socket write"
+        );
+
+        drop(delivery_permit);
+        waiter.await.unwrap();
+        assert!(recipients.authorize_delivery("team-1", "owner", "collaborator").await.is_none());
     }
 
     #[tokio::test]

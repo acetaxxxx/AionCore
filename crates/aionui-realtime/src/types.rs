@@ -21,6 +21,14 @@ impl std::fmt::Display for ConnectionId {
 pub enum WsOutbound {
     /// UTF-8 text frame.
     Text(String),
+    /// Team-scoped event retained as scoped until the socket send loop checks
+    /// current authorization immediately before delivery.
+    ScopedText {
+        text: String,
+        scope_id: String,
+        owner_user_id: String,
+        recipient_user_id: String,
+    },
     /// Close frame with status code and reason.
     Close(WebSocketCloseCode, String),
     /// UTF-8 text frame followed immediately by a close frame.
