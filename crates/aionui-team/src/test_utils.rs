@@ -627,6 +627,7 @@ pub(crate) mod workspace_harness {
         messages: Mutex<Vec<aionui_db::models::MailboxMessageRow>>,
         shared_teams: Mutex<HashSet<String>>,
         collaborators: Mutex<HashMap<String, HashSet<String>>>,
+        fail_allowlist_read_for_unpersisted_team: Mutex<bool>,
     }
 
     impl FullMockTeamRepo {
@@ -636,7 +637,12 @@ pub(crate) mod workspace_harness {
                 messages: Mutex::new(Vec::new()),
                 shared_teams: Mutex::new(HashSet::new()),
                 collaborators: Mutex::new(HashMap::new()),
+                fail_allowlist_read_for_unpersisted_team: Mutex::new(false),
             }
+        }
+
+        pub(crate) fn fail_allowlist_read_for_unpersisted_team(&self) {
+            *self.fail_allowlist_read_for_unpersisted_team.lock().unwrap() = true;
         }
 
         pub(crate) fn add_test_collaborator(&self, team_id: &str, user_id: &str) {
@@ -683,6 +689,19 @@ pub(crate) mod workspace_harness {
             } else {
                 aionui_db::models::TeamSharingMode::Private
             })
+        }
+
+        async fn list_team_mcp_allowlist(
+            &self,
+            _owner_user_id: &str,
+            team_id: &str,
+        ) -> Result<Vec<String>, DbError> {
+            if *self.fail_allowlist_read_for_unpersisted_team.lock().unwrap()
+                && !self.teams.lock().unwrap().iter().any(|team| team.id == team_id)
+            {
+                return Err(DbError::NotFound(format!("shared Team {team_id}")));
+            }
+            Ok(Vec::new())
         }
 
         async fn list_teams_by_member(&self, user_id: &str) -> Result<Vec<TeamRow>, DbError> {

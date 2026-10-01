@@ -333,9 +333,16 @@ impl TeamAgentProvisioner {
         // than after an orphan conversation exists. Teammates resolve their own
         // bindings below — each member follows the assistant it is bound to, so
         // this result is NOT shared across members.
-        let leader_mcp_selection = self
-            .resolve_team_assistant_mcp_selection(user_id, team_id, leader_assistant_id.as_deref(), shared_team)
-            .await?;
+        // Initial provisioning runs before the Team row exists, so no
+        // Team-level allowlist can have been selected yet. Shared Teams start
+        // with no MCP access; the owner can configure the allowlist after
+        // creation and the next runtime attach will resolve that persisted set.
+        let leader_mcp_selection = if shared_team {
+            TeamMcpSelection::default()
+        } else {
+            self.resolve_team_assistant_mcp_selection(user_id, team_id, leader_assistant_id.as_deref(), false)
+                .await?
+        };
         let leader_backend = self
             .resolve_requested_backend(user_id, leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
@@ -393,9 +400,12 @@ impl TeamAgentProvisioner {
             let backend = self
                 .resolve_requested_backend(user_id, input.backend.as_deref(), assistant_id.as_deref())
                 .await?;
-            let mcp_selection = self
-                .resolve_team_assistant_mcp_selection(user_id, team_id, assistant_id.as_deref(), shared_team)
-                .await?;
+            let mcp_selection = if shared_team {
+                TeamMcpSelection::default()
+            } else {
+                self.resolve_team_assistant_mcp_selection(user_id, team_id, assistant_id.as_deref(), false)
+                    .await?
+            };
             let conversation = self
                 .create_team_conversation_for_agent(
                     user_id,

@@ -2393,6 +2393,30 @@ async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() 
 }
 
 #[tokio::test]
+async fn shared_team_creation_starts_with_no_mcp_allowlist_before_team_row_exists() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.fail_allowlist_read_for_unpersisted_team();
+
+    let created = svc
+        .create_team(
+            "owner",
+            CreateTeamRequest {
+                sharing_mode: aionui_api_types::TeamSharingMode::Shared,
+                name: "Shared without implicit MCPs".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("Shared Team creation must not read an allowlist before persistence");
+
+    assert_eq!(created.sharing_mode, aionui_api_types::TeamSharingMode::Shared);
+}
+
+#[tokio::test]
 async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
     let (svc, _team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
     let created = svc
