@@ -1326,7 +1326,6 @@ pub fn build_team_state(
     service.with_project_service(Arc::new(services.project_service.clone()));
     // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
     service.with_user_order_store(services.user_order_store.clone());
-    service.with_user_repository(services.user_repo.clone());
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),

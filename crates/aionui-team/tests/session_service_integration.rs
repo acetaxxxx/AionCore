@@ -924,6 +924,8 @@ impl EventBroadcaster for RecordingBroadcaster {
 struct FullMockTeamRepo {
     inner: MockTeamRepo,
     teams: std::sync::Mutex<Vec<aionui_db::models::TeamRow>>,
+    sharing_modes: std::sync::Mutex<HashMap<String, aionui_db::models::TeamSharingMode>>,
+    stale_eligible_users: std::sync::Mutex<Vec<aionui_db::models::EligibleTeamUserRow>>,
     fail_workspace_update: std::sync::Mutex<bool>,
     fail_agent_update: std::sync::Mutex<bool>,
     fail_message_writes: std::sync::Mutex<bool>,
@@ -934,6 +936,8 @@ impl FullMockTeamRepo {
         Self {
             inner: MockTeamRepo::new(),
             teams: std::sync::Mutex::new(Vec::new()),
+            sharing_modes: std::sync::Mutex::new(HashMap::new()),
+            stale_eligible_users: std::sync::Mutex::new(Vec::new()),
             fail_workspace_update: std::sync::Mutex::new(false),
             fail_agent_update: std::sync::Mutex::new(false),
             fail_message_writes: std::sync::Mutex::new(false),
@@ -1017,6 +1021,34 @@ impl ITeamRepository for FullMockTeamRepo {
             .unwrap()
             .retain(|t| t.user_id != user_id || t.id != id);
         Ok(())
+    }
+    async fn create_team_with_sharing_mode(
+        &self,
+        row: &aionui_db::models::TeamRow,
+        mode: aionui_db::models::TeamSharingMode,
+    ) -> Result<(), DbError> {
+        self.create_team(row).await?;
+        self.sharing_modes.lock().unwrap().insert(row.id.clone(), mode);
+        Ok(())
+    }
+    async fn get_team_sharing_mode(
+        &self,
+        team_id: &str,
+    ) -> Result<aionui_db::models::TeamSharingMode, DbError> {
+        Ok(self
+            .sharing_modes
+            .lock()
+            .unwrap()
+            .get(team_id)
+            .copied()
+            .unwrap_or(aionui_db::models::TeamSharingMode::Private))
+    }
+    async fn list_eligible_team_users(
+        &self,
+        _owner_user_id: &str,
+        _team_id: &str,
+    ) -> Result<Vec<aionui_db::models::EligibleTeamUserRow>, DbError> {
+        Ok(self.stale_eligible_users.lock().unwrap().clone())
     }
 
     async fn write_message(&self, user_id: &str, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
@@ -8830,6 +8862,34 @@ async fn shared_team_reads_use_active_membership_and_revoke_blocks_next_read() {
     assert!(matches!(
         svc.list_team_mailbox("collaborator", &team.id, 10).await,
         Err(TeamError::TeamNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn stale_core_user_rows_cannot_be_listed_or_added_as_collaborators() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let team = activity_team_row("shared-team-stale-roster", "owner");
+    team_repo
+        .create_team_with_sharing_mode(&team, aionui_db::models::TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    // Models a Core users-table row that is still marked active but is stale or
+    // was seeded independently of the host's current loginable account roster.
+    team_repo.stale_eligible_users.lock().unwrap().push(aionui_db::models::EligibleTeamUserRow {
+        user_id: "stale-core-user".into(),
+        display_name: "stale@example.invalid".into(),
+    });
+
+    assert!(matches!(
+        svc.list_eligible_collaborators("owner", &team.id).await,
+        Err(TeamError::CollaboratorAccountsUnavailable)
+    ));
+    assert!(matches!(
+        svc.add_team_member("owner", &team.id, "forged-or-stale-ref").await,
+        Err(TeamError::CollaboratorAccountsUnavailable)
     ));
 }
 
