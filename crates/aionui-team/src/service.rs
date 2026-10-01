@@ -2266,37 +2266,37 @@ impl TeamSessionService {
 
     fn broadcast_team_created(&self, user_id: &str, team_id: &str, team_name: &str) {
         info!(team_id = %team_id, event_name = TEAM_CREATED_EVENT, "team event broadcast");
-        self.broadcaster.broadcast(WebSocketMessage::new(
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()).broadcast_event(
             TEAM_CREATED_EVENT,
             serde_json::json!({ "user_id": user_id, "team_id": team_id, "team_name": team_name }),
-        ));
+        );
         self.broadcast_team_list_changed(user_id, team_id, "created");
     }
 
     fn broadcast_team_removed(&self, user_id: &str, team_id: &str) {
         info!(team_id = %team_id, event_name = TEAM_REMOVED_EVENT, "team event broadcast");
-        self.broadcaster.broadcast(WebSocketMessage::new(
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()).broadcast_event(
             TEAM_REMOVED_EVENT,
             serde_json::json!({ "user_id": user_id, "team_id": team_id }),
-        ));
+        );
         self.broadcast_team_list_changed(user_id, team_id, "removed");
     }
 
     fn broadcast_team_renamed(&self, user_id: &str, team_id: &str, team_name: &str) {
         info!(team_id = %team_id, event_name = TEAM_RENAMED_EVENT, "team event broadcast");
-        self.broadcaster.broadcast(WebSocketMessage::new(
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()).broadcast_event(
             TEAM_RENAMED_EVENT,
             serde_json::json!({ "user_id": user_id, "team_id": team_id, "team_name": team_name }),
-        ));
+        );
         self.broadcast_team_list_changed(user_id, team_id, "renamed");
     }
 
     fn broadcast_team_list_changed(&self, user_id: &str, team_id: &str, action: &str) {
         info!(team_id = %team_id, event_name = crate::events::TEAM_LIST_CHANGED_EVENT, action, "team event broadcast");
-        self.broadcaster.broadcast(WebSocketMessage::new(
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()).broadcast_event(
             crate::events::TEAM_LIST_CHANGED_EVENT,
             serde_json::json!({ "user_id": user_id, "team_id": team_id, "action": action }),
-        ));
+        );
     }
 
     pub(crate) fn broadcast_agent_runtime_status(

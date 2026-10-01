@@ -28,6 +28,15 @@ impl ScopedEventRecipients {
         }
     }
 
+    pub fn snapshot(&self, scope_id: &str) -> Vec<String> {
+        self.recipients
+            .read()
+            .ok()
+            .and_then(|current| current.get(scope_id).cloned())
+            .map(|current| current.into_iter().collect())
+            .unwrap_or_default()
+    }
+
     /// Runs the delivery callback while holding a read lock so a concurrent
     /// revoke cannot return until all already-authorized enqueues finish.
     /// Missing/poisoned scope state fails closed.
@@ -69,6 +78,12 @@ pub trait EventBroadcaster: Send + Sync {
 
     /// Synchronously removes one user from an application-scoped event stream.
     fn revoke_scope_recipient(&self, _scope_id: &str, _user_id: &str) {}
+
+    /// Returns the current recipient snapshot for event construction. Final
+    /// delivery still revalidates against the shared registry in the manager.
+    fn scope_recipients(&self, _scope_id: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Default implementation of [`EventBroadcaster`] backed by
@@ -125,6 +140,10 @@ impl EventBroadcaster for BroadcastEventBus {
 
     fn revoke_scope_recipient(&self, scope_id: &str, user_id: &str) {
         self.scoped_recipients.revoke(scope_id, user_id);
+    }
+
+    fn scope_recipients(&self, scope_id: &str) -> Vec<String> {
+        self.scoped_recipients.snapshot(scope_id)
     }
 }
 
