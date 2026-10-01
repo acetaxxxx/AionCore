@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -9,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::broadcaster::EventBroadcaster;
+use crate::broadcaster::{EventBroadcaster, ScopedEventRecipients};
 use crate::types::{
     ClientInfo, ConnectionId, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, RealtimeError, WebSocketCloseCode, WsOutbound,
 };
@@ -23,6 +24,7 @@ pub type TokenValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct WebSocketManager {
     connections: Arc<DashMap<ConnectionId, ClientInfo>>,
     next_id: AtomicU64,
+    scoped_recipients: RwLock<Option<ScopedEventRecipients>>,
 }
 
 impl WebSocketManager {
@@ -30,7 +32,49 @@ impl WebSocketManager {
         Self {
             connections: Arc::new(DashMap::new()),
             next_id: AtomicU64::new(1),
+            scoped_recipients: RwLock::new(None),
         }
+    }
+
+    /// Attaches the same recipient registry used by the event bus. The app
+    /// must bind this before starting the event bridge.
+    pub fn set_scoped_event_recipients(&self, recipients: ScopedEventRecipients) {
+        if let Ok(mut current) = self.scoped_recipients.write() {
+            *current = Some(recipients);
+        }
+    }
+
+    /// Delivers a scoped event only to recipients still authorized at the
+    /// final fan-out point. The shared read lock serializes this enqueue with
+    /// synchronous membership revocation.
+    pub fn broadcast_scoped(&self, event: WebSocketMessage<serde_json::Value>) {
+        let Some(scope_id) = event.data.get("team_id").and_then(serde_json::Value::as_str) else {
+            warn!(event_name = %event.name, "dropping scoped websocket event without team_id");
+            return;
+        };
+        let Some(requested) = event
+            .data
+            .get("authorized_user_ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| values.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+        else {
+            warn!(event_name = %event.name, "dropping scoped websocket event without recipient list");
+            return;
+        };
+        let recipients = self.scoped_recipients.read().ok().and_then(|guard| guard.clone());
+        let Some(recipients) = recipients else {
+            warn!(event_name = %event.name, team_id = %scope_id, "dropping scoped websocket event without recipient authority");
+            return;
+        };
+
+        recipients.with_authorized_recipients(scope_id, &requested, |recipient| {
+            let mut scoped_event = event.clone();
+            if let Some(data) = scoped_event.data.as_object_mut() {
+                data.remove("authorized_user_ids");
+                data.insert("user_id".to_owned(), serde_json::Value::String(recipient.to_owned()));
+            }
+            self.broadcast_to_user(recipient, scoped_event);
+        });
     }
 
     /// Register a new client connection and return its assigned ID.
@@ -305,15 +349,8 @@ impl Default for WebSocketManager {
 
 impl EventBroadcaster for WebSocketManager {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
-        if let Some(recipients) = event.data.get("authorized_user_ids").and_then(|value| value.as_array()) {
-            for recipient in recipients.iter().filter_map(serde_json::Value::as_str) {
-                let mut scoped_event = event.clone();
-                if let Some(data) = scoped_event.data.as_object_mut() {
-                    data.remove("authorized_user_ids");
-                    data.insert("user_id".to_owned(), serde_json::Value::String(recipient.to_owned()));
-                }
-                self.broadcast_to_user(recipient, scoped_event);
-            }
+        if event.data.get("authorized_user_ids").and_then(|value| value.as_array()).is_some() {
+            self.broadcast_scoped(event);
             return;
         }
         let Some(user_id) = event

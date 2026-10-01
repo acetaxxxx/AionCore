@@ -75,7 +75,9 @@ async fn forward_event_bus_to_websocket(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         };
 
-        if let Some(user_id) = event
+        if event.data.get("authorized_user_ids").and_then(serde_json::Value::as_array).is_some() {
+            ws_manager.broadcast_scoped(event);
+        } else if let Some(user_id) = event
             .data
             .get("user_id")
             .and_then(|value| value.as_str())
@@ -112,6 +114,9 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
 
     // Bridge event bus → WebSocket manager: forward all broadcast events
     // to connected WebSocket clients.
+    services
+        .ws_manager
+        .set_scoped_event_recipients(services.event_bus.scoped_recipients());
     let event_rx = services.event_bus.subscribe();
     let ws_manager = services.ws_manager.clone();
     tokio::spawn(forward_event_bus_to_websocket(event_rx, ws_manager));

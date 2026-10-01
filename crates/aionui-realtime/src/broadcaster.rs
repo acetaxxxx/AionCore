@@ -1,6 +1,56 @@
 use aionui_api_types::WebSocketMessage;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 use tracing::warn;
+
+/// Current recipients for scoped events, shared by the event bus and the
+/// final WebSocket fan-out. The lock makes recipient removal synchronous with
+/// delivery enqueueing inside the single Core process.
+#[derive(Clone, Default)]
+pub struct ScopedEventRecipients {
+    recipients: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+}
+
+impl ScopedEventRecipients {
+    pub fn replace(&self, scope_id: &str, user_ids: impl IntoIterator<Item = String>) {
+        let recipients = user_ids.into_iter().filter(|id| !id.is_empty()).collect();
+        if let Ok(mut current) = self.recipients.write() {
+            current.insert(scope_id.to_owned(), recipients);
+        }
+    }
+
+    pub fn revoke(&self, scope_id: &str, user_id: &str) {
+        if let Ok(mut current) = self.recipients.write()
+            && let Some(recipients) = current.get_mut(scope_id)
+        {
+            recipients.remove(user_id);
+        }
+    }
+
+    /// Runs the delivery callback while holding a read lock so a concurrent
+    /// revoke cannot return until all already-authorized enqueues finish.
+    /// Missing/poisoned scope state fails closed.
+    pub fn with_authorized_recipients(
+        &self,
+        scope_id: &str,
+        requested: &[String],
+        mut deliver: impl FnMut(&str),
+    ) -> bool {
+        let Ok(current) = self.recipients.read() else {
+            return false;
+        };
+        let Some(authorized) = current.get(scope_id) else {
+            return false;
+        };
+        for user_id in requested {
+            if authorized.contains(user_id) {
+                deliver(user_id);
+            }
+        }
+        true
+    }
+}
 
 /// Trait for broadcasting WebSocket events to all connected clients.
 ///
@@ -12,6 +62,13 @@ use tracing::warn;
 pub trait EventBroadcaster: Send + Sync {
     /// Broadcast an event to all connected WebSocket clients.
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>);
+
+    /// Replaces current recipients for an application-scoped event stream.
+    /// Implementations that do not route scoped events may keep the default.
+    fn replace_scope_recipients(&self, _scope_id: &str, _user_ids: Vec<String>) {}
+
+    /// Synchronously removes one user from an application-scoped event stream.
+    fn revoke_scope_recipient(&self, _scope_id: &str, _user_id: &str) {}
 }
 
 /// Default implementation of [`EventBroadcaster`] backed by
@@ -22,13 +79,17 @@ pub trait EventBroadcaster: Send + Sync {
 /// forwards received events to its per-connection `mpsc` sender.
 pub struct BroadcastEventBus {
     tx: broadcast::Sender<WebSocketMessage<serde_json::Value>>,
+    scoped_recipients: ScopedEventRecipients,
 }
 
 impl BroadcastEventBus {
     /// Create a new event bus with the given channel capacity.
     pub fn new(capacity: usize) -> Self {
         let (tx, _rx) = broadcast::channel(capacity);
-        Self { tx }
+        Self {
+            tx,
+            scoped_recipients: ScopedEventRecipients::default(),
+        }
     }
 
     /// Subscribe to receive broadcast events.
@@ -42,6 +103,10 @@ impl BroadcastEventBus {
     pub fn receiver_count(&self) -> usize {
         self.tx.receiver_count()
     }
+
+    pub fn scoped_recipients(&self) -> ScopedEventRecipients {
+        self.scoped_recipients.clone()
+    }
 }
 
 impl EventBroadcaster for BroadcastEventBus {
@@ -52,6 +117,14 @@ impl EventBroadcaster for BroadcastEventBus {
                 "broadcast failed: no active receivers"
             );
         }
+    }
+
+    fn replace_scope_recipients(&self, scope_id: &str, user_ids: Vec<String>) {
+        self.scoped_recipients.replace(scope_id, user_ids);
+    }
+
+    fn revoke_scope_recipient(&self, scope_id: &str, user_id: &str) {
+        self.scoped_recipients.revoke(scope_id, user_id);
     }
 }
 

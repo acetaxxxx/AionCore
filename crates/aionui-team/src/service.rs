@@ -1045,6 +1045,12 @@ impl TeamSessionService {
             .into_iter()
             .find(|member| member.membership_ref == membership_ref)
             .map(|member| member.user_id);
+        if let Some(user_id) = member_user_id.as_deref() {
+            // Update the shared final-delivery gate before awaiting persistence.
+            // The realtime manager serializes this with socket queueing, so no
+            // stale projected event can begin delivery after this returns.
+            self.broadcaster.revoke_scope_recipient(team_id, user_id);
+        }
         if let (Some(user_id), Some(session)) = (member_user_id.as_deref(), self.sessions.get(team_id)) {
             session.session.revoke_event_user(user_id);
         }
@@ -1057,13 +1063,16 @@ impl TeamSessionService {
     }
 
     async fn refresh_session_event_users(&self, team_id: &str, owner_user_id: &str) {
-        let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) else {
-            return;
-        };
         match self.repo.list_team_members(team_id).await {
-            Ok(members) => session.set_authorized_event_users(
-                std::iter::once(owner_user_id.to_owned()).chain(members.into_iter().map(|member| member.user_id)),
-            ),
+            Ok(members) => {
+                let user_ids = std::iter::once(owner_user_id.to_owned())
+                    .chain(members.into_iter().map(|member| member.user_id))
+                    .collect::<Vec<_>>();
+                self.broadcaster.replace_scope_recipients(team_id, user_ids.clone());
+                if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+                    session.set_authorized_event_users(user_ids);
+                }
+            }
             Err(error) => warn!(team_id, error = %error, "team event recipient refresh failed; revoked recipients remain removed"),
         }
     }

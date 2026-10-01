@@ -64,12 +64,15 @@ impl TeamEventEmitter {
     pub fn set_authorized_user_ids(&self, user_ids: impl IntoIterator<Item = String>) {
         let mut authorized = HashSet::from([self.user_id.clone()]);
         authorized.extend(user_ids.into_iter().filter(|user_id| !user_id.is_empty()));
+        self.broadcaster
+            .replace_scope_recipients(&self.team_id, authorized.iter().cloned().collect());
         if let Ok(mut current) = self.authorized_user_ids.write() {
             *current = authorized;
         }
     }
 
     pub fn revoke_user(&self, user_id: &str) {
+        self.broadcaster.revoke_scope_recipient(&self.team_id, user_id);
         if let Ok(mut current) = self.authorized_user_ids.write() {
             current.remove(user_id);
         }
