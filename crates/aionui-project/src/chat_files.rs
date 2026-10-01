@@ -426,13 +426,11 @@ fn path_belongs_to_user_data_tree(user_id: &str, relative: &Path) -> bool {
         })
         .collect();
 
-    let belongs_to_user = (components.first().is_some_and(|part| part == "conversations")
+    (components.first().is_some_and(|part| part == "conversations")
         && components.get(1).is_some_and(|part| part == "users")
         && components.get(2).is_some_and(|owner| owner == user_id))
         || (components.first().is_some_and(|part| part == "users")
-            && components.get(1).is_some_and(|owner| owner == user_id));
-
-    belongs_to_user
+            && components.get(1).is_some_and(|owner| owner == user_id))
 }
 
 /// Whether `target` resolves inside `root` (both canonicalized, so `..` and
