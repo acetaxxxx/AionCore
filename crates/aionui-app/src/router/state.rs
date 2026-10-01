@@ -3,6 +3,8 @@
 //! `ModuleStates` is the bundle returned by `build_module_states`; each
 //! `build_*_state` constructs one `*RouterState` from `AppServices`.
 
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,15 +23,18 @@ use aionui_db::{
     IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
     SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository,
+    ITeamRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteSettingsRepository, SqliteTeamRepository,
 };
+use aionui_db::models::TeamSharingMode;
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{FileRouterState, FileService, SnapshotService};
+use aionui_file::{
+    FileError, FileRouterState, FileService, SnapshotService, TeamWorkspaceAuthorization, TeamWorkspaceAuthorizer,
+};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -543,6 +548,322 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
     }
 }
 
+#[derive(Clone)]
+struct AppTeamWorkspaceAuthorizer {
+    team_repo: Arc<dyn ITeamRepository>,
+    pool: sqlx::SqlitePool,
+    workspace_root: PathBuf,
+}
+
+fn normalize_absolute_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+fn canonicalize_candidate(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut canonical = ancestor.canonicalize().ok()?;
+    for part in suffix.iter().rev() {
+        canonical.push(part);
+    }
+    Some(canonical)
+}
+
+#[async_trait::async_trait]
+impl TeamWorkspaceAuthorizer for AppTeamWorkspaceAuthorizer {
+    async fn authorize_path(
+        &self,
+        user_id: &str,
+        path: &Path,
+    ) -> Result<TeamWorkspaceAuthorization, FileError> {
+        let Some(candidate) = normalize_absolute_path(path) else {
+            let relative_team_path = path
+                .components()
+                .any(|component| matches!(component, Component::Normal(value) if value == "teams"));
+            return Ok(if relative_team_path {
+                TeamWorkspaceAuthorization::Denied
+            } else {
+                TeamWorkspaceAuthorization::NotTeamWorkspace
+            });
+        };
+        let Some(canonical_candidate) = canonicalize_candidate(&candidate) else {
+            return Ok(TeamWorkspaceAuthorization::NotTeamWorkspace);
+        };
+        let upload_root = canonicalize_candidate(&std::env::temp_dir()).map(|root| root.join("aionui"));
+        if let Some(upload_root) = upload_root
+            && canonical_candidate.starts_with(&upload_root)
+            && let Some(conversation_id) = canonical_candidate
+                .strip_prefix(&upload_root)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .and_then(|component| match component {
+                    Component::Normal(value) => value.to_str(),
+                    _ => None,
+                })
+            && conversation_id != "general"
+        {
+            return self.authorize_conversation(user_id, conversation_id).await;
+        }
+        let Ok(workspace_root) = self.workspace_root.canonicalize() else {
+            return Ok(TeamWorkspaceAuthorization::NotTeamWorkspace);
+        };
+        let teams_root_lexical = workspace_root.join("teams");
+        // Preserve the raw path classification before lexical normalization:
+        // `teams/<id>/../../outside` must remain a denied Team-path attempt.
+        let raw_lexical_team_path = path.starts_with(&teams_root_lexical);
+        let lexical_team_path = raw_lexical_team_path || candidate.starts_with(&teams_root_lexical);
+        if let Ok(metadata) = fs::symlink_metadata(&teams_root_lexical)
+            && metadata.file_type().is_symlink()
+        {
+            return Ok(if lexical_team_path {
+                TeamWorkspaceAuthorization::Denied
+            } else {
+                TeamWorkspaceAuthorization::NotTeamWorkspace
+            });
+        }
+        let Ok(teams_root) = teams_root_lexical.canonicalize() else {
+            return Ok(if lexical_team_path {
+                TeamWorkspaceAuthorization::Denied
+            } else {
+                TeamWorkspaceAuthorization::NotTeamWorkspace
+            });
+        };
+        if !teams_root.starts_with(&workspace_root) {
+            return Ok(if lexical_team_path {
+                TeamWorkspaceAuthorization::Denied
+            } else {
+                TeamWorkspaceAuthorization::NotTeamWorkspace
+            });
+        }
+        let canonical_team_path = canonical_candidate.starts_with(&teams_root);
+        if !lexical_team_path && !canonical_team_path {
+            return Ok(TeamWorkspaceAuthorization::NotTeamWorkspace);
+        }
+        if !canonical_team_path {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        }
+
+        let Some(team_id) = canonical_candidate
+            .strip_prefix(&teams_root)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .and_then(|component| match component {
+                Component::Normal(value) => value.to_str(),
+                _ => None,
+            })
+            .filter(|team_id| {
+                !team_id.is_empty()
+                    && team_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            })
+        else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        let Some(team) = self
+            .team_repo
+            .get_team_for_restore(team_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        let expected_workspace = teams_root.join(team_id);
+        if fs::symlink_metadata(&expected_workspace)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        }
+        let Ok(expected_workspace) = expected_workspace.canonicalize() else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        let Ok(row_workspace) = Path::new(&team.workspace).canonicalize() else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        if row_workspace != expected_workspace || !canonical_candidate.starts_with(&expected_workspace) {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        }
+
+        if team.user_id == user_id {
+            return Ok(TeamWorkspaceAuthorization::Allowed);
+        }
+        if self.team_repo.get_team_sharing_mode(team_id).await.ok() != Some(TeamSharingMode::Shared) {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        }
+        if self
+            .team_repo
+            .list_team_members(team_id)
+            .await
+            .is_ok_and(|members| members.iter().any(|member| member.user_id == user_id))
+        {
+            Ok(TeamWorkspaceAuthorization::Allowed)
+        } else {
+            Ok(TeamWorkspaceAuthorization::Denied)
+        }
+    }
+
+    async fn authorize_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<TeamWorkspaceAuthorization, FileError> {
+        let conversation: Option<(String, String)> = sqlx::query_as(
+            "SELECT user_id, extra FROM conversations WHERE id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| FileError::Forbidden("conversation access is forbidden".into()))?;
+        let Some((execution_owner_id, extra)) = conversation else {
+            return Ok(TeamWorkspaceAuthorization::NotTeamWorkspace);
+        };
+        let binding = match aionui_api_types::TeamSessionBinding::from_extra_str(&extra) {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                return Ok(if execution_owner_id == user_id {
+                    TeamWorkspaceAuthorization::Allowed
+                } else {
+                    TeamWorkspaceAuthorization::Denied
+                });
+            }
+            Err(_) => return Ok(TeamWorkspaceAuthorization::Denied),
+        };
+        let Some(team) = self
+            .team_repo
+            .get_team_for_restore(&binding.team_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        if team.user_id != execution_owner_id {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        }
+        if team.user_id == user_id {
+            return Ok(TeamWorkspaceAuthorization::Allowed);
+        }
+        if self.team_repo.get_team_sharing_mode(&binding.team_id).await.ok()
+            != Some(TeamSharingMode::Shared)
+        {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        }
+        Ok(if self
+            .team_repo
+            .list_team_members(&binding.team_id)
+            .await
+            .is_ok_and(|members| members.iter().any(|member| member.user_id == user_id))
+        {
+            TeamWorkspaceAuthorization::Allowed
+        } else {
+            TeamWorkspaceAuthorization::Denied
+        })
+    }
+
+    async fn authorize_exact_workspace(
+        &self,
+        user_id: &str,
+        workspace: &Path,
+    ) -> Result<TeamWorkspaceAuthorization, FileError> {
+        if self.authorize_path(user_id, workspace).await? != TeamWorkspaceAuthorization::Allowed {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        }
+        let Ok(workspace_root) = self.workspace_root.canonicalize() else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        let Ok(teams_root) = workspace_root.join("teams").canonicalize() else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        let Ok(canonical_workspace) = workspace.canonicalize() else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        let Ok(relative) = canonical_workspace.strip_prefix(&teams_root) else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        let mut components = relative.components();
+        let Some(std::path::Component::Normal(team_id)) = components.next() else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        if components.next().is_some() {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        }
+        let Some(team) = self
+            .team_repo
+            .get_team_for_restore(&team_id.to_string_lossy())
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        let Ok(persisted_workspace) = Path::new(&team.workspace).canonicalize() else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        Ok(if persisted_workspace == canonical_workspace {
+            TeamWorkspaceAuthorization::Allowed
+        } else {
+            TeamWorkspaceAuthorization::Denied
+        })
+    }
+
+    async fn authorize_team_path_with_workspace(
+        &self,
+        user_id: &str,
+        path: &Path,
+        workspace: &Path,
+    ) -> Result<TeamWorkspaceAuthorization, FileError> {
+        if self.authorize_path(user_id, path).await? != TeamWorkspaceAuthorization::Allowed
+            || self.authorize_exact_workspace(user_id, workspace).await? != TeamWorkspaceAuthorization::Allowed
+        {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        }
+        let Ok(canonical_workspace) = workspace.canonicalize() else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            canonical_workspace.join(path)
+        };
+        let Some(canonical_path) = canonicalize_candidate(&candidate) else {
+            return Ok(TeamWorkspaceAuthorization::Denied);
+        };
+        Ok(if canonical_path.starts_with(&canonical_workspace) {
+            TeamWorkspaceAuthorization::Allowed
+        } else {
+            TeamWorkspaceAuthorization::Denied
+        })
+    }
+}
+
 /// Build the default `FileRouterState` from application services.
 pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
@@ -571,6 +892,11 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         system_opener,
         clipboard,
         allowed_roots,
+        team_workspace_authorizer: Arc::new(AppTeamWorkspaceAuthorizer {
+            team_repo: Arc::new(SqliteTeamRepository::new(services.database.pool().clone())),
+            pool: services.database.pool().clone(),
+            workspace_root: services.work_dir.clone(),
+        }),
     })
 }
 
@@ -1000,6 +1326,7 @@ pub fn build_team_state(
     service.with_project_service(Arc::new(services.project_service.clone()));
     // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
     service.with_user_order_store(services.user_order_store.clone());
+    service.with_user_repository(services.user_repo.clone());
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),
@@ -1571,6 +1898,305 @@ mod tests {
         );
 
         services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn shared_team_workspace_authorizer_checks_membership_revocation_and_escape() {
+        use aionui_db::{ITeamRepository, SqliteTeamRepository};
+        use aionui_db::models::{TeamMembershipRow, TeamRow, TeamSharingMode};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work_dir = tmp.path().join("work");
+        let workspace = work_dir.join("teams/team-1");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let database = aionui_db::init_database_memory().await.unwrap();
+        let pool = database.pool().clone();
+        for (id, username) in [("owner", "Owner"), ("member", "Member"), ("outsider", "Outsider")] {
+            sqlx::query(
+                "INSERT INTO users (id, user_type, username, status, created_at, updated_at) \
+                 VALUES (?, 'aionpro', ?, 'active', 1, 1)",
+            )
+            .bind(id)
+            .bind(username)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let team_repo = Arc::new(SqliteTeamRepository::new(pool.clone()));
+        team_repo
+            .create_team_with_sharing_mode(
+                &TeamRow {
+                    id: "team-1".into(),
+                    user_id: "owner".into(),
+                    name: "Shared".into(),
+                    workspace: workspace.to_string_lossy().into_owned(),
+                    workspace_mode: "shared".into(),
+                    agents: "[]".into(),
+                    lead_agent_id: None,
+                    session_mode: None,
+                    agents_version: "1".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                    project_id: None,
+                    folder_id: None,
+                },
+                TeamSharingMode::Shared,
+            )
+            .await
+            .unwrap();
+        let second_workspace = work_dir.join("teams/team-2");
+        std::fs::create_dir_all(&second_workspace).unwrap();
+        team_repo
+            .create_team_with_sharing_mode(
+                &TeamRow {
+                    id: "team-2".into(),
+                    user_id: "owner".into(),
+                    name: "Another Shared Team".into(),
+                    workspace: second_workspace.to_string_lossy().into_owned(),
+                    workspace_mode: "shared".into(),
+                    agents: "[]".into(),
+                    lead_agent_id: None,
+                    session_mode: None,
+                    agents_version: "1".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                    project_id: None,
+                    folder_id: None,
+                },
+                TeamSharingMode::Shared,
+            )
+            .await
+            .unwrap();
+        team_repo
+            .add_team_member(&TeamMembershipRow {
+                membership_ref: "second-membership".into(),
+                team_id: "team-2".into(),
+                user_id: "member".into(),
+                display_name: Some("Member".into()),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        team_repo
+            .add_team_member(&TeamMembershipRow {
+                membership_ref: "opaque-membership".into(),
+                team_id: "team-1".into(),
+                user_id: "member".into(),
+                display_name: Some("Member".into()),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        let private_workspace = work_dir.join("teams/private-team");
+        std::fs::create_dir_all(&private_workspace).unwrap();
+        team_repo
+            .create_team_with_sharing_mode(
+                &TeamRow {
+                    id: "private-team".into(),
+                    user_id: "owner".into(),
+                    name: "Private Team".into(),
+                    workspace: private_workspace.to_string_lossy().into_owned(),
+                    workspace_mode: "shared".into(),
+                    agents: "[]".into(),
+                    lead_agent_id: None,
+                    session_mode: None,
+                    agents_version: "1".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                    project_id: None,
+                    folder_id: None,
+                },
+                TeamSharingMode::Private,
+            )
+            .await
+            .unwrap();
+
+        let authorizer = AppTeamWorkspaceAuthorizer {
+            team_repo: team_repo.clone(),
+            pool: pool.clone(),
+            workspace_root: work_dir,
+        };
+        let nested_workspace = workspace.join("nested");
+        std::fs::create_dir_all(&nested_workspace).unwrap();
+        assert_eq!(
+            authorizer
+                .authorize_exact_workspace("member", &workspace)
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Allowed
+        );
+        assert_eq!(
+            authorizer
+                .authorize_exact_workspace("member", &nested_workspace)
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+        let file_path = workspace.join("file.txt");
+        assert_eq!(
+            authorizer
+                .authorize_team_path_with_workspace("member", &file_path, &second_workspace)
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+        assert_eq!(
+            authorizer.authorize_path("owner", &file_path).await.unwrap(),
+            TeamWorkspaceAuthorization::Allowed
+        );
+        assert_eq!(
+            authorizer.authorize_path("member", &file_path).await.unwrap(),
+            TeamWorkspaceAuthorization::Allowed
+        );
+        assert_eq!(
+            authorizer.authorize_path("outsider", &file_path).await.unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+        assert_eq!(
+            authorizer
+                .authorize_exact_workspace("owner", &private_workspace)
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Allowed
+        );
+        assert_eq!(
+            authorizer
+                .authorize_exact_workspace("member", &private_workspace)
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at) \
+             VALUES ('team-conversation', 'owner', 'Team', 'aionrs', '{\"teamId\":\"team-1\"}', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            authorizer
+                .authorize_conversation("member", "team-conversation")
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Allowed
+        );
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at) \
+             VALUES ('owner-personal-conversation', 'owner', 'Personal', 'aionrs', '{}', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            authorizer
+                .authorize_conversation("owner", "owner-personal-conversation")
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Allowed
+        );
+        assert_eq!(
+            authorizer
+                .authorize_conversation("member", "owner-personal-conversation")
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+        let upload_path = std::env::temp_dir()
+            .join("aionui/team-conversation/attachment.txt");
+        assert_eq!(
+            authorizer.authorize_path("member", &upload_path).await.unwrap(),
+            TeamWorkspaceAuthorization::Allowed
+        );
+        assert_eq!(
+            authorizer
+                .authorize_path("member", &workspace.join("../../outside/file.txt"))
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+
+        sqlx::query("DELETE FROM team_memberships WHERE team_id = 'team-1' AND user_id = 'member'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            authorizer.authorize_path("member", &file_path).await.unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+        assert_eq!(
+            authorizer
+                .authorize_conversation("member", "team-conversation")
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+        assert_eq!(
+            authorizer.authorize_path("member", &upload_path).await.unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+
+        database.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_team_workspace_authorizer_rejects_symlink_escape() {
+        use aionui_db::{ITeamRepository, SqliteTeamRepository};
+        use aionui_db::models::{TeamRow, TeamSharingMode};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work_dir = tmp.path().join("work");
+        let workspace = work_dir.join("teams/team-1");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+
+        let database = aionui_db::init_database_memory().await.unwrap();
+        let pool = database.pool().clone();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, status, created_at, updated_at) \
+             VALUES ('owner', 'aionpro', 'Owner', 'active', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let team_repo = Arc::new(SqliteTeamRepository::new(pool.clone()));
+        team_repo
+            .create_team_with_sharing_mode(
+                &TeamRow {
+                    id: "team-1".into(),
+                    user_id: "owner".into(),
+                    name: "Shared".into(),
+                    workspace: workspace.to_string_lossy().into_owned(),
+                    workspace_mode: "shared".into(),
+                    agents: "[]".into(),
+                    lead_agent_id: None,
+                    session_mode: None,
+                    agents_version: "1".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                    project_id: None,
+                    folder_id: None,
+                },
+                TeamSharingMode::Shared,
+            )
+            .await
+            .unwrap();
+
+        let authorizer = AppTeamWorkspaceAuthorizer {
+            team_repo,
+            pool: pool.clone(),
+            workspace_root: work_dir,
+        };
+        assert_eq!(
+            authorizer
+                .authorize_path("owner", &workspace.join("escape/secret.txt"))
+                .await
+                .unwrap(),
+            TeamWorkspaceAuthorization::Denied
+        );
+        database.close().await;
     }
 
     #[tokio::test]

@@ -8766,10 +8766,6 @@ async fn shared_team_reads_use_active_membership_and_revoke_blocks_next_read() {
         .create_team_with_sharing_mode(&team, aionui_db::models::TeamSharingMode::Shared)
         .await
         .unwrap();
-    assert!(matches!(
-        svc.list_eligible_collaborators("owner", &team.id).await,
-        Err(TeamError::CollaboratorAccountsUnavailable)
-    ));
     team_repo.add_test_collaborator(&team.id, "collaborator");
     team_repo
         .write_message("owner", &activity_message_row("shared-message", &team.id, 1000))

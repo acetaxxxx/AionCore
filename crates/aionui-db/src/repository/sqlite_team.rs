@@ -74,7 +74,9 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn list_team_members(&self, team_id: &str) -> Result<Vec<TeamMembershipRow>, DbError> {
         sqlx::query_as::<_, TeamMembershipRow>(
-            "SELECT m.membership_ref, m.team_id, m.user_id, u.username AS display_name, m.created_at \
+            "SELECT m.membership_ref, m.team_id, m.user_id, \
+             COALESCE(m.display_name, 'Collaborator ' || substr(m.membership_ref, 1, 8)) AS display_name, \
+             m.created_at \
              FROM team_memberships m \
              JOIN users u ON u.id = m.user_id AND u.status = 'active' \
              WHERE m.team_id = ? ORDER BY m.created_at, m.membership_ref",
@@ -93,7 +95,7 @@ impl ITeamRepository for SqliteTeamRepository {
         sqlx::query_as::<_, EligibleTeamUserRow>(
             "SELECT u.id AS user_id, u.username AS display_name FROM users u \
              WHERE u.status = 'active' AND u.username IS NOT NULL AND trim(u.username) <> '' \
-             AND u.id <> ? \
+             AND u.id <> ? AND u.id <> 'system_default_user' \
              AND EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ? AND t.sharing_mode = 'shared') \
              AND NOT EXISTS (SELECT 1 FROM team_memberships m WHERE m.team_id = ? AND m.user_id = u.id) \
              ORDER BY u.username COLLATE NOCASE, u.id",
@@ -109,13 +111,14 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn add_team_member(&self, row: &TeamMembershipRow) -> Result<(), DbError> {
         let result = sqlx::query(
-            "INSERT INTO team_memberships (membership_ref, team_id, user_id, created_at) \
-             SELECT ?, t.id, u.id, ? FROM teams t JOIN users u ON u.id = ? \
+            "INSERT INTO team_memberships (membership_ref, team_id, user_id, display_name, created_at) \
+             SELECT ?, t.id, u.id, ?, ? FROM teams t JOIN users u ON u.id = ? \
              WHERE t.id = ? AND t.sharing_mode = 'shared' AND u.status = 'active' \
-             AND u.id <> t.user_id \
+             AND u.id <> t.user_id AND u.id <> 'system_default_user' \
              AND NOT EXISTS (SELECT 1 FROM team_memberships m WHERE m.team_id = t.id AND m.user_id = u.id)",
         )
         .bind(&row.membership_ref)
+        .bind(&row.display_name)
         .bind(row.created_at)
         .bind(&row.user_id)
         .bind(&row.team_id)

@@ -125,7 +125,7 @@ async fn shared_mode_and_active_membership_persist_and_revoke_by_owner() {
         membership_ref: "opaque-membership-ref".into(),
         team_id: team.id.clone(),
         user_id: member.id.clone(),
-        display_name: member.username.clone(),
+        display_name: Some(member.username.clone()),
         created_at: now_ms(),
     };
     repo.add_team_member(&membership).await.unwrap();
@@ -161,7 +161,7 @@ async fn cannot_add_member_to_private_team_or_disabled_account() {
     let (repo, db) = repo().await;
     let users = SqliteUserRepository::new(db.pool().clone());
     let member = users
-        .create_user("inactive-collaborator", "test-password-hash")
+        .create_user("collaborator@example.com", "test-password-hash")
         .await
         .unwrap();
     let private_team = make_team("private-team", "Private Team");
@@ -170,7 +170,7 @@ async fn cannot_add_member_to_private_team_or_disabled_account() {
         membership_ref: "opaque-private-ref".into(),
         team_id: private_team.id.clone(),
         user_id: member.id.clone(),
-        display_name: member.username.clone(),
+        display_name: Some(member.username.clone()),
         created_at: now_ms(),
     };
     assert!(matches!(repo.add_team_member(&membership).await, Err(DbError::NotFound(_))));
@@ -183,10 +183,12 @@ async fn cannot_add_member_to_private_team_or_disabled_account() {
         membership_ref: "opaque-active-ref".into(),
         team_id: shared_team.id.clone(),
         user_id: member.id.clone(),
-        display_name: member.username.clone(),
+        display_name: Some("Host account opaque123".into()),
         created_at: now_ms(),
     };
     repo.add_team_member(&active_membership).await.unwrap();
+    let listed_members = repo.list_team_members(&shared_team.id).await.unwrap();
+    assert_eq!(listed_members[0].display_name.as_deref(), Some("Host account opaque123"));
     users
         .set_status(&member.id, aionui_db::models::UserStatus::Disabled)
         .await
@@ -213,6 +215,11 @@ async fn eligible_team_users_exclude_owner_members_existing_members_and_disabled
     let disabled = users.create_user("disabled-member", "disabled-hash").await.unwrap();
     users
         .set_status(&disabled.id, aionui_db::models::UserStatus::Disabled)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET username = 'System Account' WHERE id = ?")
+        .bind(DEFAULT_USER_ID)
+        .execute(db.pool())
         .await
         .unwrap();
     let team = make_team_for_user("eligible-team", &owner.id, "Eligible Team");

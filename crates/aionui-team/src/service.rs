@@ -5,6 +5,7 @@ pub(crate) mod spawn_support;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
@@ -20,10 +21,10 @@ use aionui_api_types::{
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
-use aionui_db::models::{TeamAccessRole, TeamRow, TeamSharingMode};
+use aionui_db::models::{TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, UserStatus};
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IProviderRepository, ITeamRepository, IUserOrderStore, OrderItemRef, OrderItemType, PageDirection,
+    IProviderRepository, ITeamRepository, IUserOrderStore, IUserRepository, OrderItemRef, OrderItemType, PageDirection,
     UpdateTeamParams,
 };
 use aionui_project::{ProjectService, canonical};
@@ -72,6 +73,8 @@ pub const MAX_ACTIVITY_LIMIT: i64 = 1000;
 /// Upper bound on how many task ids one dependency-resolution request may
 /// look up, to bound query size regardless of client input.
 pub const MAX_TASK_ID_LOOKUP: usize = 200;
+/// Opaque collaborator account references are single-use and short-lived.
+const ELIGIBLE_ACCOUNT_REF_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Which item kinds the unified activity feed returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +137,38 @@ impl ModelPersistTrigger {
 struct SessionEntry {
     session: Arc<TeamSession>,
     slow_monitor_handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct EligibleAccountRefGrant {
+    owner_user_id: String,
+    team_id: String,
+    user_id: String,
+    display_name: String,
+    expires_at: Instant,
+}
+
+fn claim_eligible_account_ref(
+    grants: &DashMap<String, EligibleAccountRefGrant>,
+    account_ref: &str,
+    owner_user_id: &str,
+    team_id: &str,
+) -> Result<EligibleAccountRefGrant, TeamError> {
+    let grant = grants
+        .get(account_ref)
+        .map(|entry| entry.value().clone())
+        .filter(|grant| {
+            grant.owner_user_id == owner_user_id
+                && grant.team_id == team_id
+                && grant.expires_at > Instant::now()
+        })
+        .ok_or_else(|| TeamError::InvalidRequest("account_ref is invalid or expired".into()))?;
+    grants.remove(account_ref);
+    Ok(grant)
+}
+
+fn host_account_display_name(account_ref: &str) -> String {
+    format!("Host account {}", account_ref.chars().take(8).collect::<String>())
 }
 
 pub struct TeamIdleCleanupCoordinator {
@@ -200,6 +235,8 @@ pub struct TeamSessionService {
     /// team's `user_order` rows (design §4.3, path 2). `None` → no-op, so team
     /// deletion behaves exactly as before.
     user_order: Arc<RwLock<Option<Arc<dyn IUserOrderStore>>>>,
+    user_repository: Arc<RwLock<Option<Arc<dyn IUserRepository>>>>,
+    eligible_account_refs: Arc<DashMap<String, EligibleAccountRefGrant>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -325,6 +362,8 @@ impl TeamSessionService {
             ensure_session_locks: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
+            user_repository: Arc::new(RwLock::new(None)),
+            eligible_account_refs: Arc::new(DashMap::new()),
             self_ref: weak.clone(),
         })
     }
@@ -462,6 +501,14 @@ impl TeamSessionService {
     pub fn with_user_order_store(&self, user_order: Arc<dyn IUserOrderStore>) {
         if let Ok(mut guard) = self.user_order.write() {
             *guard = Some(user_order);
+        }
+    }
+
+    /// Injects the Core user directory used to issue short-lived, opaque
+    /// collaborator account references. The directory is rechecked at add time.
+    pub fn with_user_repository(&self, user_repository: Arc<dyn IUserRepository>) {
+        if let Ok(mut guard) = self.user_repository.write() {
+            *guard = Some(user_repository);
         }
     }
 
@@ -975,13 +1022,49 @@ impl TeamSessionService {
         if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        // Core's persisted user rows are not a live host login directory: old
-        // AIONUI_USERS seeds remain after configuration changes, and external
-        // auth users may outlive their upstream identity. Listing DB-active
-        // rows here could invite an account that can no longer authenticate.
-        // Fail closed until the host supplies a sanitized, current eligible
-        // account projection through an explicit service boundary.
-        Err(TeamError::CollaboratorAccountsUnavailable)
+        let user_repository = self
+            .user_repository
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or(TeamError::CollaboratorAccountsUnavailable)?;
+        let now = Instant::now();
+        self.eligible_account_refs.retain(|_, grant| grant.expires_at > now);
+        let eligible = self.repo.list_eligible_team_users(owner_user_id, team_id).await?;
+        let mut response = Vec::with_capacity(eligible.len());
+        for account in eligible {
+            if account.user_id == "system_default_user" {
+                continue;
+            }
+            // Recheck against the configured Core user store. The team query
+            // applies the same active-status filter, while this lookup keeps
+            // the account binding explicit at the security boundary.
+            let Some(user) = user_repository.find_active_by_id(&account.user_id).await? else {
+                continue;
+            };
+            if user.status != UserStatus::Active {
+                continue;
+            }
+            let account_ref = generate_id();
+            // Usernames can be Cloudflare emails. Keep the picker useful while
+            // ensuring no account identifier or email crosses the API boundary.
+            let display_name = host_account_display_name(&account_ref);
+            self.eligible_account_refs.insert(
+                account_ref.clone(),
+                EligibleAccountRefGrant {
+                    owner_user_id: owner_user_id.to_owned(),
+                    team_id: team_id.to_owned(),
+                    user_id: account.user_id,
+                    display_name: display_name.clone(),
+                    expires_at: Instant::now() + ELIGIBLE_ACCOUNT_REF_TTL,
+                },
+            );
+            response.push(EligibleTeamCollaboratorResponse {
+                account_ref,
+                display_name,
+            });
+        }
+        Ok(response)
     }
 
     /// Lists active collaborators without exposing internal user identifiers.
@@ -1018,10 +1101,55 @@ impl TeamSessionService {
         if account_ref.trim().is_empty() {
             return Err(TeamError::InvalidRequest("account_ref is required".into()));
         }
-        // No current host-configured account source is available to validate
-        // this opaque reference. Never accept a reference minted from stale
-        // Core user rows or trust a caller-supplied identifier.
-        Err(TeamError::CollaboratorAccountsUnavailable)
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _membership_guard = membership_lock.lock().await;
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        // Consume only after scope/expiry validation. Membership operations for
+        // this Team serialize on the same lock, so a reference cannot be used
+        // twice concurrently.
+        let grant = claim_eligible_account_ref(&self.eligible_account_refs, account_ref, owner_user_id, team_id)?;
+        if grant.user_id == owner_user_id || grant.user_id == "system_default_user" {
+            return Err(TeamError::InvalidRequest("account_ref is not eligible".into()));
+        }
+        let user_repository = self
+            .user_repository
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or(TeamError::CollaboratorAccountsUnavailable)?;
+        let Some(user) = user_repository.find_active_by_id(&grant.user_id).await? else {
+            return Err(TeamError::InvalidRequest("account_ref is no longer eligible".into()));
+        };
+        if user.status != UserStatus::Active {
+            return Err(TeamError::InvalidRequest("account_ref is no longer eligible".into()));
+        }
+        if self
+            .repo
+            .list_team_members(team_id)
+            .await?
+            .iter()
+            .any(|member| member.user_id == grant.user_id)
+        {
+            return Err(TeamError::InvalidRequest("account is already a Team member".into()));
+        }
+        self.repo
+            .add_team_member(&TeamMembershipRow {
+                membership_ref: generate_id(),
+                team_id: team_id.to_owned(),
+                user_id: grant.user_id,
+                display_name: Some(grant.display_name),
+                created_at: now_ms(),
+            })
+            .await?;
+        self.refresh_session_event_users(team_id, owner_user_id).await;
+        Ok(())
     }
 
     /// Revokes by server-issued membership reference after an owner-scoped check.
@@ -3529,7 +3657,9 @@ mod tests {
     use aionui_db::{IConversationRepository, ITeamRepository};
     use tokio::sync::broadcast;
 
-    use super::TeamIdleCleanupCoordinator;
+    use super::{
+        EligibleAccountRefGrant, TeamIdleCleanupCoordinator, claim_eligible_account_ref, host_account_display_name,
+    };
     use crate::member_runtime::{MemberRuntimeFailure, ReserveAttach};
     use crate::test_utils::workspace_harness::{
         setup_with_factory_metadata_team_repo_and_conversation_repo,
@@ -3541,6 +3671,44 @@ mod tests {
     use crate::work_coordinator::{CausalBinding, EnqueueRequest, ReconcileDecision, RuntimeConstraint};
     use crate::work_source::WorkSource;
     use crate::{TeamError, TeamSession};
+
+    #[test]
+    fn eligible_account_refs_are_scoped_expiring_and_single_use() {
+        let refs = dashmap::DashMap::new();
+        refs.insert(
+            "opaque-ref".to_owned(),
+            EligibleAccountRefGrant {
+                owner_user_id: "owner".into(),
+                team_id: "team-a".into(),
+                user_id: "account".into(),
+                display_name: "Host account opaque-".into(),
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            },
+        );
+        assert!(claim_eligible_account_ref(&refs, "forged", "owner", "team-a").is_err());
+        assert!(claim_eligible_account_ref(&refs, "opaque-ref", "other-owner", "team-a").is_err());
+        assert!(claim_eligible_account_ref(&refs, "opaque-ref", "owner", "team-b").is_err());
+        let grant = claim_eligible_account_ref(&refs, "opaque-ref", "owner", "team-a").unwrap();
+        assert_eq!(grant.user_id, "account");
+        assert!(claim_eligible_account_ref(&refs, "opaque-ref", "owner", "team-a").is_err());
+
+        refs.insert(
+            "expired-ref".to_owned(),
+            EligibleAccountRefGrant {
+                owner_user_id: "owner".into(),
+                team_id: "team-a".into(),
+                user_id: "account".into(),
+                display_name: "Host account expired".into(),
+                expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            },
+        );
+        assert!(claim_eligible_account_ref(&refs, "expired-ref", "owner", "team-a").is_err());
+    }
+
+    #[test]
+    fn host_account_label_uses_only_the_opaque_reference() {
+        assert_eq!(host_account_display_name("opaque-ref-123"), "Host account opaque-r");
+    }
 
     struct ModeSettingAgent {
         conversation_id: String,
