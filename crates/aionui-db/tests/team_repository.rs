@@ -578,15 +578,12 @@ async fn mailbox_queries_preserve_actor_user_id() {
 
     assert_actor(&repo.peek_unread(DEFAULT_USER_ID, "t1", "a1").await.unwrap());
     assert_actor(
-        &repo.peek_unread_by_ids(DEFAULT_USER_ID, "t1", "a1", &["actor-message".to_owned()])
+        &repo
+            .peek_unread_by_ids(DEFAULT_USER_ID, "t1", "a1", &["actor-message".to_owned()])
             .await
             .unwrap(),
     );
-    assert_actor(
-        &repo.read_unread_and_mark(DEFAULT_USER_ID, "t1", "a1")
-            .await
-            .unwrap(),
-    );
+    assert_actor(&repo.read_unread_and_mark(DEFAULT_USER_ID, "t1", "a1").await.unwrap());
     assert_actor(&repo.get_history(DEFAULT_USER_ID, "t1", "a1", Some(10)).await.unwrap());
     assert_actor(&repo.get_history(DEFAULT_USER_ID, "t1", "a1", None).await.unwrap());
     assert_actor(&repo.list_messages_by_team("t1", 10).await.unwrap());
