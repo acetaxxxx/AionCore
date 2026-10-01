@@ -883,6 +883,7 @@ impl ConversationService {
     async fn resolve_message_attachments(
         &self,
         user_id: &str,
+        is_local_admin: bool,
         content: &str,
         files: &[ChatFileRef],
     ) -> Result<ResolvedChatMessage, ConversationError> {
@@ -902,10 +903,15 @@ impl ConversationService {
             })?;
         let upload_root = std::env::temp_dir().join("aionui");
         project
-            .resolve_chat_message(user_id, content, files, &upload_root)
+            .resolve_chat_message_with_local_admin(user_id, is_local_admin, content, files, &upload_root)
             .await
-            .map_err(|err| ConversationError::BadRequest {
-                reason: err.to_string(),
+            .map_err(|err| match err {
+                aionui_project::ProjectError::LocalPathForbidden => ConversationError::Forbidden {
+                    reason: "local file access is not authorized".to_owned(),
+                },
+                err => ConversationError::BadRequest {
+                    reason: err.to_string(),
+                },
             })
     }
 
@@ -4408,6 +4414,27 @@ impl ConversationService {
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<SendMessageResponse, ConversationError> {
+        self.send_message_with_local_admin(
+            user_id,
+            user_id == "system_default_user",
+            conversation_id,
+            req,
+            task_manager,
+        )
+        .await
+    }
+
+    /// Web route variant: the local-admin bit is derived from authenticated
+    /// server-side identity, never from a request field.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn send_message_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<SendMessageResponse, ConversationError> {
         if req.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Message content must not be empty".into(),
@@ -4469,7 +4496,7 @@ impl ConversationService {
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
         let resolved = self
-            .resolve_message_attachments(user_id, &content_with_sessions, &req.files)
+            .resolve_message_attachments(user_id, is_local_admin, &content_with_sessions, &req.files)
             .await?;
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────

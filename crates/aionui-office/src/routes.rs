@@ -87,7 +87,7 @@ async fn start_word_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, &user.id, body, DocType::Word).await
+    start_preview(state, &user, body, DocType::Word).await
 }
 
 async fn stop_word_preview(
@@ -95,7 +95,7 @@ async fn stop_word_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, &user.id, body, DocType::Word).await
+    stop_preview(state, &user, body, DocType::Word).await
 }
 
 async fn refresh_word_preview(
@@ -103,7 +103,7 @@ async fn refresh_word_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
-    refresh_preview(state, &user.id, body, DocType::Word).await
+    refresh_preview(state, &user, body, DocType::Word).await
 }
 
 async fn start_excel_preview(
@@ -111,7 +111,7 @@ async fn start_excel_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, &user.id, body, DocType::Excel).await
+    start_preview(state, &user, body, DocType::Excel).await
 }
 
 async fn stop_excel_preview(
@@ -119,7 +119,7 @@ async fn stop_excel_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, &user.id, body, DocType::Excel).await
+    stop_preview(state, &user, body, DocType::Excel).await
 }
 
 async fn refresh_excel_preview(
@@ -127,7 +127,7 @@ async fn refresh_excel_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
-    refresh_preview(state, &user.id, body, DocType::Excel).await
+    refresh_preview(state, &user, body, DocType::Excel).await
 }
 
 async fn start_ppt_preview(
@@ -135,7 +135,7 @@ async fn start_ppt_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, &user.id, body, DocType::Ppt).await
+    start_preview(state, &user, body, DocType::Ppt).await
 }
 
 async fn stop_ppt_preview(
@@ -143,7 +143,7 @@ async fn stop_ppt_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, &user.id, body, DocType::Ppt).await
+    stop_preview(state, &user, body, DocType::Ppt).await
 }
 
 async fn refresh_ppt_preview(
@@ -151,12 +151,12 @@ async fn refresh_ppt_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
-    refresh_preview(state, &user.id, body, DocType::Ppt).await
+    refresh_preview(state, &user, body, DocType::Ppt).await
 }
 
 async fn start_preview(
     state: OfficeRouterState,
-    user_id: &str,
+    user: &CurrentUser,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
@@ -169,7 +169,13 @@ async fn start_preview(
             let upload_root = std::env::temp_dir().join("aionui");
             state
                 .project
-                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .resolve_chat_file_ref_with_local_admin(
+                    &user.id,
+                    user.is_local_admin(),
+                    file,
+                    &upload_root,
+                    aionui_project::FileOp::Read,
+                )
                 .await
                 .map_err(ApiError::from)?
         }
@@ -180,7 +186,7 @@ async fn start_preview(
 
     let result = state
         .watch_manager
-        .start_for_user(user_id, &validated_path, doc_type)
+        .start_for_user(&user.id, &validated_path, doc_type)
         .await;
 
     let resp = match result {
@@ -223,7 +229,7 @@ const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// carry this POST.
 async fn refresh_preview(
     state: OfficeRouterState,
-    user_id: &str,
+    user: &CurrentUser,
     body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
@@ -236,7 +242,13 @@ async fn refresh_preview(
             let upload_root = std::env::temp_dir().join("aionui");
             state
                 .project
-                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .resolve_chat_file_ref_with_local_admin(
+                    &user.id,
+                    user.is_local_admin(),
+                    file,
+                    &upload_root,
+                    aionui_project::FileOp::Read,
+                )
                 .await
                 .map_err(refresh_resolve_error)?
         }
@@ -245,7 +257,7 @@ async fn refresh_preview(
             .into_owned(),
     };
 
-    let Some(port) = state.watch_manager.active_port_for(user_id, &target_path, doc_type) else {
+    let Some(port) = state.watch_manager.active_port_for(&user.id, &target_path, doc_type) else {
         // Nothing is serving this document, so there is nothing to refresh. Not an
         // HTTP error: the tab may simply have been closed, and the client's own
         // recovery is to start a preview rather than to surface a failure.
@@ -301,7 +313,7 @@ fn refresh_resolve_error(err: aionui_project::ProjectError) -> ApiError {
 
 async fn stop_preview(
     state: OfficeRouterState,
-    user_id: &str,
+    user: &CurrentUser,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -316,13 +328,19 @@ async fn stop_preview(
             let upload_root = std::env::temp_dir().join("aionui");
             state
                 .project
-                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .resolve_chat_file_ref_with_local_admin(
+                    &user.id,
+                    user.is_local_admin(),
+                    file,
+                    &upload_root,
+                    aionui_project::FileOp::Read,
+                )
                 .await
                 .map_err(ApiError::from)?
         }
         None => req.file_path.clone(),
     };
-    state.watch_manager.stop_for_user(user_id, &target_path, doc_type).await;
+    state.watch_manager.stop_for_user(&user.id, &target_path, doc_type).await;
     Ok(Json(ApiResponse::success()))
 }
 

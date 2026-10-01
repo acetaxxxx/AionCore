@@ -14,7 +14,10 @@ use aionui_api_types::ChatFileRef;
 async fn setup() -> (Arc<ProjectService>, String, TempDir, TempDir) {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+    let service = Arc::new(
+        ProjectService::new(Arc::clone(&store), std::env::temp_dir())
+            .with_user_data_root(std::env::temp_dir()),
+    );
     let dir = tempfile::tempdir().unwrap();
     let created = service
         .create_standard("system_default_user", to_file_uri(dir.path()).unwrap())
@@ -234,6 +237,221 @@ async fn local_readable_file_resolves_and_inlines_marker() {
     assert!(std::path::Path::new(abs).is_file());
     assert!(abs.ends_with("host.txt"));
     assert_eq!(out.content, format!("see this\n\n{AIONUI_FILES_MARKER}\n{abs}"));
+}
+
+#[tokio::test]
+async fn local_file_for_authenticated_user_is_limited_to_their_own_conversation_tree() {
+    let db = init_database_memory().await.unwrap();
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let data_root = tempfile::tempdir().unwrap();
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
+        .with_user_data_root(data_root.path());
+    let upload_root = tempfile::tempdir().unwrap();
+    let user_root = data_root.path().join("conversations/users/alice/conv/assets");
+    std::fs::create_dir_all(&user_root).unwrap();
+    let file = user_root.join("preview.jpg");
+    std::fs::write(&file, b"image").unwrap();
+
+    let out = service
+        .resolve_chat_message(
+            "alice",
+            "inspect this",
+            &[ChatFileRef::Local {
+                path: file.to_string_lossy().into_owned(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        out.files,
+        vec![std::fs::canonicalize(file)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()]
+    );
+
+    let personal_root = data_root.path().join("users/alice/settings");
+    std::fs::create_dir_all(&personal_root).unwrap();
+    let personal_file = personal_root.join("profile.txt");
+    std::fs::write(&personal_file, b"settings").unwrap();
+    let resolved = service
+        .resolve_chat_file_ref(
+            "alice",
+            &ChatFileRef::Local {
+                path: personal_file.to_string_lossy().into_owned(),
+            },
+            upload_root.path(),
+            crate::FileOp::Read,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved,
+        std::fs::canonicalize(personal_file)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    );
+}
+
+#[tokio::test]
+async fn authenticated_local_admin_can_resolve_host_file_outside_user_trees() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let host_root = tempfile::tempdir().unwrap();
+    let file = host_root.path().join("picked.txt");
+    std::fs::write(&file, b"local admin file").unwrap();
+
+    let resolved = service
+        .resolve_chat_file_ref_with_local_admin(
+            "local-admin-account",
+            true,
+            &ChatFileRef::Local {
+                path: file.to_string_lossy().into_owned(),
+            },
+            upload_root.path(),
+            crate::FileOp::Read,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resolved,
+        std::fs::canonicalize(file).unwrap().to_string_lossy().into_owned()
+    );
+}
+
+#[tokio::test]
+async fn local_ref_with_matching_user_segment_outside_configured_data_root_is_forbidden() {
+    let db = init_database_memory().await.unwrap();
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let data_root = tempfile::tempdir().unwrap();
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
+        .with_user_data_root(data_root.path());
+    let upload_root = tempfile::tempdir().unwrap();
+    let foreign_root = tempfile::tempdir().unwrap();
+    let caller_path = foreign_root
+        .path()
+        .join("conversations/users/alice/conv/private.txt");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, b"outside configured data root").unwrap();
+
+    let err = service
+        .resolve_chat_file_ref_with_local_admin(
+            "alice",
+            false,
+            &ChatFileRef::Local {
+                path: caller_path.to_string_lossy().into_owned(),
+            },
+            upload_root.path(),
+            crate::FileOp::Read,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProjectError::LocalPathForbidden), "got {err:?}");
+}
+
+#[tokio::test]
+async fn client_workspace_cannot_add_an_arbitrary_path_as_an_image_root() {
+    let db = init_database_memory().await.unwrap();
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let data_root = tempfile::tempdir().unwrap();
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
+        .with_user_data_root(data_root.path());
+    let foreign_workspace = tempfile::tempdir().unwrap();
+    let tenant_shaped_path = foreign_workspace
+        .path()
+        .join("conversations/users/alice/workspace");
+    std::fs::create_dir_all(&tenant_shaped_path).unwrap();
+
+    let err = service
+        .authorize_local_workspace_with_local_admin("alice", false, &tenant_shaped_path)
+        .unwrap_err();
+
+    assert!(matches!(err, ProjectError::LocalPathForbidden), "got {err:?}");
+}
+
+#[tokio::test]
+async fn local_file_for_another_user_is_forbidden_even_when_it_exists() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let data_root = tempfile::tempdir().unwrap();
+    let caller_root = data_root.path().join("conversations/users/alice/conv/assets");
+    let other_user_root = data_root.path().join("conversations/users/bob/conv/assets");
+    std::fs::create_dir_all(&caller_root).unwrap();
+    std::fs::create_dir_all(&other_user_root).unwrap();
+    let file = other_user_root.join("private.jpg");
+    std::fs::write(&file, b"private").unwrap();
+
+    let err = service
+        .resolve_chat_message(
+            "alice",
+            "inspect this",
+            &[ChatFileRef::Local {
+                path: caller_root
+                    .join("../../../../users/bob/conv/assets/private.jpg")
+                    .to_string_lossy()
+                    .into_owned(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProjectError::LocalPathForbidden), "got {err:?}");
+}
+
+#[tokio::test]
+async fn local_write_resolution_rejects_another_users_existing_file() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let data_root = tempfile::tempdir().unwrap();
+    let other_user_root = data_root.path().join("users/bob/documents");
+    std::fs::create_dir_all(&other_user_root).unwrap();
+    let file = other_user_root.join("private.txt");
+    std::fs::write(&file, b"private").unwrap();
+
+    let err = service
+        .resolve_chat_file_ref(
+            "alice",
+            &ChatFileRef::Local {
+                path: file.to_string_lossy().into_owned(),
+            },
+            upload_root.path(),
+            crate::FileOp::Write,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProjectError::LocalPathForbidden), "got {err:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_symlink_from_user_tree_to_host_path_is_forbidden() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let data_root = tempfile::tempdir().unwrap();
+    let user_root = data_root.path().join("conversations/users/alice/conv/assets");
+    std::fs::create_dir_all(&user_root).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, b"secret").unwrap();
+    let link = user_root.join("linked.txt");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+    let err = service
+        .resolve_chat_message(
+            "alice",
+            "inspect this",
+            &[ChatFileRef::Local {
+                path: link.to_string_lossy().into_owned(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProjectError::LocalPathForbidden), "got {err:?}");
 }
 
 #[cfg(unix)]

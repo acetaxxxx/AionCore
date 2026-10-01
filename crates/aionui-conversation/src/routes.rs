@@ -310,7 +310,7 @@ async fn send_msg(
     let Json(req) = body.map_err(ApiError::from)?;
     let response = state
         .service
-        .send_message(&user.id, &id, req, &state.task_manager)
+        .send_message_with_local_admin(&user.id, user.is_local_admin(), &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     // B5: a mid-turn delivery already handed the message to the RUNNING turn —

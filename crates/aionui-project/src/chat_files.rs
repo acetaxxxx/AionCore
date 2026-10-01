@@ -44,11 +44,38 @@ impl ProjectService {
         files: &[ChatFileRef],
         upload_root: &Path,
     ) -> Result<ResolvedChatMessage, ProjectError> {
+        self.resolve_chat_message_with_local_admin(
+            user_id,
+            user_id == "system_default_user",
+            content,
+            files,
+            upload_root,
+        )
+        .await
+    }
+
+    /// Resolve a message using the authenticated caller's trusted local-admin
+    /// privilege. Web routes must pass `CurrentUser::is_local_admin()` here;
+    /// client-provided identity fields are never used for this decision.
+    pub async fn resolve_chat_message_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        content: &str,
+        files: &[ChatFileRef],
+        upload_root: &Path,
+    ) -> Result<ResolvedChatMessage, ProjectError> {
         let mut paths = Vec::with_capacity(files.len());
         for file in files {
             paths.push(
-                self.resolve_chat_file_ref(user_id, file, upload_root, FileOp::Read)
-                    .await?,
+                self.resolve_chat_file_ref_with_local_admin(
+                    user_id,
+                    is_local_admin,
+                    file,
+                    upload_root,
+                    FileOp::Read,
+                )
+                .await?,
             );
         }
 
@@ -69,14 +96,37 @@ impl ProjectService {
     ///   realpath containment; read paths pass `Read`, the write endpoint passes `Write`); must exist
     ///   (file or folder).
     /// - `Upload` → an existing regular file under the managed `upload_root` (D2 invariant).
-    /// - `Local` → a canonicalized existing regular file; **no sandbox** (the host picker that
-    ///   produced it already exposes the whole filesystem).
+    /// - `Local` → a canonicalized existing regular file; unrestricted only when trusted server
+    ///   identity marks the caller as local admin, otherwise confined to the caller's persisted
+    ///   user data tree. Shared Team files require a separate trusted membership-aware resolver
+    ///   and therefore fail closed here.
     ///
     /// `op` only affects the `Project` arm's containment mode; `Upload`/`Local` are path-based and
     /// identical regardless of op.
     pub async fn resolve_chat_file_ref(
         &self,
         user_id: &str,
+        file: &ChatFileRef,
+        upload_root: &Path,
+        op: FileOp,
+    ) -> Result<String, ProjectError> {
+        self.resolve_chat_file_ref_with_local_admin(
+            user_id,
+            user_id == "system_default_user",
+            file,
+            upload_root,
+            op,
+        )
+        .await
+    }
+
+    /// Resolve a file reference using a privilege derived from authenticated
+    /// server-side identity. Callers must not derive `is_local_admin` from the
+    /// request payload.
+    pub async fn resolve_chat_file_ref_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
         file: &ChatFileRef,
         upload_root: &Path,
         op: FileOp,
@@ -114,16 +164,23 @@ impl ProjectService {
                 Ok(path.clone())
             }
             ChatFileRef::Local { path } => {
-                // A path the user explicitly picked in the host-file browser,
-                // which already exposes the whole filesystem. No managed-root
-                // restriction (that is the upload channel's D2 invariant only);
-                // just canonicalize (collapsing `..`/symlinks) and require an
-                // existing regular file.
+                // An authenticated local admin is the only identity allowed to
+                // address arbitrary host paths. A web/self-host user may address files
+                // only inside their own persisted user directories; a client
+                // supplied absolute path or workspace is never an authorization
+                // claim. Canonicalize before checking ownership so symlinks and
+                // `..` cannot escape that boundary.
                 let canonical = std::fs::canonicalize(path)
                     .map_err(|_| ProjectError::LocalPathNotReadable { path: path.clone() })?;
                 if !canonical.is_file() {
                     return Err(ProjectError::LocalPathNotReadable { path: path.clone() });
                 }
+                authorize_local_data_path(
+                    user_id,
+                    is_local_admin,
+                    self.user_data_root.as_deref(),
+                    &canonical,
+                )?;
                 Ok(canonical.to_string_lossy().into_owned())
             }
         }
@@ -246,6 +303,75 @@ impl ProjectService {
         }
 
         Ok(None)
+    }
+}
+
+impl ProjectService {
+    /// Canonicalize and authorize a user-supplied workspace directory using the
+    /// same trusted data-root and tenant rules as Local file refs. This lets
+    /// callers use it as a path-safety root only after server-side validation.
+    pub fn authorize_local_workspace_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        workspace: &Path,
+    ) -> Result<String, ProjectError> {
+        let canonical = std::fs::canonicalize(workspace).map_err(|_| ProjectError::LocalPathNotReadable {
+            path: workspace.to_string_lossy().into_owned(),
+        })?;
+        if !canonical.is_dir() {
+            return Err(ProjectError::LocalPathNotReadable {
+                path: workspace.to_string_lossy().into_owned(),
+            });
+        }
+        authorize_local_data_path(user_id, is_local_admin, self.user_data_root.as_deref(), &canonical)?;
+        Ok(canonical.to_string_lossy().into_owned())
+    }
+}
+
+/// Restrict a web/self-host `Local` ref to the caller's persisted data tree.
+/// The web route passes the authenticated `CurrentUser::is_local_admin()` bit;
+/// all other callers are confined to their own persisted user data tree. Shared
+/// Team workspaces intentionally fail closed until a trusted membership-aware
+/// resolver exists.
+fn authorize_local_data_path(
+    user_id: &str,
+    is_local_admin: bool,
+    user_data_root: Option<&Path>,
+    canonical: &Path,
+) -> Result<(), ProjectError> {
+    if is_local_admin {
+        return Ok(());
+    }
+
+    let Some(user_data_root) = user_data_root else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Ok(canonical_data_root) = std::fs::canonicalize(user_data_root) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Ok(relative) = canonical.strip_prefix(&canonical_data_root) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+
+    let components: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    let belongs_to_user = (components.first().is_some_and(|part| part == "conversations")
+        && components.get(1).is_some_and(|part| part == "users")
+        && components.get(2).is_some_and(|owner| owner == user_id))
+        || (components.first().is_some_and(|part| part == "users")
+            && components.get(1).is_some_and(|owner| owner == user_id));
+
+    if belongs_to_user {
+        Ok(())
+    } else {
+        Err(ProjectError::LocalPathForbidden)
     }
 }
 
