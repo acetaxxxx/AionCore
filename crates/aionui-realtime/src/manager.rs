@@ -745,14 +745,15 @@ mod tests {
         };
         mgr.broadcast_scoped(make_event("team-1", "owner", &["owner", "revoked", "remaining"]));
         mgr.broadcast_scoped(make_event("team-2", "other-owner", &["other-owner", "other-member"]));
-        // Plain user-scoped events are not Team-tagged and retain old behavior.
+        recipients.revoke("team-1", "revoked");
+        recipients.wait_for_inflight_deliveries().await;
+
+        // Plain user-scoped events are not Team-tagged and retain old behavior
+        // even after the account loses membership in this Team.
         mgr.broadcast_to_user(
             "revoked",
             WebSocketMessage::new("private.update", serde_json::json!({"user_id": "revoked"})),
         );
-
-        recipients.revoke("team-1", "revoked");
-        recipients.wait_for_inflight_deliveries().await;
 
         async fn scoped_text(
             mgr: &WebSocketManager,
