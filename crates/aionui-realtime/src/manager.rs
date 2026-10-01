@@ -305,6 +305,17 @@ impl Default for WebSocketManager {
 
 impl EventBroadcaster for WebSocketManager {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+        if let Some(recipients) = event.data.get("authorized_user_ids").and_then(|value| value.as_array()) {
+            for recipient in recipients.iter().filter_map(serde_json::Value::as_str) {
+                let mut scoped_event = event.clone();
+                if let Some(data) = scoped_event.data.as_object_mut() {
+                    data.remove("authorized_user_ids");
+                    data.insert("user_id".to_owned(), serde_json::Value::String(recipient.to_owned()));
+                }
+                self.broadcast_to_user(recipient, scoped_event);
+            }
+            return;
+        }
         let Some(user_id) = event
             .data
             .get("user_id")
@@ -532,6 +543,40 @@ mod tests {
         assert!(rx1.try_recv().is_ok());
         assert!(rx2.try_recv().is_err());
         assert!(rx3.try_recv().is_ok());
+    }
+
+    #[test]
+    fn authorized_team_event_fans_out_only_to_server_listed_users() {
+        let mgr = WebSocketManager::new();
+        let (owner_tx, mut owner_rx) = new_client_tx();
+        let (collaborator_tx, mut collaborator_rx) = new_client_tx();
+        let (unrelated_tx, mut unrelated_rx) = new_client_tx();
+        mgr.add_client_for_user("owner".into(), "owner-token".into(), owner_tx);
+        mgr.add_client_for_user("collaborator".into(), "collaborator-token".into(), collaborator_tx);
+        mgr.add_client_for_user("unrelated".into(), "unrelated-token".into(), unrelated_tx);
+        let event = WebSocketMessage::new(
+            "team.runUpdated",
+            serde_json::json!({
+                "user_id": "owner",
+                "authorized_user_ids": ["owner", "collaborator"],
+                "team_id": "team-1",
+            }),
+        );
+
+        mgr.broadcast(event);
+
+        let owner_event = match owner_rx.try_recv().unwrap() {
+            WsOutbound::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected event text, got {other:?}"),
+        };
+        let collaborator_event = match collaborator_rx.try_recv().unwrap() {
+            WsOutbound::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected event text, got {other:?}"),
+        };
+        assert_eq!(owner_event["data"]["user_id"], "owner");
+        assert_eq!(collaborator_event["data"]["user_id"], "collaborator");
+        assert!(owner_event["data"].get("authorized_user_ids").is_none());
+        assert!(unrelated_rx.try_recv().is_err());
     }
 
     #[test]

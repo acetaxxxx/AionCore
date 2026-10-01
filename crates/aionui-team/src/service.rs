@@ -1014,10 +1014,40 @@ impl TeamSessionService {
         membership_ref: &str,
     ) -> Result<(), TeamError> {
         self.load_owned_team_row(owner_user_id, team_id).await?;
-        self.repo
-            .remove_team_member(owner_user_id, team_id, membership_ref)
-            .await?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _membership_guard = membership_lock.lock().await;
+        let member_user_id = self
+            .repo
+            .list_team_members(team_id)
+            .await?
+            .into_iter()
+            .find(|member| member.membership_ref == membership_ref)
+            .map(|member| member.user_id);
+        if let (Some(user_id), Some(session)) = (member_user_id.as_deref(), self.sessions.get(team_id)) {
+            session.session.revoke_event_user(user_id);
+        }
+        if let Err(error) = self.repo.remove_team_member(owner_user_id, team_id, membership_ref).await {
+            self.refresh_session_event_users(team_id, owner_user_id).await;
+            return Err(error.into());
+        }
+        self.refresh_session_event_users(team_id, owner_user_id).await;
         Ok(())
+    }
+
+    async fn refresh_session_event_users(&self, team_id: &str, owner_user_id: &str) {
+        let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) else {
+            return;
+        };
+        match self.repo.list_team_members(team_id).await {
+            Ok(members) => session.set_authorized_event_users(
+                std::iter::once(owner_user_id.to_owned()).chain(members.into_iter().map(|member| member.user_id)),
+            ),
+            Err(error) => warn!(team_id, error = %error, "team event recipient refresh failed; revoked recipients remain removed"),
+        }
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
@@ -1696,6 +1726,13 @@ impl TeamSessionService {
                 return Err(e);
             }
         };
+
+        match self.repo.list_team_members(team_id).await {
+            Ok(members) => session.set_authorized_event_users(
+                std::iter::once(user_id.clone()).chain(members.into_iter().map(|member| member.user_id)),
+            ),
+            Err(error) => warn!(team_id, error = %error, "team event recipients unavailable; keeping owner-only fanout"),
+        }
 
         self.broadcast_session_status(
             &user_id,

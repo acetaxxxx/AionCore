@@ -119,6 +119,7 @@ pub struct TeamSession {
     /// Owner user_id for this team — needed when spawn_agent creates a
     /// new conversation (conversations are scoped per user).
     user_id: String,
+    events: Arc<TeamEventEmitter>,
     /// Weak upward ref so `spawn_agent` can reach the DB-facing orchestration
     /// in `TeamSessionService` (conversation creation, persisted agent list)
     /// without creating a strong cycle with the session map that owns `self`.
@@ -250,6 +251,7 @@ impl TeamSession {
             team_run_manager,
             work_coordinator,
             user_id,
+            events: emitter,
             service,
             broadcaster,
             event_loops,
@@ -277,6 +279,14 @@ impl TeamSession {
         &self.user_id
     }
 
+    pub fn set_authorized_event_users(&self, user_ids: impl IntoIterator<Item = String>) {
+        self.events.set_authorized_user_ids(user_ids);
+    }
+
+    pub fn revoke_event_user(&self, user_id: &str) {
+        self.events.revoke_user(user_id);
+    }
+
     pub fn scheduler(&self) -> &Arc<TeammateManager> {
         &self.scheduler
     }
@@ -302,11 +312,7 @@ impl TeamSession {
     }
 
     pub(crate) fn team_event_emitter(&self) -> Arc<TeamEventEmitter> {
-        Arc::new(TeamEventEmitter::new(
-            self.team.id.clone(),
-            self.user_id.clone(),
-            self.broadcaster.clone(),
-        ))
+        Arc::clone(&self.events)
     }
 
     pub fn team_run_manager(&self) -> &Arc<TeamRunManager> {
@@ -850,7 +856,8 @@ impl TeamSession {
             content,
             files.unwrap_or_default(),
         )
-        .with_actor_user_id(actor_user_id);
+        .with_actor_user_id(actor_user_id)
+        .with_authorized_user_ids(self.events.authorized_user_ids());
         if let Err(error) = projection.project(request).await {
             warn!(
                 team_id = %self.team.id,
@@ -903,7 +910,8 @@ impl TeamSession {
                 &agent.conversation_id,
                 content,
                 generate_id(),
-            ))
+            )
+            .with_authorized_user_ids(self.events.authorized_user_ids()))
             .await?;
         Ok(())
     }

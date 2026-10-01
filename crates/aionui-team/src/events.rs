@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use aionui_api_types::{
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
@@ -41,16 +43,43 @@ pub const TEAM_SLOT_WORK_CHANGED_EVENT: &str = "team.slotWorkChanged";
 pub struct TeamEventEmitter {
     team_id: String,
     user_id: String,
+    authorized_user_ids: Arc<RwLock<HashSet<String>>>,
     broadcaster: Arc<dyn EventBroadcaster>,
 }
 
 impl TeamEventEmitter {
     pub fn new(team_id: String, user_id: String, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
+        let authorized_user_ids = HashSet::from([user_id.clone()]);
         Self {
             team_id,
             user_id,
+            authorized_user_ids: Arc::new(RwLock::new(authorized_user_ids)),
             broadcaster,
         }
+    }
+
+    /// Replaces event recipients with the current active Team members. The
+    /// owner is always retained; callers derive collaborators from the
+    /// repository, never from a WebSocket request payload.
+    pub fn set_authorized_user_ids(&self, user_ids: impl IntoIterator<Item = String>) {
+        let mut authorized = HashSet::from([self.user_id.clone()]);
+        authorized.extend(user_ids.into_iter().filter(|user_id| !user_id.is_empty()));
+        if let Ok(mut current) = self.authorized_user_ids.write() {
+            *current = authorized;
+        }
+    }
+
+    pub fn revoke_user(&self, user_id: &str) {
+        if let Ok(mut current) = self.authorized_user_ids.write() {
+            current.remove(user_id);
+        }
+    }
+
+    pub fn authorized_user_ids(&self) -> Vec<String> {
+        self.authorized_user_ids
+            .read()
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_else(|_| vec![self.user_id.clone()])
     }
 
     pub fn team_id(&self) -> &str {
@@ -60,6 +89,7 @@ impl TeamEventEmitter {
     fn scoped_payload<T: Serialize>(&self, payload: T) -> Value {
         let mut value = serde_json::to_value(payload).expect("serialize team event payload");
         value["user_id"] = Value::String(self.user_id.clone());
+        value["authorized_user_ids"] = serde_json::json!(self.authorized_user_ids());
         value
     }
 

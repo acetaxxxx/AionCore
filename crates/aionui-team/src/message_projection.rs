@@ -28,6 +28,7 @@ pub enum TeamProjectionSource {
 pub struct TeamProjectionRequest {
     pub user_id: String,
     pub actor_user_id: String,
+    pub authorized_user_ids: Vec<String>,
     pub team_id: String,
     pub slot_id: String,
     pub conversation_id: String,
@@ -50,6 +51,7 @@ impl TeamProjectionRequest {
         Self {
             user_id: user_id.into(),
             actor_user_id: String::new(),
+            authorized_user_ids: Vec::new(),
             team_id: team_id.into(),
             slot_id: slot_id.into(),
             conversation_id: conversation_id.into(),
@@ -79,6 +81,7 @@ impl TeamProjectionRequest {
         Self {
             user_id: user_id.into(),
             actor_user_id: String::new(),
+            authorized_user_ids: Vec::new(),
             dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
             team_id,
             slot_id: slot_id.into(),
@@ -110,6 +113,7 @@ impl TeamProjectionRequest {
         Self {
             user_id: user_id.into(),
             actor_user_id: String::new(),
+            authorized_user_ids: Vec::new(),
             dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
             team_id,
             slot_id: slot_id.into(),
@@ -124,11 +128,21 @@ impl TeamProjectionRequest {
 
     fn as_owner_actor(mut self) -> Self {
         self.actor_user_id = self.user_id.clone();
+        self.authorized_user_ids = vec![self.user_id.clone()];
         self
     }
 
     pub fn with_actor_user_id(mut self, actor_user_id: impl Into<String>) -> Self {
         self.actor_user_id = actor_user_id.into();
+        self
+    }
+
+    pub fn with_authorized_user_ids(mut self, user_ids: Vec<String>) -> Self {
+        self.authorized_user_ids = if user_ids.is_empty() {
+            vec![self.user_id.clone()]
+        } else {
+            user_ids
+        };
         self
     }
 
@@ -228,6 +242,7 @@ where
                 sender_conversation_id,
             } => Some(serde_json::json!({
                 "user_id": request.user_id,
+                "authorized_user_ids": request.authorized_user_ids.clone(),
                 "team_id": request.team_id,
                 "slot_id": request.slot_id,
                 "conversation_id": request.conversation_id,
@@ -241,6 +256,7 @@ where
             })),
             TeamProjectionSource::TeamSystem => Some(serde_json::json!({
                 "user_id": request.user_id,
+                "authorized_user_ids": request.authorized_user_ids.clone(),
                 "team_id": request.team_id,
                 "slot_id": request.slot_id,
                 "conversation_id": request.conversation_id,
