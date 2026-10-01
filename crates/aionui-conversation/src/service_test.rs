@@ -1896,10 +1896,10 @@ async fn make_injected_project_service(temp_root: &std::path::Path) -> std::sync
     let store: std::sync::Arc<dyn aionui_db::IProjectStore> =
         std::sync::Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
     std::mem::forget(db);
-    std::sync::Arc::new(aionui_project::ProjectService::new(
-        store,
-        temp_root.join("conversations"),
-    ))
+    std::sync::Arc::new(
+        aionui_project::ProjectService::new(store, temp_root.join("conversations"))
+            .with_user_data_root(temp_root),
+    )
 }
 
 #[tokio::test]
@@ -9946,9 +9946,14 @@ mod session_mentions_integration {
         )
         .await;
 
-        // A `Local` ref only has to be an existing regular file, so it needs no
-        // upload root and no project binding.
-        let attachment = work_root.path().join("auth.rs");
+        // Authenticated local refs are limited to the caller's persisted data
+        // tree. This fixture mirrors an uploaded conversation attachment and
+        // needs no upload root or project binding.
+        let attachment_root = work_root
+            .path()
+            .join("conversations/users/user_1/attachments");
+        std::fs::create_dir_all(&attachment_root).unwrap();
+        let attachment = attachment_root.join("auth.rs");
         std::fs::write(&attachment, "fn main() {}").unwrap();
 
         let request: SendMessageRequest = serde_json::from_value(json!({
