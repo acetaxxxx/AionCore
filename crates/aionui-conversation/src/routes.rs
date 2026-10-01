@@ -166,7 +166,9 @@ async fn direct_conversation_owner_guard(
     };
     match state.service.ensure_owned_conversation(&user.id, conversation_id).await {
         Ok(()) => next.run(request).await,
-        Err(ConversationError::NotFound { .. }) => ApiError::NotFound("Conversation not found".into()).into_response(),
+        // Keep the legacy owner-scoped 404 detail stable. The ID is already
+        // caller-supplied; no message or other owner's data is included.
+        Err(error @ ConversationError::NotFound { .. }) => ApiError::from(error).into_response(),
         Err(error) => ApiError::from(error).into_response(),
     }
 }
