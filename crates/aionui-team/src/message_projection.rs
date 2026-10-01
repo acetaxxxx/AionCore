@@ -61,7 +61,7 @@ impl TeamProjectionRequest {
             visibility: TeamVisibilityPolicy::user_message(),
             dedupe_key: None,
         }
-        .as_owner_actor()
+        .with_owner_actor()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -96,7 +96,7 @@ impl TeamProjectionRequest {
             files: Vec::new(),
             visibility: TeamVisibilityPolicy::teammate_message(),
         }
-        .as_owner_actor()
+        .with_owner_actor()
     }
 
     pub fn team_system_visible(
@@ -123,10 +123,10 @@ impl TeamProjectionRequest {
             files: Vec::new(),
             visibility: TeamVisibilityPolicy::teammate_message(),
         }
-        .as_owner_actor()
+        .with_owner_actor()
     }
 
-    fn as_owner_actor(mut self) -> Self {
+    fn with_owner_actor(mut self) -> Self {
         self.actor_user_id = self.user_id.clone();
         self.authorized_user_ids = vec![self.user_id.clone()];
         self

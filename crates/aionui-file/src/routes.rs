@@ -214,12 +214,10 @@ async fn resolve_chat_file_ref_for_user(
 ) -> Result<String, ApiError> {
     if let ChatFileRef::Local { path } = file
         && !user.is_local_admin()
-    {
-        if let Some(team_path) =
+        && let Some(team_path) =
             authorize_local_team_file(state.team_workspace_authorizer.as_ref(), &user.id, path).await?
-        {
-            return Ok(team_path);
-        }
+    {
+        return Ok(team_path);
     }
 
     state
