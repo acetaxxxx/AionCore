@@ -122,8 +122,9 @@ async fn create_team(
     ensure_default_team_assistant(app, services, token, csrf).await;
     let req = json_with_token("POST", "/api/teams", two_agent_body(), token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    let status = resp.status();
     let json = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "team creation failed: {json}");
     assert!(json["success"].as_bool().unwrap());
     json["data"].clone()
 }
