@@ -242,7 +242,13 @@ async fn resolve_chat_file_ref_for_user(
 
     state
         .project
-        .resolve_chat_file_ref(&user.id, file, &content_upload_root(), op)
+        .resolve_chat_file_ref_with_local_admin(
+            &user.id,
+            user.is_local_admin(),
+            file,
+            &content_upload_root(),
+            op,
+        )
         .await
         .map_err(chat_file_resolve_error)
 }
@@ -597,6 +603,9 @@ fn chat_file_resolve_error(err: aionui_project::ProjectError) -> ApiError {
     tracing::warn!(target: "chat_file", error = %err, code, "could not resolve chat file reference");
     match err {
         aionui_project::ProjectError::Database(_) => ApiError::Internal("failed to resolve target".to_owned()),
+        aionui_project::ProjectError::LocalPathForbidden => {
+            ApiError::Forbidden("local file access is not authorized".to_owned())
+        }
         _ => ApiError::coded(
             axum::http::StatusCode::NOT_FOUND,
             "FILE_NOT_FOUND",
@@ -880,24 +889,58 @@ async fn get_image_base64(
         }
         (req.path, req.workspace.map(PathBuf::from))
     } else if let Some(workspace) = req.workspace.as_deref() {
-        if state
+        match state
             .team_workspace_authorizer
             .authorize_exact_workspace(&user.id, Path::new(workspace))
             .await?
-            != TeamWorkspaceAuthorization::Allowed
         {
-            return Err(ApiError::Forbidden("Team workspace access is forbidden".into()));
+            TeamWorkspaceAuthorization::Allowed => {
+                let canonical_path =
+                    resolve_team_image_path(Path::new(workspace), Path::new(&req.path))?;
+                let canonical_path_text = canonical_path.to_string_lossy().into_owned();
+                validate_request_path(&state, &user, &canonical_path_text).await?;
+                (canonical_path_text, None)
+            }
+            TeamWorkspaceAuthorization::Denied => {
+                return Err(ApiError::Forbidden("Team workspace access is forbidden".into()));
+            }
+            TeamWorkspaceAuthorization::NotTeamWorkspace => {
+                // A client-supplied personal workspace is only a path hint after
+                // both paths have been checked against the authenticated user's
+                // persisted data root by ProjectService.
+                let path = resolve_chat_file_ref_for_user(
+                    &state,
+                    &user,
+                    &ChatFileRef::Local {
+                        path: req.path.clone(),
+                    },
+                    aionui_project::FileOp::Read,
+                )
+                .await?;
+                validate_resolved_path(&state, &user, &path).await?;
+                let workspace = state
+                    .project
+                    .authorize_local_workspace_with_local_admin(
+                        &user.id,
+                        false,
+                        Path::new(workspace),
+                    )
+                    .map_err(chat_file_resolve_error)?;
+                (path, Some(PathBuf::from(workspace)))
+            }
         }
-        let canonical_path = resolve_team_image_path(Path::new(workspace), Path::new(&req.path))?;
-        let canonical_path_text = canonical_path.to_string_lossy().into_owned();
-        validate_request_path(&state, &user, &canonical_path_text).await?;
-        (canonical_path_text, None)
     } else {
-        if !Path::new(&req.path).is_absolute() {
-            return Err(ApiError::BadRequest("absolute path is required".into()));
-        }
-        validate_request_path(&state, &user, &req.path).await?;
-        (req.path, None)
+        let path = resolve_chat_file_ref_for_user(
+            &state,
+            &user,
+            &ChatFileRef::Local {
+                path: req.path.clone(),
+            },
+            aionui_project::FileOp::Read,
+        )
+        .await?;
+        validate_resolved_path(&state, &user, &path).await?;
+        (path, None)
     };
     let data_url = state
         .file_service
@@ -1531,15 +1574,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chat_file_resolve_error_denies_unauthorized_local_paths_without_echoing_them() {
+        let api_err = chat_file_resolve_error(aionui_project::ProjectError::LocalPathForbidden);
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(api_err.error_code(), "FORBIDDEN");
+        assert_eq!(api_err.public_message(), "Forbidden.");
+        assert!(api_err.error_details().is_none());
+    }
+
     /// Every `ChatFileRef`-addressed handler must route its resolver failure through
     /// [`chat_file_resolve_error`], not the shared `From<ProjectError>` mapping.
     ///
-    /// Asserted against the source text because the alternative — spinning up five
+    /// Asserted against the source text because the alternative — spinning up six
     /// authenticated handlers with a real `ProjectService` — would not actually pin
     /// this: the wiring is a single `map_err` per handler, and a future edit swapping
     /// one back to `ApiError::from` is exactly the regression worth catching. The
-    /// count guards against a sixth such endpoint being added without a decision:
-    /// bump it deliberately, having checked the new one addresses files by identity.
+    /// The six call sites cover content read/write, metadata, stream, open-system,
+    /// and the legacy image-base64 route. The count guards against another resolver
+    /// call being added without a decision: bump it deliberately after checking the
+    /// new call is sealed as well.
     #[test]
     fn every_chat_file_ref_endpoint_uses_the_sealed_resolver_mapping() {
         // Scan handler code only. This test module mentions both needles in its own
@@ -1550,26 +1604,21 @@ mod tests {
             .map(|(before, _)| before)
             .expect("routes.rs has a #[cfg(test)] module");
 
-        let endpoint_calls = handlers.matches("let abs = resolve_chat_file_ref_for_user(").count();
-        let project_resolve_calls = handlers.matches(".resolve_chat_file_ref(").count();
+        let endpoint_calls = handlers.matches("resolve_chat_file_ref_for_user(").count() - 1;
+        let project_resolve_calls = handlers
+            .matches(".resolve_chat_file_ref_with_local_admin(")
+            .count();
         let sealed = handlers.matches(".map_err(chat_file_resolve_error)").count();
 
         assert_eq!(
-            endpoint_calls, 5,
-            "expected 5 ChatFileRef-addressed endpoints (content read/write, metadata, stream, \
-             open-system); found {endpoint_calls} — a new one must be checked for identity \
-             addressing and sealed before bumping this"
+            endpoint_calls, 6,
+            "all six file handlers must use the shared per-user resolver"
         );
         assert_eq!(
             project_resolve_calls, 1,
-            "only the shared resolver may call ProjectService::resolve_chat_file_ref; \
-             found {project_resolve_calls} direct calls"
+            "the shared resolver owns direct project resolution"
         );
-        assert_eq!(
-            sealed, 1,
-            "the shared resolver must seal ProjectError through chat_file_resolve_error; \
-             found {sealed} sealed calls"
-        );
+        assert_eq!(sealed, 2, "file and workspace resolution errors must be sealed");
     }
 
     /// The `Database` arm (reachable through `resolve_reference`) is deliberately

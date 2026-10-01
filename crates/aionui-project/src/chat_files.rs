@@ -44,10 +44,31 @@ impl ProjectService {
         files: &[ChatFileRef],
         upload_root: &Path,
     ) -> Result<ResolvedChatMessage, ProjectError> {
+        self.resolve_chat_message_with_local_admin(
+            user_id,
+            user_id == "system_default_user",
+            content,
+            files,
+            upload_root,
+        )
+        .await
+    }
+
+    /// Resolve a message using the authenticated caller's trusted local-admin
+    /// privilege. Web routes must pass `CurrentUser::is_local_admin()` here;
+    /// client-provided identity fields are never used for this decision.
+    pub async fn resolve_chat_message_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        content: &str,
+        files: &[ChatFileRef],
+        upload_root: &Path,
+    ) -> Result<ResolvedChatMessage, ProjectError> {
         let mut paths = Vec::with_capacity(files.len());
         for file in files {
             paths.push(
-                self.resolve_chat_file_ref(user_id, file, upload_root, FileOp::Read)
+                self.resolve_chat_file_ref_with_local_admin(user_id, is_local_admin, file, upload_root, FileOp::Read)
                     .await?,
             );
         }
@@ -69,14 +90,31 @@ impl ProjectService {
     ///   realpath containment; read paths pass `Read`, the write endpoint passes `Write`); must exist
     ///   (file or folder).
     /// - `Upload` → an existing regular file under the managed `upload_root` (D2 invariant).
-    /// - `Local` → a canonicalized existing regular file; **no sandbox** (the host picker that
-    ///   produced it already exposes the whole filesystem).
+    /// - `Local` → a canonicalized existing regular file; unrestricted only when trusted server
+    ///   identity marks the caller as local admin, otherwise confined to the caller's persisted
+    ///   user data tree. Shared Team files require a separate trusted membership-aware resolver
+    ///   and therefore fail closed here.
     ///
     /// `op` only affects the `Project` arm's containment mode; `Upload`/`Local` are path-based and
     /// identical regardless of op.
     pub async fn resolve_chat_file_ref(
         &self,
         user_id: &str,
+        file: &ChatFileRef,
+        upload_root: &Path,
+        op: FileOp,
+    ) -> Result<String, ProjectError> {
+        self.resolve_chat_file_ref_with_local_admin(user_id, user_id == "system_default_user", file, upload_root, op)
+            .await
+    }
+
+    /// Resolve a file reference using a privilege derived from authenticated
+    /// server-side identity. Callers must not derive `is_local_admin` from the
+    /// request payload.
+    pub async fn resolve_chat_file_ref_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
         file: &ChatFileRef,
         upload_root: &Path,
         op: FileOp,
@@ -114,16 +152,21 @@ impl ProjectService {
                 Ok(path.clone())
             }
             ChatFileRef::Local { path } => {
-                // A path the user explicitly picked in the host-file browser,
-                // which already exposes the whole filesystem. No managed-root
-                // restriction (that is the upload channel's D2 invariant only);
-                // just canonicalize (collapsing `..`/symlinks) and require an
-                // existing regular file.
-                let canonical = std::fs::canonicalize(path)
-                    .map_err(|_| ProjectError::LocalPathNotReadable { path: path.clone() })?;
+                // An authenticated local admin is the only identity allowed to
+                // address arbitrary host paths. A web/self-host user may address files
+                // only inside their own persisted user directories; a client
+                // supplied absolute path or workspace is never an authorization
+                // claim. Reject paths that lexically name another tenant before
+                // touching the target, then canonicalize and check again so
+                // symlinks cannot escape that boundary. The early check ensures
+                // missing and existing foreign paths receive the same denial.
+                authorize_local_data_path_candidate(user_id, is_local_admin, self.user_data_root(), Path::new(path))?;
+                let canonical =
+                    std::fs::canonicalize(path).map_err(|_| local_path_not_readable(path, is_local_admin))?;
                 if !canonical.is_file() {
-                    return Err(ProjectError::LocalPathNotReadable { path: path.clone() });
+                    return Err(local_path_not_readable(path, is_local_admin));
                 }
+                authorize_local_data_path(user_id, is_local_admin, self.user_data_root(), &canonical)?;
                 Ok(canonical.to_string_lossy().into_owned())
             }
         }
@@ -247,6 +290,147 @@ impl ProjectService {
 
         Ok(None)
     }
+}
+
+impl ProjectService {
+    /// Canonicalize and authorize a user-supplied workspace directory using the
+    /// same trusted data-root and tenant rules as Local file refs. This lets
+    /// callers use it as a path-safety root only after server-side validation.
+    pub fn authorize_local_workspace_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        workspace: &Path,
+    ) -> Result<String, ProjectError> {
+        authorize_local_data_path_candidate(user_id, is_local_admin, self.user_data_root(), workspace)?;
+        let workspace_text = workspace.to_string_lossy();
+        let canonical =
+            std::fs::canonicalize(workspace).map_err(|_| local_path_not_readable(&workspace_text, is_local_admin))?;
+        if !canonical.is_dir() {
+            return Err(local_path_not_readable(&workspace_text, is_local_admin));
+        }
+        authorize_local_data_path(user_id, is_local_admin, self.user_data_root(), &canonical)?;
+        Ok(canonical.to_string_lossy().into_owned())
+    }
+}
+
+/// Do not let a non-admin distinguish an absent own path from a symlink whose
+/// target is outside their tenant. Local admins retain the legacy not-readable
+/// detail used by desktop callers.
+fn local_path_not_readable(path: &str, is_local_admin: bool) -> ProjectError {
+    if is_local_admin {
+        ProjectError::LocalPathNotReadable { path: path.to_owned() }
+    } else {
+        ProjectError::LocalPathForbidden
+    }
+}
+
+/// Restrict a web/self-host `Local` ref to the caller's persisted data tree.
+/// The web route passes the authenticated `CurrentUser::is_local_admin()` bit;
+/// all other callers are confined to their own persisted user data tree. Shared
+/// Team workspaces intentionally fail closed until a trusted membership-aware
+/// resolver exists.
+fn authorize_local_data_path(
+    user_id: &str,
+    is_local_admin: bool,
+    user_data_root: Option<&Path>,
+    canonical: &Path,
+) -> Result<(), ProjectError> {
+    if is_local_admin {
+        return Ok(());
+    }
+
+    let Some(user_data_root) = user_data_root else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Ok(canonical_data_root) = std::fs::canonicalize(user_data_root) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Ok(relative) = canonical.strip_prefix(&canonical_data_root) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+
+    if path_belongs_to_user_data_tree(user_id, relative) {
+        Ok(())
+    } else {
+        Err(ProjectError::LocalPathForbidden)
+    }
+}
+
+/// Reject a path outside the caller's lexical data tree before checking whether
+/// the target exists. The resolved-path check remains mandatory after
+/// canonicalization to catch symlinks. This is a privacy boundary as well as an
+/// authorization check: a caller must not distinguish a missing foreign path
+/// from an existing one by comparing the resolver's errors.
+fn authorize_local_data_path_candidate(
+    user_id: &str,
+    is_local_admin: bool,
+    user_data_root: Option<&Path>,
+    candidate: &Path,
+) -> Result<(), ProjectError> {
+    if is_local_admin {
+        return Ok(());
+    }
+
+    let Some(user_data_root) = user_data_root else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Some(root) = normalize_lexical_absolute(user_data_root) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Some(candidate) = normalize_lexical_absolute(candidate) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Ok(relative) = candidate.strip_prefix(root) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+
+    if path_belongs_to_user_data_tree(user_id, relative) {
+        Ok(())
+    } else {
+        Err(ProjectError::LocalPathForbidden)
+    }
+}
+
+/// Normalize `.` and `..` without following symlinks, using the same current
+/// directory semantics as filesystem lookup for relative paths.
+fn normalize_lexical_absolute(path: &Path) -> Option<std::path::PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match &component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+fn path_belongs_to_user_data_tree(user_id: &str, relative: &Path) -> bool {
+    let components: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    (components.first().is_some_and(|part| part == "conversations")
+        && components.get(1).is_some_and(|part| part == "users")
+        && components.get(2).is_some_and(|owner| owner == user_id))
+        || (components.first().is_some_and(|part| part == "users")
+            && components.get(1).is_some_and(|owner| owner == user_id))
 }
 
 /// Whether `target` resolves inside `root` (both canonicalized, so `..` and

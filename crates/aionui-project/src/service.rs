@@ -21,6 +21,9 @@ use crate::types::{
 pub struct ProjectService {
     store: Arc<dyn IProjectStore>,
     temp_root: PathBuf,
+    /// Authoritative application data root for persisted per-user local refs.
+    /// `None` fails closed for non-admin Local refs (e.g. unconfigured tests).
+    user_data_root: Option<PathBuf>,
     /// Sink for project-root changes to the source-control actor. Shared across
     /// clones (behind `Arc`) so the one instance the scm monitor installs the
     /// sender on is the same one the HTTP handlers see. Set once at startup;
@@ -34,8 +37,21 @@ impl ProjectService {
         Self {
             store,
             temp_root,
+            user_data_root: None,
             scm_roots_tx: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Configure the trusted root that contains persisted user conversation and
+    /// personal data. This is injected by application composition, never by a
+    /// request.
+    pub fn with_user_data_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.user_data_root = Some(root.into());
+        self
+    }
+
+    pub(crate) fn user_data_root(&self) -> Option<&Path> {
+        self.user_data_root.as_deref()
     }
 
     /// Install the sink that carries project-root changes to the source-control

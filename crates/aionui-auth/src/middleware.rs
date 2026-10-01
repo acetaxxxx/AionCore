@@ -66,9 +66,13 @@ impl CurrentUser {
         }
     }
 
-    /// Whether this user is the local administrative user.
+    /// Whether this user is the built-in system account with host-local access.
+    ///
+    /// `UserType::Local` also describes password-backed tenant accounts in
+    /// WebUI mode, so the account type alone must never grant host filesystem
+    /// access.
     pub fn is_local_admin(&self) -> bool {
-        self.user_type == UserType::Local || self.id == "system_default_user"
+        self.id == crate::account::SYSTEM_DEFAULT_USER_ID
     }
 }
 
@@ -401,5 +405,18 @@ mod tests {
             std::str::from_utf8(&body).unwrap(),
             "system_default_user:system_default_user"
         );
+        assert!(CurrentUser::local_default().is_local_admin());
+    }
+
+    #[test]
+    fn local_account_type_does_not_grant_local_admin_access() {
+        let user = CurrentUser {
+            id: "user_webui_local".to_owned(),
+            username: "alice".to_owned(),
+            user_type: UserType::Local,
+            status: UserStatus::Active,
+        };
+
+        assert!(!user.is_local_admin());
     }
 }

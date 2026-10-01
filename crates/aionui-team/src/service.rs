@@ -2781,20 +2781,36 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_with_local_admin(
+            user_id,
+            user_id == "system_default_user",
+            team_id,
+            content,
+            files,
+        )
+        .await
+    }
+
+    pub async fn send_message_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        team_id: &str,
+        content: &str,
+        files: Option<Vec<ChatFileRef>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let access = self.authorize_team(user_id, team_id).await?;
         Self::reject_shared_team_attachments(&access, files.as_deref())?;
         self.ensure_session_inner(team_id, Some(&access.execution_owner_id)).await?;
         let (content, files) = self
-            .resolve_message_attachments(&access.execution_owner_id, content, files)
+            .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
             .await?;
         let membership_lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
-        // Serialize the final membership check + enqueue with member removal.
-        // If revoke owns this lock first, the recheck rejects the send; if this
-        // send owns it first, the enqueue is accepted before revoke can return.
+        // Serialize final membership validation and enqueue with member removal.
         let _membership_guard = membership_lock.lock().await;
         let current_access = self.authorize_team(user_id, team_id).await?;
         if current_access.execution_owner_id != access.execution_owner_id {
@@ -2812,21 +2828,44 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_to_agent_with_local_admin(
+            user_id,
+            user_id == "system_default_user",
+            team_id,
+            slot_id,
+            content,
+            files,
+        )
+        .await
+    }
+
+    pub async fn send_message_to_agent_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        team_id: &str,
+        slot_id: &str,
+        content: &str,
+        files: Option<Vec<ChatFileRef>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let access = self.authorize_team(user_id, team_id).await?;
-        if !can_send_direct_team_message(access.role, access.team.lead_agent_id.as_deref(), slot_id) {
+        if !can_send_direct_team_message(
+            access.role,
+            access.team.lead_agent_id.as_deref(),
+            slot_id,
+        ) {
             return Err(TeamError::Forbidden("collaborators may only send directly to the shared Team Lead".into()));
         }
         Self::reject_shared_team_attachments(&access, files.as_deref())?;
         self.ensure_session_inner(team_id, Some(&access.execution_owner_id)).await?;
         let (content, files) = self
-            .resolve_message_attachments(&access.execution_owner_id, content, files)
+            .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
             .await?;
         let membership_lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
-        // Keep the final authorization and mailbox enqueue atomic with revoke.
         let _membership_guard = membership_lock.lock().await;
         let current_access = self.authorize_team(user_id, team_id).await?;
         if current_access.execution_owner_id != access.execution_owner_id {
@@ -2854,10 +2893,22 @@ impl TeamSessionService {
         slot_id: &str,
         request: InterruptTeamAgentRequest,
     ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.interrupt_agent_with_local_admin(user_id, user_id == "system_default_user", team_id, slot_id, request)
+            .await
+    }
+
+    pub async fn interrupt_agent_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        team_id: &str,
+        slot_id: &str,
+        request: InterruptTeamAgentRequest,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (message, files) = self
-            .resolve_message_attachments(user_id, &request.message, request.files)
+            .resolve_message_attachments(user_id, is_local_admin, &request.message, request.files)
             .await?;
         self.published_session(team_id)?
             .interrupt_agent_from_user(slot_id, &message, files, request.reason, request.queued_policy)
@@ -2911,6 +2962,7 @@ impl TeamSessionService {
     async fn resolve_message_attachments(
         &self,
         user_id: &str,
+        is_local_admin: bool,
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<(String, Option<Vec<String>>), TeamError> {
@@ -2928,9 +2980,14 @@ impl TeamSessionService {
             })?;
         let upload_root = std::env::temp_dir().join("aionui");
         let resolved = project
-            .resolve_chat_message(user_id, content, &files, &upload_root)
+            .resolve_chat_message_with_local_admin(user_id, is_local_admin, content, &files, &upload_root)
             .await
-            .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
+            .map_err(|err| match err {
+                aionui_project::ProjectError::LocalPathForbidden => {
+                    TeamError::Forbidden("local file access is not authorized".to_owned())
+                }
+                err => TeamError::InvalidRequest(err.to_string()),
+            })?;
         Ok((resolved.content, Some(resolved.files)))
     }
 

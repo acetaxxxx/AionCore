@@ -9,8 +9,8 @@ use axum::routing::{get, post};
 use std::path::{Path as FsPath, PathBuf};
 
 use aionui_api_types::{
-    ApiResponse, DocumentConversionRequest, PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse,
-    StartPreviewRequest, StopPreviewRequest,
+    ApiResponse, ChatFileRef, DocumentConversionRequest, PreviewUrlResponse, RefreshPreviewRequest,
+    RefreshPreviewResponse, StartPreviewRequest, StopPreviewRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -87,7 +87,7 @@ async fn start_word_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, &user.id, body, DocType::Word).await
+    start_preview(state, &user, body, DocType::Word).await
 }
 
 async fn stop_word_preview(
@@ -95,7 +95,7 @@ async fn stop_word_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, &user.id, body, DocType::Word).await
+    stop_preview(state, &user, body, DocType::Word).await
 }
 
 async fn refresh_word_preview(
@@ -103,7 +103,7 @@ async fn refresh_word_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
-    refresh_preview(state, &user.id, body, DocType::Word).await
+    refresh_preview(state, &user, body, DocType::Word).await
 }
 
 async fn start_excel_preview(
@@ -111,7 +111,7 @@ async fn start_excel_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, &user.id, body, DocType::Excel).await
+    start_preview(state, &user, body, DocType::Excel).await
 }
 
 async fn stop_excel_preview(
@@ -119,7 +119,7 @@ async fn stop_excel_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, &user.id, body, DocType::Excel).await
+    stop_preview(state, &user, body, DocType::Excel).await
 }
 
 async fn refresh_excel_preview(
@@ -127,7 +127,7 @@ async fn refresh_excel_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
-    refresh_preview(state, &user.id, body, DocType::Excel).await
+    refresh_preview(state, &user, body, DocType::Excel).await
 }
 
 async fn start_ppt_preview(
@@ -135,7 +135,7 @@ async fn start_ppt_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, &user.id, body, DocType::Ppt).await
+    start_preview(state, &user, body, DocType::Ppt).await
 }
 
 async fn stop_ppt_preview(
@@ -143,7 +143,7 @@ async fn stop_ppt_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, &user.id, body, DocType::Ppt).await
+    stop_preview(state, &user, body, DocType::Ppt).await
 }
 
 async fn refresh_ppt_preview(
@@ -151,36 +151,40 @@ async fn refresh_ppt_preview(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
-    refresh_preview(state, &user.id, body, DocType::Ppt).await
+    refresh_preview(state, &user, body, DocType::Ppt).await
 }
 
 async fn start_preview(
     state: OfficeRouterState,
-    user_id: &str,
+    user: &CurrentUser,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     // Prefer the ChatFileRef identity (resolved server-side, already
-    // containment-checked per variant); fall back to the legacy device path +
-    // office sandbox validation for callers that have not migrated yet.
+    // containment-checked per variant); legacy paths are resolved through the
+    // authenticated caller's tenant scope below.
     let validated_path = match &req.file {
         Some(file) => {
             let upload_root = std::env::temp_dir().join("aionui");
             state
                 .project
-                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .resolve_chat_file_ref_with_local_admin(
+                    &user.id,
+                    user.is_local_admin(),
+                    file,
+                    &upload_root,
+                    aionui_project::FileOp::Read,
+                )
                 .await
-                .map_err(ApiError::from)?
+                .map_err(office_file_resolve_error)?
         }
-        None => validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
-            .to_string_lossy()
-            .into_owned(),
+        None => resolve_legacy_office_path(&state, user, &req.file_path, req.workspace.as_deref()).await?,
     };
 
     let result = state
         .watch_manager
-        .start_for_user(user_id, &validated_path, doc_type)
+        .start_for_user(&user.id, &validated_path, doc_type)
         .await;
 
     let resp = match result {
@@ -223,29 +227,33 @@ const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// carry this POST.
 async fn refresh_preview(
     state: OfficeRouterState,
-    user_id: &str,
+    user: &CurrentUser,
     body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     // Resolve exactly as start/stop do, so the session key derived below is the one
-    // the watch was registered under. Prefer the ChatFileRef; fall back to the
-    // legacy device path.
+    // the watch was registered under. Prefer the ChatFileRef; tenant legacy paths
+    // are constrained to the caller's persisted data tree.
     let target_path = match &req.file {
         Some(file) => {
             let upload_root = std::env::temp_dir().join("aionui");
             state
                 .project
-                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .resolve_chat_file_ref_with_local_admin(
+                    &user.id,
+                    user.is_local_admin(),
+                    file,
+                    &upload_root,
+                    aionui_project::FileOp::Read,
+                )
                 .await
-                .map_err(refresh_resolve_error)?
+                .map_err(office_file_resolve_error)?
         }
-        None => validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
-            .to_string_lossy()
-            .into_owned(),
+        None => resolve_legacy_office_path(&state, user, &req.file_path, req.workspace.as_deref()).await?,
     };
 
-    let Some(port) = state.watch_manager.active_port_for(user_id, &target_path, doc_type) else {
+    let Some(port) = state.watch_manager.active_port_for(&user.id, &target_path, doc_type) else {
         // Nothing is serving this document, so there is nothing to refresh. Not an
         // HTTP error: the tab may simply have been closed, and the client's own
         // recovery is to start a preview rather than to surface a failure.
@@ -268,40 +276,9 @@ async fn refresh_preview(
     })))
 }
 
-/// Collapse a `ChatFileRef` resolution failure into a path-free API error.
-///
-/// The shared `From<ProjectError>` mapping renders the error's `Display` as the
-/// public message and repeats the path under `details.path`, and several variants
-/// carry the absolute path. This caller addressed the file by identity, so that
-/// path is server-side knowledge and must not travel back out.
-///
-/// # Why the neighbours differ
-///
-/// `start_preview` and `stop_preview`, a few lines below, resolve the same way but
-/// still map through the shared conversion — so they *do* echo the path on a
-/// resolve failure. That asymmetry is deliberate, not an oversight here.
-///
-/// The leak is domain-wide, not local: `ApiError::NotFound` is constructed at 63
-/// sites across the workspace and `ApiError::Coded::public_message` clones its
-/// message too, so most of them publish whatever the caller passed. Sealing two
-/// more endpoints in passing would leave the real problem untouched while making
-/// this area *look* handled, which is worse for whoever takes on the sweep. It is
-/// registered as the "backend error-message domain-wide cleanup" follow-up; fix it
-/// there, across all call sites, rather than one endpoint at a time.
-fn refresh_resolve_error(err: aionui_project::ProjectError) -> ApiError {
-    let code = err.code();
-    tracing::warn!(target: "office_refresh", error = %err, code, "could not resolve refresh target");
-    ApiError::coded(
-        StatusCode::NOT_FOUND,
-        "FILE_NOT_FOUND",
-        "The requested file no longer exists.",
-        None::<serde_json::Value>,
-    )
-}
-
 async fn stop_preview(
     state: OfficeRouterState,
-    user_id: &str,
+    user: &CurrentUser,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -316,13 +293,26 @@ async fn stop_preview(
             let upload_root = std::env::temp_dir().join("aionui");
             state
                 .project
-                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .resolve_chat_file_ref_with_local_admin(
+                    &user.id,
+                    user.is_local_admin(),
+                    file,
+                    &upload_root,
+                    aionui_project::FileOp::Read,
+                )
                 .await
-                .map_err(ApiError::from)?
+                .map_err(office_file_resolve_error)?
         }
-        None => req.file_path.clone(),
+        // Stop only addresses a session keyed by this authenticated user. Keep
+        // the local-admin legacy behavior: the watch manager canonicalizes the
+        // path, and no document contents are read by this operation.
+        None if user.is_local_admin() => req.file_path.clone(),
+        None => resolve_legacy_office_path(&state, user, &req.file_path, None).await?,
     };
-    state.watch_manager.stop_for_user(user_id, &target_path, doc_type).await;
+    state
+        .watch_manager
+        .stop_for_user(&user.id, &target_path, doc_type)
+        .await;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -330,15 +320,12 @@ async fn stop_preview(
 
 async fn convert_document(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<DocumentConversionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<aionui_api_types::DocumentConversionResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
-    let resp = state
-        .conversion_service
-        .convert(validated_path.to_string_lossy().as_ref(), req.to)
-        .await?;
+    let validated_path = resolve_legacy_office_path(&state, &user, &req.file_path, req.workspace.as_deref()).await?;
+    let resp = state.conversion_service.convert(&validated_path, req.to).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 
@@ -350,6 +337,64 @@ fn validate_office_path(
     let allowed_roots: Vec<&FsPath> = state.allowed_roots.iter().map(PathBuf::as_path).collect();
     validate_path_with_extra_root(file_path, &allowed_roots, workspace.map(FsPath::new))
         .map_err(file_error_to_api_error)
+}
+
+/// Resolve a legacy absolute path without letting a web caller expand its own
+/// authorization root by supplying `workspace`. Local-admin callers retain the
+/// historical office-root/workspace behavior; tenant callers are restricted to
+/// their persisted user tree by the same canonical Local-ref resolver used by
+/// file endpoints. Shared Team paths therefore remain denied until a trusted
+/// membership-aware resolver is available.
+async fn resolve_legacy_office_path(
+    state: &OfficeRouterState,
+    user: &CurrentUser,
+    file_path: &str,
+    workspace: Option<&str>,
+) -> Result<String, ApiError> {
+    if user.is_local_admin() {
+        return validate_office_path(state, file_path, workspace).map(|path| path.to_string_lossy().into_owned());
+    }
+
+    if let Some(workspace) = workspace {
+        state
+            .project
+            .authorize_local_workspace_with_local_admin(&user.id, false, FsPath::new(workspace))
+            .map_err(office_file_resolve_error)?;
+    }
+
+    state
+        .project
+        .resolve_chat_file_ref_with_local_admin(
+            &user.id,
+            false,
+            &ChatFileRef::Local {
+                path: file_path.to_owned(),
+            },
+            &std::env::temp_dir().join("aionui"),
+            aionui_project::FileOp::Read,
+        )
+        .await
+        .map_err(office_file_resolve_error)
+}
+
+/// Office preview targets arrive either as a client-supplied legacy path or a
+/// server-resolved ChatFileRef. Keep resolution failures path-free at this
+/// boundary; in particular, never serialize an absolute host path on denial.
+fn office_file_resolve_error(error: aionui_project::ProjectError) -> ApiError {
+    let code = error.code();
+    tracing::warn!(target: "office_file", error = %error, code, "could not resolve office file");
+    match error {
+        aionui_project::ProjectError::Database(_) => ApiError::Internal("failed to resolve office file".into()),
+        aionui_project::ProjectError::LocalPathForbidden => {
+            ApiError::Forbidden("local file access is not authorized".into())
+        }
+        _ => ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "FILE_NOT_FOUND",
+            "The requested file is unavailable.",
+            None::<serde_json::Value>,
+        ),
+    }
 }
 
 fn file_error_to_api_error(error: FileError) -> ApiError {
@@ -472,8 +517,14 @@ async fn proxy_forward(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
+    use aionui_api_types::{
+        ConversionTarget, DocumentConversionRequest, RefreshPreviewRequest, StartPreviewRequest, StopPreviewRequest,
+    };
+    use aionui_auth::CurrentUser;
+    use aionui_db::{UserStatus, UserType};
     use aionui_file::FileError;
 
     use crate::conversion::ConversionService;
@@ -483,7 +534,28 @@ mod tests {
     use crate::types::DocType;
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
 
-    use super::{ApiError, file_error_to_api_error, office_proxy_routes, office_routes};
+    use super::{
+        ApiError, convert_document, file_error_to_api_error, office_proxy_routes, office_routes, refresh_preview,
+        resolve_legacy_office_path, start_preview, stop_preview,
+    };
+
+    fn tenant_user(id: &str) -> CurrentUser {
+        CurrentUser {
+            id: id.to_owned(),
+            username: id.to_owned(),
+            user_type: UserType::Aionpro,
+            status: UserStatus::Active,
+        }
+    }
+
+    fn make_user_data_tree(root: &std::path::Path, user_id: &str) -> (PathBuf, PathBuf) {
+        let file = root.join("users").join(user_id).join("documents").join("report.docx");
+        let workspace = root.join("conversations").join("users").join(user_id).join("workspace");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&file, b"doc").unwrap();
+        (file, workspace)
+    }
 
     #[tokio::test]
     async fn office_routes_builds_without_panic() {
@@ -495,6 +567,179 @@ mod tests {
     async fn office_proxy_routes_builds_without_panic() {
         let state = build_test_state().await;
         let _router = office_proxy_routes(state);
+    }
+
+    #[tokio::test]
+    async fn legacy_office_path_allows_callers_own_persisted_file() {
+        let data_root = tempfile::tempdir().unwrap();
+        let (file, workspace) = make_user_data_tree(data_root.path(), "alice");
+        let state = build_test_state_with_user_data_root(Some(data_root.path().to_path_buf())).await;
+
+        let resolved = resolve_legacy_office_path(
+            &state,
+            &tenant_user("alice"),
+            file.to_str().unwrap(),
+            Some(workspace.to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::path::Path::new(&resolved), std::fs::canonicalize(file).unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_office_path_rejects_untrusted_workspace_root() {
+        let data_root = tempfile::tempdir().unwrap();
+        let (file, _) = make_user_data_tree(data_root.path(), "alice");
+        let outside_workspace = tempfile::tempdir().unwrap();
+        let state = build_test_state_with_user_data_root(Some(data_root.path().to_path_buf())).await;
+
+        let result = resolve_legacy_office_path(
+            &state,
+            &tenant_user("alice"),
+            file.to_str().unwrap(),
+            Some(outside_workspace.path().to_str().unwrap()),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::Forbidden(message)) if message == "local file access is not authorized")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_office_path_rejects_other_users_file_even_with_that_workspace() {
+        let data_root = tempfile::tempdir().unwrap();
+        let (file, workspace) = make_user_data_tree(data_root.path(), "bob");
+        let state = build_test_state_with_user_data_root(Some(data_root.path().to_path_buf())).await;
+
+        let result = resolve_legacy_office_path(
+            &state,
+            &tenant_user("alice"),
+            file.to_str().unwrap(),
+            Some(workspace.to_str().unwrap()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::Forbidden(_))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_office_path_rejects_symlink_escape_from_callers_tree() {
+        use std::os::unix::fs::symlink;
+
+        let data_root = tempfile::tempdir().unwrap();
+        let (own_file, workspace) = make_user_data_tree(data_root.path(), "alice");
+        let outside = tempfile::tempdir().unwrap();
+        let secret_file = outside.path().join("outside.docx");
+        std::fs::write(&secret_file, b"secret").unwrap();
+        let link = own_file.parent().unwrap().join("escape.docx");
+        symlink(&secret_file, &link).unwrap();
+        let workspace_link = data_root.path().join("users/alice/workspace-link");
+        symlink(outside.path(), &workspace_link).unwrap();
+        let state = build_test_state_with_user_data_root(Some(data_root.path().to_path_buf())).await;
+
+        let result = resolve_legacy_office_path(
+            &state,
+            &tenant_user("alice"),
+            link.to_str().unwrap(),
+            Some(workspace.to_str().unwrap()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::Forbidden(_))));
+
+        let workspace_result = resolve_legacy_office_path(
+            &state,
+            &tenant_user("alice"),
+            own_file.to_str().unwrap(),
+            Some(workspace_link.to_str().unwrap()),
+        )
+        .await;
+        assert!(matches!(workspace_result, Err(ApiError::Forbidden(_))));
+    }
+
+    #[tokio::test]
+    async fn local_admin_keeps_legacy_workspace_root_support() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("report.docx");
+        std::fs::write(&file, b"doc").unwrap();
+        let state = build_test_state().await;
+
+        let resolved = resolve_legacy_office_path(
+            &state,
+            &CurrentUser::local_default(),
+            file.to_str().unwrap(),
+            Some(workspace.path().to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::path::Path::new(&resolved), std::fs::canonicalize(file).unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_office_handlers_reject_workspace_based_authorization() {
+        let data_root = tempfile::tempdir().unwrap();
+        let (file, _) = make_user_data_tree(data_root.path(), "alice");
+        let outside_workspace = tempfile::tempdir().unwrap();
+        let state = build_test_state_with_user_data_root(Some(data_root.path().to_path_buf())).await;
+        let user = tenant_user("alice");
+        let file_path = file.to_str().unwrap().to_owned();
+        let workspace = outside_workspace.path().to_str().unwrap().to_owned();
+
+        let start = start_preview(
+            state.clone(),
+            &user,
+            Ok(axum::Json(StartPreviewRequest {
+                file_path: file_path.clone(),
+                workspace: Some(workspace.clone()),
+                file: None,
+            })),
+            DocType::Word,
+        )
+        .await;
+        assert!(matches!(start, Err(ApiError::Forbidden(_))));
+
+        let refresh = refresh_preview(
+            state.clone(),
+            &user,
+            Ok(axum::Json(RefreshPreviewRequest {
+                file_path: file_path.clone(),
+                workspace: Some(workspace.clone()),
+                file: None,
+            })),
+            DocType::Word,
+        )
+        .await;
+        assert!(matches!(refresh, Err(ApiError::Forbidden(_))));
+
+        let convert = convert_document(
+            axum::extract::State(state.clone()),
+            axum::Extension(user.clone()),
+            Ok(axum::Json(DocumentConversionRequest {
+                file_path: file_path.clone(),
+                to: ConversionTarget::Markdown,
+                workspace: Some(workspace),
+            })),
+        )
+        .await;
+        assert!(matches!(convert, Err(ApiError::Forbidden(_))));
+
+        let other_root = tempfile::tempdir().unwrap();
+        let (other_file, _) = make_user_data_tree(other_root.path(), "bob");
+        let stop = stop_preview(
+            state,
+            &user,
+            Ok(axum::Json(StopPreviewRequest {
+                file_path: other_file.to_str().unwrap().to_owned(),
+                file: None,
+            })),
+            DocType::Word,
+        )
+        .await;
+        assert!(matches!(stop, Err(ApiError::Forbidden(_))));
     }
 
     #[test]
@@ -583,6 +828,10 @@ mod tests {
     }
 
     async fn build_test_state() -> OfficeRouterState {
+        build_test_state_with_user_data_root(None).await
+    }
+
+    async fn build_test_state_with_user_data_root(user_data_root: Option<PathBuf>) -> OfficeRouterState {
         struct NoopSpawner;
 
         #[async_trait::async_trait]
@@ -620,14 +869,17 @@ mod tests {
 
         let db = aionui_db::init_database_memory().await.unwrap();
         let store: Arc<dyn aionui_db::IProjectStore> = Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
-        let project = Arc::new(aionui_project::ProjectService::new(store, std::env::temp_dir()));
+        let mut project = aionui_project::ProjectService::new(store, std::env::temp_dir());
+        if let Some(root) = user_data_root {
+            project = project.with_user_data_root(root);
+        }
 
         OfficeRouterState {
             watch_manager: wm,
             conversion_service: conversion,
             proxy_service: proxy,
             allowed_roots: vec![std::env::temp_dir()],
-            project,
+            project: Arc::new(project),
         }
     }
 }

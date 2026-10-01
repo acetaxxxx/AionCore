@@ -162,6 +162,15 @@ async fn auth_app(jwt_service: Arc<JwtService>) -> Router {
     protected_auth_app(jwt_service, user_repo)
 }
 
+async fn report_local_admin(request: Request<Body>) -> String {
+    request
+        .extensions()
+        .get::<CurrentUser>()
+        .expect("auth middleware should inject the user")
+        .is_local_admin()
+        .to_string()
+}
+
 fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepository>) -> Router {
     protected_auth_app_with_mode(jwt_service, user_repo, AuthIdentityMode::UserSession)
 }
@@ -625,6 +634,45 @@ async fn auth_middleware_session_generation_mismatch_returns_unauthorized_code()
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = json_body(resp).await;
     assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn authenticated_local_account_in_webui_mode_is_not_local_admin() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
+    let account = repo.create_user("alice", "test-password-hash").await.unwrap();
+    let token = jwt_service
+        .sign_with_session_generation(&account.id, "alice", account.session_generation)
+        .unwrap();
+    let app = Router::new()
+        .route("/protected", get(report_local_admin))
+        .route_layer(middleware::from_fn_with_state(
+            AuthState {
+                jwt_service,
+                user_repo: repo as Arc<dyn IUserRepository>,
+                identity_mode: AuthIdentityMode::UserSession,
+                runtime_token_verifier: None,
+                cloudflare_access: None,
+                fs_adopter: None,
+                cookie_config: None,
+            },
+            auth_middleware,
+        ));
+
+    let response = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(std::str::from_utf8(&body).unwrap(), "false");
 }
 
 #[tokio::test]
