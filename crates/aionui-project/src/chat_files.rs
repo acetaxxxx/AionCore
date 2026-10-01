@@ -68,14 +68,8 @@ impl ProjectService {
         let mut paths = Vec::with_capacity(files.len());
         for file in files {
             paths.push(
-                self.resolve_chat_file_ref_with_local_admin(
-                    user_id,
-                    is_local_admin,
-                    file,
-                    upload_root,
-                    FileOp::Read,
-                )
-                .await?,
+                self.resolve_chat_file_ref_with_local_admin(user_id, is_local_admin, file, upload_root, FileOp::Read)
+                    .await?,
             );
         }
 
@@ -110,14 +104,8 @@ impl ProjectService {
         upload_root: &Path,
         op: FileOp,
     ) -> Result<String, ProjectError> {
-        self.resolve_chat_file_ref_with_local_admin(
-            user_id,
-            user_id == "system_default_user",
-            file,
-            upload_root,
-            op,
-        )
-        .await
+        self.resolve_chat_file_ref_with_local_admin(user_id, user_id == "system_default_user", file, upload_root, op)
+            .await
     }
 
     /// Resolve a file reference using a privilege derived from authenticated
@@ -175,20 +163,15 @@ impl ProjectService {
                 authorize_local_data_path_candidate(
                     user_id,
                     is_local_admin,
-                    self.user_data_root.as_deref(),
+                    self.user_data_root(),
                     Path::new(path),
                 )?;
-                let canonical = std::fs::canonicalize(path)
-                    .map_err(|_| local_path_not_readable(path, is_local_admin))?;
+                let canonical =
+                    std::fs::canonicalize(path).map_err(|_| local_path_not_readable(path, is_local_admin))?;
                 if !canonical.is_file() {
                     return Err(local_path_not_readable(path, is_local_admin));
                 }
-                authorize_local_data_path(
-                    user_id,
-                    is_local_admin,
-                    self.user_data_root.as_deref(),
-                    &canonical,
-                )?;
+                authorize_local_data_path(user_id, is_local_admin, self.user_data_root(), &canonical)?;
                 Ok(canonical.to_string_lossy().into_owned())
             }
         }
@@ -324,19 +307,14 @@ impl ProjectService {
         is_local_admin: bool,
         workspace: &Path,
     ) -> Result<String, ProjectError> {
-        authorize_local_data_path_candidate(
-            user_id,
-            is_local_admin,
-            self.user_data_root.as_deref(),
-            workspace,
-        )?;
+        authorize_local_data_path_candidate(user_id, is_local_admin, self.user_data_root(), workspace)?;
         let workspace_text = workspace.to_string_lossy();
-        let canonical = std::fs::canonicalize(workspace)
-            .map_err(|_| local_path_not_readable(&workspace_text, is_local_admin))?;
+        let canonical =
+            std::fs::canonicalize(workspace).map_err(|_| local_path_not_readable(&workspace_text, is_local_admin))?;
         if !canonical.is_dir() {
             return Err(local_path_not_readable(&workspace_text, is_local_admin));
         }
-        authorize_local_data_path(user_id, is_local_admin, self.user_data_root.as_deref(), &canonical)?;
+        authorize_local_data_path(user_id, is_local_admin, self.user_data_root(), &canonical)?;
         Ok(canonical.to_string_lossy().into_owned())
     }
 }
@@ -346,9 +324,7 @@ impl ProjectService {
 /// detail used by desktop callers.
 fn local_path_not_readable(path: &str, is_local_admin: bool) -> ProjectError {
     if is_local_admin {
-        ProjectError::LocalPathNotReadable {
-            path: path.to_owned(),
-        }
+        ProjectError::LocalPathNotReadable { path: path.to_owned() }
     } else {
         ProjectError::LocalPathForbidden
     }

@@ -179,9 +179,7 @@ async fn start_preview(
                 .await
                 .map_err(office_file_resolve_error)?
         }
-        None => {
-            resolve_legacy_office_path(&state, user, &req.file_path, req.workspace.as_deref()).await?
-        }
+        None => resolve_legacy_office_path(&state, user, &req.file_path, req.workspace.as_deref()).await?,
     };
 
     let result = state
@@ -252,9 +250,7 @@ async fn refresh_preview(
                 .await
                 .map_err(office_file_resolve_error)?
         }
-        None => {
-            resolve_legacy_office_path(&state, user, &req.file_path, req.workspace.as_deref()).await?
-        }
+        None => resolve_legacy_office_path(&state, user, &req.file_path, req.workspace.as_deref()).await?,
     };
 
     let Some(port) = state.watch_manager.active_port_for(&user.id, &target_path, doc_type) else {
@@ -313,7 +309,10 @@ async fn stop_preview(
         None if user.is_local_admin() => req.file_path.clone(),
         None => resolve_legacy_office_path(&state, user, &req.file_path, None).await?,
     };
-    state.watch_manager.stop_for_user(&user.id, &target_path, doc_type).await;
+    state
+        .watch_manager
+        .stop_for_user(&user.id, &target_path, doc_type)
+        .await;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -325,12 +324,8 @@ async fn convert_document(
     body: Result<Json<DocumentConversionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<aionui_api_types::DocumentConversionResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let validated_path =
-        resolve_legacy_office_path(&state, &user, &req.file_path, req.workspace.as_deref()).await?;
-    let resp = state
-        .conversion_service
-        .convert(&validated_path, req.to)
-        .await?;
+    let validated_path = resolve_legacy_office_path(&state, &user, &req.file_path, req.workspace.as_deref()).await?;
+    let resp = state.conversion_service.convert(&validated_path, req.to).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 
@@ -357,8 +352,7 @@ async fn resolve_legacy_office_path(
     workspace: Option<&str>,
 ) -> Result<String, ApiError> {
     if user.is_local_admin() {
-        return validate_office_path(state, file_path, workspace)
-            .map(|path| path.to_string_lossy().into_owned());
+        return validate_office_path(state, file_path, workspace).map(|path| path.to_string_lossy().into_owned());
     }
 
     if let Some(workspace) = workspace {
@@ -390,9 +384,7 @@ fn office_file_resolve_error(error: aionui_project::ProjectError) -> ApiError {
     let code = error.code();
     tracing::warn!(target: "office_file", error = %error, code, "could not resolve office file");
     match error {
-        aionui_project::ProjectError::Database(_) => {
-            ApiError::Internal("failed to resolve office file".into())
-        }
+        aionui_project::ProjectError::Database(_) => ApiError::Internal("failed to resolve office file".into()),
         aionui_project::ProjectError::LocalPathForbidden => {
             ApiError::Forbidden("local file access is not authorized".into())
         }
@@ -529,8 +521,7 @@ mod tests {
     use std::sync::Arc;
 
     use aionui_api_types::{
-        ConversionTarget, DocumentConversionRequest, RefreshPreviewRequest, StartPreviewRequest,
-        StopPreviewRequest,
+        ConversionTarget, DocumentConversionRequest, RefreshPreviewRequest, StartPreviewRequest, StopPreviewRequest,
     };
     use aionui_auth::CurrentUser;
     use aionui_db::{UserStatus, UserType};
@@ -544,8 +535,8 @@ mod tests {
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
 
     use super::{
-        ApiError, convert_document, file_error_to_api_error, office_proxy_routes, office_routes,
-        refresh_preview, resolve_legacy_office_path, start_preview, stop_preview,
+        ApiError, convert_document, file_error_to_api_error, office_proxy_routes, office_routes, refresh_preview,
+        resolve_legacy_office_path, start_preview, stop_preview,
     };
 
     fn tenant_user(id: &str) -> CurrentUser {
@@ -559,11 +550,7 @@ mod tests {
 
     fn make_user_data_tree(root: &std::path::Path, user_id: &str) -> (PathBuf, PathBuf) {
         let file = root.join("users").join(user_id).join("documents").join("report.docx");
-        let workspace = root
-            .join("conversations")
-            .join("users")
-            .join(user_id)
-            .join("workspace");
+        let workspace = root.join("conversations").join("users").join(user_id).join("workspace");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(&file, b"doc").unwrap();
@@ -597,10 +584,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            std::path::Path::new(&resolved),
-            std::fs::canonicalize(file).unwrap()
-        );
+        assert_eq!(std::path::Path::new(&resolved), std::fs::canonicalize(file).unwrap());
     }
 
     #[tokio::test]
@@ -618,7 +602,9 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(ApiError::Forbidden(message)) if message == "local file access is not authorized"));
+        assert!(
+            matches!(result, Err(ApiError::Forbidden(message)) if message == "local file access is not authorized")
+        );
     }
 
     #[tokio::test]
@@ -690,10 +676,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            std::path::Path::new(&resolved),
-            std::fs::canonicalize(file).unwrap()
-        );
+        assert_eq!(std::path::Path::new(&resolved), std::fs::canonicalize(file).unwrap());
     }
 
     #[tokio::test]
@@ -848,9 +831,7 @@ mod tests {
         build_test_state_with_user_data_root(None).await
     }
 
-    async fn build_test_state_with_user_data_root(
-        user_data_root: Option<PathBuf>,
-    ) -> OfficeRouterState {
+    async fn build_test_state_with_user_data_root(user_data_root: Option<PathBuf>) -> OfficeRouterState {
         struct NoopSpawner;
 
         #[async_trait::async_trait]

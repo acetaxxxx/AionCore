@@ -2499,14 +2499,8 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
-        self.send_message_with_local_admin(
-            user_id,
-            user_id == "system_default_user",
-            team_id,
-            content,
-            files,
-        )
-        .await
+        self.send_message_with_local_admin(user_id, user_id == "system_default_user", team_id, content, files)
+            .await
     }
 
     pub async fn send_message_with_local_admin(
@@ -2519,7 +2513,9 @@ impl TeamSessionService {
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self.resolve_message_attachments(user_id, is_local_admin, content, files).await?;
+        let (content, files) = self
+            .resolve_message_attachments(user_id, is_local_admin, content, files)
+            .await?;
         let session = self.published_session(team_id)?;
         session.send_message(&content, files).await
     }
@@ -2554,7 +2550,9 @@ impl TeamSessionService {
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self.resolve_message_attachments(user_id, is_local_admin, content, files).await?;
+        let (content, files) = self
+            .resolve_message_attachments(user_id, is_local_admin, content, files)
+            .await?;
         let session = self.published_session(team_id)?;
         session.send_message_to_agent(slot_id, &content, files).await
     }
@@ -2566,14 +2564,8 @@ impl TeamSessionService {
         slot_id: &str,
         request: InterruptTeamAgentRequest,
     ) -> Result<TeamInterruptAgentResponse, TeamError> {
-        self.interrupt_agent_with_local_admin(
-            user_id,
-            user_id == "system_default_user",
-            team_id,
-            slot_id,
-            request,
-        )
-        .await
+        self.interrupt_agent_with_local_admin(user_id, user_id == "system_default_user", team_id, slot_id, request)
+            .await
     }
 
     pub async fn interrupt_agent_with_local_admin(

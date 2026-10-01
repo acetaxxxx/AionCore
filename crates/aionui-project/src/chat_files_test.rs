@@ -15,8 +15,7 @@ async fn setup() -> (Arc<ProjectService>, String, TempDir, TempDir) {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
     let service = Arc::new(
-        ProjectService::new(Arc::clone(&store), std::env::temp_dir())
-            .with_user_data_root(std::env::temp_dir()),
+        ProjectService::new(Arc::clone(&store), std::env::temp_dir()).with_user_data_root(std::env::temp_dir()),
     );
     let dir = tempfile::tempdir().unwrap();
     let created = service
@@ -244,8 +243,7 @@ async fn local_file_for_authenticated_user_is_limited_to_their_own_conversation_
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
     let data_root = tempfile::tempdir().unwrap();
-    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
-        .with_user_data_root(data_root.path());
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir()).with_user_data_root(data_root.path());
     let upload_root = tempfile::tempdir().unwrap();
     let user_root = data_root.path().join("conversations/users/alice/conv/assets");
     std::fs::create_dir_all(&user_root).unwrap();
@@ -266,10 +264,7 @@ async fn local_file_for_authenticated_user_is_limited_to_their_own_conversation_
 
     assert_eq!(
         out.files,
-        vec![std::fs::canonicalize(file)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()]
+        vec![std::fs::canonicalize(file).unwrap().to_string_lossy().into_owned()]
     );
 
     let personal_root = data_root.path().join("users/alice/settings");
@@ -327,13 +322,10 @@ async fn local_ref_with_matching_user_segment_outside_configured_data_root_is_fo
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
     let data_root = tempfile::tempdir().unwrap();
-    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
-        .with_user_data_root(data_root.path());
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir()).with_user_data_root(data_root.path());
     let upload_root = tempfile::tempdir().unwrap();
     let foreign_root = tempfile::tempdir().unwrap();
-    let caller_path = foreign_root
-        .path()
-        .join("conversations/users/alice/conv/private.txt");
+    let caller_path = foreign_root.path().join("conversations/users/alice/conv/private.txt");
     std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
     std::fs::write(&caller_path, b"outside configured data root").unwrap();
 
@@ -358,12 +350,9 @@ async fn client_workspace_cannot_add_an_arbitrary_path_as_an_image_root() {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
     let data_root = tempfile::tempdir().unwrap();
-    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
-        .with_user_data_root(data_root.path());
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir()).with_user_data_root(data_root.path());
     let foreign_workspace = tempfile::tempdir().unwrap();
-    let tenant_shaped_path = foreign_workspace
-        .path()
-        .join("conversations/users/alice/workspace");
+    let tenant_shaped_path = foreign_workspace.path().join("conversations/users/alice/workspace");
     std::fs::create_dir_all(&tenant_shaped_path).unwrap();
 
     let err = service
@@ -378,8 +367,7 @@ async fn foreign_local_paths_are_denied_before_target_existence_can_be_observed(
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
     let data_root = tempfile::tempdir().unwrap();
-    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
-        .with_user_data_root(data_root.path());
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir()).with_user_data_root(data_root.path());
     let upload_root = tempfile::tempdir().unwrap();
     let foreign_root = data_root.path().join("conversations/users/bob/2026/09/28");
     std::fs::create_dir_all(&foreign_root).unwrap();
@@ -418,8 +406,7 @@ async fn unresolved_owner_paths_do_not_disclose_foreign_target_existence() {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
     let data_root = tempfile::tempdir().unwrap();
-    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
-        .with_user_data_root(data_root.path());
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir()).with_user_data_root(data_root.path());
     let upload_root = tempfile::tempdir().unwrap();
     let own_root = data_root.path().join("conversations/users/alice/assets");
     let foreign_root = data_root.path().join("conversations/users/bob/assets");

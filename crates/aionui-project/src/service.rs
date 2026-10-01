@@ -50,6 +50,10 @@ impl ProjectService {
         self
     }
 
+    pub(crate) fn user_data_root(&self) -> Option<&Path> {
+        self.user_data_root.as_deref()
+    }
+
     /// Install the sink that carries project-root changes to the source-control
     /// actor. Called once, at startup, by the scm monitor's composition wiring;
     /// later calls are ignored (set-once). Because the field is shared across
