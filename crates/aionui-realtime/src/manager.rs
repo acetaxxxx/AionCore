@@ -781,6 +781,9 @@ mod tests {
         assert!(scoped_text(&mgr, &mut remaining_rx, "remaining").await.is_some());
         assert!(scoped_text(&mgr, &mut other_owner_rx, "other-owner").await.is_some());
         assert!(scoped_text(&mgr, &mut other_member_rx, "other-member").await.is_some());
+        // The revoked account has two sockets, and each had a Team frame
+        // queued before revocation. Both queued frames must be rejected.
+        assert!(scoped_text(&mgr, &mut revoked_private_rx, "revoked").await.is_none());
         assert!(matches!(revoked_private_rx.try_recv(), Ok(WsOutbound::Text(_))));
     }
 
