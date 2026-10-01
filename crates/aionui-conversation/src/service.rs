@@ -805,6 +805,94 @@ impl ConversationService {
         Ok(ws_path.to_string_lossy().into_owned())
     }
 
+    /// Creates a Team-scoped workspace outside every user's conversation tree.
+    /// Team IDs are server-generated path components; reject unexpected input
+    /// here as this method is also called through internal adapters.
+    pub fn create_shared_team_workspace(&self, team_id: &str) -> Result<String, ConversationError> {
+        if team_id.is_empty()
+            || !team_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(ConversationError::internal("Invalid Shared Team workspace identifier"));
+        }
+        std::fs::create_dir_all(&self.workspace_root)
+            .map_err(|error| ConversationError::internal(format!("Failed to create workspace root: {error}")))?;
+        let canonical_root = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|error| ConversationError::internal(format!("Failed to resolve workspace root: {error}")))?;
+        let team_root = self.workspace_root.join("teams");
+        match std::fs::symlink_metadata(&team_root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ConversationError::internal("Shared Team root cannot be a symlink"));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(ConversationError::internal("Shared Team root is not a directory"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&team_root).map_err(|create_error| {
+                    ConversationError::internal(format!("Failed to create Shared Team root: {create_error}"))
+                })?;
+            }
+            Err(error) => {
+                return Err(ConversationError::internal(format!("Failed to inspect Shared Team root: {error}")));
+            }
+        }
+        let canonical_team_root = team_root
+            .canonicalize()
+            .map_err(|error| ConversationError::internal(format!("Failed to resolve Shared Team root: {error}")))?;
+        if !canonical_team_root.starts_with(&canonical_root) {
+            return Err(ConversationError::internal("Shared Team workspace escapes the configured root"));
+        }
+        let workspace = team_root.join(team_id);
+        match std::fs::symlink_metadata(&workspace) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ConversationError::internal("Shared Team workspace cannot be a symlink"));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(ConversationError::internal("Shared Team workspace is not a directory"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&workspace).map_err(|create_error| {
+                    ConversationError::internal(format!("Failed to create Shared Team workspace: {create_error}"))
+                })?;
+            }
+            Err(error) => {
+                return Err(ConversationError::internal(format!("Failed to inspect Shared Team workspace: {error}")));
+            }
+        }
+        let canonical_workspace = workspace
+            .canonicalize()
+            .map_err(|error| ConversationError::internal(format!("Failed to resolve Shared Team workspace: {error}")))?;
+        if !canonical_workspace.starts_with(&canonical_team_root) {
+            return Err(ConversationError::internal("Shared Team workspace escapes the configured root"));
+        }
+        Ok(canonical_workspace.to_string_lossy().into_owned())
+    }
+
+    pub fn is_shared_team_workspace(&self, team_id: &str, candidate: &str) -> bool {
+        if team_id.is_empty()
+            || !team_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return false;
+        }
+        let Ok(root) = self.workspace_root.canonicalize() else {
+            return false;
+        };
+        let Ok(expected) = root.join("teams").join(team_id).canonicalize() else {
+            return false;
+        };
+        let Ok(candidate) = std::path::Path::new(candidate).canonicalize() else {
+            return false;
+        };
+        expected == candidate && candidate.starts_with(root.join("teams"))
+    }
+
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
         if let Ok(mut guard) = self.mcp_server_repo.write() {
             *guard = Some(repo);

@@ -59,6 +59,15 @@ pub struct TeamMembershipRow {
     pub created_at: TimestampMs,
 }
 
+/// Minimal internal projection for an active local Core account eligible for
+/// Team membership. `user_id` is server-only and must never be serialized to
+/// an API response.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct EligibleTeamUserRow {
+    pub user_id: String,
+    pub display_name: String,
+}
+
 /// Row mapping for the `mailbox` table.
 ///
 /// Represents an inter-agent message within a team.

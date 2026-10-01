@@ -19,7 +19,7 @@ use aionui_api_types::{
     TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
-use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
+use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, generate_id_with_length, now_ms};
 use aionui_db::models::{TeamAccessRole, TeamRow, TeamSharingMode};
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -128,6 +128,16 @@ struct SessionEntry {
     slow_monitor_handle: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct EligibleAccountRef {
+    owner_user_id: String,
+    team_id: String,
+    user_id: String,
+    expires_at: TimestampMs,
+}
+
+const ELIGIBLE_ACCOUNT_REF_TTL_MS: TimestampMs = 5 * 60 * 1000;
+
 pub struct TeamIdleCleanupCoordinator {
     service: Arc<TeamSessionService>,
     active_leases: Arc<ActiveLeaseRegistry>,
@@ -185,6 +195,9 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Short-lived opaque picker references. The referenced Core user ID never
+    /// crosses the API boundary and is revalidated by the repository on add.
+    eligible_account_refs: Arc<DashMap<String, EligibleAccountRef>>,
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -315,6 +328,7 @@ impl TeamSessionService {
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
+            eligible_account_refs: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
@@ -817,13 +831,26 @@ impl TeamSessionService {
             ));
         }
 
-        let shared_workspace = match req.workspace.as_deref() {
-            Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
-            _ => None,
-        };
-
         let team_id = generate_id();
         let now = now_ms();
+        let shared_workspace = match req.sharing_mode {
+            aionui_api_types::TeamSharingMode::Private => match req.workspace.as_deref() {
+                Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
+                _ => None,
+            },
+            aionui_api_types::TeamSharingMode::Shared => {
+                if req.workspace.as_deref().is_some_and(|workspace| !workspace.trim().is_empty()) {
+                    return Err(TeamError::InvalidRequest(
+                        "Shared Team workspace is provisioned by the server".into(),
+                    ));
+                }
+                Some(
+                    self.conversation_port
+                        .create_shared_team_workspace(&team_id)
+                        .await?,
+                )
+            }
+        };
 
         let provisioned = self
             .provisioner()
@@ -852,7 +879,11 @@ impl TeamSessionService {
             project_id,
             folder_id,
         };
-        self.repo.create_team(&row).await?;
+        let sharing_mode = match req.sharing_mode {
+            aionui_api_types::TeamSharingMode::Private => TeamSharingMode::Private,
+            aionui_api_types::TeamSharingMode::Shared => TeamSharingMode::Shared,
+        };
+        self.repo.create_team_with_sharing_mode(&row, sharing_mode).await?;
 
         let team = Team {
             id: team_id,
@@ -867,7 +898,7 @@ impl TeamSessionService {
         info!(
             team_id = %team.id,
             workspace_source = if shared_workspace.is_some() {
-                "user_supplied"
+                "explicit_team_workspace"
             } else {
                 "auto_from_leader"
             },
@@ -877,15 +908,45 @@ impl TeamSessionService {
 
         self.broadcast_team_created(user_id, &team.id, &team.name);
 
-        self.build_team_response(user_id, &team).await
+        self.build_team_response_for_access(
+            user_id,
+            &team,
+            req.sharing_mode,
+            aionui_api_types::TeamAccessRole::Owner,
+        )
+        .await
     }
 
     pub async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamResponse>, TeamError> {
-        let rows = self.repo.list_teams_by_user(user_id).await?;
+        let mut rows = self.repo.list_teams_by_user(user_id).await?;
+        let mut team_ids: HashSet<String> = rows.iter().map(|row| row.id.clone()).collect();
+        for row in self.repo.list_teams_by_member(user_id).await? {
+            if team_ids.insert(row.id.clone()) {
+                rows.push(row);
+            }
+        }
         let mut teams = Vec::with_capacity(rows.len());
         for row in &rows {
+            let Some(role) = self.repo.team_access_role(&row.id, user_id).await? else {
+                continue;
+            };
+            let sharing_mode = self.repo.get_team_sharing_mode(&row.id).await?;
             match Team::from_row(row) {
-                Ok(team) => match self.build_team_response(user_id, &team).await {
+                Ok(team) => match self
+                    .build_team_response_for_access(
+                        &row.user_id,
+                        &team,
+                        match sharing_mode {
+                            TeamSharingMode::Private => aionui_api_types::TeamSharingMode::Private,
+                            TeamSharingMode::Shared => aionui_api_types::TeamSharingMode::Shared,
+                        },
+                        match role {
+                            TeamAccessRole::Owner => aionui_api_types::TeamAccessRole::Owner,
+                            TeamAccessRole::Collaborator => aionui_api_types::TeamAccessRole::Collaborator,
+                        },
+                    )
+                    .await
+                {
                     Ok(resp) => teams.push(resp),
                     Err(e) => {
                         tracing::warn!(team_id = %row.id, error = %e, "skipping team with build error");
@@ -899,20 +960,37 @@ impl TeamSessionService {
         Ok(teams)
     }
 
-    /// Eligible-account discovery is unavailable until the host's live account
-    /// configuration is exposed through a trusted server-side adapter. Do not
-    /// substitute persisted auth projections: those can be stale or incomplete.
     pub async fn list_eligible_collaborators(
         &self,
         owner_user_id: &str,
+        team_id: &str,
     ) -> Result<Vec<EligibleTeamCollaboratorResponse>, TeamError> {
-        let teams = self.repo.list_teams_by_user(owner_user_id).await?;
-        for team in teams {
-            if self.repo.get_team_sharing_mode(&team.id).await? == TeamSharingMode::Shared {
-                return Err(TeamError::CollaboratorAccountsUnavailable);
-            }
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        Ok(Vec::new())
+        let now = now_ms();
+        self.eligible_account_refs
+            .retain(|_, value| value.expires_at > now);
+        let candidates = self.repo.list_eligible_team_users(owner_user_id, team_id).await?;
+        let mut responses = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let account_ref = generate_id_with_length(Some(64));
+            self.eligible_account_refs.insert(
+                account_ref.clone(),
+                EligibleAccountRef {
+                    owner_user_id: owner_user_id.to_owned(),
+                    team_id: team_id.to_owned(),
+                    user_id: candidate.user_id,
+                    expires_at: now.saturating_add(ELIGIBLE_ACCOUNT_REF_TTL_MS),
+                },
+            );
+            responses.push(EligibleTeamCollaboratorResponse {
+                account_ref,
+                display_name: candidate.display_name,
+            });
+        }
+        Ok(responses)
     }
 
     /// Lists active collaborators without exposing internal user identifiers.
@@ -936,8 +1014,6 @@ impl TeamSessionService {
             .collect())
     }
 
-    /// Adds by opaque account reference only. This remains fail-closed until
-    /// host account eligibility and reference revalidation are wired.
     pub async fn add_team_member(
         &self,
         owner_user_id: &str,
@@ -951,7 +1027,27 @@ impl TeamSessionService {
         if account_ref.trim().is_empty() {
             return Err(TeamError::InvalidRequest("account_ref is required".into()));
         }
-        Err(TeamError::CollaboratorAccountsUnavailable)
+        let candidate = self
+            .eligible_account_refs
+            .get(account_ref)
+            .map(|entry| entry.value().clone())
+            .filter(|entry| {
+                entry.owner_user_id == owner_user_id
+                    && entry.team_id == team_id
+                    && entry.expires_at > now_ms()
+            })
+            .ok_or_else(|| TeamError::TeamNotFound("eligible collaborator account".into()))?;
+        self.repo
+            .add_team_member(&aionui_db::models::TeamMembershipRow {
+                membership_ref: generate_id(),
+                team_id: team_id.to_owned(),
+                user_id: candidate.user_id,
+                display_name: None,
+                created_at: now_ms(),
+            })
+            .await?;
+        self.eligible_account_refs.remove(account_ref);
+        Ok(())
     }
 
     /// Revokes by server-issued membership reference after an owner-scoped check.
@@ -975,17 +1071,32 @@ impl TeamSessionService {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
-        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
         // Project-bind side branch: lazily backfill binding only when a single
         // team is opened (never during list_teams / lease renew).
-        self.backfill_team_binding_best_effort(&row).await;
-        let team = Team::from_row(&row)?;
+        if access.role == TeamAccessRole::Owner {
+            self.backfill_team_binding_best_effort(&access.team).await;
+        }
+        let sharing_mode = self.repo.get_team_sharing_mode(team_id).await?;
+        let team = Team::from_row(&access.team)?;
         // Deliberately does NOT reconcile legacy model facts. That repair reads
         // three extra tables PER MEMBER, and this is a plain read endpoint the
         // frontend hits whenever a team is opened. Session start owns the repair
         // (`ensure_session`), which is the point where a stale roster would
         // actually feed a rebuilt runtime.
-        self.build_team_response(user_id, &team).await
+        self.build_team_response_for_access(
+            &access.execution_owner_id,
+            &team,
+            match sharing_mode {
+                TeamSharingMode::Private => aionui_api_types::TeamSharingMode::Private,
+                TeamSharingMode::Shared => aionui_api_types::TeamSharingMode::Shared,
+            },
+            match access.role {
+                TeamAccessRole::Owner => aionui_api_types::TeamAccessRole::Owner,
+                TeamAccessRole::Collaborator => aionui_api_types::TeamAccessRole::Collaborator,
+            },
+        )
+        .await
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
@@ -3594,7 +3705,9 @@ mod tests {
     }
 
     fn two_agent_team_request(name: &str) -> aionui_api_types::CreateTeamRequest {
+        sharing_mode: Default::default(),
         aionui_api_types::CreateTeamRequest {
+            sharing_mode: Default::default(),
             name: name.into(),
             agents: vec![
                 aionui_api_types::TeamAgentInput {
@@ -3619,6 +3732,7 @@ mod tests {
     }
 
     fn team_with_aionrs_worker_request(name: &str) -> aionui_api_types::CreateTeamRequest {
+        sharing_mode: Default::default(),
         let mut request = two_agent_team_request(name);
         request.agents.push(aionui_api_types::TeamAgentInput {
             name: "Butler".into(),

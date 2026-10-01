@@ -203,6 +203,38 @@ async fn cannot_add_member_to_private_team_or_disabled_account() {
 }
 
 #[tokio::test]
+async fn eligible_team_users_exclude_owner_members_existing_members_and_disabled_rows() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let owner = users.create_user("team-owner", "owner-hash").await.unwrap();
+    let existing = users.create_user("existing-member", "existing-hash").await.unwrap();
+    let eligible = users.create_user("eligible-member", "eligible-hash").await.unwrap();
+    let disabled = users.create_user("disabled-member", "disabled-hash").await.unwrap();
+    users
+        .set_status(&disabled.id, aionui_db::models::UserStatus::Disabled)
+        .await
+        .unwrap();
+    let team = make_team_for_user("eligible-team", &owner.id, "Eligible Team");
+    repo.create_team_with_sharing_mode(&team, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    repo.add_team_member(&TeamMembershipRow {
+        membership_ref: "existing-membership-ref".into(),
+        team_id: team.id.clone(),
+        user_id: existing.id,
+        display_name: None,
+        created_at: now_ms(),
+    })
+    .await
+    .unwrap();
+
+    let candidates = repo.list_eligible_team_users(&owner.id, &team.id).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].user_id, eligible.id);
+    assert_eq!(candidates[0].display_name, "eligible-member");
+}
+
+#[tokio::test]
 async fn get_nonexistent_team_returns_none() {
     let (repo, _db) = repo().await;
     let result = repo.get_team("system_default_user", "nonexistent").await.unwrap();

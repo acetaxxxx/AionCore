@@ -304,6 +304,8 @@ impl Team {
             workspace: self.workspace.clone(),
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
+            sharing_mode: aionui_api_types::TeamSharingMode::Private,
+            role: aionui_api_types::TeamAccessRole::Owner,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }

@@ -2,7 +2,9 @@ use aionui_common::now_ms;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
+use crate::models::{
+    EligibleTeamUserRow, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow,
+};
 use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
@@ -83,11 +85,35 @@ impl ITeamRepository for SqliteTeamRepository {
         .map_err(Into::into)
     }
 
+    async fn list_eligible_team_users(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+    ) -> Result<Vec<EligibleTeamUserRow>, DbError> {
+        sqlx::query_as::<_, EligibleTeamUserRow>(
+            "SELECT u.id AS user_id, u.username AS display_name FROM users u \
+             WHERE u.status = 'active' AND u.username IS NOT NULL AND trim(u.username) <> '' \
+             AND u.id <> ? AND u.id <> 'system_default_user' \
+             AND EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ? AND t.sharing_mode = 'shared') \
+             AND NOT EXISTS (SELECT 1 FROM team_memberships m WHERE m.team_id = ? AND m.user_id = u.id) \
+             ORDER BY u.username COLLATE NOCASE, u.id",
+        )
+        .bind(owner_user_id)
+        .bind(team_id)
+        .bind(owner_user_id)
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     async fn add_team_member(&self, row: &TeamMembershipRow) -> Result<(), DbError> {
         let result = sqlx::query(
             "INSERT INTO team_memberships (membership_ref, team_id, user_id, created_at) \
              SELECT ?, t.id, u.id, ? FROM teams t JOIN users u ON u.id = ? \
-             WHERE t.id = ? AND t.sharing_mode = 'shared' AND u.status = 'active' AND u.id <> t.user_id",
+             WHERE t.id = ? AND t.sharing_mode = 'shared' AND u.status = 'active' \
+             AND u.id <> t.user_id AND u.id <> 'system_default_user' \
+             AND NOT EXISTS (SELECT 1 FROM team_memberships m WHERE m.team_id = t.id AND m.user_id = u.id)",
         )
         .bind(&row.membership_ref)
         .bind(row.created_at)

@@ -28,7 +28,7 @@ pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
     ExternalUserProjection, FolderRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
-    SkillImportRecordRow, SkillRow, TeamAccessRole, TeamMembershipRow, TeamSharingMode,
+    EligibleTeamUserRow, SkillImportRecordRow, SkillRow, TeamAccessRole, TeamMembershipRow, TeamSharingMode,
     UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
     UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserOrderRow,

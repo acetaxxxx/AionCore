@@ -108,6 +108,8 @@ pub struct CreateTeamRequest {
     pub agents: Vec<TeamAgentInput>,
     #[serde(default)]
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub sharing_mode: TeamSharingMode,
 }
 
 /// A selectable host account represented by a server-issued opaque reference.
@@ -610,6 +612,23 @@ pub struct TeamAgentResponse {
     pub context_reset: TeamContextResetCapability,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TeamSharingMode {
+    #[default]
+    Private,
+    Shared,
+}
+
+/// Caller's authorization role on a Team.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TeamAccessRole {
+    #[default]
+    Owner,
+    Collaborator,
+}
+
 /// Full team response returned by create, get, and list endpoints.
 ///
 /// Corresponds to the `TTeam` shared type in the API Spec.
@@ -623,6 +642,10 @@ pub struct TeamResponse {
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
     pub leader_assistant_id: Option<String>,
+    #[serde(default)]
+    pub sharing_mode: TeamSharingMode,
+    #[serde(default)]
+    pub role: TeamAccessRole,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -894,6 +917,21 @@ mod tests {
             json!({"account_ref":"acct_opaque", "user_id":"caller-chosen"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn create_team_sharing_mode_defaults_private_and_accepts_explicit_shared() {
+        let request = json!({
+            "name": "Family Team",
+            "agents": [{"name": "Lead", "role": "lead", "model": "model-1", "assistant_id": "assistant-1"}]
+        });
+        let private: CreateTeamRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(private.sharing_mode, TeamSharingMode::Private);
+
+        let mut shared_request = request;
+        shared_request["sharing_mode"] = json!("shared");
+        let shared: CreateTeamRequest = serde_json::from_value(shared_request).unwrap();
+        assert_eq!(shared.sharing_mode, TeamSharingMode::Shared);
     }
 
     // -- Unified team activity feed -------------------------------------------
@@ -1339,6 +1377,8 @@ mod tests {
                 },
             }],
             leader_assistant_id: Some("slot-1".into()),
+            sharing_mode: TeamSharingMode::Private,
+            role: TeamAccessRole::Owner,
             created_at: 1700000000000,
             updated_at: 1700001000000,
         };
@@ -1347,6 +1387,8 @@ mod tests {
         assert_eq!(json["name"], "Alpha");
         assert_eq!(json["workspace"], "/workspace/team-1");
         assert_eq!(json["leader_assistant_id"], "slot-1");
+        assert_eq!(json["sharing_mode"], "private");
+        assert_eq!(json["role"], "owner");
         assert_eq!(json["created_at"], 1700000000000_i64);
         assert_eq!(json["updated_at"], 1700001000000_i64);
         assert_eq!(json["assistants"].as_array().unwrap().len(), 1);
@@ -1361,6 +1403,8 @@ mod tests {
             workspace: String::new(),
             assistants: vec![],
             leader_assistant_id: None,
+            sharing_mode: TeamSharingMode::Private,
+            role: TeamAccessRole::Owner,
             created_at: 1700000000000,
             updated_at: 1700000000000,
         };
@@ -1511,6 +1555,8 @@ mod tests {
                 },
             ],
             leader_assistant_id: Some("s1".into()),
+            sharing_mode: TeamSharingMode::Private,
+            role: TeamAccessRole::Owner,
             created_at: 1000,
             updated_at: 2000,
         };

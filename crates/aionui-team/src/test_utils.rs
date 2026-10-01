@@ -1060,6 +1060,12 @@ pub(crate) mod workspace_harness {
             Ok(path.to_string_lossy().into_owned())
         }
 
+        async fn create_shared_team_workspace(&self, team_id: &str) -> Result<String, TeamError> {
+            let path = self.workspace_root.join("teams").join(team_id);
+            std::fs::create_dir_all(&path).unwrap();
+            Ok(path.to_string_lossy().into_owned())
+        }
+
         async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError> {
             let mut extra = self
                 .repo
@@ -1782,7 +1788,9 @@ pub(crate) mod workspace_harness {
     }
 
     pub(crate) fn single_agent_team_request(name: &str) -> CreateTeamRequest {
+        sharing_mode: Default::default(),
         CreateTeamRequest {
+            sharing_mode: Default::default(),
             name: name.into(),
             agents: vec![aionui_api_types::TeamAgentInput {
                 name: "Lead".into(),

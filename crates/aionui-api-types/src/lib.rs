@@ -199,7 +199,8 @@ pub use team::{
     AddAgentRequest, AddTeamMemberRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     EligibleTeamCollaboratorResponse, InterruptTeamAgentRequest,
     PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
-    TeamActivityCursor, TeamActivityItemResponse, TeamActivityKind, TeamActivityPageResponse, TeamAgentInput,
+    TeamAccessRole, TeamActivityCursor, TeamActivityItemResponse, TeamActivityKind, TeamActivityPageResponse,
+    TeamAgentInput,
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
     TeamContextResetAvailability, TeamContextResetCapability, TeamContextResetNotice, TeamContextResetResponse,
@@ -210,7 +211,8 @@ pub use team::{
     TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed,
     TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
     TeamSlotBlockedReason, TeamSlotWorkChangedPayload, TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange,
-    TeamTaskChangedPayload, TeamTaskResponse, TeammateMessagePayload, assistant_mcp_binding_fingerprint,
+    TeamSharingMode, TeamTaskChangedPayload, TeamTaskResponse, TeammateMessagePayload,
+    assistant_mcp_binding_fingerprint,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{

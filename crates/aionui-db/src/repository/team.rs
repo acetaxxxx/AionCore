@@ -1,5 +1,7 @@
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
+use crate::models::{
+    EligibleTeamUserRow, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow,
+};
 
 /// Sort/paging direction for the activity feed cursor queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +79,16 @@ pub trait ITeamRepository: Send + Sync {
         Err(DbError::Init("Team membership persistence is unavailable".into()))
     }
 
+    /// Lists active account rows eligible for a specific owned Shared Team.
+    /// The returned user IDs are internal and must not be exposed to clients.
+    async fn list_eligible_team_users(
+        &self,
+        _owner_user_id: &str,
+        _team_id: &str,
+    ) -> Result<Vec<EligibleTeamUserRow>, DbError> {
+        Err(DbError::Init("eligible Team account lookup is unavailable".into()))
+    }
+
     /// Creates an active membership using a server-generated opaque reference.
     async fn add_team_member(&self, _row: &TeamMembershipRow) -> Result<(), DbError> {
         Err(DbError::Init("Team membership persistence is unavailable".into()))
@@ -94,7 +106,8 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Lists active Teams where `user_id` is a collaborator.
     async fn list_teams_by_member(&self, _user_id: &str) -> Result<Vec<TeamRow>, DbError> {
-        Err(DbError::Init("Team membership persistence is unavailable".into()))
+        // Compatibility default for private-only repository implementations.
+        Ok(Vec::new())
     }
 
     /// Returns the caller's current role, with owner precedence over membership.

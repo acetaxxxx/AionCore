@@ -105,6 +105,18 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
 
+    /// Creates the dedicated workspace for a Shared Team. Implementations must
+    /// not fall back to the owner's conversation workspace.
+    async fn create_shared_team_workspace(&self, _team_id: &str) -> Result<String, TeamError> {
+        Err(TeamError::WorkspacePathUnavailable(
+            "Shared Team workspace provisioning is unavailable".into(),
+        ))
+    }
+
+    async fn is_shared_team_workspace(&self, _team_id: &str, _workspace: &str) -> Result<bool, TeamError> {
+        Ok(false)
+    }
+
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
 
     async fn persist_confirmed_model(&self, conversation_id: &str, model: &str) -> Result<(), TeamError> {
@@ -367,7 +379,7 @@ impl TeamAgentProvisioner {
             team_id,
             count = agents.len(),
             workspace_source = if shared_workspace.is_some() {
-                "user_supplied"
+                "explicit_team_workspace"
             } else {
                 "auto_from_leader"
             },
@@ -1070,6 +1082,10 @@ mod tests {
 
         async fn create_team_temp_workspace(&self, _user_id: &str, _team_id: &str) -> Result<String, TeamError> {
             Err(TeamError::InvalidRequest("unused".into()))
+        }
+
+        async fn create_shared_team_workspace(&self, team_id: &str) -> Result<String, TeamError> {
+            Ok(format!("/tmp/teams/{team_id}"))
         }
 
         async fn patch_runtime_config(

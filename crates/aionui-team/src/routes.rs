@@ -250,9 +250,21 @@ pub fn team_routes(state: TeamRouterState) -> Router {
 async fn list_eligible_collaborators(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
+    Query(query): Query<EligibleCollaboratorQuery>,
 ) -> Result<Json<ApiResponse<Vec<EligibleTeamCollaboratorResponse>>>, ApiError> {
-    let accounts = state.service.list_eligible_collaborators(&user.id).await?;
+    let team_id = query
+        .team_id
+        .ok_or_else(|| ApiError::BadRequest("team_id is required".into()))?;
+    let accounts = state
+        .service
+        .list_eligible_collaborators(&user.id, &team_id)
+        .await?;
     Ok(Json(ApiResponse::ok(accounts)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EligibleCollaboratorQuery {
+    team_id: Option<String>,
 }
 
 async fn list_team_members(
