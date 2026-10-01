@@ -511,7 +511,7 @@ async fn send_message(
     let Json(req) = body.map_err(ApiError::from)?;
     let ack = state
         .service
-        .send_message(&user.id, &id, &req.content, req.files)
+        .send_message_with_local_admin(&user.id, user.is_local_admin(), &id, &req.content, req.files)
         .await?;
     Ok(Json(ApiResponse::ok(ack)))
 }
@@ -525,7 +525,14 @@ async fn send_message_to_agent(
     let Json(req) = body.map_err(ApiError::from)?;
     let ack = state
         .service
-        .send_message_to_agent(&user.id, &params.id, &params.slot_id, &req.content, req.files)
+        .send_message_to_agent_with_local_admin(
+            &user.id,
+            user.is_local_admin(),
+            &params.id,
+            &params.slot_id,
+            &req.content,
+            req.files,
+        )
         .await?;
     Ok(Json(ApiResponse::ok(ack)))
 }
@@ -539,7 +546,7 @@ async fn interrupt_agent(
     let Json(req) = body.map_err(ApiError::from)?;
     let response = state
         .service
-        .interrupt_agent(&user.id, &params.id, &params.slot_id, req)
+        .interrupt_agent_with_local_admin(&user.id, user.is_local_admin(), &params.id, &params.slot_id, req)
         .await?;
     Ok(Json(ApiResponse::ok(response)))
 }

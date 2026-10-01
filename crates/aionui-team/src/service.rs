@@ -2499,9 +2499,23 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_with_local_admin(user_id, user_id == "system_default_user", team_id, content, files)
+            .await
+    }
+
+    pub async fn send_message_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        team_id: &str,
+        content: &str,
+        files: Option<Vec<ChatFileRef>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
+        let (content, files) = self
+            .resolve_message_attachments(user_id, is_local_admin, content, files)
+            .await?;
         let session = self.published_session(team_id)?;
         session.send_message(&content, files).await
     }
@@ -2514,9 +2528,31 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_to_agent_with_local_admin(
+            user_id,
+            user_id == "system_default_user",
+            team_id,
+            slot_id,
+            content,
+            files,
+        )
+        .await
+    }
+
+    pub async fn send_message_to_agent_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        team_id: &str,
+        slot_id: &str,
+        content: &str,
+        files: Option<Vec<ChatFileRef>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
+        let (content, files) = self
+            .resolve_message_attachments(user_id, is_local_admin, content, files)
+            .await?;
         let session = self.published_session(team_id)?;
         session.send_message_to_agent(slot_id, &content, files).await
     }
@@ -2528,10 +2564,22 @@ impl TeamSessionService {
         slot_id: &str,
         request: InterruptTeamAgentRequest,
     ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.interrupt_agent_with_local_admin(user_id, user_id == "system_default_user", team_id, slot_id, request)
+            .await
+    }
+
+    pub async fn interrupt_agent_with_local_admin(
+        &self,
+        user_id: &str,
+        is_local_admin: bool,
+        team_id: &str,
+        slot_id: &str,
+        request: InterruptTeamAgentRequest,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (message, files) = self
-            .resolve_message_attachments(user_id, &request.message, request.files)
+            .resolve_message_attachments(user_id, is_local_admin, &request.message, request.files)
             .await?;
         self.published_session(team_id)?
             .interrupt_agent_from_user(slot_id, &message, files, request.reason, request.queued_policy)
@@ -2571,6 +2619,7 @@ impl TeamSessionService {
     async fn resolve_message_attachments(
         &self,
         user_id: &str,
+        is_local_admin: bool,
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<(String, Option<Vec<String>>), TeamError> {
@@ -2588,9 +2637,14 @@ impl TeamSessionService {
             })?;
         let upload_root = std::env::temp_dir().join("aionui");
         let resolved = project
-            .resolve_chat_message(user_id, content, &files, &upload_root)
+            .resolve_chat_message_with_local_admin(user_id, is_local_admin, content, &files, &upload_root)
             .await
-            .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
+            .map_err(|err| match err {
+                aionui_project::ProjectError::LocalPathForbidden => {
+                    TeamError::Forbidden("local file access is not authorized".to_owned())
+                }
+                err => TeamError::InvalidRequest(err.to_string()),
+            })?;
         Ok((resolved.content, Some(resolved.files)))
     }
 

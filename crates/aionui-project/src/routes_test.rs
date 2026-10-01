@@ -103,6 +103,15 @@ async fn local_path_not_readable_maps_to_400_with_stable_code() {
 }
 
 #[tokio::test]
+async fn unauthorized_local_path_maps_to_403_without_path_details() {
+    let (status, body) = map_error(ProjectError::LocalPathForbidden).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "local_path_forbidden");
+    assert_eq!(body["success"], false);
+    assert!(body["details"].is_null());
+}
+
+#[tokio::test]
 async fn upload_path_outside_root_maps_to_400_with_stable_code() {
     let (status, body) = map_error(ProjectError::UploadPathOutsideRoot {
         path: "/outside/root".into(),

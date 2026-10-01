@@ -182,6 +182,9 @@ pub enum ProjectError {
     #[error("local file path is not a readable file: {path}")]
     LocalPathNotReadable { path: String },
 
+    #[error("local file access is not authorized")]
+    LocalPathForbidden,
+
     #[error(transparent)]
     Database(#[from] DbError),
 }
@@ -209,6 +212,7 @@ impl ProjectError {
             ProjectError::UploadPathOutsideRoot { .. } => "upload_path_outside_root",
             ProjectError::ChatFileMissing { .. } => "chat_file_missing",
             ProjectError::LocalPathNotReadable { .. } => "local_path_not_readable",
+            ProjectError::LocalPathForbidden => "local_path_forbidden",
             ProjectError::Database(_) => "internal_db_error",
         }
     }

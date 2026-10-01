@@ -2,7 +2,7 @@
 //!
 //! Covers test-plan items:
 //! - AU-1/AU-2: Unauthenticated access rejected
-//! - DC-1/DC-4/DC-9: Document conversion (Excel→JSON, file not found, invalid target)
+//! - DC-1/DC-4/DC-5/DC-9: Document conversion (Excel→JSON, tenant path privacy, invalid target)
 //! - RP-2/RP-4: Proxy SSRF protection (inactive port rejected)
 //! - WP-4: Word preview start when officecli not available
 //!
@@ -52,6 +52,17 @@ async fn build_office_app_with_roots(
 
     let router = create_router_with_states(&services, states);
     (router, services, tmp)
+}
+
+fn assert_local_path_forbidden(status: StatusCode, body: serde_json::Value, path: &std::path::Path) {
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["error"], "Forbidden.");
+    assert!(
+        !serde_json::to_string(&body)
+            .unwrap()
+            .contains(&path.to_string_lossy().to_string())
+    );
 }
 
 fn build_test_office_state(
@@ -153,8 +164,16 @@ async fn au2_unauthenticated_all_office_endpoints() {
 async fn wp4_word_preview_officecli_not_available() {
     let (mut app, services, tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
 
-    let file_path = tmp.path().join("test.docx");
+    let file_path = tmp
+        .path()
+        .join("conversations")
+        .join("users")
+        .join(user_id)
+        .join("office")
+        .join("test.docx");
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, b"docx").unwrap();
 
     let body = json!({"file_path": file_path.to_str().unwrap()});
@@ -170,7 +189,7 @@ async fn wp4_word_preview_officecli_not_available() {
 }
 
 #[tokio::test]
-async fn wp5_word_preview_with_workspace_accepts_non_sandbox_path() {
+async fn wp5_word_preview_with_workspace_rejects_path_outside_user_data() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.docx");
@@ -186,14 +205,13 @@ async fn wp5_word_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/word-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_local_path_forbidden(status, body, &file_path);
 }
 
 #[tokio::test]
-async fn wp6_word_preview_without_workspace_rejects_non_sandbox_path() {
+async fn wp6_word_preview_without_workspace_rejects_path_outside_user_data() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.docx");
@@ -208,13 +226,13 @@ async fn wp6_word_preview_without_workspace_rejects_non_sandbox_path() {
     let req = json_with_token("POST", "/api/word-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let json = body_json(resp).await;
-    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_local_path_forbidden(status, body, &file_path);
 }
 
 #[tokio::test]
-async fn ep1_excel_preview_with_workspace_accepts_non_sandbox_path() {
+async fn ep1_excel_preview_with_workspace_rejects_path_outside_user_data() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.xlsx");
@@ -230,14 +248,13 @@ async fn ep1_excel_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/excel-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_local_path_forbidden(status, body, &file_path);
 }
 
 #[tokio::test]
-async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
+async fn pp1_ppt_preview_with_workspace_rejects_path_outside_user_data() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.pptx");
@@ -253,10 +270,9 @@ async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/ppt-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_local_path_forbidden(status, body, &file_path);
 }
 
 // ── SO-1: Star Office detect route removed ───────────────────────────
@@ -293,8 +309,16 @@ async fn so2_detect_route_removed_with_preferred_url() {
 async fn dc1_excel_to_json() {
     let (mut app, services, tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
 
-    let xlsx_path = tmp.path().join("test.xlsx");
+    let xlsx_path = tmp
+        .path()
+        .join("conversations")
+        .join("users")
+        .join(user_id)
+        .join("office")
+        .join("test.xlsx");
+    std::fs::create_dir_all(xlsx_path.parent().unwrap()).unwrap();
     create_test_xlsx(&xlsx_path);
 
     let body = json!({
@@ -316,34 +340,47 @@ async fn dc1_excel_to_json() {
     assert!(sheets[0]["data"].is_array());
 }
 
-// ── DC-4: Excel → JSON (file not found) ─────────────────────────────
+// ── DC-4: Excel → JSON (missing other-tenant path stays private) ────
 
 #[tokio::test]
-async fn dc4_excel_file_not_found() {
-    let (mut app, services, _tmp) = build_office_app().await;
+async fn dc4_excel_missing_other_tenant_file_is_forbidden() {
+    let (mut app, services, tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let path = tmp
+        .path()
+        .join("conversations")
+        .join("users")
+        .join("another-user")
+        .join("missing.xlsx");
 
     let body = json!({
-        "file_path": "/nonexistent/file.xlsx",
+        "file_path": path.to_str().unwrap(),
         "to": "excel-json"
     });
     let req = json_with_token("POST", "/api/document/convert", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let status = resp.status();
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "BAD_REQUEST");
+    assert_local_path_forbidden(status, json, &path);
 }
 
 #[tokio::test]
-async fn dc5_document_convert_rejects_outside_sandbox() {
-    let sandbox = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    let xlsx_path = outside.path().join("test.xlsx");
+async fn dc5_document_convert_rejects_other_tenant_path_under_allowed_root() {
+    let (mut app, services, tmp) = build_office_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user6", "pass123").await;
+    let user_id = services.user_repo.find_by_username("user6").await.unwrap().unwrap().id;
+    let other_user_id = "another-user";
+    let xlsx_path = tmp
+        .path()
+        .join("conversations")
+        .join("users")
+        .join(other_user_id)
+        .join("test.xlsx");
+    std::fs::create_dir_all(xlsx_path.parent().unwrap()).unwrap();
     create_test_xlsx(&xlsx_path);
 
-    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user6", "pass123").await;
+    assert_ne!(user_id, other_user_id);
 
     let body = json!({
         "file_path": xlsx_path.to_str().unwrap(),
@@ -352,9 +389,9 @@ async fn dc5_document_convert_rejects_outside_sandbox() {
     let req = json_with_token("POST", "/api/document/convert", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let status = resp.status();
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
+    assert_local_path_forbidden(status, json, &xlsx_path);
 }
 
 // ── DC-9: Invalid conversion target ─────────────────────────────────

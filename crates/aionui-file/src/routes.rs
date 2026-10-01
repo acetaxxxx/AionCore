@@ -392,6 +392,9 @@ fn chat_file_resolve_error(err: aionui_project::ProjectError) -> ApiError {
     tracing::warn!(target: "chat_file", error = %err, code, "could not resolve chat file reference");
     match err {
         aionui_project::ProjectError::Database(_) => ApiError::Internal("failed to resolve target".to_owned()),
+        aionui_project::ProjectError::LocalPathForbidden => {
+            ApiError::Forbidden("local file access is not authorized".to_owned())
+        }
         _ => ApiError::coded(
             axum::http::StatusCode::NOT_FOUND,
             "FILE_NOT_FOUND",
@@ -433,8 +436,9 @@ async fn open_system_file(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
+        .resolve_chat_file_ref_with_local_admin(
             &user.id,
+            user.is_local_admin(),
             &req.file,
             &content_upload_root(),
             aionui_project::FileOp::Read,
@@ -478,8 +482,9 @@ async fn read_content(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
+        .resolve_chat_file_ref_with_local_admin(
             &user.id,
+            user.is_local_admin(),
             &req.file,
             &content_upload_root(),
             aionui_project::FileOp::Read,
@@ -507,8 +512,9 @@ async fn write_content(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
+        .resolve_chat_file_ref_with_local_admin(
             &user.id,
+            user.is_local_admin(),
             &req.file,
             &content_upload_root(),
             aionui_project::FileOp::Write,
@@ -542,8 +548,9 @@ async fn content_metadata(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
+        .resolve_chat_file_ref_with_local_admin(
             &user.id,
+            user.is_local_admin(),
             &req.file,
             &content_upload_root(),
             aionui_project::FileOp::Read,
@@ -574,8 +581,9 @@ async fn stream_file(
         .map_err(|m| ApiError::BadRequest(m.to_owned()))?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
+        .resolve_chat_file_ref_with_local_admin(
             &user.id,
+            user.is_local_admin(),
             &file_ref,
             &content_upload_root(),
             aionui_project::FileOp::Read,
@@ -695,12 +703,31 @@ async fn get_image_base64(
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     crate::tenant_guard::validate_tenant_path(&user, &req.path)?;
-    if let Some(ws) = req.workspace.as_deref() {
-        crate::tenant_guard::validate_tenant_path(&user, ws)?;
-    }
+    let path = state
+        .project
+        .resolve_chat_file_ref_with_local_admin(
+            &user.id,
+            user.is_local_admin(),
+            &aionui_api_types::ChatFileRef::Local { path: req.path },
+            &content_upload_root(),
+            aionui_project::FileOp::Read,
+        )
+        .await
+        .map_err(chat_file_resolve_error)?;
+    let workspace = req
+        .workspace
+        .as_deref()
+        .map(|workspace| {
+            crate::tenant_guard::validate_tenant_path(&user, workspace)?;
+            state
+                .project
+                .authorize_local_workspace_with_local_admin(&user.id, user.is_local_admin(), Path::new(workspace))
+                .map_err(chat_file_resolve_error)
+        })
+        .transpose()?;
     let data_url = state
         .file_service
-        .get_image_base64(&req.path, req.workspace.as_deref().map(Path::new))
+        .get_image_base64(&path, workspace.as_deref().map(Path::new))
         .await?;
     Ok(Json(ApiResponse::ok(data_url)))
 }
@@ -1205,15 +1232,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chat_file_resolve_error_denies_unauthorized_local_paths_without_echoing_them() {
+        let api_err = chat_file_resolve_error(aionui_project::ProjectError::LocalPathForbidden);
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(api_err.error_code(), "FORBIDDEN");
+        assert_eq!(api_err.public_message(), "Forbidden.");
+        assert!(api_err.error_details().is_none());
+    }
+
     /// Every `ChatFileRef`-addressed handler must route its resolver failure through
     /// [`chat_file_resolve_error`], not the shared `From<ProjectError>` mapping.
     ///
-    /// Asserted against the source text because the alternative — spinning up five
+    /// Asserted against the source text because the alternative — spinning up six
     /// authenticated handlers with a real `ProjectService` — would not actually pin
     /// this: the wiring is a single `map_err` per handler, and a future edit swapping
     /// one back to `ApiError::from` is exactly the regression worth catching. The
-    /// count guards against a sixth such endpoint being added without a decision:
-    /// bump it deliberately, having checked the new one addresses files by identity.
+    /// The six call sites cover content read/write, metadata, stream, open-system,
+    /// and the legacy image-base64 route. The count guards against another resolver
+    /// call being added without a decision: bump it deliberately after checking the
+    /// new call is sealed as well.
     #[test]
     fn every_chat_file_ref_endpoint_uses_the_sealed_resolver_mapping() {
         // Scan handler code only. This test module mentions both needles in its own
@@ -1224,14 +1262,15 @@ mod tests {
             .map(|(before, _)| before)
             .expect("routes.rs has a #[cfg(test)] module");
 
-        let resolve_calls = handlers.matches(".resolve_chat_file_ref(").count();
+        let resolve_calls = handlers.matches(".resolve_chat_file_ref(").count()
+            + handlers.matches(".resolve_chat_file_ref_with_local_admin(").count();
         let sealed = handlers.matches(".map_err(chat_file_resolve_error)?").count();
 
         assert_eq!(
-            resolve_calls, 5,
-            "expected 5 ChatFileRef-addressed endpoints (content read/write, metadata, stream, \
-             open-system); found {resolve_calls} — a new one must be checked for identity \
-             addressing and sealed before bumping this"
+            resolve_calls, 6,
+            "expected 6 sealed ChatFileRef resolver call sites (content read/write, metadata, \
+             stream, open-system, legacy image-base64); found {resolve_calls} — a new one must \
+             be checked before bumping this"
         );
         assert_eq!(
             sealed, resolve_calls,

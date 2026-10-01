@@ -318,7 +318,8 @@ impl AppServices {
         // `resolve_existing` classifies auto workspaces as temp and
         // user-picked directories as standard.
         let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
-        let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
+        let project_service =
+            ProjectService::new(project_store, work_dir.join("conversations")).with_user_data_root(data_dir.clone());
 
         // Sidebar ordering store (`user_order` table). Built early so it can be
         // shared by the conversation delete hook, the team service, and the
