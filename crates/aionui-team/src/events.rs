@@ -547,6 +547,7 @@ mod tests {
                 id: "m1".into(),
                 team_id: "team-1".into(),
                 from_agent_id: "a2".into(),
+                actor_user_id: None,
                 to_agent_id: "a1".into(),
                 msg_type: "message".into(),
                 content: "hi".into(),

@@ -78,6 +78,9 @@ pub struct MailboxMessageRow {
     pub team_id: String,
     pub to_agent_id: String,
     pub from_agent_id: String,
+    /// Authenticated human actor for direct user messages; execution remains
+    /// owned by the Team owner. Null for existing rows and agent-originated events.
+    pub actor_user_id: Option<String>,
     /// Message type: 'message', 'idle_notification', or 'shutdown_request'.
     #[sqlx(rename = "type")]
     pub msg_type: String,
@@ -144,6 +147,7 @@ mod tests {
             team_id: "t1".into(),
             to_agent_id: "a1".into(),
             from_agent_id: "a2".into(),
+            actor_user_id: None,
             msg_type: "message".into(),
             content: "hello".into(),
             summary: None,

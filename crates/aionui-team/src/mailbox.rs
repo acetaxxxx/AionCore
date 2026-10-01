@@ -63,6 +63,22 @@ impl Mailbox {
         summary: Option<&str>,
         files: Option<&[String]>,
     ) -> Result<MailboxMessage, TeamError> {
+        self.write_as_actor_with_files(team_id, to_agent_id, from_agent_id, None, msg_type, content, summary, files)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_as_actor_with_files(
+        &self,
+        team_id: &str,
+        to_agent_id: &str,
+        from_agent_id: &str,
+        actor_user_id: Option<&str>,
+        msg_type: MailboxMessageType,
+        content: &str,
+        summary: Option<&str>,
+        files: Option<&[String]>,
+    ) -> Result<MailboxMessage, TeamError> {
         let files_json = files
             .filter(|f| !f.is_empty())
             .map(|f| serde_json::to_string(f).unwrap_or_default());
@@ -71,6 +87,7 @@ impl Mailbox {
             team_id: team_id.to_owned(),
             to_agent_id: to_agent_id.to_owned(),
             from_agent_id: from_agent_id.to_owned(),
+            actor_user_id: actor_user_id.map(str::to_owned),
             msg_type: msg_type.to_string(),
             content: content.to_owned(),
             summary: summary.map(str::to_owned),
@@ -275,6 +292,30 @@ mod tests {
         assert_eq!(changes[0].change, TeamMailboxChange::Created);
         assert_eq!(changes[0].message.content, "hi");
         assert!(!changes[0].message.read);
+    }
+
+    #[tokio::test]
+    async fn write_persists_actor_separately_from_execution_owner() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Mailbox::new_for_user(repo.clone(), "execution-owner");
+
+        mailbox
+            .write_as_actor_with_files(
+                "t1",
+                "lead",
+                "user",
+                Some("collaborator"),
+                MailboxMessageType::Message,
+                "hello",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let rows = repo.state.lock().unwrap().messages.clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].actor_user_id.as_deref(), Some("collaborator"));
     }
 
     #[tokio::test]

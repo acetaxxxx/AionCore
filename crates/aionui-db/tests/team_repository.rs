@@ -57,6 +57,7 @@ fn make_mailbox_msg(id: &str, team_id: &str, to: &str, from: &str, msg_type: &st
         team_id: team_id.into(),
         to_agent_id: to.into(),
         from_agent_id: from.into(),
+        actor_user_id: None,
         msg_type: msg_type.into(),
         content: format!("content-{id}"),
         summary: None,

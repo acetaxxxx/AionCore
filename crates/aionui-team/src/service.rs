@@ -19,7 +19,7 @@ use aionui_api_types::{
     TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
-use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, generate_id_with_length, now_ms};
+use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::{TeamAccessRole, TeamRow, TeamSharingMode};
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -91,6 +91,7 @@ pub struct TeamAuthorizationContext {
     pub actor_user_id: String,
     pub execution_owner_id: String,
     pub role: TeamAccessRole,
+    pub sharing_mode: TeamSharingMode,
     pub team: TeamRow,
 }
 
@@ -127,16 +128,6 @@ struct SessionEntry {
     session: Arc<TeamSession>,
     slow_monitor_handle: tokio::task::JoinHandle<()>,
 }
-
-#[derive(Clone)]
-struct EligibleAccountRef {
-    owner_user_id: String,
-    team_id: String,
-    user_id: String,
-    expires_at: TimestampMs,
-}
-
-const ELIGIBLE_ACCOUNT_REF_TTL_MS: TimestampMs = 5 * 60 * 1000;
 
 pub struct TeamIdleCleanupCoordinator {
     service: Arc<TeamSessionService>,
@@ -195,9 +186,6 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Short-lived opaque picker references. The referenced Core user ID never
-    /// crosses the API boundary and is revalidated by the repository on add.
-    eligible_account_refs: Arc<DashMap<String, EligibleAccountRef>>,
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -328,7 +316,6 @@ impl TeamSessionService {
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
-            eligible_account_refs: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
@@ -562,15 +549,15 @@ impl TeamSessionService {
             TeamAccessRole::Collaborator => self.repo.get_team_for_restore(team_id).await?,
         }
         .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        if role == TeamAccessRole::Collaborator
-            && self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared
-        {
+        let sharing_mode = self.repo.get_team_sharing_mode(team_id).await?;
+        if role == TeamAccessRole::Collaborator && sharing_mode != TeamSharingMode::Shared {
             return Err(TeamError::TeamNotFound(team_id.into()));
         }
         Ok(TeamAuthorizationContext {
             actor_user_id: actor_user_id.to_owned(),
             execution_owner_id: team.user_id.clone(),
             role,
+            sharing_mode,
             team,
         })
     }
@@ -970,28 +957,13 @@ impl TeamSessionService {
         if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        let now = now_ms();
-        self.eligible_account_refs
-            .retain(|_, value| value.expires_at > now);
-        let candidates = self.repo.list_eligible_team_users(owner_user_id, team_id).await?;
-        let mut responses = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let account_ref = generate_id_with_length(Some(64));
-            self.eligible_account_refs.insert(
-                account_ref.clone(),
-                EligibleAccountRef {
-                    owner_user_id: owner_user_id.to_owned(),
-                    team_id: team_id.to_owned(),
-                    user_id: candidate.user_id,
-                    expires_at: now.saturating_add(ELIGIBLE_ACCOUNT_REF_TTL_MS),
-                },
-            );
-            responses.push(EligibleTeamCollaboratorResponse {
-                account_ref,
-                display_name: candidate.display_name,
-            });
-        }
-        Ok(responses)
+        // Core's persisted user rows are not a live host login directory: old
+        // AIONUI_USERS seeds remain after configuration changes, and external
+        // auth users may outlive their upstream identity. Listing DB-active
+        // rows here could invite an account that can no longer authenticate.
+        // Fail closed until the host supplies a sanitized, current eligible
+        // account projection through an explicit service boundary.
+        Err(TeamError::CollaboratorAccountsUnavailable)
     }
 
     /// Lists active collaborators without exposing internal user identifiers.
@@ -1028,27 +1000,10 @@ impl TeamSessionService {
         if account_ref.trim().is_empty() {
             return Err(TeamError::InvalidRequest("account_ref is required".into()));
         }
-        let candidate = self
-            .eligible_account_refs
-            .get(account_ref)
-            .map(|entry| entry.value().clone())
-            .filter(|entry| {
-                entry.owner_user_id == owner_user_id
-                    && entry.team_id == team_id
-                    && entry.expires_at > now_ms()
-            })
-            .ok_or_else(|| TeamError::TeamNotFound("eligible collaborator account".into()))?;
-        self.repo
-            .add_team_member(&aionui_db::models::TeamMembershipRow {
-                membership_ref: generate_id(),
-                team_id: team_id.to_owned(),
-                user_id: candidate.user_id,
-                display_name: None,
-                created_at: now_ms(),
-            })
-            .await?;
-        self.eligible_account_refs.remove(account_ref);
-        Ok(())
+        // No current host-configured account source is available to validate
+        // this opaque reference. Never accept a reference minted from stale
+        // Core user rows or trust a caller-supplied identifier.
+        Err(TeamError::CollaboratorAccountsUnavailable)
     }
 
     /// Revokes by server-issued membership reference after an owner-scoped check.
@@ -2723,11 +2678,14 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
+        Self::reject_shared_team_attachments(&access, files.as_deref())?;
+        self.ensure_session_inner(team_id, Some(&access.execution_owner_id)).await?;
+        let (content, files) = self
+            .resolve_message_attachments(&access.execution_owner_id, content, files)
+            .await?;
         let session = self.published_session(team_id)?;
-        session.send_message(&content, files).await
+        session.send_message_as_actor(user_id, &content, files).await
     }
 
     pub async fn send_message_to_agent(
@@ -2738,11 +2696,16 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
+        Self::reject_shared_team_attachments(&access, files.as_deref())?;
+        self.ensure_session_inner(team_id, Some(&access.execution_owner_id)).await?;
+        let (content, files) = self
+            .resolve_message_attachments(&access.execution_owner_id, content, files)
+            .await?;
         let session = self.published_session(team_id)?;
-        session.send_message_to_agent(slot_id, &content, files).await
+        session
+            .send_message_to_agent_as_actor(user_id, slot_id, &content, files)
+            .await
     }
 
     pub async fn interrupt_agent(
@@ -2767,6 +2730,20 @@ impl TeamSessionService {
             .get(team_id)
             .map(|entry| Arc::clone(&entry.session))
             .ok_or_else(|| TeamError::SessionNotFound(team_id.to_owned()))
+    }
+
+    fn reject_shared_team_attachments(
+        access: &TeamAuthorizationContext,
+        files: Option<&[ChatFileRef]>,
+    ) -> Result<(), TeamError> {
+        if access.sharing_mode == TeamSharingMode::Shared
+            && files.is_some_and(|files| !files.is_empty())
+        {
+            return Err(TeamError::InvalidRequest(
+                "Shared Team file attachments are unavailable until Team-scoped upload is configured".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn peek_agent_messages(

@@ -643,12 +643,21 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_as_actor(&self.user_id, content, files).await
+    }
+
+    pub async fn send_message_as_actor(
+        &self,
+        actor_user_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let lead_slot_id = self
             .scheduler
             .find_lead_slot_id()
             .await
             .ok_or_else(|| TeamError::AgentNotFound("no lead agent in team".into()))?;
-        self.enqueue_user_message(&lead_slot_id, TeamRunTargetRole::Lead, content, files)
+        self.enqueue_user_message(actor_user_id, &lead_slot_id, TeamRunTargetRole::Lead, content, files)
             .await
     }
 
@@ -658,8 +667,18 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_to_agent_as_actor(&self.user_id, slot_id, content, files).await
+    }
+
+    pub async fn send_message_to_agent_as_actor(
+        &self,
+        actor_user_id: &str,
+        slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
-        self.enqueue_user_message(slot_id, target_role_for(agent.role), content, files)
+        self.enqueue_user_message(actor_user_id, slot_id, target_role_for(agent.role), content, files)
             .await
     }
 
@@ -718,6 +737,7 @@ impl TeamSession {
 
     async fn enqueue_user_message(
         &self,
+        actor_user_id: &str,
         slot_id: &str,
         role: TeamRunTargetRole,
         content: &str,
@@ -802,10 +822,11 @@ impl TeamSession {
         })?;
         let mailbox_message = match self
             .mailbox
-            .write_with_files(
+            .write_as_actor_with_files(
                 &self.team.id,
                 slot_id,
                 "user",
+                Some(actor_user_id),
                 MailboxMessageType::Message,
                 content,
                 None,
@@ -828,7 +849,8 @@ impl TeamSession {
             &agent.conversation_id,
             content,
             files.unwrap_or_default(),
-        );
+        )
+        .with_actor_user_id(actor_user_id);
         if let Err(error) = projection.project(request).await {
             warn!(
                 team_id = %self.team.id,

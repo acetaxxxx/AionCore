@@ -27,6 +27,7 @@ pub enum TeamProjectionSource {
 #[derive(Debug, Clone)]
 pub struct TeamProjectionRequest {
     pub user_id: String,
+    pub actor_user_id: String,
     pub team_id: String,
     pub slot_id: String,
     pub conversation_id: String,
@@ -48,6 +49,7 @@ impl TeamProjectionRequest {
     ) -> Self {
         Self {
             user_id: user_id.into(),
+            actor_user_id: String::new(),
             team_id: team_id.into(),
             slot_id: slot_id.into(),
             conversation_id: conversation_id.into(),
@@ -57,6 +59,7 @@ impl TeamProjectionRequest {
             visibility: TeamVisibilityPolicy::user_message(),
             dedupe_key: None,
         }
+        .as_owner_actor()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -75,6 +78,7 @@ impl TeamProjectionRequest {
         let mailbox_message_id = mailbox_message_id.into();
         Self {
             user_id: user_id.into(),
+            actor_user_id: String::new(),
             dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
             team_id,
             slot_id: slot_id.into(),
@@ -89,6 +93,7 @@ impl TeamProjectionRequest {
             files: Vec::new(),
             visibility: TeamVisibilityPolicy::teammate_message(),
         }
+        .as_owner_actor()
     }
 
     pub fn team_system_visible(
@@ -104,6 +109,7 @@ impl TeamProjectionRequest {
         let mailbox_message_id = mailbox_message_id.into();
         Self {
             user_id: user_id.into(),
+            actor_user_id: String::new(),
             dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
             team_id,
             slot_id: slot_id.into(),
@@ -113,6 +119,17 @@ impl TeamProjectionRequest {
             files: Vec::new(),
             visibility: TeamVisibilityPolicy::teammate_message(),
         }
+        .as_owner_actor()
+    }
+
+    fn as_owner_actor(mut self) -> Self {
+        self.actor_user_id = self.user_id.clone();
+        self
+    }
+
+    pub fn with_actor_user_id(mut self, actor_user_id: impl Into<String>) -> Self {
+        self.actor_user_id = actor_user_id.into();
+        self
     }
 
     fn should_insert_visible_bubble(&self) -> bool {
@@ -274,6 +291,7 @@ where
                     "right",
                     serde_json::json!({
                         "content": content,
+                        "actor_user_id": request.actor_user_id.clone(),
                     }),
                 )
             }
@@ -316,5 +334,31 @@ where
             created_at,
             backend_turn_id: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::*;
+
+    #[test]
+    fn user_message_keeps_authenticated_actor_separate_from_execution_owner() {
+        let request = TeamProjectionRequest::user_visible(
+            "execution-owner",
+            "team-1",
+            "lead",
+            "conversation-1",
+            "hello",
+            Vec::new(),
+        )
+        .with_actor_user_id("collaborator");
+
+        assert_eq!(request.user_id, "execution-owner");
+        assert_eq!(request.actor_user_id, "collaborator");
+        let row = TeamMessageProjection::<dyn TeamProjectionMessageStore>::build_message_row(&request, "msg-1", 1)
+            .expect("message row");
+        let content: serde_json::Value = serde_json::from_str(&row.content).expect("JSON content");
+        assert_eq!(content["actor_user_id"], "collaborator");
+        assert_eq!(content["content"], "hello");
     }
 }

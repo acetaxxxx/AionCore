@@ -311,14 +311,15 @@ impl ITeamRepository for SqliteTeamRepository {
     async fn write_message(&self, user_id: &str, row: &MailboxMessageRow) -> Result<(), DbError> {
         let result = sqlx::query(
             "INSERT INTO mailbox \
-                (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+                (id, team_id, to_agent_id, from_agent_id, actor_user_id, type, content, summary, files, read, created_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ?)",
         )
         .bind(&row.id)
         .bind(&row.team_id)
         .bind(&row.to_agent_id)
         .bind(&row.from_agent_id)
+        .bind(&row.actor_user_id)
         .bind(&row.msg_type)
         .bind(&row.content)
         .bind(&row.summary)

@@ -2355,6 +2355,7 @@ async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() 
                 team_id: created.id.clone(),
                 to_agent_id: lead_slot_id.clone(),
                 from_agent_id: "worker-or-user".into(),
+                actor_user_id: None,
                 msg_type: "message".into(),
                 content: "orphan backlog".into(),
                 summary: None,
@@ -2481,6 +2482,7 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
                 team_id: created.id.clone(),
                 to_agent_id: lead_slot_id.clone(),
                 from_agent_id: lead_slot_id,
+                actor_user_id: None,
                 msg_type: "message".into(),
                 content: "self backlog".into(),
                 summary: None,
@@ -8619,6 +8621,7 @@ fn activity_message_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::
         team_id: team_id.into(),
         to_agent_id: "a1".into(),
         from_agent_id: "lead".into(),
+        actor_user_id: None,
         msg_type: "message".into(),
         content: format!("content-{id}"),
         summary: None,
@@ -8763,6 +8766,10 @@ async fn shared_team_reads_use_active_membership_and_revoke_blocks_next_read() {
         .create_team_with_sharing_mode(&team, aionui_db::models::TeamSharingMode::Shared)
         .await
         .unwrap();
+    assert!(matches!(
+        svc.list_eligible_collaborators("owner", &team.id).await,
+        Err(TeamError::CollaboratorAccountsUnavailable)
+    ));
     team_repo.add_test_collaborator(&team.id, "collaborator");
     team_repo
         .write_message("owner", &activity_message_row("shared-message", &team.id, 1000))
