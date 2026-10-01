@@ -1237,7 +1237,7 @@ mod tests {
         let api_err = chat_file_resolve_error(aionui_project::ProjectError::LocalPathForbidden);
         assert_eq!(api_err.status_code(), axum::http::StatusCode::FORBIDDEN);
         assert_eq!(api_err.error_code(), "FORBIDDEN");
-        assert_eq!(api_err.public_message(), "local file access is not authorized");
+        assert_eq!(api_err.public_message(), "Forbidden.");
         assert!(api_err.error_details().is_none());
     }
 
