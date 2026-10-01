@@ -98,8 +98,14 @@ pub trait ITeamRepository: Send + Sync {
     }
 
     /// Returns the caller's current role, with owner precedence over membership.
-    async fn team_access_role(&self, _team_id: &str, _user_id: &str) -> Result<Option<TeamAccessRole>, DbError> {
-        Err(DbError::Init("Team membership authorization is unavailable".into()))
+    async fn team_access_role(&self, team_id: &str, user_id: &str) -> Result<Option<TeamAccessRole>, DbError> {
+        // Compatibility default for repositories and test doubles that only
+        // support private, owner-scoped Teams. Shared membership must opt in.
+        if self.get_team(user_id, team_id).await?.is_some() {
+            Ok(Some(TeamAccessRole::Owner))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns all teams for startup/session restore.

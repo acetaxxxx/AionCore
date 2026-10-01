@@ -20,7 +20,7 @@ use aionui_api_types::{
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
-use aionui_db::models::{TeamRow, TeamSharingMode};
+use aionui_db::models::{TeamAccessRole, TeamRow, TeamSharingMode};
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IProviderRepository, ITeamRepository, IUserOrderStore, OrderItemRef, OrderItemType, PageDirection,
@@ -82,6 +82,16 @@ pub enum ActivityKind {
     Message,
     /// Tasks only.
     Task,
+}
+
+/// Authenticated actor and persisted Team execution owner after authorization.
+/// The two identities intentionally remain separate for collaborator actions.
+#[derive(Debug, Clone)]
+pub struct TeamAuthorizationContext {
+    pub actor_user_id: String,
+    pub execution_owner_id: String,
+    pub role: TeamAccessRole,
+    pub team: TeamRow,
 }
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
@@ -514,10 +524,41 @@ impl TeamSessionService {
     }
 
     async fn load_owned_team_row(&self, user_id: &str, team_id: &str) -> Result<TeamRow, TeamError> {
-        self.repo
-            .get_team(user_id, team_id)
+        let access = self.authorize_team(user_id, team_id).await?;
+        if access.role != TeamAccessRole::Owner {
+            return Err(TeamError::TeamNotFound(team_id.into()));
+        }
+        Ok(access.team)
+    }
+
+    /// Central Team authorization seam. Current handlers remain owner-only
+    /// unless they explicitly consume this context as a collaborator operation.
+    pub async fn authorize_team(
+        &self,
+        actor_user_id: &str,
+        team_id: &str,
+    ) -> Result<TeamAuthorizationContext, TeamError> {
+        let role = self
+            .repo
+            .team_access_role(team_id, actor_user_id)
             .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        let team = match role {
+            TeamAccessRole::Owner => self.repo.get_team(actor_user_id, team_id).await?,
+            TeamAccessRole::Collaborator => self.repo.get_team_for_restore(team_id).await?,
+        }
+        .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        if role == TeamAccessRole::Collaborator
+            && self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared
+        {
+            return Err(TeamError::TeamNotFound(team_id.into()));
+        }
+        Ok(TeamAuthorizationContext {
+            actor_user_id: actor_user_id.to_owned(),
+            execution_owner_id: team.user_id.clone(),
+            role,
+            team,
+        })
     }
 
     pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
