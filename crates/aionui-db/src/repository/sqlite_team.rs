@@ -72,7 +72,8 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn list_team_members(&self, team_id: &str) -> Result<Vec<TeamMembershipRow>, DbError> {
         sqlx::query_as::<_, TeamMembershipRow>(
-            "SELECT m.membership_ref, m.team_id, m.user_id, m.created_at FROM team_memberships m \
+            "SELECT m.membership_ref, m.team_id, m.user_id, u.username AS display_name, m.created_at \
+             FROM team_memberships m \
              JOIN users u ON u.id = m.user_id AND u.status = 'active' \
              WHERE m.team_id = ? ORDER BY m.created_at, m.membership_ref",
         )

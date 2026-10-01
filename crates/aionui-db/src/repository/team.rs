@@ -44,7 +44,7 @@ pub struct UpdateTaskParams {
 
 /// Data access abstraction for team collaboration tables.
 ///
-/// Covers three tables: `teams`, `mailbox`, and `team_tasks`.
+/// Covers `teams`, `team_memberships`, `mailbox`, and `team_tasks`.
 ///
 /// Object-safe via `async_trait` to support `Arc<dyn ITeamRepository>`.
 #[async_trait::async_trait]

@@ -124,6 +124,7 @@ async fn shared_mode_and_active_membership_persist_and_revoke_by_owner() {
         membership_ref: "opaque-membership-ref".into(),
         team_id: team.id.clone(),
         user_id: member.id.clone(),
+        display_name: member.username.clone(),
         created_at: now_ms(),
     };
     repo.add_team_member(&membership).await.unwrap();
@@ -168,6 +169,7 @@ async fn cannot_add_member_to_private_team_or_disabled_account() {
         membership_ref: "opaque-private-ref".into(),
         team_id: private_team.id.clone(),
         user_id: member.id.clone(),
+        display_name: member.username.clone(),
         created_at: now_ms(),
     };
     assert!(matches!(repo.add_team_member(&membership).await, Err(DbError::NotFound(_))));
@@ -180,6 +182,7 @@ async fn cannot_add_member_to_private_team_or_disabled_account() {
         membership_ref: "opaque-active-ref".into(),
         team_id: shared_team.id.clone(),
         user_id: member.id.clone(),
+        display_name: member.username.clone(),
         created_at: now_ms(),
     };
     repo.add_team_member(&active_membership).await.unwrap();

@@ -55,6 +55,7 @@ pub struct TeamMembershipRow {
     pub membership_ref: String,
     pub team_id: String,
     pub user_id: String,
+    pub display_name: Option<String>,
     pub created_at: TimestampMs,
 }
 

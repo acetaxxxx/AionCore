@@ -10,12 +10,14 @@ use axum::routing::{get, post, put};
 
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
-    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
+    AddAgentRequest, AddTeamMemberRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest,
+    CreateTeamRequest, EligibleTeamCollaboratorResponse, GetConfigOptionsResponse, InterruptTeamAgentRequest,
+    PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
     SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse,
+    TeamMemberListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -55,6 +57,12 @@ impl From<TeamError> for ApiError {
             }
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
+            TeamError::CollaboratorAccountsUnavailable => ApiError::coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "TEAM_ACCOUNT_DIRECTORY_UNAVAILABLE",
+                "Eligible host-configured collaborator accounts are unavailable",
+                None,
+            ),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
@@ -179,7 +187,16 @@ impl From<TeamError> for ApiError {
 pub fn team_routes(state: TeamRouterState) -> Router {
     Router::new()
         .route("/api/teams", post(create_team).get(list_teams))
+        .route("/api/teams/eligible-collaborators", get(list_eligible_collaborators))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
+        .route(
+            "/api/teams/{id}/members",
+            get(list_team_members).post(add_team_member),
+        )
+        .route(
+            "/api/teams/{id}/members/{membership_ref}",
+            axum::routing::delete(remove_team_member),
+        )
         .route("/api/teams/{id}/run-state", get(get_run_state))
         .route("/api/teams/{id}/mailbox", get(list_mailbox))
         .route("/api/teams/{id}/tasks", get(list_tasks))
@@ -228,6 +245,49 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/active-lease", post(active_lease))
         .route("/api/teams/{id}/session-mode", post(set_session_mode))
         .with_state(state)
+}
+
+async fn list_eligible_collaborators(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<EligibleTeamCollaboratorResponse>>>, ApiError> {
+    let accounts = state.service.list_eligible_collaborators(&user.id).await?;
+    Ok(Json(ApiResponse::ok(accounts)))
+}
+
+async fn list_team_members(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<TeamMemberListResponse>>, ApiError> {
+    let members = state.service.list_team_members(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(members)))
+}
+
+async fn add_team_member(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<AddTeamMemberRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<()>>), ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .add_team_member(&user.id, &id, &request.account_ref)
+        .await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::success())))
+}
+
+async fn remove_team_member(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, membership_ref)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .remove_team_member(&user.id, &id, &membership_ref)
+        .await?;
+    Ok(Json(ApiResponse::success()))
 }
 
 async fn create_team(

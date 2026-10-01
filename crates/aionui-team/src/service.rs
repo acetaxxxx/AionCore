@@ -9,16 +9,18 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
+    AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, EligibleTeamCollaboratorResponse,
+    GetConfigOptionsResponse,
     InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
     TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
     TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse,
-    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
+    TeamMailboxMessageResponse, TeamMemberResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    TeamSessionBinding,
     TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
-use aionui_db::models::TeamRow;
+use aionui_db::models::{TeamRow, TeamSharingMode};
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IProviderRepository, ITeamRepository, IUserOrderStore, OrderItemRef, OrderItemType, PageDirection,
@@ -854,6 +856,75 @@ impl TeamSessionService {
             }
         }
         Ok(teams)
+    }
+
+    /// Eligible-account discovery is unavailable until the host's live account
+    /// configuration is exposed through a trusted server-side adapter. Do not
+    /// substitute persisted auth projections: those can be stale or incomplete.
+    pub async fn list_eligible_collaborators(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<EligibleTeamCollaboratorResponse>, TeamError> {
+        let teams = self.repo.list_teams_by_user(owner_user_id).await?;
+        for team in teams {
+            if self.repo.get_team_sharing_mode(&team.id).await? == TeamSharingMode::Shared {
+                return Err(TeamError::CollaboratorAccountsUnavailable);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Lists active collaborators without exposing internal user identifiers.
+    pub async fn list_team_members(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+    ) -> Result<Vec<TeamMemberResponse>, TeamError> {
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let members = self.repo.list_team_members(team_id).await?;
+        Ok(members
+            .into_iter()
+            .map(|member| TeamMemberResponse {
+                membership_ref: member.membership_ref,
+                display_name: member.display_name,
+                created_at: member.created_at,
+            })
+            .collect())
+    }
+
+    /// Adds by opaque account reference only. This remains fail-closed until
+    /// host account eligibility and reference revalidation are wired.
+    pub async fn add_team_member(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        account_ref: &str,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        if account_ref.trim().is_empty() {
+            return Err(TeamError::InvalidRequest("account_ref is required".into()));
+        }
+        Err(TeamError::CollaboratorAccountsUnavailable)
+    }
+
+    /// Revokes by server-issued membership reference after an owner-scoped check.
+    pub async fn remove_team_member(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        membership_ref: &str,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        self.repo
+            .remove_team_member(owner_user_id, team_id, membership_ref)
+            .await?;
+        Ok(())
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {

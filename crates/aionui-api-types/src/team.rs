@@ -110,6 +110,33 @@ pub struct CreateTeamRequest {
     pub workspace: Option<String>,
 }
 
+/// A selectable host account represented by a server-issued opaque reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EligibleTeamCollaboratorResponse {
+    pub account_ref: String,
+    pub display_name: String,
+}
+
+/// Request body for `POST /api/teams/{id}/members`.
+///
+/// Account identity is resolved by the server; callers cannot submit a user ID.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddTeamMemberRequest {
+    pub account_ref: String,
+}
+
+/// Active Team collaborator representation. User IDs are never exposed here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamMemberResponse {
+    pub membership_ref: String,
+    pub display_name: Option<String>,
+    pub created_at: TimestampMs,
+}
+
+/// Type alias for active Team members.
+pub type TeamMemberListResponse = Vec<TeamMemberResponse>;
+
 /// Request body for `PATCH /api/teams/:id/name`.
 #[derive(Debug, Deserialize)]
 pub struct RenameTeamRequest {
@@ -854,6 +881,20 @@ pub struct TeamMailboxChangedPayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn add_team_member_accepts_only_opaque_account_ref() {
+        assert_eq!(
+            serde_json::from_value::<AddTeamMemberRequest>(json!({"account_ref":"acct_opaque"}))
+                .unwrap()
+                .account_ref,
+            "acct_opaque"
+        );
+        assert!(serde_json::from_value::<AddTeamMemberRequest>(
+            json!({"account_ref":"acct_opaque", "user_id":"caller-chosen"})
+        )
+        .is_err());
+    }
 
     // -- Unified team activity feed -------------------------------------------
 
