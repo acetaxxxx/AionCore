@@ -12,10 +12,10 @@
 use std::sync::Arc;
 
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use aionui_db::models::{MailboxMessageRow, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
 use aionui_db::{
-    ActivityCursor, DbError, ITeamRepository, PageDirection, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams,
-    init_database_memory,
+    ActivityCursor, DbError, ITeamRepository, IUserRepository, PageDirection, SqliteTeamRepository,
+    SqliteUserRepository, UpdateTaskParams, UpdateTeamParams, init_database_memory,
 };
 
 const DEFAULT_USER_ID: &str = "system_default_user";
@@ -99,6 +99,104 @@ async fn create_and_get_team() {
     assert_eq!(fetched.id, "t1");
     assert_eq!(fetched.name, "Team Alpha");
     assert_eq!(fetched.lead_agent_id, Some("a1".into()));
+    assert_eq!(repo.get_team_sharing_mode("t1").await.unwrap(), TeamSharingMode::Private);
+}
+
+#[tokio::test]
+async fn shared_mode_and_active_membership_persist_and_revoke_by_owner() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let member = users
+        .create_user("collaborator", "test-password-hash")
+        .await
+        .unwrap();
+    let team = make_team("shared-team", "Shared Team");
+    repo.create_team_with_sharing_mode(&team, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+
+    assert_eq!(repo.get_team_sharing_mode(&team.id).await.unwrap(), TeamSharingMode::Shared);
+    assert_eq!(
+        repo.team_access_role(&team.id, DEFAULT_USER_ID).await.unwrap(),
+        Some(aionui_db::models::TeamAccessRole::Owner)
+    );
+    let membership = TeamMembershipRow {
+        membership_ref: "opaque-membership-ref".into(),
+        team_id: team.id.clone(),
+        user_id: member.id.clone(),
+        created_at: now_ms(),
+    };
+    repo.add_team_member(&membership).await.unwrap();
+    assert_eq!(
+        repo.team_access_role(&team.id, &member.id).await.unwrap(),
+        Some(aionui_db::models::TeamAccessRole::Collaborator)
+    );
+
+    let members = repo.list_team_members(&team.id).await.unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].membership_ref, membership.membership_ref);
+    assert_eq!(members[0].user_id, member.id);
+    let shared_teams = repo.list_teams_by_member(&member.id).await.unwrap();
+    assert_eq!(shared_teams.len(), 1);
+    assert_eq!(shared_teams[0].id, team.id);
+
+    assert!(matches!(
+        repo.remove_team_member("not-the-owner", &team.id, &membership.membership_ref)
+            .await,
+        Err(DbError::NotFound(_))
+    ));
+    assert_eq!(repo.list_team_members(&team.id).await.unwrap().len(), 1);
+
+    repo.remove_team_member(DEFAULT_USER_ID, &team.id, &membership.membership_ref)
+        .await
+        .unwrap();
+    assert!(repo.list_teams_by_member(&member.id).await.unwrap().is_empty());
+    assert_eq!(repo.team_access_role(&team.id, &member.id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn cannot_add_member_to_private_team_or_disabled_account() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let member = users
+        .create_user("inactive-collaborator", "test-password-hash")
+        .await
+        .unwrap();
+    let private_team = make_team("private-team", "Private Team");
+    repo.create_team(&private_team).await.unwrap();
+    let membership = TeamMembershipRow {
+        membership_ref: "opaque-private-ref".into(),
+        team_id: private_team.id.clone(),
+        user_id: member.id.clone(),
+        created_at: now_ms(),
+    };
+    assert!(matches!(repo.add_team_member(&membership).await, Err(DbError::NotFound(_))));
+
+    let shared_team = make_team("shared-team-disabled", "Shared Team");
+    repo.create_team_with_sharing_mode(&shared_team, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    let active_membership = TeamMembershipRow {
+        membership_ref: "opaque-active-ref".into(),
+        team_id: shared_team.id.clone(),
+        user_id: member.id.clone(),
+        created_at: now_ms(),
+    };
+    repo.add_team_member(&active_membership).await.unwrap();
+    users
+        .set_status(&member.id, aionui_db::models::UserStatus::Disabled)
+        .await
+        .unwrap();
+    assert!(repo.list_team_members(&shared_team.id).await.unwrap().is_empty());
+    assert_eq!(repo.team_access_role(&shared_team.id, &member.id).await.unwrap(), None);
+    let disabled_membership = TeamMembershipRow {
+        team_id: shared_team.id,
+        ..membership
+    };
+    assert!(matches!(
+        repo.add_team_member(&disabled_membership).await,
+        Err(DbError::NotFound(_))
+    ));
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@ use aionui_common::now_ms;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
 use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
@@ -15,16 +15,11 @@ impl SqliteTeamRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
-}
 
-#[async_trait::async_trait]
-impl ITeamRepository for SqliteTeamRepository {
-    // ── Team CRUD ────────────────────────────────────────────────────
-
-    async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
+    async fn insert_team(&self, row: &TeamRow, mode: TeamSharingMode) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at, project_id, folder_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at, project_id, folder_id, sharing_mode) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -39,9 +34,124 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(row.updated_at)
         .bind(&row.project_id)
         .bind(&row.folder_id)
+        .bind(mode.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ITeamRepository for SqliteTeamRepository {
+    // ── Team CRUD ────────────────────────────────────────────────────
+
+    async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
+        self.insert_team(row, TeamSharingMode::Private).await
+    }
+
+    async fn create_team_with_sharing_mode(
+        &self,
+        row: &TeamRow,
+        mode: TeamSharingMode,
+    ) -> Result<(), DbError> {
+        self.insert_team(row, mode).await
+    }
+
+    async fn get_team_sharing_mode(&self, team_id: &str) -> Result<TeamSharingMode, DbError> {
+        let mode: Option<String> = sqlx::query_scalar("SELECT sharing_mode FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match mode.as_deref() {
+            Some("private") => Ok(TeamSharingMode::Private),
+            Some("shared") => Ok(TeamSharingMode::Shared),
+            Some(other) => Err(DbError::Init(format!("unknown Team sharing mode: {other}"))),
+            None => Err(DbError::NotFound(format!("team {team_id}"))),
+        }
+    }
+
+    async fn list_team_members(&self, team_id: &str) -> Result<Vec<TeamMembershipRow>, DbError> {
+        sqlx::query_as::<_, TeamMembershipRow>(
+            "SELECT m.membership_ref, m.team_id, m.user_id, m.created_at FROM team_memberships m \
+             JOIN users u ON u.id = m.user_id AND u.status = 'active' \
+             WHERE m.team_id = ? ORDER BY m.created_at, m.membership_ref",
+        )
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn add_team_member(&self, row: &TeamMembershipRow) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "INSERT INTO team_memberships (membership_ref, team_id, user_id, created_at) \
+             SELECT ?, t.id, u.id, ? FROM teams t JOIN users u ON u.id = ? \
+             WHERE t.id = ? AND t.sharing_mode = 'shared' AND u.status = 'active' AND u.id <> t.user_id",
+        )
+        .bind(&row.membership_ref)
+        .bind(row.created_at)
+        .bind(&row.user_id)
+        .bind(&row.team_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("active shared Team or account for {}", row.team_id)));
+        }
+        Ok(())
+    }
+
+    async fn remove_team_member(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        membership_ref: &str,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "DELETE FROM team_memberships WHERE team_id = ? AND membership_ref = ? \
+             AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_memberships.team_id AND t.user_id = ?)",
+        )
+        .bind(team_id)
+        .bind(membership_ref)
+        .bind(owner_user_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("Team membership {membership_ref}")));
+        }
+        Ok(())
+    }
+
+    async fn list_teams_by_member(&self, user_id: &str) -> Result<Vec<TeamRow>, DbError> {
+        sqlx::query_as::<_, TeamRow>(
+            "SELECT t.* FROM teams t JOIN team_memberships m ON m.team_id = t.id \
+             JOIN users u ON u.id = m.user_id AND u.status = 'active' \
+             WHERE m.user_id = ? AND t.sharing_mode = 'shared' AND t.archived_at IS NULL \
+             ORDER BY t.created_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn team_access_role(&self, team_id: &str, user_id: &str) -> Result<Option<TeamAccessRole>, DbError> {
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT CASE WHEN t.user_id = ? THEN 'owner' ELSE 'collaborator' END \
+             FROM teams t JOIN users u ON u.id = ? AND u.status = 'active' \
+             WHERE t.id = ? AND (t.user_id = u.id OR (t.sharing_mode = 'shared' AND EXISTS (\
+                 SELECT 1 FROM team_memberships m WHERE m.team_id = t.id AND m.user_id = u.id)))",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match role.as_deref() {
+            Some("owner") => Ok(Some(TeamAccessRole::Owner)),
+            Some("collaborator") => Ok(Some(TeamAccessRole::Collaborator)),
+            Some(other) => Err(DbError::Init(format!("unknown Team access role: {other}"))),
+            None => Ok(None),
+        }
     }
 
     async fn list_teams_for_restore(&self) -> Result<Vec<TeamRow>, DbError> {
@@ -148,14 +258,24 @@ impl ITeamRepository for SqliteTeamRepository {
     }
 
     async fn delete_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM team_memberships WHERE team_id = ? \
+             AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_memberships.team_id AND t.user_id = ?)",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query("DELETE FROM teams WHERE user_id = ? AND id = ?")
             .bind(user_id)
             .bind(team_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("team {team_id}")));
         }
+        tx.commit().await?;
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
 
 /// Sort/paging direction for the activity feed cursor queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,54 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Inserts a new team record.
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError>;
+
+    /// Creates a Team with an explicit sharing policy. Repositories that have
+    /// not implemented shared membership must fail closed for `Shared`.
+    async fn create_team_with_sharing_mode(
+        &self,
+        row: &TeamRow,
+        mode: TeamSharingMode,
+    ) -> Result<(), DbError> {
+        match mode {
+            TeamSharingMode::Private => self.create_team(row).await,
+            TeamSharingMode::Shared => Err(DbError::Init("shared Team persistence is unavailable".into())),
+        }
+    }
+
+    /// Returns the persisted sharing policy; legacy repositories are private by default.
+    async fn get_team_sharing_mode(&self, _team_id: &str) -> Result<TeamSharingMode, DbError> {
+        Ok(TeamSharingMode::Private)
+    }
+
+    /// Lists active collaborator memberships for a Team.
+    async fn list_team_members(&self, _team_id: &str) -> Result<Vec<TeamMembershipRow>, DbError> {
+        Err(DbError::Init("Team membership persistence is unavailable".into()))
+    }
+
+    /// Creates an active membership using a server-generated opaque reference.
+    async fn add_team_member(&self, _row: &TeamMembershipRow) -> Result<(), DbError> {
+        Err(DbError::Init("Team membership persistence is unavailable".into()))
+    }
+
+    /// Removes an active membership only when the caller owns the Team.
+    async fn remove_team_member(
+        &self,
+        _owner_user_id: &str,
+        _team_id: &str,
+        _membership_ref: &str,
+    ) -> Result<(), DbError> {
+        Err(DbError::Init("Team membership persistence is unavailable".into()))
+    }
+
+    /// Lists active Teams where `user_id` is a collaborator.
+    async fn list_teams_by_member(&self, _user_id: &str) -> Result<Vec<TeamRow>, DbError> {
+        Err(DbError::Init("Team membership persistence is unavailable".into()))
+    }
+
+    /// Returns the caller's current role, with owner precedence over membership.
+    async fn team_access_role(&self, _team_id: &str, _user_id: &str) -> Result<Option<TeamAccessRole>, DbError> {
+        Err(DbError::Init("Team membership authorization is unavailable".into()))
+    }
 
     /// Returns all teams for startup/session restore.
     async fn list_teams_for_restore(&self) -> Result<Vec<TeamRow>, DbError>;
