@@ -339,7 +339,7 @@ impl TeamAgentProvisioner {
         let leader_mcp_selection = if shared_team {
             TeamMcpSelection::default()
         } else {
-            self.resolve_team_assistant_mcp_selection(user_id, team_id, leader_assistant_id.as_deref(), false)
+            self.resolve_assistant_mcp_selection(user_id, leader_assistant_id.as_deref())
                 .await?
         };
         let leader_backend = self
@@ -402,7 +402,7 @@ impl TeamAgentProvisioner {
             let mcp_selection = if shared_team {
                 TeamMcpSelection::default()
             } else {
-                self.resolve_team_assistant_mcp_selection(user_id, team_id, assistant_id.as_deref(), false)
+                self.resolve_assistant_mcp_selection(user_id, assistant_id.as_deref())
                     .await?
             };
             let conversation = self
