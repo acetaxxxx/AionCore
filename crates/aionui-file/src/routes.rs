@@ -1244,12 +1244,14 @@ mod tests {
     /// Every `ChatFileRef`-addressed handler must route its resolver failure through
     /// [`chat_file_resolve_error`], not the shared `From<ProjectError>` mapping.
     ///
-    /// Asserted against the source text because the alternative — spinning up five
+    /// Asserted against the source text because the alternative — spinning up six
     /// authenticated handlers with a real `ProjectService` — would not actually pin
     /// this: the wiring is a single `map_err` per handler, and a future edit swapping
     /// one back to `ApiError::from` is exactly the regression worth catching. The
-    /// count guards against a sixth such endpoint being added without a decision:
-    /// bump it deliberately, having checked the new one addresses files by identity.
+    /// The six call sites cover content read/write, metadata, stream, open-system,
+    /// and the legacy image-base64 route. The count guards against another resolver
+    /// call being added without a decision: bump it deliberately after checking the
+    /// new call is sealed as well.
     #[test]
     fn every_chat_file_ref_endpoint_uses_the_sealed_resolver_mapping() {
         // Scan handler code only. This test module mentions both needles in its own
@@ -1265,10 +1267,10 @@ mod tests {
         let sealed = handlers.matches(".map_err(chat_file_resolve_error)?").count();
 
         assert_eq!(
-            resolve_calls, 5,
-            "expected 5 ChatFileRef-addressed endpoints (content read/write, metadata, stream, \
-             open-system); found {resolve_calls} — a new one must be checked for identity \
-             addressing and sealed before bumping this"
+            resolve_calls, 6,
+            "expected 6 sealed ChatFileRef resolver call sites (content read/write, metadata, \
+             stream, open-system, legacy image-base64); found {resolve_calls} — a new one must \
+             be checked before bumping this"
         );
         assert_eq!(
             sealed, resolve_calls,
