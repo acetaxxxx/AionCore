@@ -982,6 +982,8 @@ impl TeamSession {
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest {
             user_id: self.user_id.clone(),
+            actor_user_id: self.user_id.clone(),
+            authorized_user_ids: self.events.authorized_user_ids(),
             team_id: self.team.id.clone(),
             slot_id: to_slot_id.to_owned(),
             conversation_id: to_agent.conversation_id.clone(),
@@ -1244,6 +1246,8 @@ impl TeamSession {
             };
             let request = TeamProjectionRequest {
                 user_id: self.user_id.clone(),
+                actor_user_id: self.user_id.clone(),
+                authorized_user_ids: self.events.authorized_user_ids(),
                 team_id: self.team.id.clone(),
                 slot_id: msg.to_agent_id.clone(),
                 conversation_id: input.conversation_id.clone(),
@@ -1789,6 +1793,8 @@ impl TeamSession {
             let from_agent = self.scheduler.get_agent(from_slot_id).await?;
             TeamProjectionRequest {
                 user_id: self.user_id.clone(),
+                actor_user_id: self.user_id.clone(),
+                authorized_user_ids: self.events.authorized_user_ids(),
                 team_id: self.team.id.clone(),
                 slot_id: to_slot_id.to_owned(),
                 conversation_id: target_agent.conversation_id.clone(),

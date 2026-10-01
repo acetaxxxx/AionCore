@@ -3823,7 +3823,6 @@ mod tests {
     }
 
     fn two_agent_team_request(name: &str) -> aionui_api_types::CreateTeamRequest {
-        sharing_mode: Default::default(),
         aionui_api_types::CreateTeamRequest {
             sharing_mode: Default::default(),
             name: name.into(),
@@ -3850,7 +3849,6 @@ mod tests {
     }
 
     fn team_with_aionrs_worker_request(name: &str) -> aionui_api_types::CreateTeamRequest {
-        sharing_mode: Default::default(),
         let mut request = two_agent_team_request(name);
         request.agents.push(aionui_api_types::TeamAgentInput {
             name: "Butler".into(),
