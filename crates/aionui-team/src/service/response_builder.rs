@@ -1,16 +1,6 @@
 use super::*;
 
 impl TeamSessionService {
-    pub(super) async fn build_team_response(&self, user_id: &str, team: &Team) -> Result<TeamResponse, TeamError> {
-        self.build_team_response_for_access(
-            user_id,
-            team,
-            aionui_api_types::TeamSharingMode::Private,
-            aionui_api_types::TeamAccessRole::Owner,
-        )
-        .await
-    }
-
     pub(super) async fn build_team_response_for_access(
         &self,
         execution_owner_id: &str,

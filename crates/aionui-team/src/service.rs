@@ -5,7 +5,6 @@ pub(crate) mod spawn_support;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Weak};
-use std::time::{Duration, Instant};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
@@ -21,7 +20,7 @@ use aionui_api_types::{
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
-use aionui_db::models::{TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode};
+use aionui_db::models::{TeamAccessRole, TeamRow, TeamSharingMode};
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IProviderRepository, ITeamRepository, IUserOrderStore, OrderItemRef, OrderItemType, PageDirection, UpdateTeamParams,

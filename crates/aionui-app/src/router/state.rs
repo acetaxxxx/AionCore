@@ -551,7 +551,7 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 #[derive(Clone)]
 struct AppTeamWorkspaceAuthorizer {
     team_repo: Arc<dyn ITeamRepository>,
-    pool: sqlx::SqlitePool,
+    conversation_repo: Arc<dyn IConversationRepository>,
     workspace_root: PathBuf,
 }
 
@@ -735,27 +735,32 @@ impl TeamWorkspaceAuthorizer for AppTeamWorkspaceAuthorizer {
         user_id: &str,
         conversation_id: &str,
     ) -> Result<TeamWorkspaceAuthorization, FileError> {
-        let conversation: Option<(String, String)> = sqlx::query_as(
-            "SELECT user_id, extra FROM conversations WHERE id = ?",
-        )
-        .bind(conversation_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|_| FileError::Forbidden("conversation access is forbidden".into()))?;
-        let Some((execution_owner_id, extra)) = conversation else {
+        let Some(execution_owner_id) = self
+            .conversation_repo
+            .owner_user_id(conversation_id)
+            .await
+            .map_err(|_| FileError::Forbidden("conversation access is forbidden".into()))?
+        else {
             return Ok(TeamWorkspaceAuthorization::NotTeamWorkspace);
         };
-        let binding = match aionui_api_types::TeamSessionBinding::from_extra_str(&extra) {
-            Ok(Some(binding)) => binding,
-            Ok(None) => {
-                return Ok(if execution_owner_id == user_id {
-                    TeamWorkspaceAuthorization::Allowed
-                } else {
-                    TeamWorkspaceAuthorization::Denied
-                });
-            }
-            Err(_) => return Ok(TeamWorkspaceAuthorization::Denied),
-        };
+        let conversation = self
+            .conversation_repo
+            .get(&execution_owner_id, conversation_id)
+            .await
+            .map_err(|_| FileError::Forbidden("conversation access is forbidden".into()))?
+            .ok_or_else(|| FileError::Forbidden("conversation access is forbidden".into()))?;
+        let binding =
+            match aionui_api_types::TeamSessionBinding::from_extra_str(&conversation.extra) {
+                Ok(Some(binding)) => binding,
+                Ok(None) => {
+                    return Ok(if execution_owner_id == user_id {
+                        TeamWorkspaceAuthorization::Allowed
+                    } else {
+                        TeamWorkspaceAuthorization::Denied
+                    });
+                }
+                Err(_) => return Ok(TeamWorkspaceAuthorization::Denied),
+            };
         let Some(team) = self
             .team_repo
             .get_team_for_restore(&binding.team_id)
@@ -894,7 +899,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         allowed_roots,
         team_workspace_authorizer: Arc::new(AppTeamWorkspaceAuthorizer {
             team_repo: Arc::new(SqliteTeamRepository::new(services.database.pool().clone())),
-            pool: services.database.pool().clone(),
+            conversation_repo: services.conversation_repo.clone(),
             workspace_root: services.work_dir.clone(),
         }),
     })
@@ -2012,7 +2017,7 @@ mod tests {
 
         let authorizer = AppTeamWorkspaceAuthorizer {
             team_repo: team_repo.clone(),
-            pool: pool.clone(),
+            conversation_repo: Arc::new(SqliteConversationRepository::new(pool.clone())),
             workspace_root: work_dir,
         };
         let nested_workspace = workspace.join("nested");
@@ -2185,7 +2190,7 @@ mod tests {
 
         let authorizer = AppTeamWorkspaceAuthorizer {
             team_repo,
-            pool: pool.clone(),
+            conversation_repo: Arc::new(SqliteConversationRepository::new(pool.clone())),
             workspace_root: work_dir,
         };
         assert_eq!(
