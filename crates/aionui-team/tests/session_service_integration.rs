@@ -929,6 +929,7 @@ struct FullMockTeamRepo {
     fail_workspace_update: std::sync::Mutex<bool>,
     fail_agent_update: std::sync::Mutex<bool>,
     fail_message_writes: std::sync::Mutex<bool>,
+    fail_allowlist_read_for_unpersisted_team: std::sync::Mutex<bool>,
 }
 
 impl FullMockTeamRepo {
@@ -941,6 +942,7 @@ impl FullMockTeamRepo {
             fail_workspace_update: std::sync::Mutex::new(false),
             fail_agent_update: std::sync::Mutex::new(false),
             fail_message_writes: std::sync::Mutex::new(false),
+            fail_allowlist_read_for_unpersisted_team: std::sync::Mutex::new(false),
         }
     }
 
@@ -954,6 +956,10 @@ impl FullMockTeamRepo {
 
     fn fail_message_writes(&self) {
         *self.fail_message_writes.lock().unwrap() = true;
+    }
+
+    fn fail_allowlist_read_for_unpersisted_team(&self) {
+        *self.fail_allowlist_read_for_unpersisted_team.lock().unwrap() = true;
     }
 }
 
@@ -1039,6 +1045,18 @@ impl ITeamRepository for FullMockTeamRepo {
             .get(team_id)
             .copied()
             .unwrap_or(aionui_db::models::TeamSharingMode::Private))
+    }
+    async fn list_team_mcp_allowlist(&self, owner_user_id: &str, team_id: &str) -> Result<Vec<String>, DbError> {
+        let team_is_persisted = self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|team| team.user_id == owner_user_id && team.id == team_id);
+        if !team_is_persisted && *self.fail_allowlist_read_for_unpersisted_team.lock().unwrap() {
+            return Err(DbError::Init("allowlist read before Team persistence".into()));
+        }
+        Ok(Vec::new())
     }
     async fn list_eligible_team_users(
         &self,
