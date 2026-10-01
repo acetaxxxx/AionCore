@@ -168,12 +168,20 @@ impl ProjectService {
                 // address arbitrary host paths. A web/self-host user may address files
                 // only inside their own persisted user directories; a client
                 // supplied absolute path or workspace is never an authorization
-                // claim. Canonicalize before checking ownership so symlinks and
-                // `..` cannot escape that boundary.
+                // claim. Reject paths that lexically name another tenant before
+                // touching the target, then canonicalize and check again so
+                // symlinks cannot escape that boundary. The early check ensures
+                // missing and existing foreign paths receive the same denial.
+                authorize_local_data_path_candidate(
+                    user_id,
+                    is_local_admin,
+                    self.user_data_root.as_deref(),
+                    Path::new(path),
+                )?;
                 let canonical = std::fs::canonicalize(path)
-                    .map_err(|_| ProjectError::LocalPathNotReadable { path: path.clone() })?;
+                    .map_err(|_| local_path_not_readable(path, is_local_admin))?;
                 if !canonical.is_file() {
-                    return Err(ProjectError::LocalPathNotReadable { path: path.clone() });
+                    return Err(local_path_not_readable(path, is_local_admin));
                 }
                 authorize_local_data_path(
                     user_id,
@@ -316,16 +324,33 @@ impl ProjectService {
         is_local_admin: bool,
         workspace: &Path,
     ) -> Result<String, ProjectError> {
-        let canonical = std::fs::canonicalize(workspace).map_err(|_| ProjectError::LocalPathNotReadable {
-            path: workspace.to_string_lossy().into_owned(),
-        })?;
+        authorize_local_data_path_candidate(
+            user_id,
+            is_local_admin,
+            self.user_data_root.as_deref(),
+            workspace,
+        )?;
+        let workspace_text = workspace.to_string_lossy();
+        let canonical = std::fs::canonicalize(workspace)
+            .map_err(|_| local_path_not_readable(&workspace_text, is_local_admin))?;
         if !canonical.is_dir() {
-            return Err(ProjectError::LocalPathNotReadable {
-                path: workspace.to_string_lossy().into_owned(),
-            });
+            return Err(local_path_not_readable(&workspace_text, is_local_admin));
         }
         authorize_local_data_path(user_id, is_local_admin, self.user_data_root.as_deref(), &canonical)?;
         Ok(canonical.to_string_lossy().into_owned())
+    }
+}
+
+/// Do not let a non-admin distinguish an absent own path from a symlink whose
+/// target is outside their tenant. Local admins retain the legacy not-readable
+/// detail used by desktop callers.
+fn local_path_not_readable(path: &str, is_local_admin: bool) -> ProjectError {
+    if is_local_admin {
+        ProjectError::LocalPathNotReadable {
+            path: path.to_owned(),
+        }
+    } else {
+        ProjectError::LocalPathForbidden
     }
 }
 
@@ -354,6 +379,74 @@ fn authorize_local_data_path(
         return Err(ProjectError::LocalPathForbidden);
     };
 
+    if path_belongs_to_user_data_tree(user_id, relative) {
+        Ok(())
+    } else {
+        Err(ProjectError::LocalPathForbidden)
+    }
+}
+
+/// Reject a path outside the caller's lexical data tree before checking whether
+/// the target exists. The resolved-path check remains mandatory after
+/// canonicalization to catch symlinks. This is a privacy boundary as well as an
+/// authorization check: a caller must not distinguish a missing foreign path
+/// from an existing one by comparing the resolver's errors.
+fn authorize_local_data_path_candidate(
+    user_id: &str,
+    is_local_admin: bool,
+    user_data_root: Option<&Path>,
+    candidate: &Path,
+) -> Result<(), ProjectError> {
+    if is_local_admin {
+        return Ok(());
+    }
+
+    let Some(user_data_root) = user_data_root else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Some(root) = normalize_lexical_absolute(user_data_root) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Some(candidate) = normalize_lexical_absolute(candidate) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+    let Ok(relative) = candidate.strip_prefix(root) else {
+        return Err(ProjectError::LocalPathForbidden);
+    };
+
+    if path_belongs_to_user_data_tree(user_id, relative) {
+        Ok(())
+    } else {
+        Err(ProjectError::LocalPathForbidden)
+    }
+}
+
+/// Normalize `.` and `..` without following symlinks, using the same current
+/// directory semantics as filesystem lookup for relative paths.
+fn normalize_lexical_absolute(path: &Path) -> Option<std::path::PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match &component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+fn path_belongs_to_user_data_tree(user_id: &str, relative: &Path) -> bool {
     let components: Vec<String> = relative
         .components()
         .filter_map(|component| match component {
@@ -368,11 +461,7 @@ fn authorize_local_data_path(
         || (components.first().is_some_and(|part| part == "users")
             && components.get(1).is_some_and(|owner| owner == user_id));
 
-    if belongs_to_user {
-        Ok(())
-    } else {
-        Err(ProjectError::LocalPathForbidden)
-    }
+    belongs_to_user
 }
 
 /// Whether `target` resolves inside `root` (both canonicalized, so `..` and

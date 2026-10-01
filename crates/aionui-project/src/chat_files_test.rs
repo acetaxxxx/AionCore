@@ -374,6 +374,91 @@ async fn client_workspace_cannot_add_an_arbitrary_path_as_an_image_root() {
 }
 
 #[tokio::test]
+async fn foreign_local_paths_are_denied_before_target_existence_can_be_observed() {
+    let db = init_database_memory().await.unwrap();
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let data_root = tempfile::tempdir().unwrap();
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
+        .with_user_data_root(data_root.path());
+    let upload_root = tempfile::tempdir().unwrap();
+    let foreign_root = data_root.path().join("conversations/users/bob/2026/09/28");
+    std::fs::create_dir_all(&foreign_root).unwrap();
+    let existing = foreign_root.join("existing.jpg");
+    let missing = foreign_root.join("missing.jpg");
+    std::fs::write(&existing, b"private").unwrap();
+    let traversal = data_root
+        .path()
+        .join("conversations/users/alice/../bob/2026/09/28/existing.jpg");
+
+    for path in [&existing, &missing, &traversal] {
+        let err = service
+            .resolve_chat_file_ref_with_local_admin(
+                "alice",
+                false,
+                &ChatFileRef::Local {
+                    path: path.to_string_lossy().into_owned(),
+                },
+                upload_root.path(),
+                crate::FileOp::Read,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProjectError::LocalPathForbidden), "got {err:?}");
+    }
+
+    let missing_workspace = data_root.path().join("conversations/users/bob/not-created");
+    let err = service
+        .authorize_local_workspace_with_local_admin("alice", false, &missing_workspace)
+        .unwrap_err();
+    assert!(matches!(err, ProjectError::LocalPathForbidden), "got {err:?}");
+}
+
+#[tokio::test]
+async fn unresolved_owner_paths_do_not_disclose_foreign_target_existence() {
+    let db = init_database_memory().await.unwrap();
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let data_root = tempfile::tempdir().unwrap();
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
+        .with_user_data_root(data_root.path());
+    let upload_root = tempfile::tempdir().unwrap();
+    let own_root = data_root.path().join("conversations/users/alice/assets");
+    let foreign_root = data_root.path().join("conversations/users/bob/assets");
+    std::fs::create_dir_all(&own_root).unwrap();
+    std::fs::create_dir_all(&foreign_root).unwrap();
+    let foreign_target = foreign_root.join("existing.jpg");
+    std::fs::write(&foreign_target, b"private").unwrap();
+    let own_missing = own_root.join("missing.jpg");
+
+    let mut paths = vec![own_missing];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let link_to_existing = own_root.join("foreign-existing.jpg");
+        let link_to_missing = own_root.join("foreign-missing.jpg");
+        symlink(&foreign_target, &link_to_existing).unwrap();
+        symlink(foreign_root.join("missing.jpg"), &link_to_missing).unwrap();
+        paths.extend([link_to_existing, link_to_missing]);
+    }
+
+    for path in paths {
+        let err = service
+            .resolve_chat_file_ref_with_local_admin(
+                "alice",
+                false,
+                &ChatFileRef::Local {
+                    path: path.to_string_lossy().into_owned(),
+                },
+                upload_root.path(),
+                crate::FileOp::Read,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProjectError::LocalPathForbidden), "got {err:?}");
+    }
+}
+
+#[tokio::test]
 async fn local_file_for_another_user_is_forbidden_even_when_it_exists() {
     let (service, _pe, _dir, upload_root) = setup().await;
     let data_root = tempfile::tempdir().unwrap();
