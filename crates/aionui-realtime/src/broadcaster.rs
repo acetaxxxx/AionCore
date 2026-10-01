@@ -43,17 +43,22 @@ impl ScopedEventRecipients {
     pub fn with_authorized_recipients(
         &self,
         scope_id: &str,
+        owner_user_id: &str,
         requested: &[String],
         mut deliver: impl FnMut(&str),
     ) -> bool {
         let Ok(current) = self.recipients.read() else {
             return false;
         };
-        let Some(authorized) = current.get(scope_id) else {
-            return false;
-        };
+        let authorized = current.get(scope_id);
         for user_id in requested {
-            if authorized.contains(user_id) {
+            // Before a Team has loaded its membership snapshot, preserve
+            // owner-only delivery without trusting collaborator IDs from the
+            // event. Once registered, the current set is authoritative.
+            let is_authorized = authorized
+                .map(|recipients| recipients.contains(user_id))
+                .unwrap_or_else(|| user_id == owner_user_id);
+            if is_authorized {
                 deliver(user_id);
             }
         }

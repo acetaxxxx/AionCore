@@ -51,7 +51,6 @@ impl TeamEventEmitter {
     pub fn new(team_id: String, user_id: String, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
         let mut authorized_user_ids = HashSet::from([user_id.clone()]);
         authorized_user_ids.extend(broadcaster.scope_recipients(&team_id));
-        broadcaster.replace_scope_recipients(&team_id, authorized_user_ids.iter().cloned().collect());
         Self {
             team_id,
             user_id,

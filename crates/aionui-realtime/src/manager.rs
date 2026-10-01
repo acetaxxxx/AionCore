@@ -61,13 +61,17 @@ impl WebSocketManager {
             warn!(event_name = %event.name, "dropping scoped websocket event without recipient list");
             return;
         };
+        let Some(owner_user_id) = event.data.get("user_id").and_then(serde_json::Value::as_str) else {
+            warn!(event_name = %event.name, team_id = %scope_id, "dropping scoped websocket event without owner identity");
+            return;
+        };
         let recipients = self.scoped_recipients.read().ok().and_then(|guard| guard.clone());
         let Some(recipients) = recipients else {
             warn!(event_name = %event.name, team_id = %scope_id, "dropping scoped websocket event without recipient authority");
             return;
         };
 
-        recipients.with_authorized_recipients(scope_id, &requested, |recipient| {
+        recipients.with_authorized_recipients(scope_id, owner_user_id, &requested, |recipient| {
             let mut scoped_event = event.clone();
             if let Some(data) = scoped_event.data.as_object_mut() {
                 data.remove("authorized_user_ids");
@@ -585,6 +589,9 @@ mod tests {
     #[test]
     fn authorized_team_event_fans_out_only_to_server_listed_users() {
         let mgr = WebSocketManager::new();
+        let recipients = ScopedEventRecipients::default();
+        recipients.replace("team-1", ["owner".into(), "collaborator".into()]);
+        mgr.set_scoped_event_recipients(recipients);
         let (owner_tx, mut owner_rx) = new_client_tx();
         let (collaborator_tx, mut collaborator_rx) = new_client_tx();
         let (unrelated_tx, mut unrelated_rx) = new_client_tx();
@@ -614,6 +621,28 @@ mod tests {
         assert_eq!(collaborator_event["data"]["user_id"], "collaborator");
         assert!(owner_event["data"].get("authorized_user_ids").is_none());
         assert!(unrelated_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn uninitialized_scope_falls_back_to_owner_only() {
+        let mgr = WebSocketManager::new();
+        mgr.set_scoped_event_recipients(ScopedEventRecipients::default());
+        let (owner_tx, mut owner_rx) = new_client_tx();
+        let (collaborator_tx, mut collaborator_rx) = new_client_tx();
+        mgr.add_client_for_user("owner".into(), "owner-token".into(), owner_tx);
+        mgr.add_client_for_user("collaborator".into(), "collaborator-token".into(), collaborator_tx);
+
+        mgr.broadcast_scoped(WebSocketMessage::new(
+            "team.created",
+            serde_json::json!({
+                "user_id": "owner",
+                "authorized_user_ids": ["owner", "collaborator"],
+                "team_id": "team-uninitialized",
+            }),
+        ));
+
+        assert!(owner_rx.try_recv().is_ok());
+        assert!(collaborator_rx.try_recv().is_err());
     }
 
     #[test]
