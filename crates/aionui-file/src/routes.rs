@@ -1553,10 +1553,11 @@ mod tests {
     /// authenticated handlers with a real `ProjectService` — would not actually pin
     /// this: the wiring is a single `map_err` per handler, and a future edit swapping
     /// one back to `ApiError::from` is exactly the regression worth catching. The
-    /// The six call sites cover content read/write, metadata, stream, open-system,
-    /// and the legacy image-base64 route. The count guards against another resolver
-    /// call being added without a decision: bump it deliberately after checking the
-    /// new call is sealed as well.
+    /// These call sites cover content read/write, metadata, stream, open-system,
+    /// and the legacy image-base64 route. That last handler has separate guarded
+    /// personal-workspace and no-workspace fallbacks, so it contributes two calls.
+    /// The count guards against another resolver call being added without a decision:
+    /// bump it deliberately after checking the new call is sealed as well.
     #[test]
     fn every_chat_file_ref_endpoint_uses_the_sealed_resolver_mapping() {
         // Scan handler code only. This test module mentions both needles in its own
@@ -1572,8 +1573,8 @@ mod tests {
         let sealed = handlers.matches(".map_err(chat_file_resolve_error)").count();
 
         assert_eq!(
-            endpoint_calls, 6,
-            "all six file handlers must use the shared per-user resolver"
+            endpoint_calls, 7,
+            "all six ChatFileRef handlers must use the shared per-user resolver"
         );
         assert_eq!(
             project_resolve_calls, 1,
