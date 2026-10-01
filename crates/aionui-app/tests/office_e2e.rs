@@ -58,7 +58,11 @@ fn assert_local_path_forbidden(status: StatusCode, body: serde_json::Value, path
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], "FORBIDDEN");
     assert_eq!(body["error"], "Forbidden.");
-    assert!(!serde_json::to_string(&body).unwrap().contains(&path.to_string_lossy().to_string()));
+    assert!(
+        !serde_json::to_string(&body)
+            .unwrap()
+            .contains(&path.to_string_lossy().to_string())
+    );
 }
 
 fn build_test_office_state(
