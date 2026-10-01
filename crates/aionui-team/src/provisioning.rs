@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
@@ -84,6 +85,56 @@ pub struct TeamConversationCreateResult {
 pub struct TeamMcpSnapshotResolution {
     pub snapshot: McpRuntimeSnapshot,
     pub fingerprint: Option<String>,
+}
+
+fn restrict_mcp_selection_to_allowlist(
+    mut selection: TeamMcpSelection,
+    allowed_ids: &[String],
+) -> TeamMcpSelection {
+    let allowed_ids = allowed_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    selection.selected_ids.retain(|id| allowed_ids.contains(id.as_str()));
+    selection.mcp_server_ids.retain(|id| allowed_ids.contains(id.as_str()));
+    selection
+        .session_mcp_servers
+        .retain(|server| allowed_ids.contains(server.id.as_str()));
+    selection.mcp_statuses.retain(|status| allowed_ids.contains(status.id.as_str()));
+    selection
+}
+
+fn restrict_mcp_snapshot_to_allowlist(
+    mut resolution: TeamMcpSnapshotResolution,
+    allowed_ids: &[String],
+) -> TeamMcpSnapshotResolution {
+    let allowed_ids = allowed_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    resolution
+        .snapshot
+        .mcp_server_ids
+        .retain(|id| allowed_ids.contains(id.as_str()));
+    resolution
+        .snapshot
+        .session_mcp_servers
+        .retain(|server| allowed_ids.contains(server.id.as_str()));
+    resolution
+        .snapshot
+        .mcp_statuses
+        .retain(|status| allowed_ids.contains(status.id.as_str()));
+    let mut names = HashSet::new();
+    resolution.snapshot.mcp_servers = resolution
+        .snapshot
+        .mcp_statuses
+        .iter()
+        .filter_map(|status| names.insert(status.name.clone()).then_some(status.name.clone()))
+        .collect();
+    let ids = resolution
+        .snapshot
+        .mcp_server_ids
+        .iter()
+        .chain(resolution.snapshot.session_mcp_servers.iter().map(|server| &server.id))
+        .chain(resolution.snapshot.mcp_statuses.iter().map(|status| &status.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    resolution.fingerprint = Some(assistant_mcp_binding_fingerprint(&ids));
+    resolution
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -606,15 +657,28 @@ impl TeamAgentProvisioner {
         assistant_id: Option<&str>,
         shared_team: bool,
     ) -> Result<TeamMcpSelection, TeamError> {
-        // No Team-level MCP allowlist exists yet. Shared Teams therefore use
-        // an empty set instead of inheriting any owner's personal selection.
+        // Shared Teams use only the owner's explicit Team allowlist, intersected
+        // with the selected assistant binding. Personal MCP selections outside
+        // this persisted allowlist never flow into the Team runtime.
         if shared_team {
-            return Ok(TeamMcpSelection::default());
+            let allowed_ids = self.repo.list_team_mcp_allowlist(user_id, team_id).await?;
+            if allowed_ids.is_empty() {
+                return Ok(TeamMcpSelection::default());
+            }
+            let selection = self.resolve_assistant_mcp_selection(user_id, assistant_id).await?;
+            return Ok(restrict_mcp_selection_to_allowlist(selection, &allowed_ids));
         }
         // Ensure the caller supplied the expected Team scope even for private
         // mode, and fail closed if the persisted sharing policy cannot be read.
         if self.repo.get_team_sharing_mode(team_id).await? == TeamSharingMode::Shared {
-            return Ok(TeamMcpSelection::default());
+            let allowed_ids = self.repo.list_team_mcp_allowlist(user_id, team_id).await?;
+            if allowed_ids.is_empty() {
+                return Ok(TeamMcpSelection::default());
+            }
+            return Ok(restrict_mcp_selection_to_allowlist(
+                self.resolve_assistant_mcp_selection(user_id, assistant_id).await?,
+                &allowed_ids,
+            ));
         }
         self.resolve_assistant_mcp_selection(user_id, assistant_id).await
     }
@@ -627,10 +691,18 @@ impl TeamAgentProvisioner {
         assistant_id: Option<&str>,
     ) -> Result<TeamMcpSnapshotResolution, TeamError> {
         if self.repo.get_team_sharing_mode(team_id).await? == TeamSharingMode::Shared {
-            return Ok(TeamMcpSnapshotResolution {
-                snapshot: McpRuntimeSnapshot::default(),
-                fingerprint: Some(assistant_mcp_binding_fingerprint(&[])),
-            });
+            let allowed_ids = self.repo.list_team_mcp_allowlist(user_id, team_id).await?;
+            if allowed_ids.is_empty() || assistant_id.is_none() {
+                return Ok(TeamMcpSnapshotResolution {
+                    snapshot: McpRuntimeSnapshot::default(),
+                    fingerprint: Some(assistant_mcp_binding_fingerprint(&[])),
+                });
+            }
+            let resolution = self
+                .conversation_port
+                .resolve_conversation_mcp_snapshot(user_id, conversation_id, assistant_id)
+                .await?;
+            return Ok(restrict_mcp_snapshot_to_allowlist(resolution, &allowed_ids));
         }
         self.conversation_port
             .resolve_conversation_mcp_snapshot(user_id, conversation_id, assistant_id)
@@ -1065,6 +1137,115 @@ mod tests {
     use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
     use std::sync::Mutex;
     use tokio::sync::watch;
+
+    #[test]
+    fn shared_team_mcp_selection_is_intersected_with_explicit_allowlist() {
+        let selection = TeamMcpSelection {
+            selected_ids: vec!["allowed".into(), "personal-only".into()],
+            mcp_server_ids: vec!["allowed".into(), "personal-only".into()],
+            session_mcp_servers: vec![
+                aionui_api_types::SessionMcpServer {
+                    id: "allowed-builtin".into(),
+                    name: "Allowed builtin".into(),
+                    transport: aionui_api_types::SessionMcpTransport::Stdio {
+                        command: "mcp".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                },
+                aionui_api_types::SessionMcpServer {
+                    id: "personal-builtin".into(),
+                    name: "Personal builtin".into(),
+                    transport: aionui_api_types::SessionMcpTransport::Stdio {
+                        command: "personal-mcp".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                },
+            ],
+            mcp_statuses: vec![
+                aionui_api_types::ConversationMcpStatus {
+                    id: "allowed".into(),
+                    name: "Allowed".into(),
+                    status: aionui_api_types::ConversationMcpStatusKind::Loaded,
+                    reason: None,
+                },
+                aionui_api_types::ConversationMcpStatus {
+                    id: "personal-only".into(),
+                    name: "Personal".into(),
+                    status: aionui_api_types::ConversationMcpStatusKind::Loaded,
+                    reason: None,
+                },
+            ],
+        };
+
+        let filtered = restrict_mcp_selection_to_allowlist(
+            selection,
+            &["allowed".into(), "allowed-builtin".into()],
+        );
+
+        assert_eq!(filtered.selected_ids, vec!["allowed".to_owned()]);
+        assert_eq!(filtered.mcp_server_ids, vec!["allowed".to_owned()]);
+        assert_eq!(filtered.session_mcp_servers.len(), 1);
+        assert_eq!(filtered.session_mcp_servers[0].id, "allowed-builtin");
+        assert_eq!(filtered.mcp_statuses.len(), 1);
+        assert_eq!(filtered.mcp_statuses[0].id, "allowed");
+    }
+
+    #[test]
+    fn shared_team_persisted_mcp_snapshot_excludes_unlisted_owner_servers() {
+        let snapshot = McpRuntimeSnapshot {
+            mcp_server_ids: vec!["team-approved".into(), "owner-private".into()],
+            session_mcp_servers: vec![
+                aionui_api_types::SessionMcpServer {
+                    id: "team-session-approved".into(),
+                    name: "Team session server".into(),
+                    transport: aionui_api_types::SessionMcpTransport::Stdio {
+                        command: "team-mcp".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                },
+                aionui_api_types::SessionMcpServer {
+                    id: "owner-session-private".into(),
+                    name: "Owner private server".into(),
+                    transport: aionui_api_types::SessionMcpTransport::Stdio {
+                        command: "private-mcp".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                },
+            ],
+            mcp_servers: vec!["Team approved".into(), "Owner private".into()],
+            mcp_statuses: vec![
+                aionui_api_types::ConversationMcpStatus {
+                    id: "team-approved".into(),
+                    name: "Team approved".into(),
+                    status: aionui_api_types::ConversationMcpStatusKind::Loaded,
+                    reason: None,
+                },
+                aionui_api_types::ConversationMcpStatus {
+                    id: "owner-private".into(),
+                    name: "Owner private".into(),
+                    status: aionui_api_types::ConversationMcpStatusKind::Loaded,
+                    reason: None,
+                },
+            ],
+        };
+        let resolution = TeamMcpSnapshotResolution {
+            snapshot,
+            fingerprint: Some("unfiltered".into()),
+        };
+
+        let filtered = restrict_mcp_snapshot_to_allowlist(resolution, &["team-approved".into()]);
+
+        assert_eq!(filtered.snapshot.mcp_server_ids, vec!["team-approved"]);
+        assert!(filtered.snapshot.session_mcp_servers.is_empty());
+        assert_eq!(filtered.snapshot.mcp_servers, vec!["Team approved"]);
+        assert_eq!(filtered.snapshot.mcp_statuses.len(), 1);
+        assert_eq!(filtered.snapshot.mcp_statuses[0].id, "team-approved");
+        assert_ne!(filtered.fingerprint.as_deref(), Some("unfiltered"));
+    }
 
     struct RecordingProvisioningPort {
         events: Arc<Mutex<Vec<&'static str>>>,

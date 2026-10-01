@@ -104,6 +104,29 @@ pub trait ITeamRepository: Send + Sync {
         Err(DbError::Init("Team membership persistence is unavailable".into()))
     }
 
+    /// Reads the explicitly selected owner MCP IDs for an owned Shared Team.
+    /// Private-only repository implementations have no Team MCP sharing.
+    async fn list_team_mcp_allowlist(
+        &self,
+        _owner_user_id: &str,
+        _team_id: &str,
+    ) -> Result<Vec<String>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically replaces the owner-selected MCP IDs for an owned Shared
+    /// Team. Implementations must verify every MCP belongs to the Team owner.
+    async fn replace_team_mcp_allowlist(
+        &self,
+        _owner_user_id: &str,
+        _team_id: &str,
+        _mcp_server_ids: &[String],
+    ) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "Team MCP allowlist persistence is unavailable".into(),
+        ))
+    }
+
     /// Lists active Teams where `user_id` is a collaborator.
     async fn list_teams_by_member(&self, _user_id: &str) -> Result<Vec<TeamRow>, DbError> {
         // Compatibility default for private-only repository implementations.

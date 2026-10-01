@@ -139,6 +139,20 @@ pub struct TeamMemberResponse {
 /// Type alias for active Team members.
 pub type TeamMemberListResponse = Vec<TeamMemberResponse>;
 
+/// Replaces the owner-configured MCP allowlist for a Shared Team.
+/// IDs are revalidated against the authenticated Team owner on the server.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceTeamMcpAllowlistRequest {
+    pub mcp_server_ids: Vec<String>,
+}
+
+/// The explicitly selected owner MCP server IDs for a Shared Team.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamMcpAllowlistResponse {
+    pub mcp_server_ids: Vec<String>,
+}
+
 /// Request body for `PATCH /api/teams/:id/name`.
 #[derive(Debug, Deserialize)]
 pub struct RenameTeamRequest {

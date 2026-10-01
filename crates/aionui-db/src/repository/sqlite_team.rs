@@ -151,6 +151,77 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
+    async fn list_team_mcp_allowlist(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let team_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM teams WHERE id = ? AND user_id = ? AND sharing_mode = 'shared'",
+        )
+        .bind(team_id)
+        .bind(owner_user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if team_count == 0 {
+            return Err(DbError::NotFound(format!("shared Team {team_id}")));
+        }
+        sqlx::query_scalar(
+            "SELECT allowlist.mcp_server_id FROM team_mcp_allowlist allowlist \
+             JOIN mcp_servers mcp ON mcp.id = allowlist.mcp_server_id AND mcp.user_id = ? AND mcp.deleted_at IS NULL \
+             WHERE allowlist.team_id = ? ORDER BY allowlist.mcp_server_id",
+        )
+        .bind(owner_user_id)
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn replace_team_mcp_allowlist(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        mcp_server_ids: &[String],
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let team_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM teams WHERE id = ? AND user_id = ? AND sharing_mode = 'shared'",
+        )
+        .bind(team_id)
+        .bind(owner_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if team_count == 0 {
+            return Err(DbError::NotFound(format!("shared Team {team_id}")));
+        }
+        for mcp_server_id in mcp_server_ids {
+            let server_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM mcp_servers WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+            )
+            .bind(mcp_server_id)
+            .bind(owner_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if server_count == 0 {
+                return Err(DbError::NotFound(format!("owner MCP server {mcp_server_id}")));
+            }
+        }
+        sqlx::query("DELETE FROM team_mcp_allowlist WHERE team_id = ?")
+            .bind(team_id)
+            .execute(&mut *tx)
+            .await?;
+        for mcp_server_id in mcp_server_ids {
+            sqlx::query("INSERT INTO team_mcp_allowlist (team_id, mcp_server_id) VALUES (?, ?)")
+                .bind(team_id)
+                .bind(mcp_server_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn list_teams_by_member(&self, user_id: &str) -> Result<Vec<TeamRow>, DbError> {
         sqlx::query_as::<_, TeamRow>(
             "SELECT t.* FROM teams t JOIN team_memberships m ON m.team_id = t.id \

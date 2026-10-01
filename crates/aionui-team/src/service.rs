@@ -1190,6 +1190,66 @@ impl TeamSessionService {
         Ok(())
     }
 
+    pub async fn list_team_mcp_allowlist(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+    ) -> Result<Vec<String>, TeamError> {
+        let access = self.authorize_team(owner_user_id, team_id).await?;
+        if access.role != TeamAccessRole::Owner || access.sharing_mode != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        self.repo
+            .list_team_mcp_allowlist(owner_user_id, team_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn replace_team_mcp_allowlist(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        mcp_server_ids: Vec<String>,
+    ) -> Result<(), TeamError> {
+        let access = self.authorize_team(owner_user_id, team_id).await?;
+        if access.role != TeamAccessRole::Owner || access.sharing_mode != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let mut normalized = Vec::with_capacity(mcp_server_ids.len());
+        let mut unique = HashSet::with_capacity(mcp_server_ids.len());
+        for id in mcp_server_ids {
+            let id = id.trim();
+            if id.is_empty() || !unique.insert(id.to_owned()) {
+                return Err(TeamError::InvalidRequest(
+                    "MCP allowlist IDs must be non-empty and unique".into(),
+                ));
+            }
+            normalized.push(id.to_owned());
+        }
+
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = lock.lock().await;
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        self.repo
+            .replace_team_mcp_allowlist(owner_user_id, team_id, &normalized)
+            .await?;
+        drop(guard);
+
+        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+            for agent in session.scheduler().list_agents().await {
+                self.refresh_member_mcp_binding(&session, owner_user_id, &agent).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn refresh_session_event_users(&self, team_id: &str, owner_user_id: &str) {
         match self.repo.list_team_members(team_id).await {
             Ok(members) => {

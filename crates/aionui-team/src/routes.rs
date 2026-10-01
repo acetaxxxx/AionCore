@@ -12,11 +12,11 @@ use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, AddTeamMemberRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest,
     CreateTeamRequest, EligibleTeamCollaboratorResponse, GetConfigOptionsResponse, InterruptTeamAgentRequest,
-    PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
+    PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, ReplaceTeamMcpAllowlistRequest,
     SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse,
-    TeamMemberListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    TeamMemberListResponse, TeamMcpAllowlistResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
     TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
@@ -197,6 +197,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             "/api/teams/{id}/members/{membership_ref}",
             axum::routing::delete(remove_team_member),
         )
+        .route(
+            "/api/teams/{id}/mcp-allowlist",
+            get(get_team_mcp_allowlist).put(replace_team_mcp_allowlist),
+        )
         .route("/api/teams/{id}/run-state", get(get_run_state))
         .route("/api/teams/{id}/mailbox", get(list_mailbox))
         .route("/api/teams/{id}/tasks", get(list_tasks))
@@ -298,6 +302,29 @@ async fn remove_team_member(
     state
         .service
         .remove_team_member(&user.id, &id, &membership_ref)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn get_team_mcp_allowlist(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<TeamMcpAllowlistResponse>>, ApiError> {
+    let mcp_server_ids = state.service.list_team_mcp_allowlist(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(TeamMcpAllowlistResponse { mcp_server_ids })))
+}
+
+async fn replace_team_mcp_allowlist(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ReplaceTeamMcpAllowlistRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .replace_team_mcp_allowlist(&user.id, &id, request.mcp_server_ids)
         .await?;
     Ok(Json(ApiResponse::success()))
 }

@@ -14,8 +14,9 @@ use std::sync::Arc;
 use aionui_common::now_ms;
 use aionui_db::models::{MailboxMessageRow, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
 use aionui_db::{
-    ActivityCursor, DbError, ITeamRepository, IUserRepository, PageDirection, SqliteTeamRepository,
-    SqliteUserRepository, UpdateTaskParams, UpdateTeamParams, init_database_memory,
+    ActivityCursor, CreateMcpServerParams, DbError, ITeamRepository, IMcpServerRepository, IUserRepository,
+    PageDirection, SqliteMcpServerRepository, SqliteTeamRepository, SqliteUserRepository, UpdateTaskParams,
+    UpdateTeamParams, init_database_memory,
 };
 
 const DEFAULT_USER_ID: &str = "system_default_user";
@@ -240,6 +241,69 @@ async fn eligible_team_users_exclude_owner_members_existing_members_and_disabled
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].user_id, eligible.id);
     assert_eq!(candidates[0].display_name, "eligible-member");
+}
+
+#[tokio::test]
+async fn team_mcp_allowlist_is_shared_team_owner_scoped_and_atomic() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let other_owner = users.create_user("other-owner", "test-password-hash").await.unwrap();
+    let mcp_repo = SqliteMcpServerRepository::new(db.pool().clone());
+    let owner_mcp = mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: DEFAULT_USER_ID,
+            name: "owner-mcp",
+            description: None,
+            enabled: true,
+            transport_type: "stdio",
+            transport_config: r#"{"command":"mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+    let private_mcp = mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: &other_owner.id,
+            name: "private-mcp",
+            description: None,
+            enabled: true,
+            transport_type: "stdio",
+            transport_config: r#"{"command":"private-mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+
+    let shared = make_team("team-mcp-allowlist", "Shared Team");
+    repo.create_team_with_sharing_mode(&shared, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    let selected = vec![owner_mcp.id.clone()];
+    repo.replace_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id, &selected)
+        .await
+        .unwrap();
+    assert_eq!(repo.list_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id).await.unwrap(), selected);
+
+    assert!(matches!(
+        repo.replace_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id, &[private_mcp.id]).await,
+        Err(DbError::NotFound(_))
+    ));
+    assert_eq!(repo.list_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id).await.unwrap(), vec![owner_mcp.id]);
+    assert!(matches!(
+        repo.list_team_mcp_allowlist(&other_owner.id, &shared.id).await,
+        Err(DbError::NotFound(_))
+    ));
+
+    let private = make_team("private-team-mcp", "Private Team");
+    repo.create_team(&private).await.unwrap();
+    assert!(matches!(
+        repo.replace_team_mcp_allowlist(DEFAULT_USER_ID, &private.id, &[]).await,
+        Err(DbError::NotFound(_))
+    ));
 }
 
 #[tokio::test]
