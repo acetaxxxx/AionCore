@@ -164,8 +164,16 @@ async fn au2_unauthenticated_all_office_endpoints() {
 async fn wp4_word_preview_officecli_not_available() {
     let (mut app, services, tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
 
-    let file_path = tmp.path().join("test.docx");
+    let file_path = tmp
+        .path()
+        .join("conversations")
+        .join("users")
+        .join(user_id)
+        .join("office")
+        .join("test.docx");
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, b"docx").unwrap();
 
     let body = json!({"file_path": file_path.to_str().unwrap()});
