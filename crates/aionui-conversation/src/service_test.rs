@@ -2042,7 +2042,8 @@ fn create_shared_team_workspace_uses_team_root_and_rejects_path_components() {
     let workspace_root = temp.path().join("aionui-data");
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
 
-    let workspace = Path::new(&svc.create_shared_team_workspace("team_123").unwrap());
+    let workspace_string = svc.create_shared_team_workspace("team_123").unwrap();
+    let workspace = Path::new(&workspace_string);
     assert_eq!(workspace, workspace_root.join("teams").join("team_123"));
     assert!(workspace.is_dir());
     let workspace_string = workspace.to_string_lossy();

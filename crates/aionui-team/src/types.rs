@@ -806,7 +806,6 @@ mod tests {
             team_id: "t1".into(),
             to_agent_id: "a1".into(),
             from_agent_id: "a2".into(),
-            actor_user_id: None,
             msg_type: MailboxMessageType::Message,
             content: "hello".into(),
             summary: None,
