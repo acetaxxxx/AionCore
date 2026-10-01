@@ -95,6 +95,13 @@ pub struct TeamAuthorizationContext {
     pub team: TeamRow,
 }
 
+fn can_send_direct_team_message(role: TeamAccessRole, lead_slot_id: Option<&str>, target_slot_id: &str) -> bool {
+    match role {
+        TeamAccessRole::Owner => true,
+        TeamAccessRole::Collaborator => lead_slot_id == Some(target_slot_id),
+    }
+}
+
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
         extra["workspace"] = serde_json::Value::String(workspace.to_owned());
@@ -2745,6 +2752,9 @@ impl TeamSessionService {
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         let access = self.authorize_team(user_id, team_id).await?;
+        if !can_send_direct_team_message(access.role, access.team.lead_agent_id.as_deref(), slot_id) {
+            return Err(TeamError::Forbidden("collaborators may only send directly to the shared Team Lead".into()));
+        }
         Self::reject_shared_team_attachments(&access, files.as_deref())?;
         self.ensure_session_inner(team_id, Some(&access.execution_owner_id)).await?;
         let (content, files) = self
@@ -5300,5 +5310,31 @@ mod tests {
             .expect_err("team config options must reject cross-user access");
 
         assert!(matches!(err, crate::error::TeamError::TeamNotFound(_)));
+    }
+
+    #[test]
+    fn collaborator_direct_message_target_is_limited_to_shared_lead() {
+        use aionui_db::models::TeamAccessRole;
+
+        assert!(super::can_send_direct_team_message(
+            TeamAccessRole::Collaborator,
+            Some("lead-slot"),
+            "lead-slot"
+        ));
+        assert!(!super::can_send_direct_team_message(
+            TeamAccessRole::Collaborator,
+            Some("lead-slot"),
+            "worker-slot"
+        ));
+        assert!(!super::can_send_direct_team_message(
+            TeamAccessRole::Collaborator,
+            None,
+            "worker-slot"
+        ));
+        assert!(super::can_send_direct_team_message(
+            TeamAccessRole::Owner,
+            Some("lead-slot"),
+            "worker-slot"
+        ));
     }
 }
