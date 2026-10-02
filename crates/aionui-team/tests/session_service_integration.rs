@@ -925,7 +925,7 @@ struct FullMockTeamRepo {
     inner: MockTeamRepo,
     teams: std::sync::Mutex<Vec<aionui_db::models::TeamRow>>,
     sharing_modes: std::sync::Mutex<HashMap<String, aionui_db::models::TeamSharingMode>>,
-    collaborators: std::sync::Mutex<HashMap<String, HashMap<String, String>>>,
+    collaborators: std::sync::Mutex<HashMap<String, HashMap<String, (String, Option<String>)>>>,
     stale_eligible_users: std::sync::Mutex<Vec<aionui_db::models::EligibleTeamUserRow>>,
     fail_workspace_update: std::sync::Mutex<bool>,
     fail_agent_update: std::sync::Mutex<bool>,
@@ -970,7 +970,10 @@ impl FullMockTeamRepo {
             .unwrap()
             .entry(team_id.to_owned())
             .or_default()
-            .insert(user_id.to_owned(), format!("membership-{team_id}-{user_id}"));
+            .insert(
+                user_id.to_owned(),
+                (format!("membership-{team_id}-{user_id}"), Some(user_id.to_owned())),
+            );
     }
 
     fn revoke_test_collaborator(&self, team_id: &str, user_id: &str) {
@@ -1083,11 +1086,11 @@ impl ITeamRepository for FullMockTeamRepo {
             .get(team_id)
             .into_iter()
             .flat_map(|members| members.iter())
-            .map(|(user_id, membership_ref)| aionui_db::models::TeamMembershipRow {
+            .map(|(user_id, (membership_ref, display_name))| aionui_db::models::TeamMembershipRow {
                 membership_ref: membership_ref.clone(),
                 team_id: team_id.to_owned(),
                 user_id: user_id.clone(),
-                display_name: Some(user_id.clone()),
+                display_name: display_name.clone(),
                 created_at: aionui_common::now_ms(),
             })
             .collect())
@@ -1197,7 +1200,7 @@ impl ITeamRepository for FullMockTeamRepo {
             .unwrap()
             .entry(row.team_id.clone())
             .or_default()
-            .insert(row.user_id.clone(), row.membership_ref.clone());
+            .insert(row.user_id.clone(), (row.membership_ref.clone(), row.display_name.clone()));
         Ok(())
     }
 
