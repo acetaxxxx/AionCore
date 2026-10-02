@@ -205,7 +205,7 @@ impl OwnerEligibleAccountRefs {
     fn can_evict(&self, now: Instant) -> bool {
         self.by_team.is_empty()
             && self.latest_listing_by_team.is_empty()
-            && self.last_activity_at.map_or(true, |last| {
+            && self.last_activity_at.is_none_or(|last| {
                 now.saturating_duration_since(last) >= ELIGIBLE_OWNER_RECORD_IDLE_TTL
             })
     }
@@ -276,10 +276,10 @@ impl EligibleAccountRefStore {
         let mut owner = self.by_owner.entry(owner_user_id.to_owned()).or_default();
         owner.prune_expired(now_ms, now);
         owner.last_activity_at = Some(now);
-        if !owner
+        if owner
             .latest_listing_by_team
             .get(team_id)
-            .is_some_and(|(latest, _)| latest.as_str() == generation)
+            .is_none_or(|(latest, _)| latest.as_str() != generation)
         {
             return Err(EligibleAccountRefStoreError::ListingSuperseded);
         }
