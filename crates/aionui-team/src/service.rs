@@ -205,9 +205,7 @@ impl OwnerEligibleAccountRefs {
     fn can_evict(&self, now: Instant) -> bool {
         self.by_team.is_empty()
             && self.latest_listing_by_team.is_empty()
-            && self.last_activity_at.is_none_or(|last| {
-                now.saturating_duration_since(last) >= ELIGIBLE_OWNER_RECORD_IDLE_TTL
-            })
+            && self.last_activity_at.is_none_or(|last| now.saturating_duration_since(last) >= ELIGIBLE_OWNER_RECORD_IDLE_TTL)
     }
 }
 
