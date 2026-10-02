@@ -1,6 +1,7 @@
 use std::path::{Component, Path};
 
 use aionui_auth::CurrentUser;
+use aionui_common::user_dir_name;
 
 use crate::error::FileError;
 
@@ -11,7 +12,7 @@ use crate::error::FileError;
 /// 2. General/tenant users (`!user.is_local_admin()`) are forbidden from:
 ///    - Accessing system databases: `aionui-backend.db*`, `aionui-memory.db*`, or system logs.
 ///    - Browsing the system data root `/data` or shared user root directories (`/data/users`, `conversations/users`).
-///    - Accessing any other tenant's directory under `users/<other_user_id>` or `conversations/users/<other_user_id>`.
+///    - Accessing any other tenant's directory under `users/<other_user_dir>` or `conversations/users/<other_user_dir>`.
 pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileError> {
     if user.is_local_admin() {
         return Ok(());
@@ -21,6 +22,8 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
     if trimmed.is_empty() {
         return Err(FileError::Forbidden("path is required".to_owned()));
     }
+    let user_dir = user_dir_name(&user.id)
+        .map_err(|_| FileError::Forbidden("authenticated user path is invalid".to_owned()))?;
 
     // Normalize separators to forward slash and lowercase for pattern checks
     let normalized = trimmed.replace('\\', "/");
@@ -74,7 +77,7 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
             && components[i + 1].eq_ignore_ascii_case("users")
         {
             let target_user = components[i + 2];
-            if target_user != user.id {
+            if target_user != user_dir.as_str() {
                 return Err(FileError::Forbidden(
                     "cross-tenant access to conversation path is forbidden".to_owned(),
                 ));
@@ -85,7 +88,7 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
             // Check if this is "conversations/users" (handled above) or standalone "users/{id}"
             if i == 0 || !components[i - 1].eq_ignore_ascii_case("conversations") {
                 let target_user = components[i + 1];
-                if target_user != user.id {
+                if target_user != user_dir.as_str() {
                     return Err(FileError::Forbidden(
                         "cross-tenant access to user path is forbidden".to_owned(),
                     ));
@@ -131,7 +134,7 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
                 && can_components[i + 1].eq_ignore_ascii_case("users")
             {
                 let target_user = can_components[i + 2];
-                if target_user != user.id {
+                if target_user != user_dir.as_str() {
                     return Err(FileError::Forbidden(
                         "cross-tenant access to conversation path is forbidden".to_owned(),
                     ));
@@ -143,7 +146,7 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
                 && (i == 0 || !can_components[i - 1].eq_ignore_ascii_case("conversations"))
             {
                 let target_user = can_components[i + 1];
-                if target_user != user.id {
+                if target_user != user_dir.as_str() {
                     return Err(FileError::Forbidden(
                         "cross-tenant access to user path is forbidden".to_owned(),
                     ));
