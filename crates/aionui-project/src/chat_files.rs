@@ -418,6 +418,9 @@ fn normalize_lexical_absolute(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 fn path_belongs_to_user_data_tree(user_id: &str, relative: &Path) -> bool {
+    let Ok(user_dir) = aionui_common::user_dir_name(user_id) else {
+        return false;
+    };
     let components: Vec<String> = relative
         .components()
         .filter_map(|component| match component {
@@ -428,9 +431,9 @@ fn path_belongs_to_user_data_tree(user_id: &str, relative: &Path) -> bool {
 
     (components.first().is_some_and(|part| part == "conversations")
         && components.get(1).is_some_and(|part| part == "users")
-        && components.get(2).is_some_and(|owner| owner == user_id))
+        && components.get(2).is_some_and(|owner| owner == &user_dir))
         || (components.first().is_some_and(|part| part == "users")
-            && components.get(1).is_some_and(|owner| owner == user_id))
+            && components.get(1).is_some_and(|owner| owner == &user_dir))
 }
 
 /// Whether `target` resolves inside `root` (both canonicalized, so `..` and

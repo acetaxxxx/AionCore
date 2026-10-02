@@ -292,6 +292,75 @@ async fn local_file_for_authenticated_user_is_limited_to_their_own_conversation_
 }
 
 #[tokio::test]
+async fn authenticated_user_paths_use_the_normalized_user_directory_name() {
+    let db = init_database_memory().await.unwrap();
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let data_root = tempfile::tempdir().unwrap();
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir()).with_user_data_root(data_root.path());
+    let upload_root = tempfile::tempdir().unwrap();
+    let user_id = "user_alice";
+    let own_workspace = data_root.path().join("conversations/users/alice/teams/travel");
+    std::fs::create_dir_all(&own_workspace).unwrap();
+    let own_image = own_workspace.join("preview.jpg");
+    std::fs::write(&own_image, b"image").unwrap();
+
+    let authorized_workspace = service
+        .authorize_local_workspace_with_local_admin(user_id, false, &own_workspace)
+        .unwrap();
+    assert_eq!(
+        authorized_workspace,
+        std::fs::canonicalize(&own_workspace)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    );
+
+    let resolved_image = service
+        .resolve_chat_file_ref_with_local_admin(
+            user_id,
+            false,
+            &ChatFileRef::Local {
+                path: own_image.to_string_lossy().into_owned(),
+            },
+            upload_root.path(),
+            crate::FileOp::Read,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved_image,
+        std::fs::canonicalize(&own_image)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    );
+
+    let foreign_workspace = data_root.path().join("conversations/users/bob/teams/private");
+    std::fs::create_dir_all(&foreign_workspace).unwrap();
+    let foreign_image = foreign_workspace.join("private.jpg");
+    std::fs::write(&foreign_image, b"private").unwrap();
+
+    let workspace_error = service
+        .authorize_local_workspace_with_local_admin(user_id, false, &foreign_workspace)
+        .unwrap_err();
+    assert!(matches!(workspace_error, ProjectError::LocalPathForbidden));
+
+    let image_error = service
+        .resolve_chat_file_ref_with_local_admin(
+            user_id,
+            false,
+            &ChatFileRef::Local {
+                path: foreign_image.to_string_lossy().into_owned(),
+            },
+            upload_root.path(),
+            crate::FileOp::Read,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(image_error, ProjectError::LocalPathForbidden));
+}
+
+#[tokio::test]
 async fn authenticated_local_admin_can_resolve_host_file_outside_user_trees() {
     let (service, _pe, _dir, upload_root) = setup().await;
     let host_root = tempfile::tempdir().unwrap();

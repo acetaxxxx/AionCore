@@ -165,12 +165,13 @@ async fn wp4_word_preview_officecli_not_available() {
     let (mut app, services, tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
     let user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
+    let user_dir = aionui_common::user_dir_name(&user_id).unwrap();
 
     let file_path = tmp
         .path()
         .join("conversations")
         .join("users")
-        .join(user_id)
+        .join(user_dir)
         .join("office")
         .join("test.docx");
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
@@ -310,12 +311,13 @@ async fn dc1_excel_to_json() {
     let (mut app, services, tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
     let user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
+    let user_dir = aionui_common::user_dir_name(&user_id).unwrap();
 
     let xlsx_path = tmp
         .path()
         .join("conversations")
         .join("users")
-        .join(user_id)
+        .join(user_dir)
         .join("office")
         .join("test.xlsx");
     std::fs::create_dir_all(xlsx_path.parent().unwrap()).unwrap();

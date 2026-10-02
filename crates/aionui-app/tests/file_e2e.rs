@@ -402,7 +402,7 @@ async fn image_base64_personal_workspace_allows_owner_and_denies_other_user() {
     let workspace = data_root
         .path()
         .join("conversations/users")
-        .join(&owner.id)
+        .join(aionui_common::user_dir_name(&owner.id).unwrap())
         .join("personal-workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let image_path = workspace.join("preview.png");
