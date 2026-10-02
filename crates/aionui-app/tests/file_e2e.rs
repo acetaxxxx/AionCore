@@ -408,11 +408,7 @@ async fn image_base64_personal_workspace_allows_owner_and_denies_other_user() {
         .join("personal-workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let image_path = workspace.join("preview.png");
-    std::fs::write(
-        &image_path,
-        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
-    )
-    .unwrap();
+    std::fs::write(&image_path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
     let request_body = json!({
         "path": image_path.to_string_lossy(),
         "workspace": workspace.to_string_lossy(),
@@ -431,7 +427,12 @@ async fn image_base64_personal_workspace_allows_owner_and_denies_other_user() {
         .unwrap();
     assert_eq!(owner_response.status(), StatusCode::OK);
     let owner_json = body_json(owner_response).await;
-    assert!(owner_json["data"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    assert!(
+        owner_json["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
 
     let (collaborator_token, collaborator_csrf) =
         setup_and_login(&mut app, &services, "image-collaborator", "StrongP@ss1").await;
