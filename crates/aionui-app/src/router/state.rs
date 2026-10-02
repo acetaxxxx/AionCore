@@ -785,8 +785,12 @@ impl TeamWorkspaceAuthorizer for AppTeamWorkspaceAuthorizer {
         user_id: &str,
         workspace: &Path,
     ) -> Result<TeamWorkspaceAuthorization, FileError> {
-        if self.authorize_path(user_id, workspace).await? != TeamWorkspaceAuthorization::Allowed {
-            return Ok(TeamWorkspaceAuthorization::Denied);
+        match self.authorize_path(user_id, workspace).await? {
+            TeamWorkspaceAuthorization::Allowed => {}
+            TeamWorkspaceAuthorization::NotTeamWorkspace => {
+                return Ok(TeamWorkspaceAuthorization::NotTeamWorkspace);
+            }
+            TeamWorkspaceAuthorization::Denied => return Ok(TeamWorkspaceAuthorization::Denied),
         }
         let Ok(workspace_root) = self.workspace_root.canonicalize() else {
             return Ok(TeamWorkspaceAuthorization::Denied);
