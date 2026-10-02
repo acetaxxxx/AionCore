@@ -390,8 +390,6 @@ async fn image_base64_with_workspace_field_accepts_non_home_path() {
 
 #[tokio::test]
 async fn image_base64_personal_workspace_allows_owner_and_denies_other_user() {
-    use aionui_db::IUserRepository;
-
     let data_root = tempfile::tempdir().unwrap();
     let (mut app, services, _) = build_app_with_skill_paths(data_root.path()).await;
     let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "image-owner", "StrongP@ss1").await;
