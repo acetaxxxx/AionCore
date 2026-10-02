@@ -326,13 +326,21 @@ async fn owner_scoped_member_insert_rechecks_team_owner_sharing_and_active_user(
         created_at: now_ms(),
     };
 
-    assert!(repo.add_team_member_for_owner(&foreign_owner.id, &membership).await.is_err());
+    assert!(
+        repo.add_team_member_for_owner(&foreign_owner.id, &membership)
+            .await
+            .is_err()
+    );
     let inactive_membership = TeamMembershipRow {
         membership_ref: "inactive-membership-ref".into(),
         user_id: disabled_candidate.id,
         ..membership.clone()
     };
-    assert!(repo.add_team_member_for_owner(&owner.id, &inactive_membership).await.is_err());
+    assert!(
+        repo.add_team_member_for_owner(&owner.id, &inactive_membership)
+            .await
+            .is_err()
+    );
     repo.add_team_member_for_owner(&owner.id, &membership).await.unwrap();
     assert_eq!(repo.list_team_members(&team.id).await.unwrap().len(), 1);
 
@@ -343,7 +351,11 @@ async fn owner_scoped_member_insert_rechecks_team_owner_sharing_and_active_user(
         team_id: private_team.id,
         ..membership
     };
-    assert!(repo.add_team_member_for_owner(&owner.id, &private_membership).await.is_err());
+    assert!(
+        repo.add_team_member_for_owner(&owner.id, &private_membership)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
