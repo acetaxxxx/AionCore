@@ -76,7 +76,9 @@ pub trait ITeamRepository: Send + Sync {
     }
 
     /// Lists active account rows eligible for a specific owned Shared Team.
-    /// The returned user IDs are internal and must not be exposed to clients.
+    /// Returns at most `MAX_ELIGIBLE_TEAM_USERS + 1` rows; the extra row is an
+    /// overflow sentinel. The returned user IDs are internal and must not be
+    /// exposed to clients.
     async fn list_eligible_team_users(
         &self,
         _owner_user_id: &str,
@@ -85,9 +87,32 @@ pub trait ITeamRepository: Send + Sync {
         Err(DbError::Init("eligible Team account lookup is unavailable".into()))
     }
 
+    /// Revalidates one candidate by internal ID against the active account
+    /// directory and current Team eligibility. Implementations should use an
+    /// ID-filtered query rather than materializing the full directory.
+    async fn find_eligible_team_user(
+        &self,
+        _owner_user_id: &str,
+        _team_id: &str,
+        _user_id: &str,
+    ) -> Result<Option<EligibleTeamUserRow>, DbError> {
+        Err(DbError::Init(
+            "eligible Team account revalidation is unavailable".into(),
+        ))
+    }
+
     /// Creates an active membership using a server-generated opaque reference.
     async fn add_team_member(&self, _row: &TeamMembershipRow) -> Result<(), DbError> {
         Err(DbError::Init("Team membership persistence is unavailable".into()))
+    }
+
+    /// Creates an active membership only when the Team is still owned by
+    /// `owner_user_id` and Shared. Implementations must enforce this in the
+    /// same database statement/transaction as the insert.
+    async fn add_team_member_for_owner(&self, _owner_user_id: &str, _row: &TeamMembershipRow) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "owner-scoped Team membership persistence is unavailable".into(),
+        ))
     }
 
     /// Removes an active membership only when the caller owns the Team.

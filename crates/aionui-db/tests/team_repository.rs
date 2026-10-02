@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
+use aionui_db::models::{
+    MAX_ELIGIBLE_TEAM_USERS, MailboxMessageRow, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow,
+};
 use aionui_db::{
     ActivityCursor, CreateMcpServerParams, DbError, IMcpServerRepository, ITeamRepository, IUserRepository,
     PageDirection, SqliteMcpServerRepository, SqliteTeamRepository, SqliteUserRepository, UpdateTaskParams,
@@ -239,7 +241,7 @@ async fn eligible_team_users_exclude_owner_members_existing_members_and_disabled
     repo.add_team_member(&TeamMembershipRow {
         membership_ref: "existing-membership-ref".into(),
         team_id: team.id.clone(),
-        user_id: existing.id,
+        user_id: existing.id.clone(),
         display_name: None,
         created_at: now_ms(),
     })
@@ -250,6 +252,110 @@ async fn eligible_team_users_exclude_owner_members_existing_members_and_disabled
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].user_id, eligible.id);
     assert_eq!(candidates[0].display_name, "eligible-member");
+    assert!(candidates.iter().all(|candidate| candidate.user_id != DEFAULT_USER_ID));
+    assert_eq!(
+        repo.find_eligible_team_user(&owner.id, &team.id, &eligible.id)
+            .await
+            .unwrap(),
+        Some(candidates[0].clone())
+    );
+    for ineligible_id in [
+        owner.id.as_str(),
+        existing.id.as_str(),
+        disabled.id.as_str(),
+        DEFAULT_USER_ID,
+    ] {
+        assert!(
+            repo.find_eligible_team_user(&owner.id, &team.id, ineligible_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn eligible_team_user_listing_returns_two_thousand_rows_and_one_overflow_sentinel() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let owner = users.create_user("directory-owner", "owner-hash").await.unwrap();
+    let team = make_team_for_user("directory-boundary-team", &owner.id, "Directory Boundary");
+    repo.create_team_with_sharing_mode(&team, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+
+    for index in 0..MAX_ELIGIBLE_TEAM_USERS {
+        users
+            .create_user(&format!("eligible-{index:04}"), "candidate-hash")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        repo.list_eligible_team_users(&owner.id, &team.id).await.unwrap().len(),
+        MAX_ELIGIBLE_TEAM_USERS
+    );
+
+    users.create_user("eligible-overflow", "candidate-hash").await.unwrap();
+    assert_eq!(
+        repo.list_eligible_team_users(&owner.id, &team.id).await.unwrap().len(),
+        MAX_ELIGIBLE_TEAM_USERS + 1
+    );
+}
+
+#[tokio::test]
+async fn owner_scoped_member_insert_rechecks_team_owner_sharing_and_active_user() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let owner = users.create_user("scoped-owner", "owner-hash").await.unwrap();
+    let foreign_owner = users.create_user("foreign-owner", "owner-hash").await.unwrap();
+    let candidate = users.create_user("scoped-candidate", "candidate-hash").await.unwrap();
+    let disabled_candidate = users.create_user("disabled-candidate", "candidate-hash").await.unwrap();
+    users
+        .set_status(&disabled_candidate.id, aionui_db::models::UserStatus::Disabled)
+        .await
+        .unwrap();
+    let team = make_team_for_user("owner-scoped-shared-team", &owner.id, "Shared");
+    repo.create_team_with_sharing_mode(&team, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    let membership = TeamMembershipRow {
+        membership_ref: "owner-scoped-membership-ref".into(),
+        team_id: team.id.clone(),
+        user_id: candidate.id.clone(),
+        display_name: Some("scoped-candidate".into()),
+        created_at: now_ms(),
+    };
+
+    assert!(
+        repo.add_team_member_for_owner(&foreign_owner.id, &membership)
+            .await
+            .is_err()
+    );
+    let inactive_membership = TeamMembershipRow {
+        membership_ref: "inactive-membership-ref".into(),
+        user_id: disabled_candidate.id,
+        ..membership.clone()
+    };
+    assert!(
+        repo.add_team_member_for_owner(&owner.id, &inactive_membership)
+            .await
+            .is_err()
+    );
+    repo.add_team_member_for_owner(&owner.id, &membership).await.unwrap();
+    assert_eq!(repo.list_team_members(&team.id).await.unwrap().len(), 1);
+
+    let private_team = make_team_for_user("owner-scoped-private-team", &owner.id, "Private");
+    repo.create_team(&private_team).await.unwrap();
+    let private_membership = TeamMembershipRow {
+        membership_ref: "private-membership-ref".into(),
+        team_id: private_team.id,
+        ..membership
+    };
+    assert!(
+        repo.add_team_member_for_owner(&owner.id, &private_membership)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

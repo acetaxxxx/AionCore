@@ -57,10 +57,34 @@ impl From<TeamError> for ApiError {
             }
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
-            TeamError::CollaboratorAccountsUnavailable => ApiError::coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "TEAM_ACCOUNT_DIRECTORY_UNAVAILABLE",
-                "Eligible host-configured collaborator accounts are unavailable",
+            TeamError::RateLimited => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_COLLABORATOR_LIST_RATE_LIMITED",
+                "Wait at least one second before refreshing eligible collaborators",
+                None,
+            ),
+            TeamError::EligibleCollaboratorQuotaReached => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_COLLABORATOR_REFERENCE_QUOTA_REACHED",
+                concat!(
+                    "Too many collaborator choices are pending; ",
+                    "wait up to five minutes for old references to expire, then retry"
+                ),
+                None,
+            ),
+            TeamError::EligibleCollaboratorCandidateLimitExceeded => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_COLLABORATOR_CANDIDATE_LIMIT_EXCEEDED",
+                concat!(
+                    "Too many active accounts for this picker; ",
+                    "ask the host administrator to reduce the active account directory"
+                ),
+                None,
+            ),
+            TeamError::EligibleCollaboratorListingSuperseded => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_COLLABORATOR_LISTING_SUPERSEDED",
+                "A newer collaborator list is available; refresh the picker and try again",
                 None,
             ),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
@@ -853,6 +877,38 @@ mod tests {
     fn leader_only_maps_to_forbidden() {
         let err: ApiError = TeamError::LeaderOnly("spawn_agent".into()).into();
         assert!(matches!(err, ApiError::Forbidden(msg) if msg == "spawn_agent"));
+    }
+
+    #[test]
+    fn collaborator_list_rate_limit_maps_to_actionable_429() {
+        let err: ApiError = TeamError::RateLimited.into();
+        assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.error_code(), "TEAM_COLLABORATOR_LIST_RATE_LIMITED");
+        assert!(err.to_string().contains("one second"));
+    }
+
+    #[test]
+    fn collaborator_reference_quota_maps_to_expiry_guidance_429() {
+        let err: ApiError = TeamError::EligibleCollaboratorQuotaReached.into();
+        assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.error_code(), "TEAM_COLLABORATOR_REFERENCE_QUOTA_REACHED");
+        assert!(err.to_string().contains("five minutes"));
+    }
+
+    #[test]
+    fn collaborator_candidate_limit_maps_to_actionable_429() {
+        let err: ApiError = TeamError::EligibleCollaboratorCandidateLimitExceeded.into();
+        assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.error_code(), "TEAM_COLLABORATOR_CANDIDATE_LIMIT_EXCEEDED");
+        assert!(err.to_string().contains("host administrator"));
+    }
+
+    #[test]
+    fn superseded_collaborator_listing_maps_to_refresh_conflict() {
+        let err: ApiError = TeamError::EligibleCollaboratorListingSuperseded.into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_COLLABORATOR_LISTING_SUPERSEDED");
+        assert!(err.to_string().contains("refresh the picker"));
     }
 
     #[test]

@@ -925,7 +925,7 @@ struct FullMockTeamRepo {
     inner: MockTeamRepo,
     teams: std::sync::Mutex<Vec<aionui_db::models::TeamRow>>,
     sharing_modes: std::sync::Mutex<HashMap<String, aionui_db::models::TeamSharingMode>>,
-    collaborators: std::sync::Mutex<HashMap<String, HashMap<String, String>>>,
+    collaborators: std::sync::Mutex<HashMap<String, HashMap<String, (String, Option<String>)>>>,
     stale_eligible_users: std::sync::Mutex<Vec<aionui_db::models::EligibleTeamUserRow>>,
     fail_workspace_update: std::sync::Mutex<bool>,
     fail_agent_update: std::sync::Mutex<bool>,
@@ -970,7 +970,10 @@ impl FullMockTeamRepo {
             .unwrap()
             .entry(team_id.to_owned())
             .or_default()
-            .insert(user_id.to_owned(), format!("membership-{team_id}-{user_id}"));
+            .insert(
+                user_id.to_owned(),
+                (format!("membership-{team_id}-{user_id}"), Some(user_id.to_owned())),
+            );
     }
 
     fn revoke_test_collaborator(&self, team_id: &str, user_id: &str) {
@@ -1083,13 +1086,15 @@ impl ITeamRepository for FullMockTeamRepo {
             .get(team_id)
             .into_iter()
             .flat_map(|members| members.iter())
-            .map(|(user_id, membership_ref)| aionui_db::models::TeamMembershipRow {
-                membership_ref: membership_ref.clone(),
-                team_id: team_id.to_owned(),
-                user_id: user_id.clone(),
-                display_name: Some(user_id.clone()),
-                created_at: aionui_common::now_ms(),
-            })
+            .map(
+                |(user_id, (membership_ref, display_name))| aionui_db::models::TeamMembershipRow {
+                    membership_ref: membership_ref.clone(),
+                    team_id: team_id.to_owned(),
+                    user_id: user_id.clone(),
+                    display_name: display_name.clone(),
+                    created_at: aionui_common::now_ms(),
+                },
+            )
             .collect())
     }
     async fn list_teams_by_member(&self, user_id: &str) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
@@ -1127,10 +1132,81 @@ impl ITeamRepository for FullMockTeamRepo {
     }
     async fn list_eligible_team_users(
         &self,
-        _owner_user_id: &str,
-        _team_id: &str,
+        owner_user_id: &str,
+        team_id: &str,
     ) -> Result<Vec<aionui_db::models::EligibleTeamUserRow>, DbError> {
-        Ok(self.stale_eligible_users.lock().unwrap().clone())
+        let team_is_owned_and_shared = self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|team| team.id == team_id && team.user_id == owner_user_id)
+            && self.sharing_modes.lock().unwrap().get(team_id).copied()
+                == Some(aionui_db::models::TeamSharingMode::Shared);
+        if !team_is_owned_and_shared {
+            return Ok(Vec::new());
+        }
+        let members = self.collaborators.lock().unwrap();
+        let existing = members.get(team_id);
+        Ok(self
+            .stale_eligible_users
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|candidate| {
+                candidate.user_id != owner_user_id
+                    && candidate.user_id != "system_default_user"
+                    && !existing.is_some_and(|members| members.contains_key(&candidate.user_id))
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn find_eligible_team_user(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        user_id: &str,
+    ) -> Result<Option<aionui_db::models::EligibleTeamUserRow>, DbError> {
+        Ok(self
+            .list_eligible_team_users(owner_user_id, team_id)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.user_id == user_id))
+    }
+
+    async fn add_team_member_for_owner(
+        &self,
+        owner_user_id: &str,
+        row: &aionui_db::models::TeamMembershipRow,
+    ) -> Result<(), DbError> {
+        let team_is_owned_and_shared = self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|team| team.id == row.team_id && team.user_id == owner_user_id)
+            && self.sharing_modes.lock().unwrap().get(&row.team_id).copied()
+                == Some(aionui_db::models::TeamSharingMode::Shared);
+        let still_eligible = self
+            .stale_eligible_users
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.user_id == row.user_id);
+        if !team_is_owned_and_shared || !still_eligible {
+            return Err(DbError::NotFound("eligible shared Team account".into()));
+        }
+        self.collaborators
+            .lock()
+            .unwrap()
+            .entry(row.team_id.clone())
+            .or_default()
+            .insert(
+                row.user_id.clone(),
+                (row.membership_ref.clone(), row.display_name.clone()),
+            );
+        Ok(())
     }
 
     async fn write_message(&self, user_id: &str, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
@@ -8957,7 +9033,7 @@ async fn shared_team_reads_use_active_membership_and_revoke_blocks_next_read() {
 }
 
 #[tokio::test]
-async fn stale_core_user_rows_cannot_be_listed_or_added_as_collaborators() {
+async fn active_core_users_are_listed_with_scoped_opaque_refs_and_revalidated_on_add() {
     let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
         success_factory(),
         Arc::new(StubAgentMetadataRepo::empty()),
@@ -8967,24 +9043,64 @@ async fn stale_core_user_rows_cannot_be_listed_or_added_as_collaborators() {
         .create_team_with_sharing_mode(&team, aionui_db::models::TeamSharingMode::Shared)
         .await
         .unwrap();
-    // Models a Core users-table row that is still marked active but is stale or
-    // was seeded independently of the host's current loginable account roster.
+    // The selected policy treats an active Core user row as eligible. Email-
+    // shaped usernames are represented by a privacy-safe ordinal label.
     team_repo
         .stale_eligible_users
         .lock()
         .unwrap()
         .push(aionui_db::models::EligibleTeamUserRow {
-            user_id: "stale-core-user".into(),
-            display_name: "stale@example.invalid".into(),
+            user_id: "core-user-internal-id".into(),
+            display_name: "person@example.invalid".into(),
         });
-
-    assert!(matches!(
-        svc.list_eligible_collaborators("owner", &team.id).await,
-        Err(TeamError::CollaboratorAccountsUnavailable)
-    ));
+    let second_team = activity_team_row("shared-team-stale-roster-2", "owner");
+    team_repo
+        .create_team_with_sharing_mode(&second_team, aionui_db::models::TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    let eligible = svc.list_eligible_collaborators("owner", &team.id).await.unwrap();
+    assert_eq!(eligible.len(), 1);
+    assert_eq!(eligible[0].display_name, "Account 1");
+    assert!(!eligible[0].account_ref.contains("core-user-internal-id"));
+    let serialized = serde_json::to_string(&eligible).unwrap();
+    assert!(!serialized.contains("core-user-internal-id"));
+    assert!(!serialized.contains("person@example.invalid"));
     assert!(matches!(
         svc.add_team_member("owner", &team.id, "forged-or-stale-ref").await,
-        Err(TeamError::CollaboratorAccountsUnavailable)
+        Err(TeamError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        svc.add_team_member("not-owner", &team.id, &eligible[0].account_ref)
+            .await,
+        Err(TeamError::TeamNotFound(_))
+    ));
+    assert!(matches!(
+        svc.add_team_member("owner", &second_team.id, &eligible[0].account_ref)
+            .await,
+        Err(TeamError::InvalidRequest(_))
+    ));
+
+    svc.add_team_member("owner", &team.id, &eligible[0].account_ref)
+        .await
+        .unwrap();
+    let members = svc.list_team_members("owner", &team.id).await.unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].display_name.as_deref(), Some("Account 1"));
+    assert!(matches!(
+        svc.add_team_member("owner", &team.id, &eligible[0].account_ref).await,
+        Err(TeamError::InvalidRequest(_))
+    ));
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let stale = svc
+        .list_eligible_collaborators("owner", &second_team.id)
+        .await
+        .unwrap()
+        .remove(0);
+    team_repo.stale_eligible_users.lock().unwrap().clear();
+    assert!(matches!(
+        svc.add_team_member("owner", &second_team.id, &stale.account_ref).await,
+        Err(TeamError::InvalidRequest(_))
     ));
 }
 

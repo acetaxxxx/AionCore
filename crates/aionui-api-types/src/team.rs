@@ -112,7 +112,9 @@ pub struct CreateTeamRequest {
     pub sharing_mode: TeamSharingMode,
 }
 
-/// A selectable host account represented by a server-issued opaque reference.
+/// A selectable active Core account represented by a server-issued opaque
+/// reference. The display label is sanitized by the service and never contains
+/// the Core user ID, email, or credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EligibleTeamCollaboratorResponse {
     pub account_ref: String,
