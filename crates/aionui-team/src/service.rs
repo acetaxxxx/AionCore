@@ -71,6 +71,8 @@ pub const MAX_ACTIVITY_LIMIT: i64 = 1000;
 /// Upper bound on how many task ids one dependency-resolution request may
 /// look up, to bound query size regardless of client input.
 pub const MAX_TASK_ID_LOOKUP: usize = 200;
+/// Account references can be used once within five minutes of being listed.
+const ELIGIBLE_ACCOUNT_REF_TTL_MS: TimestampMs = 5 * 60 * 1000;
 /// Which item kinds the unified activity feed returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -97,6 +99,18 @@ fn can_send_direct_team_message(role: TeamAccessRole, lead_slot_id: Option<&str>
     match role {
         TeamAccessRole::Owner => true,
         TeamAccessRole::Collaborator => lead_slot_id == Some(target_slot_id),
+    }
+}
+
+/// Usernames for federated identities may be the email address itself. Keep
+/// those values out of the owner-visible picker and use a per-list ordinal;
+/// ordinary usernames remain the useful display label.
+fn collaborator_display_label(username: &str, ordinal: usize) -> String {
+    let username = username.trim();
+    if username.contains('@') {
+        format!("Account {ordinal}")
+    } else {
+        username.to_owned()
     }
 }
 
@@ -132,6 +146,15 @@ impl ModelPersistTrigger {
 struct SessionEntry {
     session: Arc<TeamSession>,
     slow_monitor_handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct EligibleAccountRef {
+    owner_user_id: String,
+    team_id: String,
+    user_id: String,
+    display_name: String,
+    expires_at: TimestampMs,
 }
 
 pub struct TeamIdleCleanupCoordinator {
@@ -191,6 +214,9 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Short-lived, single-use account references scoped to the listing owner
+    /// and Team. Raw Core user IDs never cross the API boundary.
+    eligible_account_refs: DashMap<String, EligibleAccountRef>,
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -321,6 +347,7 @@ impl TeamSessionService {
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
+            eligible_account_refs: DashMap::new(),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
@@ -946,10 +973,39 @@ impl TeamSessionService {
         if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        // Core's persisted users table contains seeded/provisioned identities,
-        // not an authoritative roster of accounts currently loginable through
-        // this host. Until such a host directory is injected, fail closed.
-        Err(TeamError::CollaboratorAccountsUnavailable)
+        let issued_at = now_ms();
+        self.eligible_account_refs
+            .retain(|_, reference| reference.expires_at > issued_at);
+        let candidates = self.repo.list_eligible_team_users(owner_user_id, team_id).await?;
+        let mut labels = HashSet::new();
+        Ok(candidates
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let base_label = collaborator_display_label(&candidate.display_name, index + 1);
+                let mut display_name = base_label.clone();
+                let mut suffix = 1;
+                while !labels.insert(display_name.clone()) {
+                    suffix += 1;
+                    display_name = format!("{base_label} ({suffix})");
+                }
+                let account_ref = generate_id();
+                self.eligible_account_refs.insert(
+                    account_ref.clone(),
+                    EligibleAccountRef {
+                        owner_user_id: owner_user_id.to_owned(),
+                        team_id: team_id.to_owned(),
+                        user_id: candidate.user_id,
+                        display_name: display_name.clone(),
+                        expires_at: issued_at.saturating_add(ELIGIBLE_ACCOUNT_REF_TTL_MS),
+                    },
+                );
+                EligibleTeamCollaboratorResponse {
+                    account_ref,
+                    display_name,
+                }
+            })
+            .collect())
     }
 
     /// Lists active collaborators without exposing internal user identifiers.
@@ -983,11 +1039,42 @@ impl TeamSessionService {
         if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        let _ = account_ref;
-        // Opaque refs can only be issued by an authoritative host account
-        // directory. The Core users table is not that directory, so accepting
-        // any DB-derived or caller-supplied identity here would be unsafe.
-        Err(TeamError::CollaboratorAccountsUnavailable)
+        let now = now_ms();
+        self.eligible_account_refs
+            .retain(|_, reference| reference.expires_at > now);
+        let invalid_ref = || TeamError::InvalidRequest("Invalid or expired account reference".into());
+        let Some(reference) = self
+            .eligible_account_refs
+            .get(account_ref)
+            .map(|reference| reference.value().clone())
+        else {
+            return Err(invalid_ref());
+        };
+        if reference.expires_at <= now
+            || reference.owner_user_id != owner_user_id
+            || reference.team_id != team_id
+        {
+            return Err(invalid_ref());
+        }
+        let Some((_, reference)) = self.eligible_account_refs.remove(account_ref) else {
+            return Err(invalid_ref());
+        };
+
+        // Re-read eligibility immediately before the owner-scoped insert. This
+        // rejects disabled, removed, or otherwise stale users after listing.
+        let candidates = self.repo.list_eligible_team_users(owner_user_id, team_id).await?;
+        if !candidates.iter().any(|candidate| candidate.user_id == reference.user_id) {
+            return Err(invalid_ref());
+        }
+        let membership = aionui_db::models::TeamMembershipRow {
+            membership_ref: generate_id(),
+            team_id: team_id.to_owned(),
+            user_id: reference.user_id,
+            display_name: Some(reference.display_name),
+            created_at: now_ms(),
+        };
+        self.repo.add_team_member_for_owner(owner_user_id, &membership).await?;
+        Ok(())
     }
 
     /// Revokes by server-issued membership reference after an owner-scoped check.

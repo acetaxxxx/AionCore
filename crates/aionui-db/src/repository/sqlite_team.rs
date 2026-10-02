@@ -129,6 +129,35 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
+    async fn add_team_member_for_owner(
+        &self,
+        owner_user_id: &str,
+        row: &TeamMembershipRow,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "INSERT INTO team_memberships (membership_ref, team_id, user_id, display_name, created_at) \
+             SELECT ?, t.id, u.id, ?, ? FROM teams t JOIN users u ON u.id = ? \
+             WHERE t.id = ? AND t.user_id = ? AND t.sharing_mode = 'shared' AND u.status = 'active' \
+             AND u.id <> t.user_id AND u.id <> 'system_default_user' \
+             AND NOT EXISTS (SELECT 1 FROM team_memberships m WHERE m.team_id = t.id AND m.user_id = u.id)",
+        )
+        .bind(&row.membership_ref)
+        .bind(&row.display_name)
+        .bind(row.created_at)
+        .bind(&row.user_id)
+        .bind(&row.team_id)
+        .bind(owner_user_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!(
+                "active shared Team or account for {}",
+                row.team_id
+            )));
+        }
+        Ok(())
+    }
+
     async fn remove_team_member(
         &self,
         owner_user_id: &str,

@@ -57,12 +57,6 @@ impl From<TeamError> for ApiError {
             }
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
-            TeamError::CollaboratorAccountsUnavailable => ApiError::coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "TEAM_ACCOUNT_DIRECTORY_UNAVAILABLE",
-                "Eligible host-configured collaborator accounts are unavailable",
-                None,
-            ),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),

@@ -90,6 +90,17 @@ pub trait ITeamRepository: Send + Sync {
         Err(DbError::Init("Team membership persistence is unavailable".into()))
     }
 
+    /// Creates an active membership only when the Team is still owned by
+    /// `owner_user_id` and Shared. Implementations must enforce this in the
+    /// same database statement/transaction as the insert.
+    async fn add_team_member_for_owner(
+        &self,
+        _owner_user_id: &str,
+        _row: &TeamMembershipRow,
+    ) -> Result<(), DbError> {
+        Err(DbError::Init("owner-scoped Team membership persistence is unavailable".into()))
+    }
+
     /// Removes an active membership only when the caller owns the Team.
     async fn remove_team_member(
         &self,
