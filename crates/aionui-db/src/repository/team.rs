@@ -1,6 +1,6 @@
 use crate::error::DbError;
 use crate::models::{
-    EligibleTeamUserRow, MailboxMessageRow, MAX_ELIGIBLE_TEAM_USERS, TeamAccessRole, TeamMembershipRow, TeamRow,
+    EligibleTeamUserRow, MAX_ELIGIBLE_TEAM_USERS, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow,
     TeamSharingMode, TeamTaskRow,
 };
 
@@ -97,7 +97,9 @@ pub trait ITeamRepository: Send + Sync {
         _team_id: &str,
         _user_id: &str,
     ) -> Result<Option<EligibleTeamUserRow>, DbError> {
-        Err(DbError::Init("eligible Team account revalidation is unavailable".into()))
+        Err(DbError::Init(
+            "eligible Team account revalidation is unavailable".into(),
+        ))
     }
 
     /// Creates an active membership using a server-generated opaque reference.
@@ -108,12 +110,10 @@ pub trait ITeamRepository: Send + Sync {
     /// Creates an active membership only when the Team is still owned by
     /// `owner_user_id` and Shared. Implementations must enforce this in the
     /// same database statement/transaction as the insert.
-    async fn add_team_member_for_owner(
-        &self,
-        _owner_user_id: &str,
-        _row: &TeamMembershipRow,
-    ) -> Result<(), DbError> {
-        Err(DbError::Init("owner-scoped Team membership persistence is unavailable".into()))
+    async fn add_team_member_for_owner(&self, _owner_user_id: &str, _row: &TeamMembershipRow) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "owner-scoped Team membership persistence is unavailable".into(),
+        ))
     }
 
     /// Removes an active membership only when the caller owns the Team.

@@ -9062,11 +9062,13 @@ async fn active_core_users_are_listed_with_scoped_opaque_refs_and_revalidated_on
         Err(TeamError::InvalidRequest(_))
     ));
     assert!(matches!(
-        svc.add_team_member("not-owner", &team.id, &eligible[0].account_ref).await,
+        svc.add_team_member("not-owner", &team.id, &eligible[0].account_ref)
+            .await,
         Err(TeamError::TeamNotFound(_))
     ));
     assert!(matches!(
-        svc.add_team_member("owner", &second_team.id, &eligible[0].account_ref).await,
+        svc.add_team_member("owner", &second_team.id, &eligible[0].account_ref)
+            .await,
         Err(TeamError::InvalidRequest(_))
     ));
 

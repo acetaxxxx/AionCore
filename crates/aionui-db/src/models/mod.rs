@@ -41,7 +41,7 @@ pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRow};
 pub use system_settings::SystemSettings;
 pub use team::{
-    EligibleTeamUserRow, MailboxMessageRow, MAX_ELIGIBLE_TEAM_USERS, TeamAccessRole, TeamMembershipRow, TeamRow,
+    EligibleTeamUserRow, MAX_ELIGIBLE_TEAM_USERS, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow,
     TeamSharingMode, TeamTaskRow,
 };
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};

@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{
-    EligibleTeamUserRow, MailboxMessageRow, MAX_ELIGIBLE_TEAM_USERS, TeamAccessRole, TeamMembershipRow, TeamRow,
+    EligibleTeamUserRow, MAX_ELIGIBLE_TEAM_USERS, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow,
     TeamSharingMode, TeamTaskRow,
 };
 use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
@@ -154,11 +154,7 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
-    async fn add_team_member_for_owner(
-        &self,
-        owner_user_id: &str,
-        row: &TeamMembershipRow,
-    ) -> Result<(), DbError> {
+    async fn add_team_member_for_owner(&self, owner_user_id: &str, row: &TeamMembershipRow) -> Result<(), DbError> {
         let result = sqlx::query(
             "INSERT INTO team_memberships (membership_ref, team_id, user_id, display_name, created_at) \
              SELECT ?, t.id, u.id, ?, ? FROM teams t JOIN users u ON u.id = ? \
