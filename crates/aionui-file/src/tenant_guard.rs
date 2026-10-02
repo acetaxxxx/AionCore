@@ -22,8 +22,8 @@ pub fn validate_tenant_path(user: &CurrentUser, path: &str) -> Result<(), FileEr
     if trimmed.is_empty() {
         return Err(FileError::Forbidden("path is required".to_owned()));
     }
-    let user_dir = user_dir_name(&user.id)
-        .map_err(|_| FileError::Forbidden("authenticated user path is invalid".to_owned()))?;
+    let user_dir =
+        user_dir_name(&user.id).map_err(|_| FileError::Forbidden("authenticated user path is invalid".to_owned()))?;
 
     // Normalize separators to forward slash and lowercase for pattern checks
     let normalized = trimmed.replace('\\', "/");

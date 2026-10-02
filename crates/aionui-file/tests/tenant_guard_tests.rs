@@ -98,9 +98,7 @@ fn tenant_allows_existing_paths_under_its_normalized_user_directory() {
     let tenant_alice = make_tenant("user_alice");
     let data_root = tempfile::tempdir().unwrap();
     let own_user_file = data_root.path().join("users/alice/vault/key.txt");
-    let own_conversation_file = data_root
-        .path()
-        .join("conversations/users/alice/2026/10/02/note.txt");
+    let own_conversation_file = data_root.path().join("conversations/users/alice/2026/10/02/note.txt");
     let foreign_file = data_root.path().join("users/bob/vault/key.txt");
     std::fs::create_dir_all(own_user_file.parent().unwrap()).unwrap();
     std::fs::create_dir_all(own_conversation_file.parent().unwrap()).unwrap();

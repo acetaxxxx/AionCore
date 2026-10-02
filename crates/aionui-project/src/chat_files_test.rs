@@ -296,13 +296,10 @@ async fn authenticated_user_paths_use_the_normalized_user_directory_name() {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
     let data_root = tempfile::tempdir().unwrap();
-    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir())
-        .with_user_data_root(data_root.path());
+    let service = ProjectService::new(Arc::clone(&store), std::env::temp_dir()).with_user_data_root(data_root.path());
     let upload_root = tempfile::tempdir().unwrap();
     let user_id = "user_alice";
-    let own_workspace = data_root
-        .path()
-        .join("conversations/users/alice/teams/travel");
+    let own_workspace = data_root.path().join("conversations/users/alice/teams/travel");
     std::fs::create_dir_all(&own_workspace).unwrap();
     let own_image = own_workspace.join("preview.jpg");
     std::fs::write(&own_image, b"image").unwrap();
