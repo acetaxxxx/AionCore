@@ -241,7 +241,7 @@ async fn eligible_team_users_exclude_owner_members_existing_members_and_disabled
     repo.add_team_member(&TeamMembershipRow {
         membership_ref: "existing-membership-ref".into(),
         team_id: team.id.clone(),
-        user_id: existing.id,
+        user_id: existing.id.clone(),
         display_name: None,
         created_at: now_ms(),
     })
