@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
+use aionui_db::models::{
+    MailboxMessageRow, MAX_ELIGIBLE_TEAM_USERS, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow,
+};
 use aionui_db::{
     ActivityCursor, CreateMcpServerParams, DbError, IMcpServerRepository, ITeamRepository, IUserRepository,
     PageDirection, SqliteMcpServerRepository, SqliteTeamRepository, SqliteUserRepository, UpdateTaskParams,
@@ -251,6 +253,59 @@ async fn eligible_team_users_exclude_owner_members_existing_members_and_disabled
     assert_eq!(candidates[0].user_id, eligible.id);
     assert_eq!(candidates[0].display_name, "eligible-member");
     assert!(candidates.iter().all(|candidate| candidate.user_id != DEFAULT_USER_ID));
+    assert_eq!(
+        repo.find_eligible_team_user(&owner.id, &team.id, &eligible.id)
+            .await
+            .unwrap(),
+        Some(candidates[0].clone())
+    );
+    for ineligible_id in [
+        owner.id.as_str(),
+        existing.id.as_str(),
+        disabled.id.as_str(),
+        DEFAULT_USER_ID,
+    ] {
+        assert!(
+            repo.find_eligible_team_user(&owner.id, &team.id, ineligible_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn eligible_team_user_listing_returns_two_thousand_rows_and_one_overflow_sentinel() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let owner = users.create_user("directory-owner", "owner-hash").await.unwrap();
+    let team = make_team_for_user("directory-boundary-team", &owner.id, "Directory Boundary");
+    repo.create_team_with_sharing_mode(&team, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+
+    for index in 0..MAX_ELIGIBLE_TEAM_USERS {
+        users
+            .create_user(&format!("eligible-{index:04}"), "candidate-hash")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        repo.list_eligible_team_users(&owner.id, &team.id)
+            .await
+            .unwrap()
+            .len(),
+        MAX_ELIGIBLE_TEAM_USERS
+    );
+
+    users.create_user("eligible-overflow", "candidate-hash").await.unwrap();
+    assert_eq!(
+        repo.list_eligible_team_users(&owner.id, &team.id)
+            .await
+            .unwrap()
+            .len(),
+        MAX_ELIGIBLE_TEAM_USERS + 1
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,10 @@
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of eligible Core accounts returned by a Team collaborator
+/// listing before the repository signals overflow with one extra row.
+pub const MAX_ELIGIBLE_TEAM_USERS: usize = 2_000;
+
 /// Row mapping for the `teams` table.
 ///
 /// The `agents` column stores a JSON array of `TeamAgent` objects.

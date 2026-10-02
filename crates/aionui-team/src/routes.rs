@@ -81,6 +81,12 @@ impl From<TeamError> for ApiError {
                 ),
                 None,
             ),
+            TeamError::EligibleCollaboratorListingSuperseded => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_COLLABORATOR_LISTING_SUPERSEDED",
+                "A newer collaborator list is available; refresh the picker and try again",
+                None,
+            ),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
@@ -895,6 +901,14 @@ mod tests {
         assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(err.error_code(), "TEAM_COLLABORATOR_CANDIDATE_LIMIT_EXCEEDED");
         assert!(err.to_string().contains("host administrator"));
+    }
+
+    #[test]
+    fn superseded_collaborator_listing_maps_to_refresh_conflict() {
+        let err: ApiError = TeamError::EligibleCollaboratorListingSuperseded.into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_COLLABORATOR_LISTING_SUPERSEDED");
+        assert!(err.to_string().contains("refresh the picker"));
     }
 
     #[test]

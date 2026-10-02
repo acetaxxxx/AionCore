@@ -1157,6 +1157,19 @@ impl ITeamRepository for FullMockTeamRepo {
             .collect())
     }
 
+    async fn find_eligible_team_user(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        user_id: &str,
+    ) -> Result<Option<aionui_db::models::EligibleTeamUserRow>, DbError> {
+        Ok(self
+            .list_eligible_team_users(owner_user_id, team_id)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.user_id == user_id))
+    }
+
     async fn add_team_member_for_owner(
         &self,
         owner_user_id: &str,
@@ -9068,6 +9081,7 @@ async fn active_core_users_are_listed_with_scoped_opaque_refs_and_revalidated_on
         Err(TeamError::InvalidRequest(_))
     ));
 
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let stale = svc
         .list_eligible_collaborators("owner", &second_team.id)
         .await

@@ -21,8 +21,17 @@ accessed directly, without a per-request scan of all owners or Teams.
 If the host's active account directory itself contains more than 2,000 eligible
 candidates, listing returns a distinct actionable HTTP 429 asking the host
 administrator to reduce that directory; it never silently omits candidates.
+SQLite fetches no more than 2,001 eligible rows, using the last row only as an
+overflow sentinel. Add-member revalidates its single referenced user with an
+ID-filtered eligibility query before the existing atomic owner/shared/status
+insert check. Owner limiter records become evictable after ten minutes idle;
+a throttled sweep removes them during collaborator-ref operations, at most
+once per minute, and preserves owner state while references are live. The
+owner map is not scanned on every request. If overlapping requests complete
+out of order, an older response fails with
+`TEAM_COLLABORATOR_LISTING_SUPERSEDED` instead of replacing newer refs.
 Add-member resolves that reference in process memory, reloads the eligible DB
-users, then inserts through a single-statement owner-scoped query that
+user, then inserts through a single-statement owner-scoped query that
 rechecks Team ownership, Shared mode, active user status, and existing
 membership. A restart invalidates outstanding references. References are not
 durable credentials or proof of host login.

@@ -35,6 +35,9 @@ pub enum TeamError {
     )]
     EligibleCollaboratorCandidateLimitExceeded,
 
+    #[error("A newer collaborator list is available; refresh the picker and try again")]
+    EligibleCollaboratorListingSuperseded,
+
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 

@@ -3,7 +3,8 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{
-    EligibleTeamUserRow, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow,
+    EligibleTeamUserRow, MailboxMessageRow, MAX_ELIGIBLE_TEAM_USERS, TeamAccessRole, TeamMembershipRow, TeamRow,
+    TeamSharingMode, TeamTaskRow,
 };
 use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 
@@ -90,17 +91,41 @@ impl ITeamRepository for SqliteTeamRepository {
     ) -> Result<Vec<EligibleTeamUserRow>, DbError> {
         sqlx::query_as::<_, EligibleTeamUserRow>(
             "SELECT u.id AS user_id, u.username AS display_name FROM users u \
-             WHERE u.status = 'active' AND u.username IS NOT NULL AND trim(u.username) <> '' \
+             WHERE u.status = 'active' \
              AND u.id <> ? AND u.id <> 'system_default_user' \
              AND EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ? AND t.sharing_mode = 'shared') \
              AND NOT EXISTS (SELECT 1 FROM team_memberships m WHERE m.team_id = ? AND m.user_id = u.id) \
-             ORDER BY u.username COLLATE NOCASE, u.id",
+             ORDER BY u.username COLLATE NOCASE, u.id LIMIT ?",
         )
         .bind(owner_user_id)
         .bind(team_id)
         .bind(owner_user_id)
         .bind(team_id)
+        .bind((MAX_ELIGIBLE_TEAM_USERS + 1) as i64)
         .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn find_eligible_team_user(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        user_id: &str,
+    ) -> Result<Option<EligibleTeamUserRow>, DbError> {
+        sqlx::query_as::<_, EligibleTeamUserRow>(
+            "SELECT u.id AS user_id, u.username AS display_name FROM users u \
+             WHERE u.id = ? AND u.status = 'active' \
+             AND u.id <> ? AND u.id <> 'system_default_user' \
+             AND EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ? AND t.sharing_mode = 'shared') \
+             AND NOT EXISTS (SELECT 1 FROM team_memberships m WHERE m.team_id = ? AND m.user_id = u.id)",
+        )
+        .bind(user_id)
+        .bind(owner_user_id)
+        .bind(team_id)
+        .bind(owner_user_id)
+        .bind(team_id)
+        .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
     }

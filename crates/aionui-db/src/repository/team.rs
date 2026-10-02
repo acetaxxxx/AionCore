@@ -1,6 +1,7 @@
 use crate::error::DbError;
 use crate::models::{
-    EligibleTeamUserRow, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow,
+    EligibleTeamUserRow, MailboxMessageRow, MAX_ELIGIBLE_TEAM_USERS, TeamAccessRole, TeamMembershipRow, TeamRow,
+    TeamSharingMode, TeamTaskRow,
 };
 
 /// Sort/paging direction for the activity feed cursor queries.
@@ -76,13 +77,27 @@ pub trait ITeamRepository: Send + Sync {
     }
 
     /// Lists active account rows eligible for a specific owned Shared Team.
-    /// The returned user IDs are internal and must not be exposed to clients.
+    /// Returns at most `MAX_ELIGIBLE_TEAM_USERS + 1` rows; the extra row is an
+    /// overflow sentinel. The returned user IDs are internal and must not be
+    /// exposed to clients.
     async fn list_eligible_team_users(
         &self,
         _owner_user_id: &str,
         _team_id: &str,
     ) -> Result<Vec<EligibleTeamUserRow>, DbError> {
         Err(DbError::Init("eligible Team account lookup is unavailable".into()))
+    }
+
+    /// Revalidates one candidate by internal ID against the active account
+    /// directory and current Team eligibility. Implementations should use an
+    /// ID-filtered query rather than materializing the full directory.
+    async fn find_eligible_team_user(
+        &self,
+        _owner_user_id: &str,
+        _team_id: &str,
+        _user_id: &str,
+    ) -> Result<Option<EligibleTeamUserRow>, DbError> {
+        Err(DbError::Init("eligible Team account revalidation is unavailable".into()))
     }
 
     /// Creates an active membership using a server-generated opaque reference.

@@ -4,7 +4,7 @@ pub(crate) mod spawn_support;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
@@ -20,7 +20,7 @@ use aionui_api_types::{
     TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
-use aionui_db::models::{TeamAccessRole, TeamRow, TeamSharingMode};
+use aionui_db::models::{MAX_ELIGIBLE_TEAM_USERS, TeamAccessRole, TeamRow, TeamSharingMode};
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IProviderRepository, ITeamRepository, IUserOrderStore, OrderItemRef, OrderItemType, PageDirection,
@@ -75,7 +75,9 @@ pub const MAX_TASK_ID_LOOKUP: usize = 200;
 /// Account references can be used once within five minutes of being listed.
 const ELIGIBLE_ACCOUNT_REF_TTL_MS: TimestampMs = 5 * 60 * 1000;
 const ELIGIBLE_LIST_RATE_LIMIT: Duration = Duration::from_secs(1);
-const MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER: usize = 2_000;
+const ELIGIBLE_OWNER_RECORD_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+const ELIGIBLE_OWNER_RECORD_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER: usize = MAX_ELIGIBLE_TEAM_USERS;
 /// Which item kinds the unified activity feed returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -162,47 +164,96 @@ struct EligibleAccountRef {
 struct EligibleAccountRefStore {
     /// Each authenticated owner has one aggregate ref budget across all Teams.
     by_owner: DashMap<String, OwnerEligibleAccountRefs>,
+    /// Throttles the idle-owner sweep; ordinary requests never scan all owners.
+    last_idle_sweep_at: Mutex<Option<Instant>>,
 }
 
 #[derive(Default)]
 struct OwnerEligibleAccountRefs {
     last_listing_at: Option<Instant>,
+    last_activity_at: Option<Instant>,
+    /// The latest started list request per Team prevents a slow old response
+    /// from replacing the references issued by a newer request.
+    latest_listing_by_team: HashMap<String, (String, Instant)>,
     by_team: HashMap<String, HashMap<String, EligibleAccountRef>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EligibleAccountRefStoreError {
     OwnerQuotaReached,
+    ListingSuperseded,
 }
 
 fn ensure_candidate_count_supported(count: usize) -> Result<(), TeamError> {
-    if count > MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER {
+    if count > MAX_ELIGIBLE_TEAM_USERS {
         return Err(TeamError::EligibleCollaboratorCandidateLimitExceeded);
     }
     Ok(())
 }
 
 impl OwnerEligibleAccountRefs {
-    fn prune_expired(&mut self, now: TimestampMs) {
+    fn prune_expired(&mut self, now: TimestampMs, instant: Instant) {
         self.by_team.retain(|_, refs| {
             refs.retain(|_, reference| reference.expires_at > now);
             !refs.is_empty()
         });
+        self.latest_listing_by_team.retain(|_, (_, started_at)| {
+            instant.saturating_duration_since(*started_at) < ELIGIBLE_OWNER_RECORD_IDLE_TTL
+        });
+    }
+
+    fn can_evict(&self, now: Instant) -> bool {
+        self.by_team.is_empty()
+            && self.latest_listing_by_team.is_empty()
+            && self.last_activity_at.map_or(true, |last| {
+                now.saturating_duration_since(last) >= ELIGIBLE_OWNER_RECORD_IDLE_TTL
+            })
     }
 }
 
 impl EligibleAccountRefStore {
-    fn begin_listing(&self, owner_user_id: &str, now: Instant, now_ms: TimestampMs) -> bool {
+    fn sweep_idle_owners_if_due(&self, now: Instant, now_ms: TimestampMs) {
+        let mut last_sweep = self
+            .last_idle_sweep_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last_sweep.is_some_and(|last| {
+            now.saturating_duration_since(last) < ELIGIBLE_OWNER_RECORD_SWEEP_INTERVAL
+        }) {
+            return;
+        }
+        *last_sweep = Some(now);
+        drop(last_sweep);
+
+        self.by_owner.retain(|_, owner| {
+            owner.prune_expired(now_ms, now);
+            !owner.can_evict(now)
+        });
+    }
+
+    fn begin_listing(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        now: Instant,
+        now_ms: TimestampMs,
+    ) -> Option<String> {
+        self.sweep_idle_owners_if_due(now, now_ms);
         let mut owner = self.by_owner.entry(owner_user_id.to_owned()).or_default();
-        owner.prune_expired(now_ms);
+        owner.prune_expired(now_ms, now);
+        owner.last_activity_at = Some(now);
         if owner
             .last_listing_at
             .is_some_and(|last| now.saturating_duration_since(last) < ELIGIBLE_LIST_RATE_LIMIT)
         {
-            return false;
+            return None;
         }
         owner.last_listing_at = Some(now);
-        true
+        let generation = generate_id();
+        owner
+            .latest_listing_by_team
+            .insert(team_id.to_owned(), (generation.clone(), now));
+        Some(generation)
     }
 
     fn ensure_capacity(
@@ -210,10 +261,13 @@ impl EligibleAccountRefStore {
         owner_user_id: &str,
         team_id: &str,
         replacement_count: usize,
+        now: Instant,
         now_ms: TimestampMs,
     ) -> Result<(), EligibleAccountRefStoreError> {
+        self.sweep_idle_owners_if_due(now, now_ms);
         let mut owner = self.by_owner.entry(owner_user_id.to_owned()).or_default();
-        owner.prune_expired(now_ms);
+        owner.prune_expired(now_ms, now);
+        owner.last_activity_at = Some(now);
         Self::check_capacity(&owner, team_id, replacement_count)
     }
 
@@ -221,17 +275,29 @@ impl EligibleAccountRefStore {
         &self,
         owner_user_id: &str,
         team_id: &str,
+        generation: &str,
         refs: HashMap<String, EligibleAccountRef>,
+        now: Instant,
         now_ms: TimestampMs,
     ) -> Result<(), EligibleAccountRefStoreError> {
+        self.sweep_idle_owners_if_due(now, now_ms);
         let mut owner = self.by_owner.entry(owner_user_id.to_owned()).or_default();
-        owner.prune_expired(now_ms);
+        owner.prune_expired(now_ms, now);
+        owner.last_activity_at = Some(now);
+        if !owner
+            .latest_listing_by_team
+            .get(team_id)
+            .is_some_and(|(latest, _)| latest.as_str() == generation)
+        {
+            return Err(EligibleAccountRefStoreError::ListingSuperseded);
+        }
         Self::check_capacity(&owner, team_id, refs.len())?;
         if refs.is_empty() {
             owner.by_team.remove(team_id);
         } else {
             owner.by_team.insert(team_id.to_owned(), refs);
         }
+        owner.latest_listing_by_team.remove(team_id);
         Ok(())
     }
 
@@ -259,10 +325,13 @@ impl EligibleAccountRefStore {
         owner_user_id: &str,
         team_id: &str,
         account_ref: &str,
+        now: Instant,
         now_ms: TimestampMs,
     ) -> Option<EligibleAccountRef> {
+        self.sweep_idle_owners_if_due(now, now_ms);
         let mut owner = self.by_owner.get_mut(owner_user_id)?;
-        owner.prune_expired(now_ms);
+        owner.prune_expired(now_ms, now);
+        owner.last_activity_at = Some(now);
         let (reference, team_is_empty) = {
             let team_refs = owner.by_team.get_mut(team_id)?;
             let reference = team_refs.remove(account_ref);
@@ -279,6 +348,11 @@ impl EligibleAccountRefStore {
         self.by_owner
             .get(owner_user_id)
             .map_or(0, |owner| owner.by_team.values().map(HashMap::len).sum())
+    }
+
+    #[cfg(test)]
+    fn owner_count(&self) -> usize {
+        self.by_owner.len()
     }
 }
 
@@ -1099,19 +1173,22 @@ impl TeamSessionService {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
         let started_at = Instant::now();
-        if !self
+        let Some(listing_generation) = self
             .eligible_account_refs
-            .begin_listing(owner_user_id, started_at, now_ms())
-        {
+            .begin_listing(owner_user_id, team_id, started_at, now_ms())
+        else {
             return Err(TeamError::RateLimited);
-        }
+        };
         let issued_at = now_ms();
         let candidates = self.repo.list_eligible_team_users(owner_user_id, team_id).await?;
         ensure_candidate_count_supported(candidates.len())?;
         self.eligible_account_refs
-            .ensure_capacity(owner_user_id, team_id, candidates.len(), now_ms())
-            .map_err(|EligibleAccountRefStoreError::OwnerQuotaReached| {
-                TeamError::EligibleCollaboratorQuotaReached
+            .ensure_capacity(owner_user_id, team_id, candidates.len(), Instant::now(), now_ms())
+            .map_err(|error| match error {
+                EligibleAccountRefStoreError::OwnerQuotaReached => TeamError::EligibleCollaboratorQuotaReached,
+                EligibleAccountRefStoreError::ListingSuperseded => {
+                    TeamError::EligibleCollaboratorListingSuperseded
+                }
             })?;
         let mut labels = HashSet::new();
         let mut refs = HashMap::new();
@@ -1139,8 +1216,20 @@ impl TeamSessionService {
             });
         }
         self.eligible_account_refs
-            .replace(owner_user_id, team_id, refs, now_ms())
-            .map_err(|EligibleAccountRefStoreError::OwnerQuotaReached| TeamError::EligibleCollaboratorQuotaReached)?;
+            .replace(
+                owner_user_id,
+                team_id,
+                &listing_generation,
+                refs,
+                Instant::now(),
+                now_ms(),
+            )
+            .map_err(|error| match error {
+                EligibleAccountRefStoreError::OwnerQuotaReached => TeamError::EligibleCollaboratorQuotaReached,
+                EligibleAccountRefStoreError::ListingSuperseded => {
+                    TeamError::EligibleCollaboratorListingSuperseded
+                }
+            })?;
         Ok(response)
     }
 
@@ -1179,7 +1268,7 @@ impl TeamSessionService {
         let invalid_ref = || TeamError::InvalidRequest("Invalid or expired account reference".into());
         let Some(reference) = self
             .eligible_account_refs
-            .take(owner_user_id, team_id, account_ref, now)
+            .take(owner_user_id, team_id, account_ref, Instant::now(), now)
         else {
             return Err(invalid_ref());
         };
@@ -1189,8 +1278,12 @@ impl TeamSessionService {
 
         // Re-read eligibility immediately before the owner-scoped insert. This
         // rejects disabled, removed, or otherwise stale users after listing.
-        let candidates = self.repo.list_eligible_team_users(owner_user_id, team_id).await?;
-        if !candidates.iter().any(|candidate| candidate.user_id == reference.user_id) {
+        if self
+            .repo
+            .find_eligible_team_user(owner_user_id, team_id, &reference.user_id)
+            .await?
+            .is_none()
+        {
             return Err(invalid_ref());
         }
         let membership = aionui_db::models::TeamMembershipRow {
@@ -5691,6 +5784,15 @@ mod eligible_collaborator_reference_tests {
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn candidate_limit_accepts_two_thousand_and_rejects_overflow_sentinel() {
+        assert!(ensure_candidate_count_supported(MAX_ELIGIBLE_TEAM_USERS).is_ok());
+        assert!(matches!(
+            ensure_candidate_count_supported(MAX_ELIGIBLE_TEAM_USERS + 1),
+            Err(TeamError::EligibleCollaboratorCandidateLimitExceeded)
+        ));
+    }
+
     fn reference(user: &str, expires_at: TimestampMs) -> EligibleAccountRef {
         EligibleAccountRef {
             user_id: user.into(),
@@ -5699,29 +5801,56 @@ mod eligible_collaborator_reference_tests {
         }
     }
 
+    fn begin_listing(store: &EligibleAccountRefStore, owner: &str, team: &str, now: Instant) -> String {
+        store
+            .begin_listing(owner, team, now, 100)
+            .expect("listing should pass the owner-wide rate gate")
+    }
+
+    fn replace_refs(
+        store: &EligibleAccountRefStore,
+        owner: &str,
+        team: &str,
+        generation: &str,
+        refs: HashMap<String, EligibleAccountRef>,
+        now: Instant,
+    ) -> Result<(), EligibleAccountRefStoreError> {
+        store.replace(owner, team, generation, refs, now, 100)
+    }
+
     #[test]
     fn repeated_refresh_replaces_grants_without_growing_scope_storage() {
         let store = EligibleAccountRefStore::default();
-        store.replace(
+        let start = Instant::now();
+        let other_generation = begin_listing(&store, "owner", "other-team", start);
+        replace_refs(
+            &store,
             "owner",
             "other-team",
+            &other_generation,
             HashMap::from([("other-ref".into(), reference("other-user", 10_000))]),
-            100,
-        ).unwrap();
+            start,
+        )
+        .unwrap();
 
         for refresh in 0..1_000 {
+            let now = start + Duration::from_secs(refresh + 1);
+            let generation = begin_listing(&store, "owner", "team", now);
             let refs = (0..3)
                 .map(|candidate| {
                     let account_ref = format!("refresh-{refresh}-candidate-{candidate}");
                     (account_ref.clone(), reference(&account_ref, 10_000))
                 })
                 .collect();
-            store.replace("owner", "team", refs, 100).unwrap();
+            replace_refs(&store, "owner", "team", &generation, refs, now).unwrap();
             assert_eq!(store.len_for_owner("owner"), 4);
         }
 
-        assert!(store.take("owner", "team", "refresh-0-candidate-0", 100).is_none());
-        assert!(store.take("owner", "other-team", "other-ref", 100).is_some());
+        let now = start + Duration::from_secs(1_001);
+        assert!(store
+            .take("owner", "team", "refresh-0-candidate-0", now, 100)
+            .is_none());
+        assert!(store.take("owner", "other-team", "other-ref", now, 100).is_some());
         assert_eq!(store.len_for_owner("owner"), 3);
         assert_eq!(store.len_for_owner("another-owner"), 0);
     }
@@ -5730,12 +5859,17 @@ mod eligible_collaborator_reference_tests {
     fn concurrent_consumers_can_take_a_scoped_reference_only_once() {
         let store = Arc::new(EligibleAccountRefStore::default());
         let account_ref = "single-use-ref".to_owned();
-        store.replace(
+        let start = Instant::now();
+        let generation = begin_listing(&store, "owner", "team", start);
+        replace_refs(
+            &store,
             "owner",
             "team",
+            &generation,
             HashMap::from([(account_ref.clone(), reference("user", 10_000))]),
-            100,
-        ).unwrap();
+            start,
+        )
+        .unwrap();
 
         let workers = 8;
         let barrier = Arc::new(Barrier::new(workers));
@@ -5748,7 +5882,10 @@ mod eligible_collaborator_reference_tests {
                 let successes = Arc::clone(&successes);
                 threads.spawn(move || {
                     barrier.wait();
-                    if store.take("owner", "team", &account_ref, 100).is_some() {
+                    if store
+                        .take("owner", "team", &account_ref, start + Duration::from_secs(1), 100)
+                        .is_some()
+                    {
                         successes.fetch_add(1, Ordering::SeqCst);
                     }
                 });
@@ -5762,10 +5899,22 @@ mod eligible_collaborator_reference_tests {
         let store = Arc::new(EligibleAccountRefStore::default());
         let workers = 16;
         let barrier = Arc::new(Barrier::new(workers));
+        let start = Instant::now();
+        let generations = (0..workers)
+            .map(|worker| {
+                begin_listing(
+                    &store,
+                    "owner",
+                    &format!("team-{worker}"),
+                    start + Duration::from_secs(worker as u64),
+                )
+            })
+            .collect::<Vec<_>>();
         std::thread::scope(|threads| {
             for worker in 0..workers {
                 let store = Arc::clone(&store);
                 let barrier = Arc::clone(&barrier);
+                let generation = generations[worker].clone();
                 threads.spawn(move || {
                     let refs = (0..4)
                         .map(|candidate| {
@@ -5774,9 +5923,15 @@ mod eligible_collaborator_reference_tests {
                         })
                         .collect();
                     barrier.wait();
-                    store
-                        .replace("owner", &format!("team-{worker}"), refs, 100)
-                        .unwrap();
+                    replace_refs(
+                        &store,
+                        "owner",
+                        &format!("team-{worker}"),
+                        &generation,
+                        refs,
+                        start + Duration::from_secs(workers as u64),
+                    )
+                    .unwrap();
                 });
             }
         });
@@ -5797,15 +5952,22 @@ mod eligible_collaborator_reference_tests {
                 let admitted = Arc::clone(&admitted);
                 threads.spawn(move || {
                     barrier.wait();
-                    if store.begin_listing("owner", request_time, 100) {
+                    if store.begin_listing("owner", "team", request_time, 100).is_some() {
                         admitted.fetch_add(1, Ordering::SeqCst);
                     }
                 });
             }
         });
         assert_eq!(admitted.load(Ordering::SeqCst), 1);
-        assert!(store.begin_listing("owner", request_time + ELIGIBLE_LIST_RATE_LIMIT, 100));
-        assert!(store.begin_listing("another-owner", request_time, 100));
+        assert!(store
+            .begin_listing(
+                "owner",
+                "another-team",
+                request_time + ELIGIBLE_LIST_RATE_LIMIT,
+                100
+            )
+            .is_some());
+        assert!(store.begin_listing("another-owner", "team", request_time, 100).is_some());
     }
 
     #[test]
@@ -5817,25 +5979,46 @@ mod eligible_collaborator_reference_tests {
                 (account_ref.clone(), reference(&account_ref, 200))
             })
             .collect();
-        store.replace("owner", "team-a", initial_refs, 100).unwrap();
+        let start = Instant::now();
+        let first_generation = begin_listing(&store, "owner", "team-a", start);
+        replace_refs(&store, "owner", "team-a", &first_generation, initial_refs, start).unwrap();
+        let second_start = start + ELIGIBLE_LIST_RATE_LIMIT;
+        let second_generation = begin_listing(&store, "owner", "team-b", second_start);
         let overflow = HashMap::from([("overflow-ref".into(), reference("overflow-user", 200))]);
-        assert!(store.replace("owner", "team-b", overflow, 100).is_err());
+        assert!(replace_refs(
+            &store,
+            "owner",
+            "team-b",
+            &second_generation,
+            overflow,
+            second_start,
+        )
+        .is_err());
         assert_eq!(
             store.len_for_owner("owner"),
             MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER
         );
-        assert!(store.take("owner", "team-a", "initial-0", 100).is_some());
+        let retry_at = second_start + ELIGIBLE_LIST_RATE_LIMIT;
+        assert!(store
+            .take("owner", "team-a", "initial-0", retry_at, 100)
+            .is_some());
         assert_eq!(
             store.len_for_owner("owner"),
             MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER - 1
         );
-        assert!(store.replace(
+        let retry_generation = begin_listing(&store, "owner", "team-b", retry_at);
+        assert!(replace_refs(
+            &store,
             "owner",
             "team-b",
+            &retry_generation,
             HashMap::from([("overflow-ref".into(), reference("overflow-user", 200))]),
-            100,
-        ).is_ok());
-        assert!(store.take("owner", "team-b", "overflow-ref", 100).is_some());
+            retry_at,
+        )
+        .is_ok());
+        assert!(store
+            .take("owner", "team-b", "overflow-ref", retry_at, 100)
+            .is_some());
     }
 
     #[test]
@@ -5855,29 +6038,128 @@ mod eligible_collaborator_reference_tests {
     #[test]
     fn expired_refs_release_quota_without_affecting_other_owners_or_teams() {
         let store = EligibleAccountRefStore::default();
-        store.replace(
+        let start = Instant::now();
+        let generation_a = begin_listing(&store, "owner", "team-a", start);
+        replace_refs(
+            &store,
             "owner",
             "team-a",
+            &generation_a,
             HashMap::from([("expires-at-boundary".into(), reference("user-a", 200))]),
-            100,
-        ).unwrap();
-        store.replace(
+            start,
+        )
+        .unwrap();
+        let start_b = start + ELIGIBLE_LIST_RATE_LIMIT;
+        let generation_b = begin_listing(&store, "owner", "team-b", start_b);
+        replace_refs(
+            &store,
             "owner",
             "team-b",
+            &generation_b,
             HashMap::from([("other-team-ref".into(), reference("user-b", 300))]),
-            100,
-        ).unwrap();
-        store.replace(
+            start_b,
+        )
+        .unwrap();
+        let other_generation = begin_listing(&store, "other-owner", "team-a", start);
+        replace_refs(
+            &store,
             "other-owner",
             "team-a",
+            &other_generation,
             HashMap::from([("other-owner-ref".into(), reference("user-c", 300))]),
-            100,
-        ).unwrap();
+            start,
+        )
+        .unwrap();
 
-        assert!(store.take("owner", "team-a", "expires-at-boundary", 200).is_none());
+        let at_boundary = start_b + Duration::from_secs(1);
+        assert!(store
+            .take("owner", "team-a", "expires-at-boundary", at_boundary, 200)
+            .is_none());
         assert_eq!(store.len_for_owner("owner"), 1);
-        assert!(store.take("owner", "team-b", "other-team-ref", 200).is_some());
-        assert!(store.take("other-owner", "team-a", "other-owner-ref", 200).is_some());
+        assert!(store
+            .take("owner", "team-b", "other-team-ref", at_boundary, 200)
+            .is_some());
+        assert!(store
+            .take("other-owner", "team-a", "other-owner-ref", at_boundary, 200)
+            .is_some());
         assert_eq!(store.len_for_owner("other-owner"), 0);
+    }
+
+    #[test]
+    fn idle_owner_records_are_swept_but_live_refs_and_rate_gates_survive() {
+        let store = EligibleAccountRefStore::default();
+        let start = Instant::now();
+        for index in 0..128 {
+            let owner = format!("idle-owner-{index}");
+            assert!(store.begin_listing(&owner, "team", start, 100).is_some());
+        }
+        let live_generation = begin_listing(&store, "live-owner", "team", start);
+        replace_refs(
+            &store,
+            "live-owner",
+            "team",
+            &live_generation,
+            HashMap::from([("live-ref".into(), reference("live-user", 10_000))]),
+            start,
+        )
+        .unwrap();
+        assert_eq!(store.owner_count(), 129);
+
+        let sweep_at = start + ELIGIBLE_OWNER_RECORD_IDLE_TTL + Duration::from_secs(1);
+        store.sweep_idle_owners_if_due(sweep_at, 100);
+        assert_eq!(store.owner_count(), 1);
+        assert_eq!(store.len_for_owner("live-owner"), 1);
+
+        assert!(store
+            .begin_listing(
+                "idle-owner-0",
+                "team",
+                sweep_at + Duration::from_secs(1),
+                100
+            )
+            .is_some());
+        assert_eq!(store.owner_count(), 2);
+    }
+
+    #[test]
+    fn slow_older_listing_cannot_replace_a_newer_teams_references() {
+        let store = EligibleAccountRefStore::default();
+        let start = Instant::now();
+        let older = begin_listing(&store, "owner", "team", start);
+        let newer_started_at = start + ELIGIBLE_LIST_RATE_LIMIT;
+        let newer = begin_listing(&store, "owner", "team", newer_started_at);
+        let new_refs = HashMap::from([("new-ref".into(), reference("new-user", 10_000))]);
+        replace_refs(
+            &store,
+            "owner",
+            "team",
+            &newer,
+            new_refs,
+            newer_started_at + Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let old_refs = HashMap::from([("old-ref".into(), reference("old-user", 10_000))]);
+        assert!(matches!(
+            replace_refs(
+                &store,
+                "owner",
+                "team",
+                &older,
+                old_refs,
+                newer_started_at + Duration::from_millis(2),
+            ),
+            Err(EligibleAccountRefStoreError::ListingSuperseded)
+        ));
+        assert_eq!(store.len_for_owner("owner"), 1);
+        assert!(store
+            .take(
+                "owner",
+                "team",
+                "new-ref",
+                newer_started_at + Duration::from_secs(1),
+                100
+            )
+            .is_some());
     }
 }
