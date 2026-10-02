@@ -57,6 +57,12 @@ impl From<TeamError> for ApiError {
             }
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
+            TeamError::RateLimited => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_COLLABORATOR_LIST_RATE_LIMITED",
+                "Wait at least one second before refreshing eligible collaborators",
+                None,
+            ),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
@@ -847,6 +853,14 @@ mod tests {
     fn leader_only_maps_to_forbidden() {
         let err: ApiError = TeamError::LeaderOnly("spawn_agent".into()).into();
         assert!(matches!(err, ApiError::Forbidden(msg) if msg == "spawn_agent"));
+    }
+
+    #[test]
+    fn collaborator_list_rate_limit_maps_to_actionable_429() {
+        let err: ApiError = TeamError::RateLimited.into();
+        assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.error_code(), "TEAM_COLLABORATOR_LIST_RATE_LIMITED");
+        assert!(err.to_string().contains("one second"));
     }
 
     #[test]

@@ -9,11 +9,16 @@ check. `POST /api/teams/{id}/members` accepts only a server-issued
 `account_ref`; it never accepts a database user ID.
 
 Each listing issues an opaque, owner- and Team-scoped reference that expires
-after five minutes and can be used once. Add-member resolves that reference in
-process memory, reloads the eligible DB users, then inserts through a
-single-statement owner-scoped query that rechecks Team ownership, Shared mode,
-active user status, and existing membership. A restart invalidates outstanding
-references. References are not durable credentials or proof of host login.
+after five minutes and can be used once. A new listing replaces outstanding
+references for that owner+Team atomically; other owners and Teams keep their
+own reference sets. Candidate listing is limited in each Core process to one
+request per second per owner+Team and returns an actionable HTTP 429 response
+when refreshed sooner.
+Add-member resolves that reference in process memory, reloads the eligible DB
+users, then inserts through a single-statement owner-scoped query that
+rechecks Team ownership, Shared mode, active user status, and existing
+membership. A restart invalidates outstanding references. References are not
+durable credentials or proof of host login.
 
 Only a username is available as the Core account label; the User schema has no
 separate display-name field. Since AionPro provisioning can store the email

@@ -22,6 +22,9 @@ pub enum TeamError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Wait at least one second before refreshing eligible collaborators")]
+    RateLimited,
+
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 

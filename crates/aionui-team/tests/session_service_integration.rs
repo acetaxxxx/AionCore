@@ -9044,7 +9044,6 @@ async fn active_core_users_are_listed_with_scoped_opaque_refs_and_revalidated_on
     let serialized = serde_json::to_string(&eligible).unwrap();
     assert!(!serialized.contains("core-user-internal-id"));
     assert!(!serialized.contains("person@example.invalid"));
-
     assert!(matches!(
         svc.add_team_member("owner", &team.id, "forged-or-stale-ref").await,
         Err(TeamError::InvalidRequest(_))

@@ -2,9 +2,10 @@ mod describe_support;
 mod response_builder;
 pub(crate) mod spawn_support;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
@@ -73,6 +74,8 @@ pub const MAX_ACTIVITY_LIMIT: i64 = 1000;
 pub const MAX_TASK_ID_LOOKUP: usize = 200;
 /// Account references can be used once within five minutes of being listed.
 const ELIGIBLE_ACCOUNT_REF_TTL_MS: TimestampMs = 5 * 60 * 1000;
+const ELIGIBLE_LIST_RATE_LIMIT: Duration = Duration::from_secs(1);
+const ELIGIBLE_LIST_RATE_LIMIT_RETENTION: Duration = Duration::from_secs(60);
 /// Which item kinds the unified activity feed returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -150,11 +153,80 @@ struct SessionEntry {
 
 #[derive(Clone)]
 struct EligibleAccountRef {
-    owner_user_id: String,
-    team_id: String,
     user_id: String,
     display_name: String,
     expires_at: TimestampMs,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct EligibleAccountRefScope {
+    owner_user_id: String,
+    team_id: String,
+}
+
+#[derive(Default)]
+struct EligibleAccountRefStore {
+    /// At most one current grant set per owner+Team. Replacing a listing is a
+    /// single map insertion, so concurrent refreshes cannot accumulate refs.
+    by_scope: DashMap<EligibleAccountRefScope, HashMap<String, EligibleAccountRef>>,
+}
+
+impl EligibleAccountRefStore {
+    fn prune_expired(&self, now: TimestampMs) {
+        self.by_scope.retain(|_, refs| {
+            refs.retain(|_, reference| reference.expires_at > now);
+            !refs.is_empty()
+        });
+    }
+
+    fn replace(
+        &self,
+        scope: EligibleAccountRefScope,
+        refs: HashMap<String, EligibleAccountRef>,
+    ) {
+        self.by_scope.insert(scope, refs);
+    }
+
+    fn take(
+        &self,
+        scope: &EligibleAccountRefScope,
+        account_ref: &str,
+    ) -> Option<EligibleAccountRef> {
+        self.by_scope
+            .get_mut(scope)
+            .and_then(|mut refs| refs.remove(account_ref))
+    }
+
+    #[cfg(test)]
+    fn len_for_scope(&self, scope: &EligibleAccountRefScope) -> usize {
+        self.by_scope.get(scope).map_or(0, |refs| refs.len())
+    }
+}
+
+#[derive(Default)]
+struct EligibleListRateLimiter {
+    last_request_by_scope: DashMap<EligibleAccountRefScope, Instant>,
+}
+
+impl EligibleListRateLimiter {
+    fn allow_at(&self, scope: &EligibleAccountRefScope, now: Instant) -> bool {
+        self.last_request_by_scope.retain(|_, last_request| {
+            now.saturating_duration_since(*last_request) < ELIGIBLE_LIST_RATE_LIMIT_RETENTION
+        });
+        match self.last_request_by_scope.entry(scope.clone()) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(now);
+                true
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut entry)
+                if now.saturating_duration_since(*entry.get()) >= ELIGIBLE_LIST_RATE_LIMIT =>
+            {
+                entry.insert(now);
+                true
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+        }
+    }
 }
 
 pub struct TeamIdleCleanupCoordinator {
@@ -216,7 +288,10 @@ pub struct TeamSessionService {
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Short-lived, single-use account references scoped to the listing owner
     /// and Team. Raw Core user IDs never cross the API boundary.
-    eligible_account_refs: DashMap<String, EligibleAccountRef>,
+    eligible_account_refs: EligibleAccountRefStore,
+    /// Limits candidate-list requests per owner+Team so repeated GETs cannot
+    /// amplify database work while independent Teams remain usable.
+    eligible_list_rate_limiter: EligibleListRateLimiter,
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -347,7 +422,8 @@ impl TeamSessionService {
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
-            eligible_account_refs: DashMap::new(),
+            eligible_account_refs: EligibleAccountRefStore::default(),
+            eligible_list_rate_limiter: EligibleListRateLimiter::default(),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
@@ -973,39 +1049,43 @@ impl TeamSessionService {
         if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
+        let scope = EligibleAccountRefScope {
+            owner_user_id: owner_user_id.to_owned(),
+            team_id: team_id.to_owned(),
+        };
+        if !self.eligible_list_rate_limiter.allow_at(&scope, Instant::now()) {
+            return Err(TeamError::RateLimited);
+        }
         let issued_at = now_ms();
-        self.eligible_account_refs
-            .retain(|_, reference| reference.expires_at > issued_at);
+        self.eligible_account_refs.prune_expired(issued_at);
         let candidates = self.repo.list_eligible_team_users(owner_user_id, team_id).await?;
         let mut labels = HashSet::new();
-        Ok(candidates
-            .into_iter()
-            .enumerate()
-            .map(|(index, candidate)| {
-                let base_label = collaborator_display_label(&candidate.display_name, index + 1);
-                let mut display_name = base_label.clone();
-                let mut suffix = 1;
-                while !labels.insert(display_name.clone()) {
-                    suffix += 1;
-                    display_name = format!("{base_label} ({suffix})");
-                }
-                let account_ref = generate_id();
-                self.eligible_account_refs.insert(
-                    account_ref.clone(),
-                    EligibleAccountRef {
-                        owner_user_id: owner_user_id.to_owned(),
-                        team_id: team_id.to_owned(),
-                        user_id: candidate.user_id,
-                        display_name: display_name.clone(),
-                        expires_at: issued_at.saturating_add(ELIGIBLE_ACCOUNT_REF_TTL_MS),
-                    },
-                );
-                EligibleTeamCollaboratorResponse {
-                    account_ref,
-                    display_name,
-                }
-            })
-            .collect())
+        let mut refs = HashMap::new();
+        let mut response = Vec::with_capacity(candidates.len());
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            let base_label = collaborator_display_label(&candidate.display_name, index + 1);
+            let mut display_name = base_label.clone();
+            let mut suffix = 1;
+            while !labels.insert(display_name.clone()) {
+                suffix += 1;
+                display_name = format!("{base_label} ({suffix})");
+            }
+            let account_ref = generate_id();
+            refs.insert(
+                account_ref.clone(),
+                EligibleAccountRef {
+                    user_id: candidate.user_id,
+                    display_name: display_name.clone(),
+                    expires_at: issued_at.saturating_add(ELIGIBLE_ACCOUNT_REF_TTL_MS),
+                },
+            );
+            response.push(EligibleTeamCollaboratorResponse {
+                account_ref,
+                display_name,
+            });
+        }
+        self.eligible_account_refs.replace(scope, refs);
+        Ok(response)
     }
 
     /// Lists active collaborators without exposing internal user identifiers.
@@ -1040,25 +1120,21 @@ impl TeamSessionService {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
         let now = now_ms();
-        self.eligible_account_refs
-            .retain(|_, reference| reference.expires_at > now);
+        self.eligible_account_refs.prune_expired(now);
         let invalid_ref = || TeamError::InvalidRequest("Invalid or expired account reference".into());
+        let scope = EligibleAccountRefScope {
+            owner_user_id: owner_user_id.to_owned(),
+            team_id: team_id.to_owned(),
+        };
         let Some(reference) = self
             .eligible_account_refs
-            .get(account_ref)
-            .map(|reference| reference.value().clone())
+            .take(&scope, account_ref)
         else {
             return Err(invalid_ref());
         };
-        if reference.expires_at <= now
-            || reference.owner_user_id != owner_user_id
-            || reference.team_id != team_id
-        {
+        if reference.expires_at <= now {
             return Err(invalid_ref());
         }
-        let Some((_, reference)) = self.eligible_account_refs.remove(account_ref) else {
-            return Err(invalid_ref());
-        };
 
         // Re-read eligibility immediately before the owner-scoped insert. This
         // rejects disabled, removed, or otherwise stale users after listing.
@@ -5555,5 +5631,163 @@ mod tests {
             Some("lead-slot"),
             "worker-slot"
         ));
+    }
+}
+
+#[cfg(test)]
+mod eligible_collaborator_reference_tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn scope(owner: &str, team: &str) -> EligibleAccountRefScope {
+        EligibleAccountRefScope {
+            owner_user_id: owner.into(),
+            team_id: team.into(),
+        }
+    }
+
+    fn reference(user: &str, expires_at: TimestampMs) -> EligibleAccountRef {
+        EligibleAccountRef {
+            user_id: user.into(),
+            display_name: user.into(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn repeated_refresh_replaces_grants_without_growing_scope_storage() {
+        let store = EligibleAccountRefStore::default();
+        let scope = scope("owner", "team");
+        let other_scope = scope("owner", "other-team");
+        let other_ref = "other-ref".to_owned();
+        store.replace(
+            other_scope.clone(),
+            HashMap::from([(other_ref.clone(), reference("other-user", 10_000))]),
+        );
+
+        for refresh in 0..1_000 {
+            let refs = (0..3)
+                .map(|candidate| {
+                    let account_ref = format!("refresh-{refresh}-candidate-{candidate}");
+                    (account_ref.clone(), reference(&account_ref, 10_000))
+                })
+                .collect();
+            store.replace(scope.clone(), refs);
+            assert_eq!(store.len_for_scope(&scope), 3);
+            assert_eq!(store.len_for_scope(&other_scope), 1);
+        }
+
+        assert!(store.take(&scope, "refresh-0-candidate-0").is_none());
+        assert!(store.take(&other_scope, &other_ref).is_some());
+    }
+
+    #[test]
+    fn concurrent_consumers_can_take_a_scoped_reference_only_once() {
+        let store = Arc::new(EligibleAccountRefStore::default());
+        let scope = scope("owner", "team");
+        let account_ref = "single-use-ref".to_owned();
+        store.replace(
+            scope.clone(),
+            HashMap::from([(account_ref.clone(), reference("user", 10_000))]),
+        );
+
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let successes = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|threads| {
+            for _ in 0..workers {
+                let store = Arc::clone(&store);
+                let scope = scope.clone();
+                let account_ref = account_ref.clone();
+                let barrier = Arc::clone(&barrier);
+                let successes = Arc::clone(&successes);
+                threads.spawn(move || {
+                    barrier.wait();
+                    if store.take(&scope, &account_ref).is_some() {
+                        successes.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(successes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_refreshes_keep_one_bounded_grant_set_per_scope() {
+        let store = Arc::new(EligibleAccountRefStore::default());
+        let scope = scope("owner", "team");
+        let workers = 16;
+        let barrier = Arc::new(Barrier::new(workers));
+        std::thread::scope(|threads| {
+            for worker in 0..workers {
+                let store = Arc::clone(&store);
+                let scope = scope.clone();
+                let barrier = Arc::clone(&barrier);
+                threads.spawn(move || {
+                    let refs = (0..4)
+                        .map(|candidate| {
+                            let account_ref = format!("{worker}-{candidate}");
+                            (account_ref.clone(), reference(&account_ref, 10_000))
+                        })
+                        .collect();
+                    barrier.wait();
+                    store.replace(scope, refs);
+                });
+            }
+        });
+        assert_eq!(store.len_for_scope(&scope), 4);
+    }
+
+    #[test]
+    fn concurrent_listing_rate_gate_admits_only_one_request_per_scope() {
+        let limiter = Arc::new(EligibleListRateLimiter::default());
+        let scope = scope("owner", "team");
+        let workers = 16;
+        let barrier = Arc::new(Barrier::new(workers));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let request_time = Instant::now();
+        std::thread::scope(|threads| {
+            for _ in 0..workers {
+                let limiter = Arc::clone(&limiter);
+                let scope = scope.clone();
+                let barrier = Arc::clone(&barrier);
+                let admitted = Arc::clone(&admitted);
+                threads.spawn(move || {
+                    barrier.wait();
+                    if limiter.allow_at(&scope, request_time) {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn expiration_boundary_is_exclusive_and_listing_gate_allows_at_interval() {
+        let store = EligibleAccountRefStore::default();
+        let current_scope = scope("owner", "team");
+        store.replace(
+            current_scope.clone(),
+            HashMap::from([("boundary-ref".into(), reference("user", 200))]),
+        );
+        store.prune_expired(199);
+        assert_eq!(store.len_for_scope(&current_scope), 1);
+        store.prune_expired(200);
+        assert_eq!(store.len_for_scope(&current_scope), 0);
+
+        let limiter = EligibleListRateLimiter::default();
+        let initial = Instant::now();
+        assert!(limiter.allow_at(&current_scope, initial));
+        for _ in 0..1_000 {
+            assert!(!limiter.allow_at(&current_scope, initial));
+        }
+        assert!(!limiter.allow_at(
+            &current_scope,
+            initial + ELIGIBLE_LIST_RATE_LIMIT - Duration::from_nanos(1)
+        ));
+        assert!(limiter.allow_at(&current_scope, initial + ELIGIBLE_LIST_RATE_LIMIT));
+        assert!(limiter.allow_at(&scope("owner", "another-team"), initial));
     }
 }
