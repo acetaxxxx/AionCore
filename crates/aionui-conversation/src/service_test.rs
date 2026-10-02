@@ -2036,6 +2036,39 @@ fn create_team_temp_workspace_uses_date_partition() {
     assert!(workspace.is_dir());
 }
 
+#[test]
+fn create_shared_team_workspace_uses_team_root_and_rejects_path_components() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
+
+    let workspace_string = svc.create_shared_team_workspace("team_123").unwrap();
+    let workspace = Path::new(&workspace_string);
+    assert_eq!(workspace, workspace_root.join("teams").join("team_123"));
+    assert!(workspace.is_dir());
+    let workspace_string = workspace.to_string_lossy();
+    assert!(svc.is_shared_team_workspace("team_123", &workspace_string));
+    assert!(!svc.is_shared_team_workspace("another-team", &workspace_string));
+    assert!(!workspace.starts_with(workspace_root.join("conversations/users")));
+    assert!(svc.create_shared_team_workspace("../escape").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn create_shared_team_workspace_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, workspace_root.join("teams")).unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+
+    assert!(svc.create_shared_team_workspace("team_123").is_err());
+}
+
 #[tokio::test]
 async fn create_rejects_unavailable_workspace_with_trailing_whitespace_in_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();

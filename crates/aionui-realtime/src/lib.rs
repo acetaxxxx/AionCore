@@ -7,7 +7,7 @@ pub mod manager;
 pub mod router;
 pub mod types;
 
-pub use broadcaster::{BroadcastEventBus, EventBroadcaster};
+pub use broadcaster::{BroadcastEventBus, EventBroadcaster, ScopedEventRecipients};
 pub use handler::{TokenExtractor, TokenUserResolver, WsHandlerState, ws_upgrade_handler};
 pub use manager::{TokenValidator, WebSocketManager};
 pub use router::{MessageRouter, NoopMessageRouter};

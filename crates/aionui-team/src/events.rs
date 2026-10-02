@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use aionui_api_types::{
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
@@ -41,16 +43,47 @@ pub const TEAM_SLOT_WORK_CHANGED_EVENT: &str = "team.slotWorkChanged";
 pub struct TeamEventEmitter {
     team_id: String,
     user_id: String,
+    authorized_user_ids: Arc<RwLock<HashSet<String>>>,
     broadcaster: Arc<dyn EventBroadcaster>,
 }
 
 impl TeamEventEmitter {
     pub fn new(team_id: String, user_id: String, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
+        let mut authorized_user_ids = HashSet::from([user_id.clone()]);
+        authorized_user_ids.extend(broadcaster.scope_recipients(&team_id));
         Self {
             team_id,
             user_id,
+            authorized_user_ids: Arc::new(RwLock::new(authorized_user_ids)),
             broadcaster,
         }
+    }
+
+    /// Replaces event recipients with the current active Team members. The
+    /// owner is always retained; callers derive collaborators from the
+    /// repository, never from a WebSocket request payload.
+    pub fn set_authorized_user_ids(&self, user_ids: impl IntoIterator<Item = String>) {
+        let mut authorized = HashSet::from([self.user_id.clone()]);
+        authorized.extend(user_ids.into_iter().filter(|user_id| !user_id.is_empty()));
+        self.broadcaster
+            .replace_scope_recipients(&self.team_id, authorized.iter().cloned().collect());
+        if let Ok(mut current) = self.authorized_user_ids.write() {
+            *current = authorized;
+        }
+    }
+
+    pub fn revoke_user(&self, user_id: &str) {
+        self.broadcaster.revoke_scope_recipient(&self.team_id, user_id);
+        if let Ok(mut current) = self.authorized_user_ids.write() {
+            current.remove(user_id);
+        }
+    }
+
+    pub fn authorized_user_ids(&self) -> Vec<String> {
+        self.authorized_user_ids
+            .read()
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_else(|_| vec![self.user_id.clone()])
     }
 
     pub fn team_id(&self) -> &str {
@@ -60,7 +93,13 @@ impl TeamEventEmitter {
     fn scoped_payload<T: Serialize>(&self, payload: T) -> Value {
         let mut value = serde_json::to_value(payload).expect("serialize team event payload");
         value["user_id"] = Value::String(self.user_id.clone());
+        value["authorized_user_ids"] = serde_json::json!(self.authorized_user_ids());
         value
+    }
+
+    pub fn broadcast_event<T: Serialize>(&self, event_name: &'static str, payload: T) {
+        self.broadcaster
+            .broadcast(WebSocketMessage::new(event_name, self.scoped_payload(payload)));
     }
 
     pub fn broadcast_agent_status(&self, slot_id: &str, status: TeammateStatus) {
@@ -234,12 +273,14 @@ mod tests {
 
     struct RecordingBroadcaster {
         events: std::sync::Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+        recipients: std::sync::Mutex<std::collections::HashMap<String, HashSet<String>>>,
     }
 
     impl RecordingBroadcaster {
         fn new() -> Self {
             Self {
                 events: std::sync::Mutex::new(vec![]),
+                recipients: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
 
@@ -251,6 +292,30 @@ mod tests {
     impl EventBroadcaster for RecordingBroadcaster {
         fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
             self.events.lock().unwrap().push(event);
+        }
+
+        fn replace_scope_recipients(&self, scope_id: &str, user_ids: Vec<String>) {
+            self.recipients
+                .lock()
+                .unwrap()
+                .insert(scope_id.to_owned(), user_ids.into_iter().collect());
+        }
+
+        fn revoke_scope_recipient(&self, scope_id: &str, user_id: &str) {
+            if let Some(recipients) = self.recipients.lock().unwrap().get_mut(scope_id) {
+                recipients.remove(user_id);
+            }
+        }
+
+        fn scope_recipients(&self, scope_id: &str) -> Vec<String> {
+            self.recipients
+                .lock()
+                .unwrap()
+                .get(scope_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
         }
     }
 
@@ -274,6 +339,23 @@ mod tests {
         assert_eq!(payload.team_id, "team-1");
         assert_eq!(payload.slot_id, "slot-1");
         assert_eq!(payload.status, "working");
+    }
+
+    #[test]
+    fn a_new_team_emitter_preserves_current_collaborator_recipients() {
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        broadcaster.replace_scope_recipients("team-1", vec!["owner".into(), "collaborator".into()]);
+        let emitter = TeamEventEmitter::new("team-1".into(), "owner".into(), broadcaster.clone());
+
+        emitter.broadcast_event(
+            TEAM_RENAMED_EVENT,
+            serde_json::json!({ "team_id": "team-1", "team_name": "Shared" }),
+        );
+
+        let events = broadcaster.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["authorized_user_ids"].as_array().unwrap().len(), 2);
+        assert_eq!(events[0].data["user_id"], "owner");
     }
 
     #[test]
@@ -547,6 +629,7 @@ mod tests {
                 id: "m1".into(),
                 team_id: "team-1".into(),
                 from_agent_id: "a2".into(),
+                actor_user_id: None,
                 to_agent_id: "a1".into(),
                 msg_type: "message".into(),
                 content: "hi".into(),

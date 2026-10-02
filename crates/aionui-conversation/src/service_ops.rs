@@ -313,7 +313,11 @@ impl ConversationService {
             .map_err(ConversationError::from)
     }
 
-    async fn ensure_owned_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), ConversationError> {
+    pub(crate) async fn ensure_owned_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), ConversationError> {
         let exists = self
             .conversation_repo()
             .get(user_id, conversation_id)

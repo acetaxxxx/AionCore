@@ -1,10 +1,16 @@
 use super::*;
 
 impl TeamSessionService {
-    pub(super) async fn build_team_response(&self, user_id: &str, team: &Team) -> Result<TeamResponse, TeamError> {
+    pub(super) async fn build_team_response_for_access(
+        &self,
+        execution_owner_id: &str,
+        team: &Team,
+        sharing_mode: aionui_api_types::TeamSharingMode,
+        role: aionui_api_types::TeamAccessRole,
+    ) -> Result<TeamResponse, TeamError> {
         let mut agents = Vec::with_capacity(team.agents.len());
         for agent in &team.agents {
-            agents.push(self.build_agent_response(user_id, &team.id, agent).await?);
+            agents.push(self.build_agent_response(execution_owner_id, &team.id, agent).await?);
         }
 
         Ok(TeamResponse {
@@ -13,6 +19,8 @@ impl TeamSessionService {
             workspace: team.workspace.clone(),
             assistants: agents,
             leader_assistant_id: team.lead_agent_id.clone(),
+            sharing_mode,
+            role,
             created_at: team.created_at,
             updated_at: team.updated_at,
         })

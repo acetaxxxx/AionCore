@@ -12,7 +12,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeFile;
 
 use aionui_api_types::{
-    ApiResponse, ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, DirOrFileResponse,
+    ApiResponse, ChatFileRef, ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, DirOrFileResponse,
     FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, GetFileMetadataRequest,
     GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, OpenSystemFileRequest, ReadContentRequest,
     ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
@@ -29,6 +29,48 @@ use crate::traits::{ClipboardWriterRef, FileServiceRef, ItemRevealerRef, Snapsho
 /// Request-body cap for `PUT /api/fs/content`, aligned with the 256 MB read cap
 /// so large files can be saved (the 10 MB global limit would otherwise 413).
 const CONTENT_MAX_SIZE: usize = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamWorkspaceAuthorization {
+    NotTeamWorkspace,
+    Allowed,
+    Denied,
+}
+
+#[async_trait::async_trait]
+pub trait TeamWorkspaceAuthorizer: Send + Sync {
+    async fn authorize_path(&self, user_id: &str, path: &Path) -> Result<TeamWorkspaceAuthorization, FileError>;
+
+    async fn authorize_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<TeamWorkspaceAuthorization, FileError>;
+
+    /// Confirms that a supplied path is the exact persisted Team workspace,
+    /// rather than merely a descendant that happens to be inside it.
+    async fn authorize_exact_workspace(
+        &self,
+        user_id: &str,
+        workspace: &Path,
+    ) -> Result<TeamWorkspaceAuthorization, FileError> {
+        self.authorize_path(user_id, workspace).await
+    }
+
+    async fn authorize_team_path_with_workspace(
+        &self,
+        user_id: &str,
+        path: &Path,
+        workspace: &Path,
+    ) -> Result<TeamWorkspaceAuthorization, FileError> {
+        let path_result = self.authorize_path(user_id, path).await?;
+        if path_result != TeamWorkspaceAuthorization::Allowed {
+            return Ok(path_result);
+        }
+        self.authorize_exact_workspace(user_id, workspace).await
+    }
+}
+
 use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
 };
@@ -93,6 +135,129 @@ pub struct FileRouterState {
     /// service; the path is written server-side and never returned to the client.
     pub clipboard: ClipboardWriterRef,
     pub allowed_roots: Vec<std::path::PathBuf>,
+    pub team_workspace_authorizer: Arc<dyn TeamWorkspaceAuthorizer>,
+}
+
+async fn validate_request_path(state: &FileRouterState, user: &CurrentUser, path: &str) -> Result<(), ApiError> {
+    let tenant_result = crate::tenant_guard::validate_tenant_path(user, path);
+    if user.is_local_admin() {
+        return tenant_result.map_err(Into::into);
+    }
+
+    match state
+        .team_workspace_authorizer
+        .authorize_path(&user.id, Path::new(path))
+        .await?
+    {
+        // The persisted Team workspace is a separate authorized root; it is
+        // intentionally outside the caller's personal user-data directory.
+        TeamWorkspaceAuthorization::Allowed => Ok(()),
+        TeamWorkspaceAuthorization::Denied => Err(ApiError::Forbidden("Team workspace access is forbidden".into())),
+        TeamWorkspaceAuthorization::NotTeamWorkspace => tenant_result.map_err(Into::into),
+    }
+}
+
+async fn validate_resolved_path(state: &FileRouterState, user: &CurrentUser, path: &str) -> Result<(), ApiError> {
+    validate_request_path(state, user, path).await
+}
+
+async fn validate_path_and_workspace(
+    state: &FileRouterState,
+    user: &CurrentUser,
+    path: &str,
+    workspace: &str,
+) -> Result<(), ApiError> {
+    if user.is_local_admin() {
+        validate_request_path(state, user, path).await?;
+        return validate_request_path(state, user, workspace).await;
+    }
+    match state
+        .team_workspace_authorizer
+        .authorize_team_path_with_workspace(user.id.as_str(), Path::new(path), Path::new(workspace))
+        .await?
+    {
+        TeamWorkspaceAuthorization::Allowed => {
+            validate_request_path(state, user, path).await?;
+            validate_request_path(state, user, workspace).await
+        }
+        TeamWorkspaceAuthorization::Denied => Err(ApiError::Forbidden("Team workspace access is forbidden".into())),
+        TeamWorkspaceAuthorization::NotTeamWorkspace => {
+            validate_request_path(state, user, path).await?;
+            validate_request_path(state, user, workspace).await
+        }
+    }
+}
+
+fn resolve_team_image_path(workspace: &Path, requested_path: &Path) -> Result<PathBuf, ApiError> {
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|_| ApiError::Forbidden("Team workspace access is forbidden".into()))?;
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        canonical_workspace.join(requested_path)
+    };
+    let canonical_path = candidate
+        .canonicalize()
+        .map_err(|_| ApiError::Forbidden("Team workspace access is forbidden".into()))?;
+    if !canonical_path.starts_with(&canonical_workspace) {
+        return Err(ApiError::Forbidden("Team workspace access is forbidden".into()));
+    }
+    Ok(canonical_path)
+}
+
+async fn resolve_chat_file_ref_for_user(
+    state: &FileRouterState,
+    user: &CurrentUser,
+    file: &ChatFileRef,
+    op: aionui_project::FileOp,
+) -> Result<String, ApiError> {
+    if let ChatFileRef::Local { path } = file
+        && !user.is_local_admin()
+        && let Some(team_path) =
+            authorize_local_team_file(state.team_workspace_authorizer.as_ref(), &user.id, path).await?
+    {
+        return Ok(team_path);
+    }
+
+    state
+        .project
+        .resolve_chat_file_ref_with_local_admin(&user.id, user.is_local_admin(), file, &content_upload_root(), op)
+        .await
+        .map_err(chat_file_resolve_error)
+}
+
+async fn authorize_local_team_file(
+    authorizer: &dyn TeamWorkspaceAuthorizer,
+    user_id: &str,
+    path: &str,
+) -> Result<Option<String>, ApiError> {
+    // Preserve the submitted lexical path for the authorizer: a Team path that
+    // traverses through a symlink or `..` must remain classified as a denied
+    // Team attempt even when canonicalization would move it outside the root.
+    let submitted_authorization = authorizer.authorize_path(user_id, Path::new(path)).await?;
+    if submitted_authorization == TeamWorkspaceAuthorization::Denied {
+        return Err(ApiError::Forbidden("Team workspace access is forbidden".into()));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| {
+        chat_file_resolve_error(aionui_project::ProjectError::LocalPathNotReadable { path: path.to_owned() })
+    })?;
+    if !canonical.is_file() {
+        return Err(chat_file_resolve_error(
+            aionui_project::ProjectError::LocalPathNotReadable { path: path.to_owned() },
+        ));
+    }
+    match authorizer.authorize_path(user_id, &canonical).await? {
+        TeamWorkspaceAuthorization::Allowed => Ok(Some(canonical.to_string_lossy().into_owned())),
+        TeamWorkspaceAuthorization::Denied => Err(ApiError::Forbidden("Team workspace access is forbidden".into())),
+        TeamWorkspaceAuthorization::NotTeamWorkspace => {
+            if submitted_authorization == TeamWorkspaceAuthorization::Allowed {
+                Err(ApiError::Forbidden("Team workspace access is forbidden".into()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,8 +334,8 @@ async fn get_files_by_dir(
     body: Result<Json<GetFilesByDirRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<DirOrFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.dir)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.root)?;
+    validate_request_path(&state, &user, &req.dir).await?;
+    validate_request_path(&state, &user, &req.root).await?;
     let items = state.file_service.get_files_by_dir(&req.dir, &req.root).await?;
     let response: Vec<DirOrFileResponse> = items.into_iter().map(to_dir_or_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
@@ -186,7 +351,7 @@ async fn list_workspace_files(
     if root.is_empty() {
         return Err(ApiError::BadRequest("root is required".to_owned()));
     }
-    crate::tenant_guard::validate_tenant_path(&user, root)?;
+    validate_request_path(&state, &user, root).await?;
     let items = state
         .file_service
         .list_workspace_files_with_extra_root(root, Some(Path::new(root)))
@@ -202,9 +367,9 @@ async fn get_file_metadata(
     body: Result<Json<GetFileMetadataRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.path)?;
+    validate_request_path(&state, &user, &req.path).await?;
     if let Some(ws) = req.workspace.as_deref() {
-        crate::tenant_guard::validate_tenant_path(&user, ws)?;
+        validate_path_and_workspace(&state, &user, &req.path, ws).await?;
     }
     let meta = state
         .file_service
@@ -219,9 +384,9 @@ async fn read_file(
     body: Result<Json<ReadFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.path)?;
+    validate_request_path(&state, &user, &req.path).await?;
     if let Some(ws) = req.workspace.as_deref() {
-        crate::tenant_guard::validate_tenant_path(&user, ws)?;
+        validate_path_and_workspace(&state, &user, &req.path, ws).await?;
     }
     let content = state
         .file_service
@@ -236,7 +401,7 @@ async fn write_file(
     body: Result<Json<WriteFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.path)?;
+    validate_request_path(&state, &user, &req.path).await?;
     let workspace = req.workspace.unwrap_or_else(|| {
         std::path::Path::new(&req.path)
             .parent()
@@ -244,7 +409,7 @@ async fn write_file(
             .unwrap_or_default()
     });
     if !workspace.is_empty() {
-        crate::tenant_guard::validate_tenant_path(&user, &workspace)?;
+        validate_path_and_workspace(&state, &user, &req.path, &workspace).await?;
     }
     let ok = state
         .file_service
@@ -276,6 +441,16 @@ async fn copy_files(
     let dir = resolved
         .absolute_path
         .ok_or_else(|| ApiError::BadRequest("copy target is not a local path".to_owned()))?;
+    validate_resolved_path(&state, &user, &dir).await?;
+    if let Some(source_root) = req.source_root.as_deref() {
+        for source in &req.file_paths {
+            validate_path_and_workspace(&state, &user, source, source_root).await?;
+        }
+    } else {
+        for source in &req.file_paths {
+            validate_resolved_path(&state, &user, source).await?;
+        }
+    }
     let result = state
         .file_service
         .copy_files_to_workspace(&req.file_paths, &dir, req.source_root.as_deref())
@@ -304,6 +479,9 @@ async fn reveal_item(
         )
         .await
         .map_err(ApiError::from)?;
+    if let Some(path) = resolved.absolute_path.as_deref() {
+        validate_resolved_path(&state, &user, path).await?;
+    }
     reveal_resolved(state.revealer.as_ref(), resolved.absolute_path).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -348,6 +526,9 @@ async fn copy_absolute_path(
         )
         .await
         .map_err(ApiError::from)?;
+    if let Some(path) = resolved.absolute_path.as_deref() {
+        validate_resolved_path(&state, &user, path).await?;
+    }
     copy_absolute_path_resolved(state.clipboard.as_ref(), resolved.absolute_path).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -434,17 +615,8 @@ async fn open_system_file(
     body: Result<Json<OpenSystemFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let abs = state
-        .project
-        .resolve_chat_file_ref_with_local_admin(
-            &user.id,
-            user.is_local_admin(),
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
-        .await
-        .map_err(chat_file_resolve_error)?;
+    let abs = resolve_chat_file_ref_for_user(&state, &user, &req.file, aionui_project::FileOp::Read).await?;
+    validate_resolved_path(&state, &user, &abs).await?;
     state.system_opener.open(&abs).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -480,17 +652,8 @@ async fn read_content(
     body: Result<Json<ReadContentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let abs = state
-        .project
-        .resolve_chat_file_ref_with_local_admin(
-            &user.id,
-            user.is_local_admin(),
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
-        .await
-        .map_err(chat_file_resolve_error)?;
+    let abs = resolve_chat_file_ref_for_user(&state, &user, &req.file, aionui_project::FileOp::Read).await?;
+    validate_resolved_path(&state, &user, &abs).await?;
     let content = state
         .file_service
         .read_resolved_content(Path::new(&abs), req.encoding)
@@ -510,17 +673,8 @@ async fn write_content(
     body: Result<Json<WriteContentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let abs = state
-        .project
-        .resolve_chat_file_ref_with_local_admin(
-            &user.id,
-            user.is_local_admin(),
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Write,
-        )
-        .await
-        .map_err(chat_file_resolve_error)?;
+    let abs = resolve_chat_file_ref_for_user(&state, &user, &req.file, aionui_project::FileOp::Write).await?;
+    validate_resolved_path(&state, &user, &abs).await?;
     let path = Path::new(&abs);
 
     if let Some(expected) = parse_if_match(&headers) {
@@ -546,17 +700,8 @@ async fn content_metadata(
     body: Result<Json<ContentMetadataRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let abs = state
-        .project
-        .resolve_chat_file_ref_with_local_admin(
-            &user.id,
-            user.is_local_admin(),
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
-        .await
-        .map_err(chat_file_resolve_error)?;
+    let abs = resolve_chat_file_ref_for_user(&state, &user, &req.file, aionui_project::FileOp::Read).await?;
+    validate_resolved_path(&state, &user, &abs).await?;
     let meta = state.file_service.resolved_metadata(Path::new(&abs)).await?;
     Ok(Json(ApiResponse::ok(to_metadata_response(meta))))
 }
@@ -579,17 +724,8 @@ async fn stream_file(
     let file_ref = params
         .to_chat_file_ref()
         .map_err(|m| ApiError::BadRequest(m.to_owned()))?;
-    let abs = state
-        .project
-        .resolve_chat_file_ref_with_local_admin(
-            &user.id,
-            user.is_local_admin(),
-            &file_ref,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
-        .await
-        .map_err(chat_file_resolve_error)?;
+    let abs = resolve_chat_file_ref_for_user(&state, &user, &file_ref, aionui_project::FileOp::Read).await?;
+    validate_resolved_path(&state, &user, &abs).await?;
     // ServeFile owns Range/If-Range/Content-Type; the path is already
     // containment-checked by resolve_chat_file_ref, so no re-sandbox here.
     let response = ServeFile::new(&abs)
@@ -681,9 +817,23 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
+
+    if let Some(conversation_id) = fields.conversation_id.as_deref() {
+        match state
+            .team_workspace_authorizer
+            .authorize_conversation(&user.id, conversation_id)
+            .await?
+        {
+            TeamWorkspaceAuthorization::Denied => {
+                return Err(ApiError::Forbidden("Team conversation access is forbidden".into()));
+            }
+            TeamWorkspaceAuthorization::Allowed | TeamWorkspaceAuthorization::NotTeamWorkspace => {}
+        }
+    }
 
     let file_name = fields.file_name.or(fields.dispo_file_name).ok_or_else(|| {
         ApiError::BadRequest("missing file name: provide 'file_name' or a multipart filename".to_owned())
@@ -702,32 +852,60 @@ async fn get_image_base64(
     body: Result<Json<GetImageBase64Request>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.path)?;
-    let path = state
-        .project
-        .resolve_chat_file_ref_with_local_admin(
-            &user.id,
-            user.is_local_admin(),
-            &aionui_api_types::ChatFileRef::Local { path: req.path },
-            &content_upload_root(),
+    let (path, extra_root) = if user.is_local_admin() {
+        validate_request_path(&state, &user, &req.path).await?;
+        if let Some(workspace) = req.workspace.as_deref() {
+            validate_request_path(&state, &user, workspace).await?;
+        }
+        (req.path, req.workspace.map(PathBuf::from))
+    } else if let Some(workspace) = req.workspace.as_deref() {
+        match state
+            .team_workspace_authorizer
+            .authorize_exact_workspace(&user.id, Path::new(workspace))
+            .await?
+        {
+            TeamWorkspaceAuthorization::Allowed => {
+                let canonical_path = resolve_team_image_path(Path::new(workspace), Path::new(&req.path))?;
+                let canonical_path_text = canonical_path.to_string_lossy().into_owned();
+                validate_request_path(&state, &user, &canonical_path_text).await?;
+                (canonical_path_text, None)
+            }
+            TeamWorkspaceAuthorization::Denied => {
+                return Err(ApiError::Forbidden("Team workspace access is forbidden".into()));
+            }
+            TeamWorkspaceAuthorization::NotTeamWorkspace => {
+                // A client-supplied personal workspace is only a path hint after
+                // both paths have been checked against the authenticated user's
+                // persisted data root by ProjectService.
+                let path = resolve_chat_file_ref_for_user(
+                    &state,
+                    &user,
+                    &ChatFileRef::Local { path: req.path.clone() },
+                    aionui_project::FileOp::Read,
+                )
+                .await?;
+                validate_resolved_path(&state, &user, &path).await?;
+                let workspace = state
+                    .project
+                    .authorize_local_workspace_with_local_admin(&user.id, false, Path::new(workspace))
+                    .map_err(chat_file_resolve_error)?;
+                (path, Some(PathBuf::from(workspace)))
+            }
+        }
+    } else {
+        let path = resolve_chat_file_ref_for_user(
+            &state,
+            &user,
+            &ChatFileRef::Local { path: req.path.clone() },
             aionui_project::FileOp::Read,
         )
-        .await
-        .map_err(chat_file_resolve_error)?;
-    let workspace = req
-        .workspace
-        .as_deref()
-        .map(|workspace| {
-            crate::tenant_guard::validate_tenant_path(&user, workspace)?;
-            state
-                .project
-                .authorize_local_workspace_with_local_admin(&user.id, user.is_local_admin(), Path::new(workspace))
-                .map_err(chat_file_resolve_error)
-        })
-        .transpose()?;
+        .await?;
+        validate_resolved_path(&state, &user, &path).await?;
+        (path, None)
+    };
     let data_url = state
         .file_service
-        .get_image_base64(&path, workspace.as_deref().map(Path::new))
+        .get_image_base64(&path, extra_root.as_deref())
         .await?;
     Ok(Json(ApiResponse::ok(data_url)))
 }
@@ -751,7 +929,7 @@ async fn snapshot_init(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     let info = state.snapshot_service.init(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
@@ -762,7 +940,7 @@ async fn snapshot_info(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     let info = state.snapshot_service.get_info(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
@@ -773,7 +951,7 @@ async fn snapshot_compare(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotCompareResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     let result = state.snapshot_service.compare(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_compare_response(result))))
 }
@@ -784,7 +962,7 @@ async fn snapshot_baseline(
     body: Result<Json<SnapshotBaselineRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     let content = state
         .snapshot_service
         .get_baseline_content(&req.workspace, &req.file_path)
@@ -798,7 +976,7 @@ async fn snapshot_stage_file(
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     state
         .snapshot_service
         .stage_file(&req.workspace, &req.file_path)
@@ -812,7 +990,7 @@ async fn snapshot_stage_all(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     state.snapshot_service.stage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -823,7 +1001,7 @@ async fn snapshot_unstage_file(
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     state
         .snapshot_service
         .unstage_file(&req.workspace, &req.file_path)
@@ -837,7 +1015,7 @@ async fn snapshot_unstage_all(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     state.snapshot_service.unstage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -848,7 +1026,7 @@ async fn snapshot_discard(
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     state
         .snapshot_service
         .discard_file(&req.workspace, &req.file_path, req.operation)
@@ -862,7 +1040,7 @@ async fn snapshot_reset(
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     state
         .snapshot_service
         .reset_file(&req.workspace, &req.file_path, req.operation)
@@ -876,7 +1054,7 @@ async fn snapshot_branches(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     let branches = state.snapshot_service.get_branches(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(branches)))
 }
@@ -887,7 +1065,7 @@ async fn snapshot_dispose(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    crate::tenant_guard::validate_tenant_path(&user, &req.workspace)?;
+    validate_request_path(&state, &user, &req.workspace).await?;
     state.snapshot_service.dispose(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -967,6 +1145,133 @@ fn to_compare_response(r: CompareResult) -> SnapshotCompareResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FixedTeamAuthorizer {
+        decision: TeamWorkspaceAuthorization,
+        paths: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TeamWorkspaceAuthorizer for FixedTeamAuthorizer {
+        async fn authorize_path(&self, _user_id: &str, path: &Path) -> Result<TeamWorkspaceAuthorization, FileError> {
+            self.paths.lock().unwrap().push(path.to_path_buf());
+            Ok(self.decision)
+        }
+
+        async fn authorize_conversation(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+        ) -> Result<TeamWorkspaceAuthorization, FileError> {
+            Ok(TeamWorkspaceAuthorization::NotTeamWorkspace)
+        }
+    }
+
+    #[tokio::test]
+    async fn local_file_ref_uses_canonical_team_authorization_before_personal_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("teams/team-1");
+        let file = workspace.join("report.txt");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&file, b"team data").unwrap();
+        let authorizer = FixedTeamAuthorizer {
+            decision: TeamWorkspaceAuthorization::Allowed,
+            paths: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = authorize_local_team_file(&authorizer, "collaborator", file.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved,
+            Some(file.canonicalize().unwrap().to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            *authorizer.paths.lock().unwrap(),
+            vec![file.clone(), file.canonicalize().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_file_ref_outside_team_authorization_falls_back_only_when_not_team_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let personal_file = tmp.path().join("personal/report.txt");
+        std::fs::create_dir_all(personal_file.parent().unwrap()).unwrap();
+        std::fs::write(&personal_file, b"personal data").unwrap();
+        let authorizer = FixedTeamAuthorizer {
+            decision: TeamWorkspaceAuthorization::NotTeamWorkspace,
+            paths: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = authorize_local_team_file(&authorizer, "owner", personal_file.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, None);
+        assert_eq!(
+            *authorizer.paths.lock().unwrap(),
+            vec![
+                personal_file.canonicalize().unwrap(),
+                personal_file.canonicalize().unwrap()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_file_ref_rejects_denied_team_and_canonical_symlink_escape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("teams/team-1");
+        let outside = tmp.path().join("private/report.txt");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"private").unwrap();
+        let link = workspace.join("linked.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let authorizer = FixedTeamAuthorizer {
+            decision: TeamWorkspaceAuthorization::Denied,
+            paths: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let result = authorize_local_team_file(&authorizer, "outsider", link.to_str().unwrap()).await;
+
+        assert!(matches!(result, Err(ApiError::Forbidden(_))));
+        assert_eq!(*authorizer.paths.lock().unwrap(), vec![link]);
+    }
+
+    #[test]
+    fn team_image_resolution_stays_inside_the_supplied_authorized_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("teams/team-1");
+        let image = workspace.join("images/photo.png");
+        let outside = tmp.path().join("private/photo.png");
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"image").unwrap();
+        std::fs::write(&outside, b"private").unwrap();
+
+        assert_eq!(
+            resolve_team_image_path(&workspace, Path::new("images/photo.png")).unwrap(),
+            image.canonicalize().unwrap()
+        );
+        assert!(resolve_team_image_path(&workspace, Path::new("../../private/photo.png")).is_err());
+        assert!(resolve_team_image_path(&workspace, &outside).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn team_image_resolution_rejects_symlink_escape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("teams/team-1");
+        let outside = tmp.path().join("private");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("photo.png"), b"private").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("linked")).unwrap();
+
+        assert!(resolve_team_image_path(&workspace, Path::new("linked/photo.png")).is_err());
+    }
 
     #[test]
     fn file_path_outside_sandbox_maps_to_explicit_api_code() {
@@ -1248,10 +1553,11 @@ mod tests {
     /// authenticated handlers with a real `ProjectService` — would not actually pin
     /// this: the wiring is a single `map_err` per handler, and a future edit swapping
     /// one back to `ApiError::from` is exactly the regression worth catching. The
-    /// The six call sites cover content read/write, metadata, stream, open-system,
-    /// and the legacy image-base64 route. The count guards against another resolver
-    /// call being added without a decision: bump it deliberately after checking the
-    /// new call is sealed as well.
+    /// These call sites cover content read/write, metadata, stream, open-system,
+    /// and the legacy image-base64 route. That last handler has separate guarded
+    /// personal-workspace and no-workspace fallbacks, so it contributes two calls.
+    /// The count guards against another resolver call being added without a decision:
+    /// bump it deliberately after checking the new call is sealed as well.
     #[test]
     fn every_chat_file_ref_endpoint_uses_the_sealed_resolver_mapping() {
         // Scan handler code only. This test module mentions both needles in its own
@@ -1262,22 +1568,19 @@ mod tests {
             .map(|(before, _)| before)
             .expect("routes.rs has a #[cfg(test)] module");
 
-        let resolve_calls = handlers.matches(".resolve_chat_file_ref(").count()
-            + handlers.matches(".resolve_chat_file_ref_with_local_admin(").count();
-        let sealed = handlers.matches(".map_err(chat_file_resolve_error)?").count();
+        let endpoint_calls = handlers.matches("resolve_chat_file_ref_for_user(").count() - 1;
+        let project_resolve_calls = handlers.matches(".resolve_chat_file_ref_with_local_admin(").count();
+        let sealed = handlers.matches(".map_err(chat_file_resolve_error)").count();
 
         assert_eq!(
-            resolve_calls, 6,
-            "expected 6 sealed ChatFileRef resolver call sites (content read/write, metadata, \
-             stream, open-system, legacy image-base64); found {resolve_calls} — a new one must \
-             be checked before bumping this"
+            endpoint_calls, 7,
+            "all six ChatFileRef handlers must use the shared per-user resolver"
         );
         assert_eq!(
-            sealed, resolve_calls,
-            "every resolve_chat_file_ref call must map its error through \
-             chat_file_resolve_error; {sealed} of {resolve_calls} do. A handler using \
-             ApiError::from leaks the resolved absolute path in message and details."
+            project_resolve_calls, 1,
+            "the shared resolver owns direct project resolution"
         );
+        assert_eq!(sealed, 2, "file and workspace resolution errors must be sealed");
     }
 
     /// The `Database` arm (reachable through `resolve_reference`) is deliberately

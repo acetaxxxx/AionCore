@@ -22,6 +22,9 @@ pub enum TeamError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Eligible collaborator accounts are unavailable")]
+    CollaboratorAccountsUnavailable,
+
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 

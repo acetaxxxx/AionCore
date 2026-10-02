@@ -119,6 +119,7 @@ pub struct TeamSession {
     /// Owner user_id for this team — needed when spawn_agent creates a
     /// new conversation (conversations are scoped per user).
     user_id: String,
+    events: Arc<TeamEventEmitter>,
     /// Weak upward ref so `spawn_agent` can reach the DB-facing orchestration
     /// in `TeamSessionService` (conversation creation, persisted agent list)
     /// without creating a strong cycle with the session map that owns `self`.
@@ -250,6 +251,7 @@ impl TeamSession {
             team_run_manager,
             work_coordinator,
             user_id,
+            events: emitter,
             service,
             broadcaster,
             event_loops,
@@ -277,6 +279,14 @@ impl TeamSession {
         &self.user_id
     }
 
+    pub fn set_authorized_event_users(&self, user_ids: impl IntoIterator<Item = String>) {
+        self.events.set_authorized_user_ids(user_ids);
+    }
+
+    pub fn revoke_event_user(&self, user_id: &str) {
+        self.events.revoke_user(user_id);
+    }
+
     pub fn scheduler(&self) -> &Arc<TeammateManager> {
         &self.scheduler
     }
@@ -302,11 +312,7 @@ impl TeamSession {
     }
 
     pub(crate) fn team_event_emitter(&self) -> Arc<TeamEventEmitter> {
-        Arc::new(TeamEventEmitter::new(
-            self.team.id.clone(),
-            self.user_id.clone(),
-            self.broadcaster.clone(),
-        ))
+        Arc::clone(&self.events)
     }
 
     pub fn team_run_manager(&self) -> &Arc<TeamRunManager> {
@@ -643,12 +649,21 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_as_actor(&self.user_id, content, files).await
+    }
+
+    pub async fn send_message_as_actor(
+        &self,
+        actor_user_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let lead_slot_id = self
             .scheduler
             .find_lead_slot_id()
             .await
             .ok_or_else(|| TeamError::AgentNotFound("no lead agent in team".into()))?;
-        self.enqueue_user_message(&lead_slot_id, TeamRunTargetRole::Lead, content, files)
+        self.enqueue_user_message(actor_user_id, &lead_slot_id, TeamRunTargetRole::Lead, content, files)
             .await
     }
 
@@ -658,8 +673,19 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_to_agent_as_actor(&self.user_id, slot_id, content, files)
+            .await
+    }
+
+    pub async fn send_message_to_agent_as_actor(
+        &self,
+        actor_user_id: &str,
+        slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
-        self.enqueue_user_message(slot_id, target_role_for(agent.role), content, files)
+        self.enqueue_user_message(actor_user_id, slot_id, target_role_for(agent.role), content, files)
             .await
     }
 
@@ -718,6 +744,7 @@ impl TeamSession {
 
     async fn enqueue_user_message(
         &self,
+        actor_user_id: &str,
         slot_id: &str,
         role: TeamRunTargetRole,
         content: &str,
@@ -802,10 +829,11 @@ impl TeamSession {
         })?;
         let mailbox_message = match self
             .mailbox
-            .write_with_files(
+            .write_as_actor_with_files(
                 &self.team.id,
                 slot_id,
                 "user",
+                Some(actor_user_id),
                 MailboxMessageType::Message,
                 content,
                 None,
@@ -828,7 +856,9 @@ impl TeamSession {
             &agent.conversation_id,
             content,
             files.unwrap_or_default(),
-        );
+        )
+        .with_actor_user_id(actor_user_id)
+        .with_authorized_user_ids(self.events.authorized_user_ids());
         if let Err(error) = projection.project(request).await {
             warn!(
                 team_id = %self.team.id,
@@ -874,14 +904,17 @@ impl TeamSession {
         })?;
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         projection
-            .project(TeamProjectionRequest::team_system_visible(
-                &self.user_id,
-                &self.team.id,
-                slot_id,
-                &agent.conversation_id,
-                content,
-                generate_id(),
-            ))
+            .project(
+                TeamProjectionRequest::team_system_visible(
+                    &self.user_id,
+                    &self.team.id,
+                    slot_id,
+                    &agent.conversation_id,
+                    content,
+                    generate_id(),
+                )
+                .with_authorized_user_ids(self.events.authorized_user_ids()),
+            )
             .await?;
         Ok(())
     }
@@ -952,6 +985,8 @@ impl TeamSession {
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest {
             user_id: self.user_id.clone(),
+            actor_user_id: self.user_id.clone(),
+            authorized_user_ids: self.events.authorized_user_ids(),
             team_id: self.team.id.clone(),
             slot_id: to_slot_id.to_owned(),
             conversation_id: to_agent.conversation_id.clone(),
@@ -1214,6 +1249,8 @@ impl TeamSession {
             };
             let request = TeamProjectionRequest {
                 user_id: self.user_id.clone(),
+                actor_user_id: self.user_id.clone(),
+                authorized_user_ids: self.events.authorized_user_ids(),
                 team_id: self.team.id.clone(),
                 slot_id: msg.to_agent_id.clone(),
                 conversation_id: input.conversation_id.clone(),
@@ -1759,6 +1796,8 @@ impl TeamSession {
             let from_agent = self.scheduler.get_agent(from_slot_id).await?;
             TeamProjectionRequest {
                 user_id: self.user_id.clone(),
+                actor_user_id: self.user_id.clone(),
+                authorized_user_ids: self.events.authorized_user_ids(),
                 team_id: self.team.id.clone(),
                 slot_id: to_slot_id.to_owned(),
                 conversation_id: target_agent.conversation_id.clone(),

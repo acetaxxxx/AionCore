@@ -573,6 +573,16 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn create_shared_team_workspace(&self, team_id: &str) -> Result<String, TeamError> {
+        self.conversation_service
+            .create_shared_team_workspace(team_id)
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn is_shared_team_workspace(&self, team_id: &str, workspace: &str) -> Result<bool, TeamError> {
+        Ok(self.conversation_service.is_shared_team_workspace(team_id, workspace))
+    }
+
     async fn resolve_assistant_mcp_selection(
         &self,
         user_id: &str,

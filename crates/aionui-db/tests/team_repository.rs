@@ -12,10 +12,11 @@
 use std::sync::Arc;
 
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use aionui_db::models::{MailboxMessageRow, TeamMembershipRow, TeamRow, TeamSharingMode, TeamTaskRow};
 use aionui_db::{
-    ActivityCursor, DbError, ITeamRepository, PageDirection, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams,
-    init_database_memory,
+    ActivityCursor, CreateMcpServerParams, DbError, IMcpServerRepository, ITeamRepository, IUserRepository,
+    PageDirection, SqliteMcpServerRepository, SqliteTeamRepository, SqliteUserRepository, UpdateTaskParams,
+    UpdateTeamParams, init_database_memory,
 };
 
 const DEFAULT_USER_ID: &str = "system_default_user";
@@ -57,6 +58,7 @@ fn make_mailbox_msg(id: &str, team_id: &str, to: &str, from: &str, msg_type: &st
         team_id: team_id.into(),
         to_agent_id: to.into(),
         from_agent_id: from.into(),
+        actor_user_id: None,
         msg_type: msg_type.into(),
         content: format!("content-{id}"),
         summary: None,
@@ -99,6 +101,225 @@ async fn create_and_get_team() {
     assert_eq!(fetched.id, "t1");
     assert_eq!(fetched.name, "Team Alpha");
     assert_eq!(fetched.lead_agent_id, Some("a1".into()));
+    assert_eq!(
+        repo.get_team_sharing_mode("t1").await.unwrap(),
+        TeamSharingMode::Private
+    );
+}
+
+#[tokio::test]
+async fn shared_mode_and_active_membership_persist_and_revoke_by_owner() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let member = users.create_user("collaborator", "test-password-hash").await.unwrap();
+    let team = make_team("shared-team", "Shared Team");
+    repo.create_team_with_sharing_mode(&team, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repo.get_team_sharing_mode(&team.id).await.unwrap(),
+        TeamSharingMode::Shared
+    );
+    assert_eq!(
+        repo.team_access_role(&team.id, DEFAULT_USER_ID).await.unwrap(),
+        Some(aionui_db::models::TeamAccessRole::Owner)
+    );
+    let membership = TeamMembershipRow {
+        membership_ref: "opaque-membership-ref".into(),
+        team_id: team.id.clone(),
+        user_id: member.id.clone(),
+        display_name: member.username.clone(),
+        created_at: now_ms(),
+    };
+    repo.add_team_member(&membership).await.unwrap();
+    assert_eq!(
+        repo.team_access_role(&team.id, &member.id).await.unwrap(),
+        Some(aionui_db::models::TeamAccessRole::Collaborator)
+    );
+
+    let members = repo.list_team_members(&team.id).await.unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].membership_ref, membership.membership_ref);
+    assert_eq!(members[0].user_id, member.id);
+    let shared_teams = repo.list_teams_by_member(&member.id).await.unwrap();
+    assert_eq!(shared_teams.len(), 1);
+    assert_eq!(shared_teams[0].id, team.id);
+
+    assert!(matches!(
+        repo.remove_team_member("not-the-owner", &team.id, &membership.membership_ref)
+            .await,
+        Err(DbError::NotFound(_))
+    ));
+    assert_eq!(repo.list_team_members(&team.id).await.unwrap().len(), 1);
+
+    repo.remove_team_member(DEFAULT_USER_ID, &team.id, &membership.membership_ref)
+        .await
+        .unwrap();
+    assert!(repo.list_teams_by_member(&member.id).await.unwrap().is_empty());
+    assert_eq!(repo.team_access_role(&team.id, &member.id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn cannot_add_member_to_private_team_or_disabled_account() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let member = users
+        .create_user("collaborator@example.com", "test-password-hash")
+        .await
+        .unwrap();
+    let private_team = make_team("private-team", "Private Team");
+    repo.create_team(&private_team).await.unwrap();
+    let membership = TeamMembershipRow {
+        membership_ref: "opaque-private-ref".into(),
+        team_id: private_team.id.clone(),
+        user_id: member.id.clone(),
+        display_name: member.username.clone(),
+        created_at: now_ms(),
+    };
+    assert!(matches!(
+        repo.add_team_member(&membership).await,
+        Err(DbError::NotFound(_))
+    ));
+
+    let shared_team = make_team("shared-team-disabled", "Shared Team");
+    repo.create_team_with_sharing_mode(&shared_team, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    let active_membership = TeamMembershipRow {
+        membership_ref: "opaque-active-ref".into(),
+        team_id: shared_team.id.clone(),
+        user_id: member.id.clone(),
+        display_name: Some("Host account opaque123".into()),
+        created_at: now_ms(),
+    };
+    repo.add_team_member(&active_membership).await.unwrap();
+    let listed_members = repo.list_team_members(&shared_team.id).await.unwrap();
+    assert_eq!(
+        listed_members[0].display_name.as_deref(),
+        Some("Host account opaque123")
+    );
+    users
+        .set_status(&member.id, aionui_db::models::UserStatus::Disabled)
+        .await
+        .unwrap();
+    assert!(repo.list_team_members(&shared_team.id).await.unwrap().is_empty());
+    assert_eq!(repo.team_access_role(&shared_team.id, &member.id).await.unwrap(), None);
+    let disabled_membership = TeamMembershipRow {
+        team_id: shared_team.id,
+        ..membership
+    };
+    assert!(matches!(
+        repo.add_team_member(&disabled_membership).await,
+        Err(DbError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn eligible_team_users_exclude_owner_members_existing_members_and_disabled_rows() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let owner = users.create_user("team-owner", "owner-hash").await.unwrap();
+    let existing = users.create_user("existing-member", "existing-hash").await.unwrap();
+    let eligible = users.create_user("eligible-member", "eligible-hash").await.unwrap();
+    let disabled = users.create_user("disabled-member", "disabled-hash").await.unwrap();
+    users
+        .set_status(&disabled.id, aionui_db::models::UserStatus::Disabled)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET username = 'System Account' WHERE id = ?")
+        .bind(DEFAULT_USER_ID)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let team = make_team_for_user("eligible-team", &owner.id, "Eligible Team");
+    repo.create_team_with_sharing_mode(&team, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    repo.add_team_member(&TeamMembershipRow {
+        membership_ref: "existing-membership-ref".into(),
+        team_id: team.id.clone(),
+        user_id: existing.id,
+        display_name: None,
+        created_at: now_ms(),
+    })
+    .await
+    .unwrap();
+
+    let candidates = repo.list_eligible_team_users(&owner.id, &team.id).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].user_id, eligible.id);
+    assert_eq!(candidates[0].display_name, "eligible-member");
+}
+
+#[tokio::test]
+async fn team_mcp_allowlist_is_shared_team_owner_scoped_and_atomic() {
+    let (repo, db) = repo().await;
+    let users = SqliteUserRepository::new(db.pool().clone());
+    let other_owner = users.create_user("other-owner", "test-password-hash").await.unwrap();
+    let mcp_repo = SqliteMcpServerRepository::new(db.pool().clone());
+    let owner_mcp = mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: DEFAULT_USER_ID,
+            name: "owner-mcp",
+            description: None,
+            enabled: true,
+            transport_type: "stdio",
+            transport_config: r#"{"command":"mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+    let private_mcp = mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: &other_owner.id,
+            name: "private-mcp",
+            description: None,
+            enabled: true,
+            transport_type: "stdio",
+            transport_config: r#"{"command":"private-mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+
+    let shared = make_team("team-mcp-allowlist", "Shared Team");
+    repo.create_team_with_sharing_mode(&shared, TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    let selected = vec![owner_mcp.id.clone()];
+    repo.replace_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id, &selected)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.list_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id).await.unwrap(),
+        selected
+    );
+
+    assert!(matches!(
+        repo.replace_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id, &[private_mcp.id])
+            .await,
+        Err(DbError::NotFound(_))
+    ));
+    assert_eq!(
+        repo.list_team_mcp_allowlist(DEFAULT_USER_ID, &shared.id).await.unwrap(),
+        vec![owner_mcp.id]
+    );
+    assert!(matches!(
+        repo.list_team_mcp_allowlist(&other_owner.id, &shared.id).await,
+        Err(DbError::NotFound(_))
+    ));
+
+    let private = make_team("private-team-mcp", "Private Team");
+    repo.create_team(&private).await.unwrap();
+    assert!(matches!(
+        repo.replace_team_mcp_allowlist(DEFAULT_USER_ID, &private.id, &[]).await,
+        Err(DbError::NotFound(_))
+    ));
 }
 
 #[tokio::test]
@@ -339,6 +560,40 @@ async fn write_and_read_unread_messages() {
     // Read again: should return 0 (all marked read)
     let unread2 = repo.read_unread_and_mark(DEFAULT_USER_ID, "t1", "a1").await.unwrap();
     assert!(unread2.is_empty());
+}
+
+#[tokio::test]
+async fn mailbox_queries_preserve_actor_user_id() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+
+    let mut message = make_mailbox_msg("actor-message", "t1", "a1", "a2", "message");
+    message.actor_user_id = Some("collaborator-1".to_owned());
+    repo.write_message(DEFAULT_USER_ID, &message).await.unwrap();
+
+    let assert_actor = |rows: &[MailboxMessageRow]| {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].actor_user_id.as_deref(), Some("collaborator-1"));
+    };
+
+    assert_actor(&repo.peek_unread(DEFAULT_USER_ID, "t1", "a1").await.unwrap());
+    assert_actor(
+        &repo
+            .peek_unread_by_ids(DEFAULT_USER_ID, "t1", "a1", &["actor-message".to_owned()])
+            .await
+            .unwrap(),
+    );
+    assert_actor(&repo.read_unread_and_mark(DEFAULT_USER_ID, "t1", "a1").await.unwrap());
+    assert_actor(&repo.get_history(DEFAULT_USER_ID, "t1", "a1", Some(10)).await.unwrap());
+    assert_actor(&repo.get_history(DEFAULT_USER_ID, "t1", "a1", None).await.unwrap());
+    assert_actor(&repo.list_messages_by_team("t1", 10).await.unwrap());
+    assert_actor(
+        &repo
+            .list_messages_by_team_paged("t1", None, PageDirection::Asc, 10)
+            .await
+            .unwrap(),
+    );
+    assert_actor(&repo.list_messages_by_ids(&["actor-message".to_owned()]).await.unwrap());
 }
 
 #[tokio::test]

@@ -108,6 +108,49 @@ pub struct CreateTeamRequest {
     pub agents: Vec<TeamAgentInput>,
     #[serde(default)]
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub sharing_mode: TeamSharingMode,
+}
+
+/// A selectable host account represented by a server-issued opaque reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EligibleTeamCollaboratorResponse {
+    pub account_ref: String,
+    pub display_name: String,
+}
+
+/// Request body for `POST /api/teams/{id}/members`.
+///
+/// Account identity is resolved by the server; callers cannot submit a user ID.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddTeamMemberRequest {
+    pub account_ref: String,
+}
+
+/// Active Team collaborator representation. User IDs are never exposed here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamMemberResponse {
+    pub membership_ref: String,
+    pub display_name: Option<String>,
+    pub created_at: TimestampMs,
+}
+
+/// Type alias for active Team members.
+pub type TeamMemberListResponse = Vec<TeamMemberResponse>;
+
+/// Replaces the owner-configured MCP allowlist for a Shared Team.
+/// IDs are revalidated against the authenticated Team owner on the server.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceTeamMcpAllowlistRequest {
+    pub mcp_server_ids: Vec<String>,
+}
+
+/// The explicitly selected owner MCP server IDs for a Shared Team.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamMcpAllowlistResponse {
+    pub mcp_server_ids: Vec<String>,
 }
 
 /// Request body for `PATCH /api/teams/:id/name`.
@@ -583,6 +626,23 @@ pub struct TeamAgentResponse {
     pub context_reset: TeamContextResetCapability,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TeamSharingMode {
+    #[default]
+    Private,
+    Shared,
+}
+
+/// Caller's authorization role on a Team.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TeamAccessRole {
+    #[default]
+    Owner,
+    Collaborator,
+}
+
 /// Full team response returned by create, get, and list endpoints.
 ///
 /// Corresponds to the `TTeam` shared type in the API Spec.
@@ -596,6 +656,10 @@ pub struct TeamResponse {
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
     pub leader_assistant_id: Option<String>,
+    #[serde(default)]
+    pub sharing_mode: TeamSharingMode,
+    #[serde(default)]
+    pub role: TeamAccessRole,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -739,6 +803,8 @@ pub struct TeamMailboxMessageResponse {
     pub id: String,
     pub team_id: String,
     pub from_agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_user_id: Option<String>,
     pub to_agent_id: String,
     pub msg_type: String,
     pub content: String,
@@ -855,6 +921,37 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn add_team_member_accepts_only_opaque_account_ref() {
+        assert_eq!(
+            serde_json::from_value::<AddTeamMemberRequest>(json!({"account_ref":"acct_opaque"}))
+                .unwrap()
+                .account_ref,
+            "acct_opaque"
+        );
+        assert!(
+            serde_json::from_value::<AddTeamMemberRequest>(
+                json!({"account_ref":"acct_opaque", "user_id":"caller-chosen"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn create_team_sharing_mode_defaults_private_and_accepts_explicit_shared() {
+        let request = json!({
+            "name": "Family Team",
+            "agents": [{"name": "Lead", "role": "lead", "model": "model-1", "assistant_id": "assistant-1"}]
+        });
+        let private: CreateTeamRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(private.sharing_mode, TeamSharingMode::Private);
+
+        let mut shared_request = request;
+        shared_request["sharing_mode"] = json!("shared");
+        let shared: CreateTeamRequest = serde_json::from_value(shared_request).unwrap();
+        assert_eq!(shared.sharing_mode, TeamSharingMode::Shared);
+    }
+
     // -- Unified team activity feed -------------------------------------------
 
     #[test]
@@ -867,6 +964,7 @@ mod tests {
                 id: "m1".into(),
                 team_id: "t1".into(),
                 from_agent_id: "a".into(),
+                actor_user_id: None,
                 to_agent_id: "b".into(),
                 msg_type: "message".into(),
                 content: "hi".into(),
@@ -1298,6 +1396,8 @@ mod tests {
                 },
             }],
             leader_assistant_id: Some("slot-1".into()),
+            sharing_mode: TeamSharingMode::Private,
+            role: TeamAccessRole::Owner,
             created_at: 1700000000000,
             updated_at: 1700001000000,
         };
@@ -1306,6 +1406,8 @@ mod tests {
         assert_eq!(json["name"], "Alpha");
         assert_eq!(json["workspace"], "/workspace/team-1");
         assert_eq!(json["leader_assistant_id"], "slot-1");
+        assert_eq!(json["sharing_mode"], "private");
+        assert_eq!(json["role"], "owner");
         assert_eq!(json["created_at"], 1700000000000_i64);
         assert_eq!(json["updated_at"], 1700001000000_i64);
         assert_eq!(json["assistants"].as_array().unwrap().len(), 1);
@@ -1320,6 +1422,8 @@ mod tests {
             workspace: String::new(),
             assistants: vec![],
             leader_assistant_id: None,
+            sharing_mode: TeamSharingMode::Private,
+            role: TeamAccessRole::Owner,
             created_at: 1700000000000,
             updated_at: 1700000000000,
         };
@@ -1470,6 +1574,8 @@ mod tests {
                 },
             ],
             leader_assistant_id: Some("s1".into()),
+            sharing_mode: TeamSharingMode::Private,
+            role: TeamAccessRole::Owner,
             created_at: 1000,
             updated_at: 2000,
         };
@@ -1916,6 +2022,7 @@ mod tests {
             id: "m1".into(),
             team_id: "t1".into(),
             from_agent_id: "a2".into(),
+            actor_user_id: None,
             to_agent_id: "a1".into(),
             msg_type: "message".into(),
             content: "hello".into(),
@@ -2014,6 +2121,7 @@ mod tests {
                 id: "m1".into(),
                 team_id: "t1".into(),
                 from_agent_id: "a2".into(),
+                actor_user_id: None,
                 to_agent_id: "a1".into(),
                 msg_type: "message".into(),
                 content: "hi".into(),

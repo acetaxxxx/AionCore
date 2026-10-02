@@ -27,6 +27,8 @@ pub enum TeamProjectionSource {
 #[derive(Debug, Clone)]
 pub struct TeamProjectionRequest {
     pub user_id: String,
+    pub actor_user_id: String,
+    pub authorized_user_ids: Vec<String>,
     pub team_id: String,
     pub slot_id: String,
     pub conversation_id: String,
@@ -48,6 +50,8 @@ impl TeamProjectionRequest {
     ) -> Self {
         Self {
             user_id: user_id.into(),
+            actor_user_id: String::new(),
+            authorized_user_ids: Vec::new(),
             team_id: team_id.into(),
             slot_id: slot_id.into(),
             conversation_id: conversation_id.into(),
@@ -57,6 +61,7 @@ impl TeamProjectionRequest {
             visibility: TeamVisibilityPolicy::user_message(),
             dedupe_key: None,
         }
+        .with_owner_actor()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -75,6 +80,8 @@ impl TeamProjectionRequest {
         let mailbox_message_id = mailbox_message_id.into();
         Self {
             user_id: user_id.into(),
+            actor_user_id: String::new(),
+            authorized_user_ids: Vec::new(),
             dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
             team_id,
             slot_id: slot_id.into(),
@@ -89,6 +96,7 @@ impl TeamProjectionRequest {
             files: Vec::new(),
             visibility: TeamVisibilityPolicy::teammate_message(),
         }
+        .with_owner_actor()
     }
 
     pub fn team_system_visible(
@@ -104,6 +112,8 @@ impl TeamProjectionRequest {
         let mailbox_message_id = mailbox_message_id.into();
         Self {
             user_id: user_id.into(),
+            actor_user_id: String::new(),
+            authorized_user_ids: Vec::new(),
             dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
             team_id,
             slot_id: slot_id.into(),
@@ -113,6 +123,27 @@ impl TeamProjectionRequest {
             files: Vec::new(),
             visibility: TeamVisibilityPolicy::teammate_message(),
         }
+        .with_owner_actor()
+    }
+
+    fn with_owner_actor(mut self) -> Self {
+        self.actor_user_id = self.user_id.clone();
+        self.authorized_user_ids = vec![self.user_id.clone()];
+        self
+    }
+
+    pub fn with_actor_user_id(mut self, actor_user_id: impl Into<String>) -> Self {
+        self.actor_user_id = actor_user_id.into();
+        self
+    }
+
+    pub fn with_authorized_user_ids(mut self, user_ids: Vec<String>) -> Self {
+        self.authorized_user_ids = if user_ids.is_empty() {
+            vec![self.user_id.clone()]
+        } else {
+            user_ids
+        };
+        self
     }
 
     fn should_insert_visible_bubble(&self) -> bool {
@@ -211,6 +242,7 @@ where
                 sender_conversation_id,
             } => Some(serde_json::json!({
                 "user_id": request.user_id,
+                "authorized_user_ids": request.authorized_user_ids.clone(),
                 "team_id": request.team_id,
                 "slot_id": request.slot_id,
                 "conversation_id": request.conversation_id,
@@ -224,6 +256,7 @@ where
             })),
             TeamProjectionSource::TeamSystem => Some(serde_json::json!({
                 "user_id": request.user_id,
+                "authorized_user_ids": request.authorized_user_ids.clone(),
                 "team_id": request.team_id,
                 "slot_id": request.slot_id,
                 "conversation_id": request.conversation_id,
@@ -274,6 +307,7 @@ where
                     "right",
                     serde_json::json!({
                         "content": content,
+                        "actor_user_id": request.actor_user_id.clone(),
                     }),
                 )
             }
@@ -316,5 +350,104 @@ where
             created_at,
             backend_turn_id: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::*;
+    use aionui_realtime::{BroadcastEventBus, EventBroadcaster, WebSocketManager, WsOutbound};
+    use async_trait::async_trait;
+    use tokio::sync::Barrier;
+
+    struct PausedProjectionStore {
+        entered_lookup: Barrier,
+        resume_lookup: Barrier,
+    }
+
+    #[async_trait]
+    impl TeamProjectionMessageStore for PausedProjectionStore {
+        fn mint_message_id(&self) -> String {
+            "message-1".to_owned()
+        }
+
+        async fn find_projected_message(
+            &self,
+            _conversation_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<MessageRow>, TeamError> {
+            self.entered_lookup.wait().await;
+            self.resume_lookup.wait().await;
+            Ok(None)
+        }
+
+        async fn insert_projected_message(&self, _row: &MessageRow) -> Result<(), TeamError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn user_message_keeps_authenticated_actor_separate_from_execution_owner() {
+        let request = TeamProjectionRequest::user_visible(
+            "execution-owner",
+            "team-1",
+            "lead",
+            "conversation-1",
+            "hello",
+            Vec::new(),
+        )
+        .with_actor_user_id("collaborator");
+
+        assert_eq!(request.user_id, "execution-owner");
+        assert_eq!(request.actor_user_id, "collaborator");
+        let row = TeamMessageProjection::<dyn TeamProjectionMessageStore>::build_message_row(&request, "msg-1", 1)
+            .expect("message row");
+        let content: serde_json::Value = serde_json::from_str(&row.content).expect("JSON content");
+        assert_eq!(content["actor_user_id"], "collaborator");
+        assert_eq!(content["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn queued_projection_snapshot_cannot_reach_member_revoked_during_lookup() {
+        let bus = Arc::new(BroadcastEventBus::new(8));
+        let mut event_rx = bus.subscribe();
+        bus.replace_scope_recipients("team-1", vec!["owner".into(), "collaborator".into()]);
+
+        let manager = WebSocketManager::new();
+        manager.set_scoped_event_recipients(bus.scoped_recipients());
+        let (owner_tx, mut owner_rx) = tokio::sync::mpsc::channel(4);
+        let (collaborator_tx, mut collaborator_rx) = tokio::sync::mpsc::channel(4);
+        manager.add_client_for_user("owner".into(), "owner-token".into(), owner_tx);
+        manager.add_client_for_user("collaborator".into(), "collaborator-token".into(), collaborator_tx);
+
+        let store = Arc::new(PausedProjectionStore {
+            entered_lookup: Barrier::new(2),
+            resume_lookup: Barrier::new(2),
+        });
+        let projection = TeamMessageProjection::new(store.clone(), bus.clone());
+        let request = TeamProjectionRequest::team_system_visible(
+            "owner",
+            "team-1",
+            "agent-1",
+            "conversation-1",
+            "terminal notice",
+            "mailbox-1",
+        )
+        .with_authorized_user_ids(vec!["owner".into(), "collaborator".into()]);
+
+        let projection_task = tokio::spawn(async move { projection.project(request).await });
+        // Pause after the request captured its old recipients and while the
+        // projection is awaiting the message-store dedupe lookup.
+        store.entered_lookup.wait().await;
+        bus.revoke_scope_recipient("team-1", "collaborator");
+        store.resume_lookup.wait().await;
+        projection_task.await.expect("projection task").expect("projection");
+
+        let queued_event = event_rx.recv().await.expect("projected event");
+        manager.broadcast_scoped(queued_event);
+
+        assert!(matches!(owner_rx.try_recv(), Ok(WsOutbound::ScopedText { .. })));
+        assert!(collaborator_rx.try_recv().is_err());
     }
 }

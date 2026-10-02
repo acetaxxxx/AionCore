@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
@@ -6,7 +7,7 @@ use aionui_api_types::{
     TeamAgentInput, TeamMcpSelection, TeamToolTransport, assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
-use aionui_db::models::{AgentMetadataRow, TeamRow};
+use aionui_db::models::{AgentMetadataRow, TeamRow, TeamSharingMode};
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -86,6 +87,55 @@ pub struct TeamMcpSnapshotResolution {
     pub fingerprint: Option<String>,
 }
 
+fn restrict_mcp_selection_to_allowlist(mut selection: TeamMcpSelection, allowed_ids: &[String]) -> TeamMcpSelection {
+    let allowed_ids = allowed_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    selection.selected_ids.retain(|id| allowed_ids.contains(id.as_str()));
+    selection.mcp_server_ids.retain(|id| allowed_ids.contains(id.as_str()));
+    selection
+        .session_mcp_servers
+        .retain(|server| allowed_ids.contains(server.id.as_str()));
+    selection
+        .mcp_statuses
+        .retain(|status| allowed_ids.contains(status.id.as_str()));
+    selection
+}
+
+fn restrict_mcp_snapshot_to_allowlist(
+    mut resolution: TeamMcpSnapshotResolution,
+    allowed_ids: &[String],
+) -> TeamMcpSnapshotResolution {
+    let allowed_ids = allowed_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    resolution
+        .snapshot
+        .mcp_server_ids
+        .retain(|id| allowed_ids.contains(id.as_str()));
+    resolution
+        .snapshot
+        .session_mcp_servers
+        .retain(|server| allowed_ids.contains(server.id.as_str()));
+    resolution
+        .snapshot
+        .mcp_statuses
+        .retain(|status| allowed_ids.contains(status.id.as_str()));
+    let mut names = HashSet::new();
+    resolution.snapshot.mcp_servers = resolution
+        .snapshot
+        .mcp_statuses
+        .iter()
+        .filter_map(|status| names.insert(status.name.clone()).then_some(status.name.clone()))
+        .collect();
+    let ids = resolution
+        .snapshot
+        .mcp_server_ids
+        .iter()
+        .chain(resolution.snapshot.session_mcp_servers.iter().map(|server| &server.id))
+        .chain(resolution.snapshot.mcp_statuses.iter().map(|status| &status.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    resolution.fingerprint = Some(assistant_mcp_binding_fingerprint(&ids));
+    resolution
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TeamConversationModelFacts {
     pub confirmed_model_id: Option<String>,
@@ -104,6 +154,18 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
+
+    /// Creates the dedicated workspace for a Shared Team. Implementations must
+    /// not fall back to the owner's conversation workspace.
+    async fn create_shared_team_workspace(&self, _team_id: &str) -> Result<String, TeamError> {
+        Err(TeamError::WorkspacePathUnavailable(
+            "Shared Team workspace provisioning is unavailable".into(),
+        ))
+    }
+
+    async fn is_shared_team_workspace(&self, _team_id: &str, _workspace: &str) -> Result<bool, TeamError> {
+        Ok(false)
+    }
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
 
@@ -240,6 +302,7 @@ impl TeamAgentProvisioner {
         team_name: &str,
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
+        shared_team: bool,
     ) -> Result<InitialProvisioningResult, TeamError> {
         if inputs.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
@@ -269,9 +332,16 @@ impl TeamAgentProvisioner {
         // than after an orphan conversation exists. Teammates resolve their own
         // bindings below — each member follows the assistant it is bound to, so
         // this result is NOT shared across members.
-        let leader_mcp_selection = self
-            .resolve_assistant_mcp_selection(user_id, leader_assistant_id.as_deref())
-            .await?;
+        // Initial provisioning runs before the Team row exists, so no
+        // Team-level allowlist can have been selected yet. Shared Teams start
+        // with no MCP access; the owner can configure the allowlist after
+        // creation and the next runtime attach will resolve that persisted set.
+        let leader_mcp_selection = if shared_team {
+            TeamMcpSelection::default()
+        } else {
+            self.resolve_assistant_mcp_selection(user_id, leader_assistant_id.as_deref())
+                .await?
+        };
         let leader_backend = self
             .resolve_requested_backend(user_id, leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
@@ -329,9 +399,12 @@ impl TeamAgentProvisioner {
             let backend = self
                 .resolve_requested_backend(user_id, input.backend.as_deref(), assistant_id.as_deref())
                 .await?;
-            let mcp_selection = self
-                .resolve_assistant_mcp_selection(user_id, assistant_id.as_deref())
-                .await?;
+            let mcp_selection = if shared_team {
+                TeamMcpSelection::default()
+            } else {
+                self.resolve_assistant_mcp_selection(user_id, assistant_id.as_deref())
+                    .await?
+            };
             let conversation = self
                 .create_team_conversation_for_agent(
                     user_id,
@@ -367,7 +440,7 @@ impl TeamAgentProvisioner {
             team_id,
             count = agents.len(),
             workspace_source = if shared_workspace.is_some() {
-                "user_supplied"
+                "explicit_team_workspace"
             } else {
                 "auto_from_leader"
             },
@@ -400,8 +473,9 @@ impl TeamAgentProvisioner {
             .resolve_requested_backend(user_id, req.backend.as_deref(), assistant_id.as_deref())
             .await?;
         // Resolve the global MCP selection once for this agent.
+        let shared_team = self.repo.get_team_sharing_mode(&row.id).await? == TeamSharingMode::Shared;
         let mcp_selection = self
-            .resolve_assistant_mcp_selection(user_id, assistant_id.as_deref())
+            .resolve_team_assistant_mcp_selection(user_id, &row.id, assistant_id.as_deref(), shared_team)
             .await?;
         let agent = self
             .provision_new_agent(
@@ -461,8 +535,9 @@ impl TeamAgentProvisioner {
         let mut team = Team::from_row(&row)?;
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
         // Resolve the global MCP selection once for this spawned agent.
+        let shared_team = self.repo.get_team_sharing_mode(&req.team_id).await? == TeamSharingMode::Shared;
         let mcp_selection = self
-            .resolve_assistant_mcp_selection(&req.user_id, req.assistant_id.as_deref())
+            .resolve_team_assistant_mcp_selection(&req.user_id, &req.team_id, req.assistant_id.as_deref(), shared_team)
             .await?;
         let agent = self
             .provision_new_agent(
@@ -517,8 +592,12 @@ impl TeamAgentProvisioner {
         // snapshot. A vanished assistant degrades to the persisted snapshot
         // rather than failing; see `resolve_conversation_mcp_snapshot`.
         let mcp_resolution = self
-            .conversation_port
-            .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id, agent.assistant_id.as_deref())
+            .resolve_team_conversation_mcp_snapshot(
+                user_id,
+                &team_id,
+                &agent.conversation_id,
+                agent.assistant_id.as_deref(),
+            )
             .await?;
         match transport {
             TeamToolTransport::Mcp => {
@@ -575,16 +654,80 @@ impl TeamAgentProvisioner {
             .ok_or_else(|| TeamError::InvalidRequest(format!("Assistant MCP binding is unavailable: {assistant_id}")))
     }
 
+    async fn resolve_team_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        assistant_id: Option<&str>,
+        shared_team: bool,
+    ) -> Result<TeamMcpSelection, TeamError> {
+        // Shared Teams use only the owner's explicit Team allowlist, intersected
+        // with the selected assistant binding. Personal MCP selections outside
+        // this persisted allowlist never flow into the Team runtime.
+        if shared_team {
+            let allowed_ids = self.repo.list_team_mcp_allowlist(user_id, team_id).await?;
+            if allowed_ids.is_empty() {
+                return Ok(TeamMcpSelection::default());
+            }
+            let selection = self.resolve_assistant_mcp_selection(user_id, assistant_id).await?;
+            return Ok(restrict_mcp_selection_to_allowlist(selection, &allowed_ids));
+        }
+        // Ensure the caller supplied the expected Team scope even for private
+        // mode, and fail closed if the persisted sharing policy cannot be read.
+        if self.repo.get_team_sharing_mode(team_id).await? == TeamSharingMode::Shared {
+            let allowed_ids = self.repo.list_team_mcp_allowlist(user_id, team_id).await?;
+            if allowed_ids.is_empty() {
+                return Ok(TeamMcpSelection::default());
+            }
+            return Ok(restrict_mcp_selection_to_allowlist(
+                self.resolve_assistant_mcp_selection(user_id, assistant_id).await?,
+                &allowed_ids,
+            ));
+        }
+        self.resolve_assistant_mcp_selection(user_id, assistant_id).await
+    }
+
+    async fn resolve_team_conversation_mcp_snapshot(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+        assistant_id: Option<&str>,
+    ) -> Result<TeamMcpSnapshotResolution, TeamError> {
+        if self.repo.get_team_sharing_mode(team_id).await? == TeamSharingMode::Shared {
+            let allowed_ids = self.repo.list_team_mcp_allowlist(user_id, team_id).await?;
+            if allowed_ids.is_empty() || assistant_id.is_none() {
+                return Ok(TeamMcpSnapshotResolution {
+                    snapshot: McpRuntimeSnapshot::default(),
+                    fingerprint: Some(assistant_mcp_binding_fingerprint(&[])),
+                });
+            }
+            let resolution = self
+                .conversation_port
+                .resolve_conversation_mcp_snapshot(user_id, conversation_id, assistant_id)
+                .await?;
+            return Ok(restrict_mcp_snapshot_to_allowlist(resolution, &allowed_ids));
+        }
+        self.conversation_port
+            .resolve_conversation_mcp_snapshot(user_id, conversation_id, assistant_id)
+            .await
+    }
+
     /// Persist the latest assistant MCP snapshot without disturbing a dormant
     /// or currently working runtime.
     pub(crate) async fn refresh_agent_mcp_snapshot(
         &self,
         user_id: &str,
+        team_id: &str,
         agent: &TeamAgent,
     ) -> Result<Option<String>, TeamError> {
         let resolution = self
-            .conversation_port
-            .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id, agent.assistant_id.as_deref())
+            .resolve_team_conversation_mcp_snapshot(
+                user_id,
+                team_id,
+                &agent.conversation_id,
+                agent.assistant_id.as_deref(),
+            )
             .await?;
         let mut patch = serde_json::json!({});
         merge_mcp_snapshot_into_patch(&mut patch, &resolution);
@@ -999,6 +1142,112 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::watch;
 
+    #[test]
+    fn shared_team_mcp_selection_is_intersected_with_explicit_allowlist() {
+        let selection = TeamMcpSelection {
+            selected_ids: vec!["allowed".into(), "personal-only".into()],
+            mcp_server_ids: vec!["allowed".into(), "personal-only".into()],
+            session_mcp_servers: vec![
+                aionui_api_types::SessionMcpServer {
+                    id: "allowed-builtin".into(),
+                    name: "Allowed builtin".into(),
+                    transport: aionui_api_types::SessionMcpTransport::Stdio {
+                        command: "mcp".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                },
+                aionui_api_types::SessionMcpServer {
+                    id: "personal-builtin".into(),
+                    name: "Personal builtin".into(),
+                    transport: aionui_api_types::SessionMcpTransport::Stdio {
+                        command: "personal-mcp".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                },
+            ],
+            mcp_statuses: vec![
+                aionui_api_types::ConversationMcpStatus {
+                    id: "allowed".into(),
+                    name: "Allowed".into(),
+                    status: aionui_api_types::ConversationMcpStatusKind::Loaded,
+                    reason: None,
+                },
+                aionui_api_types::ConversationMcpStatus {
+                    id: "personal-only".into(),
+                    name: "Personal".into(),
+                    status: aionui_api_types::ConversationMcpStatusKind::Loaded,
+                    reason: None,
+                },
+            ],
+        };
+
+        let filtered = restrict_mcp_selection_to_allowlist(selection, &["allowed".into(), "allowed-builtin".into()]);
+
+        assert_eq!(filtered.selected_ids, vec!["allowed".to_owned()]);
+        assert_eq!(filtered.mcp_server_ids, vec!["allowed".to_owned()]);
+        assert_eq!(filtered.session_mcp_servers.len(), 1);
+        assert_eq!(filtered.session_mcp_servers[0].id, "allowed-builtin");
+        assert_eq!(filtered.mcp_statuses.len(), 1);
+        assert_eq!(filtered.mcp_statuses[0].id, "allowed");
+    }
+
+    #[test]
+    fn shared_team_persisted_mcp_snapshot_excludes_unlisted_owner_servers() {
+        let snapshot = McpRuntimeSnapshot {
+            mcp_server_ids: vec!["team-approved".into(), "owner-private".into()],
+            session_mcp_servers: vec![
+                aionui_api_types::SessionMcpServer {
+                    id: "team-session-approved".into(),
+                    name: "Team session server".into(),
+                    transport: aionui_api_types::SessionMcpTransport::Stdio {
+                        command: "team-mcp".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                },
+                aionui_api_types::SessionMcpServer {
+                    id: "owner-session-private".into(),
+                    name: "Owner private server".into(),
+                    transport: aionui_api_types::SessionMcpTransport::Stdio {
+                        command: "private-mcp".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                },
+            ],
+            mcp_servers: vec!["Team approved".into(), "Owner private".into()],
+            mcp_statuses: vec![
+                aionui_api_types::ConversationMcpStatus {
+                    id: "team-approved".into(),
+                    name: "Team approved".into(),
+                    status: aionui_api_types::ConversationMcpStatusKind::Loaded,
+                    reason: None,
+                },
+                aionui_api_types::ConversationMcpStatus {
+                    id: "owner-private".into(),
+                    name: "Owner private".into(),
+                    status: aionui_api_types::ConversationMcpStatusKind::Loaded,
+                    reason: None,
+                },
+            ],
+        };
+        let resolution = TeamMcpSnapshotResolution {
+            snapshot,
+            fingerprint: Some("unfiltered".into()),
+        };
+
+        let filtered = restrict_mcp_snapshot_to_allowlist(resolution, &["team-approved".into()]);
+
+        assert_eq!(filtered.snapshot.mcp_server_ids, vec!["team-approved"]);
+        assert!(filtered.snapshot.session_mcp_servers.is_empty());
+        assert_eq!(filtered.snapshot.mcp_servers, vec!["Team approved"]);
+        assert_eq!(filtered.snapshot.mcp_statuses.len(), 1);
+        assert_eq!(filtered.snapshot.mcp_statuses[0].id, "team-approved");
+        assert_ne!(filtered.fingerprint.as_deref(), Some("unfiltered"));
+    }
+
     struct RecordingProvisioningPort {
         events: Arc<Mutex<Vec<&'static str>>>,
         patches: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -1070,6 +1319,10 @@ mod tests {
 
         async fn create_team_temp_workspace(&self, _user_id: &str, _team_id: &str) -> Result<String, TeamError> {
             Err(TeamError::InvalidRequest("unused".into()))
+        }
+
+        async fn create_shared_team_workspace(&self, team_id: &str) -> Result<String, TeamError> {
+            Ok(format!("/tmp/teams/{team_id}"))
         }
 
         async fn patch_runtime_config(
@@ -1650,6 +1903,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_team_attach_clears_personal_assistant_mcp_snapshot() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
+        let repo = Arc::new(crate::test_utils::MockTeamRepo::new());
+        repo.state.lock().unwrap().shared_teams.insert("team-1".into());
+        let provisioner = TeamAgentProvisioner::new(
+            repo,
+            Arc::new(UnusedAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyProviderRepo),
+            Arc::new(RecordingProvisioningPort {
+                events: Arc::clone(&events),
+                patches: Arc::clone(&patches),
+                mcp_snapshot: Some(test_mcp_snapshot()),
+                mcp_error: None,
+                persisted_extra: Arc::new(Mutex::new(serde_json::json!({}))),
+            }),
+            Arc::new(TestCapabilityPort),
+        );
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopKillTaskManager);
+        let mut agent = test_agent();
+        agent.assistant_id = Some("owner-personal-assistant".into());
+
+        provisioner
+            .attach_agent_process("owner-1", &agent, test_mcp_config(), &task_manager, false)
+            .await
+            .unwrap();
+
+        let patches = patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0]["mcp_server_ids"], serde_json::json!([]));
+        assert_eq!(patches[0]["session_mcp_servers"], serde_json::json!([]));
+        assert_eq!(patches[0]["mcp_servers"], serde_json::json!([]));
+        assert_eq!(patches[0]["mcp_statuses"], serde_json::json!([]));
+        assert!(patches[0]["assistant_mcp_fingerprint"].is_string());
+    }
+
+    #[tokio::test]
     async fn snapshot_only_refresh_preserves_team_coordination_config() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let patches = Arc::new(Mutex::new(Vec::new()));
@@ -1665,7 +1956,7 @@ mod tests {
         );
 
         provisioner
-            .refresh_agent_mcp_snapshot("user-1", &test_agent())
+            .refresh_agent_mcp_snapshot("user-1", "team-1", &test_agent())
             .await
             .unwrap();
 
@@ -1694,7 +1985,7 @@ mod tests {
         }];
 
         let error = match provisioner
-            .provision_initial_agents("user-1", "team-1", "Team", &inputs, Some("/workspace"))
+            .provision_initial_agents("user-1", "team-1", "Team", &inputs, Some("/workspace"), false)
             .await
         {
             Err(error) => error,

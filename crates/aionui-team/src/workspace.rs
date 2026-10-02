@@ -48,6 +48,20 @@ impl TeamWorkspaceResolver {
     }
 
     pub(crate) async fn resolve_for_new_agent(&self, row: &TeamRow, team: &Team) -> Result<String, TeamError> {
+        if self.repo.get_team_sharing_mode(&row.id).await? == aionui_db::models::TeamSharingMode::Shared {
+            let Some(workspace) = usable_runtime_workspace(row.workspace.trim()) else {
+                return Err(TeamError::WorkspacePathRuntimeUnavailable(row.workspace.clone()));
+            };
+            if !self
+                .conversation_port
+                .is_shared_team_workspace(&row.id, &workspace)
+                .await?
+            {
+                return Err(TeamError::WorkspacePathRuntimeUnavailable(row.workspace.clone()));
+            }
+            return Ok(workspace);
+        }
+
         if let Some(workspace) = usable_runtime_workspace(row.workspace.trim()) {
             return Ok(workspace);
         }

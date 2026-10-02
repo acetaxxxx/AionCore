@@ -605,6 +605,12 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         Ok(path.to_string_lossy().into_owned())
     }
 
+    async fn create_shared_team_workspace(&self, team_id: &str) -> Result<String, aionui_team::TeamError> {
+        let path = self.workspace_root.join("teams").join(team_id);
+        std::fs::create_dir_all(&path).unwrap();
+        Ok(path.to_string_lossy().into_owned())
+    }
+
     async fn patch_runtime_config(
         &self,
         conversation_id: &str,
@@ -918,9 +924,13 @@ impl EventBroadcaster for RecordingBroadcaster {
 struct FullMockTeamRepo {
     inner: MockTeamRepo,
     teams: std::sync::Mutex<Vec<aionui_db::models::TeamRow>>,
+    sharing_modes: std::sync::Mutex<HashMap<String, aionui_db::models::TeamSharingMode>>,
+    collaborators: std::sync::Mutex<HashMap<String, HashMap<String, String>>>,
+    stale_eligible_users: std::sync::Mutex<Vec<aionui_db::models::EligibleTeamUserRow>>,
     fail_workspace_update: std::sync::Mutex<bool>,
     fail_agent_update: std::sync::Mutex<bool>,
     fail_message_writes: std::sync::Mutex<bool>,
+    fail_allowlist_read_for_unpersisted_team: std::sync::Mutex<bool>,
 }
 
 impl FullMockTeamRepo {
@@ -928,9 +938,13 @@ impl FullMockTeamRepo {
         Self {
             inner: MockTeamRepo::new(),
             teams: std::sync::Mutex::new(Vec::new()),
+            sharing_modes: std::sync::Mutex::new(HashMap::new()),
+            collaborators: std::sync::Mutex::new(HashMap::new()),
+            stale_eligible_users: std::sync::Mutex::new(Vec::new()),
             fail_workspace_update: std::sync::Mutex::new(false),
             fail_agent_update: std::sync::Mutex::new(false),
             fail_message_writes: std::sync::Mutex::new(false),
+            fail_allowlist_read_for_unpersisted_team: std::sync::Mutex::new(false),
         }
     }
 
@@ -944,6 +958,25 @@ impl FullMockTeamRepo {
 
     fn fail_message_writes(&self) {
         *self.fail_message_writes.lock().unwrap() = true;
+    }
+
+    fn fail_allowlist_read_for_unpersisted_team(&self) {
+        *self.fail_allowlist_read_for_unpersisted_team.lock().unwrap() = true;
+    }
+
+    fn add_test_collaborator(&self, team_id: &str, user_id: &str) {
+        self.collaborators
+            .lock()
+            .unwrap()
+            .entry(team_id.to_owned())
+            .or_default()
+            .insert(user_id.to_owned(), format!("membership-{team_id}-{user_id}"));
+    }
+
+    fn revoke_test_collaborator(&self, team_id: &str, user_id: &str) {
+        if let Some(members) = self.collaborators.lock().unwrap().get_mut(team_id) {
+            members.remove(user_id);
+        }
     }
 }
 
@@ -1011,6 +1044,93 @@ impl ITeamRepository for FullMockTeamRepo {
             .unwrap()
             .retain(|t| t.user_id != user_id || t.id != id);
         Ok(())
+    }
+    async fn create_team_with_sharing_mode(
+        &self,
+        row: &aionui_db::models::TeamRow,
+        mode: aionui_db::models::TeamSharingMode,
+    ) -> Result<(), DbError> {
+        self.create_team(row).await?;
+        self.sharing_modes.lock().unwrap().insert(row.id.clone(), mode);
+        Ok(())
+    }
+    async fn get_team_sharing_mode(&self, team_id: &str) -> Result<aionui_db::models::TeamSharingMode, DbError> {
+        Ok(self
+            .sharing_modes
+            .lock()
+            .unwrap()
+            .get(team_id)
+            .copied()
+            .unwrap_or(aionui_db::models::TeamSharingMode::Private))
+    }
+    async fn list_team_mcp_allowlist(&self, owner_user_id: &str, team_id: &str) -> Result<Vec<String>, DbError> {
+        let team_is_persisted = self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|team| team.user_id == owner_user_id && team.id == team_id);
+        if !team_is_persisted && *self.fail_allowlist_read_for_unpersisted_team.lock().unwrap() {
+            return Err(DbError::Init("allowlist read before Team persistence".into()));
+        }
+        Ok(Vec::new())
+    }
+    async fn list_team_members(&self, team_id: &str) -> Result<Vec<aionui_db::models::TeamMembershipRow>, DbError> {
+        Ok(self
+            .collaborators
+            .lock()
+            .unwrap()
+            .get(team_id)
+            .into_iter()
+            .flat_map(|members| members.iter())
+            .map(|(user_id, membership_ref)| aionui_db::models::TeamMembershipRow {
+                membership_ref: membership_ref.clone(),
+                team_id: team_id.to_owned(),
+                user_id: user_id.clone(),
+                display_name: Some(user_id.clone()),
+                created_at: aionui_common::now_ms(),
+            })
+            .collect())
+    }
+    async fn list_teams_by_member(&self, user_id: &str) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
+        let collaborators = self.collaborators.lock().unwrap();
+        let teams = self.teams.lock().unwrap();
+        Ok(teams
+            .iter()
+            .filter(|team| {
+                self.sharing_modes.lock().unwrap().get(&team.id).copied()
+                    == Some(aionui_db::models::TeamSharingMode::Shared)
+                    && collaborators
+                        .get(&team.id)
+                        .is_some_and(|members| members.contains_key(user_id))
+            })
+            .cloned()
+            .collect())
+    }
+    async fn team_access_role(
+        &self,
+        team_id: &str,
+        user_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamAccessRole>, DbError> {
+        if self.get_team(user_id, team_id).await?.is_some() {
+            return Ok(Some(aionui_db::models::TeamAccessRole::Owner));
+        }
+        let is_shared = self.sharing_modes.lock().unwrap().get(team_id).copied()
+            == Some(aionui_db::models::TeamSharingMode::Shared);
+        let is_member = self
+            .collaborators
+            .lock()
+            .unwrap()
+            .get(team_id)
+            .is_some_and(|members| members.contains_key(user_id));
+        Ok((is_shared && is_member).then_some(aionui_db::models::TeamAccessRole::Collaborator))
+    }
+    async fn list_eligible_team_users(
+        &self,
+        _owner_user_id: &str,
+        _team_id: &str,
+    ) -> Result<Vec<aionui_db::models::EligibleTeamUserRow>, DbError> {
+        Ok(self.stale_eligible_users.lock().unwrap().clone())
     }
 
     async fn write_message(&self, user_id: &str, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
@@ -2328,6 +2448,7 @@ async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() 
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Recover".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2348,6 +2469,7 @@ async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() 
                 team_id: created.id.clone(),
                 to_agent_id: lead_slot_id.clone(),
                 from_agent_id: "worker-or-user".into(),
+                actor_user_id: None,
                 msg_type: "message".into(),
                 content: "orphan backlog".into(),
                 summary: None,
@@ -2385,12 +2507,37 @@ async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() 
 }
 
 #[tokio::test]
+async fn shared_team_creation_starts_with_no_mcp_allowlist_before_team_row_exists() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.fail_allowlist_read_for_unpersisted_team();
+
+    let created = svc
+        .create_team(
+            "owner",
+            CreateTeamRequest {
+                sharing_mode: aionui_api_types::TeamSharingMode::Shared,
+                name: "Shared without implicit MCPs".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("Shared Team creation must not read an allowlist before persistence");
+
+    assert_eq!(created.sharing_mode, aionui_api_types::TeamSharingMode::Shared);
+}
+
+#[tokio::test]
 async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
     let (svc, _team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
     let created = svc
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Recover Teammate".into(),
                 agents: aionrs_two_agent_input(),
                 workspace: None,
@@ -2452,6 +2599,7 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Self Only".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2472,6 +2620,7 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
                 team_id: created.id.clone(),
                 to_agent_id: lead_slot_id.clone(),
                 from_agent_id: lead_slot_id,
+                actor_user_id: None,
                 msg_type: "message".into(),
                 content: "self backlog".into(),
                 summary: None,
@@ -2809,6 +2958,7 @@ async fn renew_active_lease_records_all_team_agent_conversations() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Lease Team".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2871,6 +3021,7 @@ async fn renew_active_lease_rejects_team_owned_by_other_user() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Lease Team".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2915,6 +3066,7 @@ async fn tc1_create_team_with_multiple_agents() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2945,6 +3097,7 @@ async fn stop_team_processes_kills_members_but_keeps_rows() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Teardown Team".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2991,6 +3144,7 @@ async fn stop_team_processes_rejects_unknown_or_foreign_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Owned".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -3018,6 +3172,7 @@ async fn create_team_rejects_existing_conversation_id_request_side_adoption() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "No Adoption".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3053,6 +3208,7 @@ async fn create_team_with_workspace_writes_same_workspace_to_team_and_initial_ag
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Shared".into(),
                 agents: two_agent_input(),
                 workspace: Some(workspace.clone()),
@@ -3105,6 +3261,7 @@ async fn create_team_side_branch_backfills_project_binding_when_injected() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Bound".into(),
                 agents: two_agent_input(),
                 workspace: Some(workspace_dir.to_string_lossy().into_owned()),
@@ -3136,6 +3293,7 @@ async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initia
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Auto Shared".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -3215,6 +3373,7 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3285,6 +3444,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3371,6 +3531,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Assistant Lead".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3457,6 +3618,7 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Assistant Lead".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3524,6 +3686,7 @@ async fn team_preset_assistant_snapshot_is_frozen() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Preset Team".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3593,6 +3756,7 @@ async fn team_assistant_mcp_selection_wins_over_frozen_preset_defaults() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Assistant MCP Wins".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3660,6 +3824,7 @@ async fn team_members_receive_only_their_own_assistant_mcp_binding() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Per Assistant MCP".into(),
                 agents: vec![
                     TeamAgentInput {
@@ -3722,6 +3887,7 @@ async fn assistant_mcp_change_refreshes_dormant_idle_and_duplicate_revisions() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Live MCP".into(),
                 agents: vec![
                     TeamAgentInput {
@@ -3854,6 +4020,7 @@ async fn full_reconcile_recovers_a_binding_change_whose_event_was_never_delivere
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Lagged MCP".into(),
                 agents: vec![
                     TeamAgentInput {
@@ -3973,6 +4140,7 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Spawn Preset".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4022,6 +4190,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4115,6 +4284,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4209,6 +4379,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4249,6 +4420,7 @@ async fn tc2_create_single_agent_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Solo".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4275,6 +4447,7 @@ async fn create_team_uses_explicit_leader_role_when_leader_is_not_first() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![
                     TeamAgentInput {
@@ -4314,6 +4487,7 @@ async fn create_team_rejects_zero_leaders() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Worker".into(),
@@ -4338,6 +4512,7 @@ async fn create_team_rejects_multiple_leaders() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![
                     TeamAgentInput {
@@ -4372,6 +4547,7 @@ async fn create_team_rejects_unknown_role() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4396,6 +4572,7 @@ async fn tc5_empty_agents_returns_error() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Empty".into(),
                 agents: vec![],
                 workspace: None,
@@ -4412,6 +4589,7 @@ async fn tc3_each_agent_has_conversation_id() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4441,6 +4619,7 @@ async fn tl2_list_multiple_teams() {
     svc.create_team(
         "user1",
         CreateTeamRequest {
+            sharing_mode: Default::default(),
             name: "A".into(),
             agents: two_agent_input(),
             workspace: None,
@@ -4451,6 +4630,7 @@ async fn tl2_list_multiple_teams() {
     svc.create_team(
         "user1",
         CreateTeamRequest {
+            sharing_mode: Default::default(),
             name: "B".into(),
             agents: two_agent_input(),
             workspace: None,
@@ -4469,6 +4649,7 @@ async fn tl3_list_teams_filters_by_owner() {
     svc.create_team(
         "user1",
         CreateTeamRequest {
+            sharing_mode: Default::default(),
             name: "Owned".into(),
             agents: two_agent_input(),
             workspace: None,
@@ -4479,6 +4660,7 @@ async fn tl3_list_teams_filters_by_owner() {
     svc.create_team(
         "user2",
         CreateTeamRequest {
+            sharing_mode: Default::default(),
             name: "Other".into(),
             agents: two_agent_input(),
             workspace: None,
@@ -4500,6 +4682,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "With Confirmations".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4542,6 +4725,7 @@ async fn tg1_get_existing_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4570,6 +4754,7 @@ async fn tg3_get_team_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4592,6 +4777,7 @@ async fn td1_delete_existing_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4621,6 +4807,7 @@ async fn tr1_rename_existing_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Old".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4648,6 +4835,7 @@ async fn tr5_rename_team_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4672,6 +4860,7 @@ async fn aa1_add_agent_to_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4720,6 +4909,7 @@ async fn manual_add_without_active_run_opens_system_lifecycle_run() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4791,6 +4981,7 @@ async fn add_agent_rejects_leader_role() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4832,6 +5023,7 @@ async fn add_agent_allows_same_assistant_id_multiple_times() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4888,6 +5080,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4966,6 +5159,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5141,6 +5335,7 @@ async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Re-ensure with broken teammate".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5255,6 +5450,7 @@ async fn failed_member_stays_inline_and_removal_restores_ready() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Failed member removal".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5352,6 +5548,7 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Remove attaching member".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5432,6 +5629,7 @@ async fn aa_add_agent_inherits_team_workspace() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5478,6 +5676,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Legacy".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5532,6 +5731,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Legacy Empty".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5593,6 +5793,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Writeback Failure".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5643,6 +5844,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Patch Failure".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5705,6 +5907,7 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Typed".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5779,6 +5982,7 @@ async fn provisioning_resolves_acp_backend_from_agent_metadata() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Metadata ACP".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5843,6 +6047,7 @@ async fn ar1_remove_agent_from_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5869,6 +6074,7 @@ async fn membership_persist_failure_does_not_delete_the_conversation() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Removal persistence failure".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5915,6 +6121,7 @@ async fn remove_tolerates_current_session_already_missing_the_slot() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Already absent runtime slot".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5955,6 +6162,7 @@ async fn manual_remove_agent_projects_team_system_message_without_active_team_ru
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5990,6 +6198,7 @@ async fn remove_agent_rejects_leader() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6013,6 +6222,7 @@ async fn ar4_remove_nonexistent_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6032,6 +6242,7 @@ async fn an1_rename_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6058,6 +6269,7 @@ async fn observed_model_switch_updates_all_model_facts_and_survives_rebuild() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6112,6 +6324,7 @@ async fn ensure_session_repairs_legacy_model_facts_from_confirmed_selection() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6181,6 +6394,7 @@ async fn setting_the_model_config_option_persists_roster_conversation_and_live_s
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6259,6 +6473,7 @@ async fn setting_a_non_model_config_option_leaves_the_model_untouched() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6306,6 +6521,7 @@ async fn update_agent_model_rejects_an_empty_model_without_changing_the_roster()
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6337,6 +6553,7 @@ async fn an3_rename_nonexistent_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6360,6 +6577,7 @@ async fn es1_ensure_session_creates_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6430,6 +6648,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6488,6 +6707,7 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Leader spawn reconciliation".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6548,6 +6768,7 @@ async fn lead_send_agent_message_without_active_run_opens_system_lifecycle_run()
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6596,6 +6817,7 @@ async fn lead_shutdown_agent_without_active_run_opens_system_lifecycle_run() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6647,6 +6869,7 @@ async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6693,6 +6916,7 @@ async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6732,6 +6956,7 @@ async fn es2_ensure_session_is_idempotent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6758,6 +6983,7 @@ async fn es4_ensure_session_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6795,6 +7021,7 @@ async fn ensure_session_broadcasts_starting_and_ready_session_status() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6831,6 +7058,7 @@ async fn ensure_session_existing_ready_session_broadcasts_ready_terminal_status(
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6869,6 +7097,7 @@ async fn ss1_stop_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6888,6 +7117,7 @@ async fn ss3_stop_session_without_active_is_noop() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6906,6 +7136,7 @@ async fn ss4_stop_session_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6937,6 +7168,7 @@ async fn sm1_send_message_with_active_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6958,6 +7190,7 @@ async fn sm2_send_message_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6978,6 +7211,7 @@ async fn sa_send_message_to_agent_with_active_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7000,6 +7234,7 @@ async fn sa2_send_message_to_agent_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7023,6 +7258,7 @@ async fn sa3_send_message_to_nonexistent_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7049,6 +7285,7 @@ async fn dispose_all_cleans_up_sessions() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "A".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7060,6 +7297,7 @@ async fn dispose_all_cleans_up_sessions() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "B".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7089,6 +7327,7 @@ async fn td_delete_team_stops_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7115,6 +7354,7 @@ async fn d9_create_team_persists_without_warming_initial_agents() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7145,6 +7385,7 @@ async fn d9_ensure_session_warms_up_only_the_lead() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7186,6 +7427,7 @@ async fn d9_ensure_session_warms_up_only_the_lead_without_teammate_stagger() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: five_agent_input_leader_not_first(),
                 workspace: None,
@@ -7255,6 +7497,7 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: aionrs_two_agent_input(),
                 workspace: None,
@@ -7303,6 +7546,7 @@ async fn direct_cli_ensure_session_persists_team_mcp_stdio_config_for_every_desc
             .create_team(
                 "user1",
                 CreateTeamRequest {
+                    sharing_mode: Default::default(),
                     name: format!("Direct {backend}"),
                     agents: vec![TeamAgentInput {
                         name: "Lead".into(),
@@ -7331,6 +7575,7 @@ async fn d9_ensure_session_is_idempotent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7363,6 +7608,7 @@ async fn manual_add_then_immediate_ensure_joins_attach_without_rebuilding_sessio
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Join dynamic attach".into(),
                 agents: vec![team_agent_input("Lead", "lead", "claude")],
                 workspace: None,
@@ -7433,6 +7679,7 @@ async fn concurrent_ensures_launch_one_dynamic_attach() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Concurrent repair".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7501,6 +7748,7 @@ async fn stopped_session_rejects_late_attach_completion() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Stopped late attach".into(),
                 agents: vec![team_agent_input("Lead", "lead", "claude")],
                 workspace: None,
@@ -7598,6 +7846,7 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7664,6 +7913,7 @@ async fn cold_bootstrap_failure_stops_session_when_leader_attach_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: four_agent_input_leader_not_first(),
                 workspace: None,
@@ -7741,6 +7991,7 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -7807,6 +8058,7 @@ async fn ensure_session_serializes_manual_remove_until_rebuild_completes() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7858,6 +8110,7 @@ async fn ensure_session_serializes_manual_rename_until_rebuild_completes() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7916,6 +8169,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -7990,6 +8244,7 @@ async fn d115_remove_team_kills_every_agent_process() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -8046,6 +8301,7 @@ async fn attach_agent_runtime_wakes_dormant_teammate() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Directed attach".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -8092,6 +8348,7 @@ async fn attach_agent_runtime_rejects_cross_user() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Directed attach isolation".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -8127,6 +8384,7 @@ async fn attach_agent_runtime_rejects_unknown_slot() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Directed attach unknown slot".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -8158,6 +8416,7 @@ async fn waking_dormant_teammate_does_not_resurface_session_starting() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Lazy wakeup overlay".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -8241,6 +8500,7 @@ async fn failed_teammate_wakeup_does_not_flip_session_to_failed() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Teammate failure stays inline".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -8321,6 +8581,7 @@ async fn lazy_attach_failure_preserves_unread_and_skips_leader_on_human_delivery
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Lazy failure preserves unread".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -8424,6 +8685,7 @@ async fn agent_triggered_attach_failure_notifies_leader() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                sharing_mode: Default::default(),
                 name: "Agent-triggered failure notifies leader".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -8497,6 +8759,7 @@ fn activity_message_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::
         team_id: team_id.into(),
         to_agent_id: "a1".into(),
         from_agent_id: "lead".into(),
+        actor_user_id: None,
         msg_type: "message".into(),
         content: format!("content-{id}"),
         summary: None,
@@ -8628,6 +8891,101 @@ async fn list_team_activity_rejects_other_user() {
     assert!(matches!(mailbox_err, TeamError::TeamNotFound(_)));
     let tasks_err = svc.list_team_tasks("intruder", "t1", 500).await.unwrap_err();
     assert!(matches!(tasks_err, TeamError::TeamNotFound(_)));
+}
+
+#[tokio::test]
+async fn shared_team_reads_use_active_membership_and_revoke_blocks_next_read() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let team = activity_team_row("shared-team", "owner");
+    team_repo
+        .create_team_with_sharing_mode(&team, aionui_db::models::TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    team_repo.add_test_collaborator(&team.id, "collaborator");
+    team_repo
+        .write_message("owner", &activity_message_row("shared-message", &team.id, 1000))
+        .await
+        .unwrap();
+
+    let visible = svc.list_teams("collaborator").await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].role, aionui_api_types::TeamAccessRole::Collaborator);
+    assert_eq!(
+        svc.get_team("collaborator", &team.id).await.unwrap().role,
+        aionui_api_types::TeamAccessRole::Collaborator
+    );
+    assert_eq!(
+        svc.list_team_mailbox("collaborator", &team.id, 10).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        svc.list_team_activity(
+            "collaborator",
+            &team.id,
+            None,
+            PageDirection::Desc,
+            aionui_team::ActivityKind::Message,
+            10,
+        )
+        .await
+        .unwrap()
+        .items
+        .len(),
+        1
+    );
+
+    team_repo.revoke_test_collaborator(&team.id, "collaborator");
+    assert!(matches!(
+        svc.get_team("collaborator", &team.id).await,
+        Err(TeamError::TeamNotFound(_))
+    ));
+    assert!(matches!(
+        svc.ensure_session("collaborator", &team.id).await,
+        Err(TeamError::TeamNotFound(_))
+    ));
+    assert!(matches!(
+        svc.send_message("collaborator", &team.id, "after revoke", None).await,
+        Err(TeamError::TeamNotFound(_))
+    ));
+    assert!(matches!(
+        svc.list_team_mailbox("collaborator", &team.id, 10).await,
+        Err(TeamError::TeamNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn stale_core_user_rows_cannot_be_listed_or_added_as_collaborators() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let team = activity_team_row("shared-team-stale-roster", "owner");
+    team_repo
+        .create_team_with_sharing_mode(&team, aionui_db::models::TeamSharingMode::Shared)
+        .await
+        .unwrap();
+    // Models a Core users-table row that is still marked active but is stale or
+    // was seeded independently of the host's current loginable account roster.
+    team_repo
+        .stale_eligible_users
+        .lock()
+        .unwrap()
+        .push(aionui_db::models::EligibleTeamUserRow {
+            user_id: "stale-core-user".into(),
+            display_name: "stale@example.invalid".into(),
+        });
+
+    assert!(matches!(
+        svc.list_eligible_collaborators("owner", &team.id).await,
+        Err(TeamError::CollaboratorAccountsUnavailable)
+    ));
+    assert!(matches!(
+        svc.add_team_member("owner", &team.id, "forged-or-stale-ref").await,
+        Err(TeamError::CollaboratorAccountsUnavailable)
+    ));
 }
 
 // ── Unified paginated activity feed (list_team_activity) ──────────────

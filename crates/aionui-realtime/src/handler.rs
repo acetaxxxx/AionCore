@@ -92,7 +92,13 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
 
     let (ws_sender, ws_receiver) = socket.split();
 
-    let send_handle = tokio::spawn(send_loop(conn_id, rx, ws_sender));
+    let send_handle = tokio::spawn(send_loop(
+        conn_id,
+        user_id.clone(),
+        rx,
+        ws_sender,
+        state.manager.clone(),
+    ));
     recv_loop(conn_id, &user_id, ws_receiver, &state).await;
 
     // Recv loop exited — client disconnected or errored.
@@ -123,12 +129,42 @@ async fn send_realtime_error_and_close(mut socket: WebSocket, error: RealtimeErr
 /// them to the WebSocket sink.
 async fn send_loop(
     conn_id: ConnectionId,
+    user_id: String,
     mut rx: mpsc::Receiver<WsOutbound>,
     mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    manager: Arc<WebSocketManager>,
 ) {
     while let Some(outbound) = rx.recv().await {
         let msg = match outbound {
             WsOutbound::Text(text) => Message::Text(text.into()),
+            WsOutbound::ScopedText {
+                text,
+                scope_id,
+                owner_user_id,
+                recipient_user_id,
+            } => {
+                if recipient_user_id != user_id {
+                    debug!(%conn_id, "dropping scoped websocket frame addressed to another user");
+                    continue;
+                }
+                let Some(_delivery_permit) = manager
+                    .authorize_scoped_delivery(&scope_id, &owner_user_id, &recipient_user_id)
+                    .await
+                else {
+                    debug!(
+                        %conn_id,
+                        %scope_id,
+                        user_id = %recipient_user_id,
+                        "dropping queued Team event after authorization changed"
+                    );
+                    continue;
+                };
+                if sender.send(Message::Text(text.into())).await.is_err() {
+                    debug!(%conn_id, "send loop: socket write failed, exiting");
+                    break;
+                }
+                continue;
+            }
             WsOutbound::Close(code, reason) => Message::Close(Some(CloseFrame {
                 code: code.as_u16(),
                 reason: reason.into(),

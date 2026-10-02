@@ -171,6 +171,8 @@ async fn projection_inserts_user_visible_bubble_with_stripped_system_notes() {
     let projection = TeamMessageProjection::new(store.clone(), bc.clone());
     let req = TeamProjectionRequest {
         user_id: "user-1".into(),
+        actor_user_id: "user-1".into(),
+        authorized_user_ids: vec!["user-1".into()],
         team_id: "team-1".into(),
         slot_id: "lead-1".into(),
         conversation_id: "conv-lead".into(),

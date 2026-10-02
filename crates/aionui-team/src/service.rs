@@ -9,16 +9,17 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
-    InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
-    TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse,
-    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
-    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
-    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
+    AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, EligibleTeamCollaboratorResponse,
+    GetConfigOptionsResponse, InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse,
+    TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
+    TeamContextResetAvailability, TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus,
+    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamMemberResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
+    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
+    TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
-use aionui_db::models::TeamRow;
+use aionui_db::models::{TeamAccessRole, TeamRow, TeamSharingMode};
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IProviderRepository, ITeamRepository, IUserOrderStore, OrderItemRef, OrderItemType, PageDirection,
@@ -70,7 +71,6 @@ pub const MAX_ACTIVITY_LIMIT: i64 = 1000;
 /// Upper bound on how many task ids one dependency-resolution request may
 /// look up, to bound query size regardless of client input.
 pub const MAX_TASK_ID_LOOKUP: usize = 200;
-
 /// Which item kinds the unified activity feed returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -80,6 +80,24 @@ pub enum ActivityKind {
     Message,
     /// Tasks only.
     Task,
+}
+
+/// Authenticated actor and persisted Team execution owner after authorization.
+/// The two identities intentionally remain separate for collaborator actions.
+#[derive(Debug, Clone)]
+pub struct TeamAuthorizationContext {
+    pub actor_user_id: String,
+    pub execution_owner_id: String,
+    pub role: TeamAccessRole,
+    pub sharing_mode: TeamSharingMode,
+    pub team: TeamRow,
+}
+
+fn can_send_direct_team_message(role: TeamAccessRole, lead_slot_id: Option<&str>, target_slot_id: &str) -> bool {
+    match role {
+        TeamAccessRole::Owner => true,
+        TeamAccessRole::Collaborator => lead_slot_id == Some(target_slot_id),
+    }
 }
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
@@ -373,7 +391,11 @@ impl TeamSessionService {
     /// runtime: leave dormant/failed slots alone, defer while attaching or
     /// removing, and restart a ready idle runtime so it picks the new set up.
     async fn refresh_member_mcp_binding(&self, session: &Arc<TeamSession>, user_id: &str, agent: &TeamAgent) {
-        let fingerprint = match self.provisioner().refresh_agent_mcp_snapshot(user_id, agent).await {
+        let fingerprint = match self
+            .provisioner()
+            .refresh_agent_mcp_snapshot(user_id, session.team_id(), agent)
+            .await
+        {
             Ok(Some(fingerprint)) => fingerprint,
             Ok(None) => return,
             Err(error) => {
@@ -512,10 +534,41 @@ impl TeamSessionService {
     }
 
     async fn load_owned_team_row(&self, user_id: &str, team_id: &str) -> Result<TeamRow, TeamError> {
-        self.repo
-            .get_team(user_id, team_id)
+        let access = self.authorize_team(user_id, team_id).await?;
+        if access.role != TeamAccessRole::Owner {
+            return Err(TeamError::TeamNotFound(team_id.into()));
+        }
+        Ok(access.team)
+    }
+
+    /// Central Team authorization seam. Current handlers remain owner-only
+    /// unless they explicitly consume this context as a collaborator operation.
+    pub async fn authorize_team(
+        &self,
+        actor_user_id: &str,
+        team_id: &str,
+    ) -> Result<TeamAuthorizationContext, TeamError> {
+        let role = self
+            .repo
+            .team_access_role(team_id, actor_user_id)
             .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        let team = match role {
+            TeamAccessRole::Owner => self.repo.get_team(actor_user_id, team_id).await?,
+            TeamAccessRole::Collaborator => self.repo.get_team_for_restore(team_id).await?,
+        }
+        .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        let sharing_mode = self.repo.get_team_sharing_mode(team_id).await?;
+        if role == TeamAccessRole::Collaborator && sharing_mode != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.into()));
+        }
+        Ok(TeamAuthorizationContext {
+            actor_user_id: actor_user_id.to_owned(),
+            execution_owner_id: team.user_id.clone(),
+            role,
+            sharing_mode,
+            team,
+        })
     }
 
     pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
@@ -529,16 +582,14 @@ impl TeamSessionService {
 
     /// Returns the most recent team-wide mailbox messages (all recipients),
     /// newest first, for the read-only activity view. `limit` is clamped to
-    /// `[1, MAX_ACTIVITY_LIMIT]`. Ownership is enforced first via a scoped
-    /// lookup: a missing team and another user's team both surface as
-    /// `TeamNotFound`, so team existence is never leaked across users.
+    /// `[1, MAX_ACTIVITY_LIMIT]`. Current membership is revalidated first.
     pub async fn list_team_mailbox(
         &self,
         user_id: &str,
         team_id: &str,
         limit: i64,
     ) -> Result<Vec<TeamMailboxMessageResponse>, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        self.authorize_team(user_id, team_id).await?;
         let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
         let rows = self.repo.list_messages_by_team(team_id, clamped).await?;
         let responses: Vec<TeamMailboxMessageResponse> = rows.iter().map(mailbox_row_to_response).collect();
@@ -549,16 +600,16 @@ impl TeamSessionService {
     /// Returns the team's tasks, newest first (`created_at` DESC, `id` as a
     /// stable secondary key), truncated to a clamped `limit`, for the
     /// read-only activity view. Reuses the existing ASC `list_tasks` and sorts
-    /// in the service. Ownership is enforced first.
+    /// in the service. Repository scoping uses the authorized execution owner.
     pub async fn list_team_tasks(
         &self,
         user_id: &str,
         team_id: &str,
         limit: i64,
     ) -> Result<Vec<TeamTaskResponse>, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
         let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
-        let rows = self.repo.list_tasks(user_id, team_id).await?;
+        let rows = self.repo.list_tasks(&access.execution_owner_id, team_id).await?;
         let mut tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
         tasks.truncate(clamped as usize);
@@ -569,7 +620,7 @@ impl TeamSessionService {
 
     /// Returns the team's tasks matching `ids` (newest first), for resolving
     /// dependency (`blocked_by`) subjects that may lie outside the loaded
-    /// activity page. Ownership is enforced first; `ids` is clamped to
+    /// activity page. Current membership is revalidated first; `ids` is clamped to
     /// `MAX_TASK_ID_LOOKUP`. An empty `ids` yields an empty result.
     pub async fn list_team_tasks_by_ids(
         &self,
@@ -577,12 +628,15 @@ impl TeamSessionService {
         team_id: &str,
         ids: &[String],
     ) -> Result<Vec<TeamTaskResponse>, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let capped = &ids[..ids.len().min(MAX_TASK_ID_LOOKUP)];
-        let rows = self.repo.list_tasks_by_ids(user_id, team_id, capped).await?;
+        let rows = self
+            .repo
+            .list_tasks_by_ids(&access.execution_owner_id, team_id, capped)
+            .await?;
         let tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
         info!(
@@ -596,7 +650,7 @@ impl TeamSessionService {
 
     /// Returns one keyset-paginated page of the unified activity feed (messages
     /// and/or tasks per `kind`), ordered by `(created_at, id)` in `direction`.
-    /// Ownership is enforced first, so another user's team is indistinguishable
+    /// Current membership is revalidated first, so unauthorized callers see
     /// from a missing one (`TeamNotFound`). For `kind = All`, each stream is
     /// fetched up to `limit` rows and merged; the global top-`limit` is
     /// mathematically complete (any item newer/older than the cursor is within
@@ -611,7 +665,7 @@ impl TeamSessionService {
         kind: ActivityKind,
         limit: i64,
     ) -> Result<TeamActivityPageResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
         let limit = limit.clamp(1, MAX_ACTIVITY_LIMIT);
 
         let (mut items, mailbox_full, tasks_full) = match kind {
@@ -630,7 +684,7 @@ impl TeamSessionService {
             ActivityKind::Task => {
                 let rows = self
                     .repo
-                    .list_tasks_paged(user_id, team_id, cursor.clone(), direction, limit)
+                    .list_tasks_paged(&access.execution_owner_id, team_id, cursor.clone(), direction, limit)
                     .await?;
                 let full = rows.len() as i64 == limit;
                 (
@@ -646,7 +700,7 @@ impl TeamSessionService {
                     .await?;
                 let tasks = self
                     .repo
-                    .list_tasks_paged(user_id, team_id, cursor.clone(), direction, limit)
+                    .list_tasks_paged(&access.execution_owner_id, team_id, cursor.clone(), direction, limit)
                     .await?;
                 let mailbox_full = msgs.len() as i64 == limit;
                 let tasks_full = tasks.len() as i64 == limit;
@@ -695,34 +749,7 @@ impl TeamSessionService {
         team_id: &str,
         active_leases: &ActiveLeaseRegistry,
     ) -> Result<(), TeamError> {
-        let team = match self.repo.get_team(user_id, team_id).await {
-            Ok(Some(row)) => Team::from_row(&row).map_err(TeamError::from),
-            Ok(None) => Err(TeamError::TeamNotFound(team_id.to_owned())),
-            Err(error) => Err(TeamError::Database(error)),
-        };
-        let team = match team {
-            Ok(team) => team,
-            Err(error @ TeamError::TeamNotFound(_)) => {
-                debug!(
-                    kind = "team",
-                    team_id,
-                    user_id,
-                    error = %error,
-                    "Team active lease renew rejected"
-                );
-                return Err(error);
-            }
-            Err(error) => {
-                warn!(
-                    kind = "team",
-                    team_id,
-                    user_id,
-                    error = %error,
-                    "Team active lease renew failed"
-                );
-                return Err(error);
-            }
-        };
+        let team = self.load_owned_team(user_id, team_id).await?;
 
         let conversation_ids = team
             .agents
@@ -774,17 +801,37 @@ impl TeamSessionService {
             ));
         }
 
-        let shared_workspace = match req.workspace.as_deref() {
-            Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
-            _ => None,
-        };
-
         let team_id = generate_id();
         let now = now_ms();
+        let shared_workspace = match req.sharing_mode {
+            aionui_api_types::TeamSharingMode::Private => match req.workspace.as_deref() {
+                Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
+                _ => None,
+            },
+            aionui_api_types::TeamSharingMode::Shared => {
+                if req
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|workspace| !workspace.trim().is_empty())
+                {
+                    return Err(TeamError::InvalidRequest(
+                        "Shared Team workspace is provisioned by the server".into(),
+                    ));
+                }
+                Some(self.conversation_port.create_shared_team_workspace(&team_id).await?)
+            }
+        };
 
         let provisioned = self
             .provisioner()
-            .provision_initial_agents(user_id, &team_id, &req.name, &req.agents, shared_workspace.as_deref())
+            .provision_initial_agents(
+                user_id,
+                &team_id,
+                &req.name,
+                &req.agents,
+                shared_workspace.as_deref(),
+                req.sharing_mode == aionui_api_types::TeamSharingMode::Shared,
+            )
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
@@ -809,7 +856,11 @@ impl TeamSessionService {
             project_id,
             folder_id,
         };
-        self.repo.create_team(&row).await?;
+        let sharing_mode = match req.sharing_mode {
+            aionui_api_types::TeamSharingMode::Private => TeamSharingMode::Private,
+            aionui_api_types::TeamSharingMode::Shared => TeamSharingMode::Shared,
+        };
+        self.repo.create_team_with_sharing_mode(&row, sharing_mode).await?;
 
         let team = Team {
             id: team_id,
@@ -824,7 +875,7 @@ impl TeamSessionService {
         info!(
             team_id = %team.id,
             workspace_source = if shared_workspace.is_some() {
-                "user_supplied"
+                "explicit_team_workspace"
             } else {
                 "auto_from_leader"
             },
@@ -834,15 +885,45 @@ impl TeamSessionService {
 
         self.broadcast_team_created(user_id, &team.id, &team.name);
 
-        self.build_team_response(user_id, &team).await
+        self.build_team_response_for_access(
+            user_id,
+            &team,
+            req.sharing_mode,
+            aionui_api_types::TeamAccessRole::Owner,
+        )
+        .await
     }
 
     pub async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamResponse>, TeamError> {
-        let rows = self.repo.list_teams_by_user(user_id).await?;
+        let mut rows = self.repo.list_teams_by_user(user_id).await?;
+        let mut team_ids: HashSet<String> = rows.iter().map(|row| row.id.clone()).collect();
+        for row in self.repo.list_teams_by_member(user_id).await? {
+            if team_ids.insert(row.id.clone()) {
+                rows.push(row);
+            }
+        }
         let mut teams = Vec::with_capacity(rows.len());
         for row in &rows {
+            let Some(role) = self.repo.team_access_role(&row.id, user_id).await? else {
+                continue;
+            };
+            let sharing_mode = self.repo.get_team_sharing_mode(&row.id).await?;
             match Team::from_row(row) {
-                Ok(team) => match self.build_team_response(user_id, &team).await {
+                Ok(team) => match self
+                    .build_team_response_for_access(
+                        &row.user_id,
+                        &team,
+                        match sharing_mode {
+                            TeamSharingMode::Private => aionui_api_types::TeamSharingMode::Private,
+                            TeamSharingMode::Shared => aionui_api_types::TeamSharingMode::Shared,
+                        },
+                        match role {
+                            TeamAccessRole::Owner => aionui_api_types::TeamAccessRole::Owner,
+                            TeamAccessRole::Collaborator => aionui_api_types::TeamAccessRole::Collaborator,
+                        },
+                    )
+                    .await
+                {
                     Ok(resp) => teams.push(resp),
                     Err(e) => {
                         tracing::warn!(team_id = %row.id, error = %e, "skipping team with build error");
@@ -856,6 +937,180 @@ impl TeamSessionService {
         Ok(teams)
     }
 
+    pub async fn list_eligible_collaborators(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+    ) -> Result<Vec<EligibleTeamCollaboratorResponse>, TeamError> {
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        // Core's persisted users table contains seeded/provisioned identities,
+        // not an authoritative roster of accounts currently loginable through
+        // this host. Until such a host directory is injected, fail closed.
+        Err(TeamError::CollaboratorAccountsUnavailable)
+    }
+
+    /// Lists active collaborators without exposing internal user identifiers.
+    pub async fn list_team_members(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+    ) -> Result<Vec<TeamMemberResponse>, TeamError> {
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let members = self.repo.list_team_members(team_id).await?;
+        Ok(members
+            .into_iter()
+            .map(|member| TeamMemberResponse {
+                membership_ref: member.membership_ref,
+                display_name: member.display_name,
+                created_at: member.created_at,
+            })
+            .collect())
+    }
+
+    pub async fn add_team_member(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        account_ref: &str,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let _ = account_ref;
+        // Opaque refs can only be issued by an authoritative host account
+        // directory. The Core users table is not that directory, so accepting
+        // any DB-derived or caller-supplied identity here would be unsafe.
+        Err(TeamError::CollaboratorAccountsUnavailable)
+    }
+
+    /// Revokes by server-issued membership reference after an owner-scoped check.
+    pub async fn remove_team_member(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        membership_ref: &str,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _membership_guard = membership_lock.lock().await;
+        let member_user_id = self
+            .repo
+            .list_team_members(team_id)
+            .await?
+            .into_iter()
+            .find(|member| member.membership_ref == membership_ref)
+            .map(|member| member.user_id);
+        let revocation_started = if let Some(user_id) = member_user_id.as_deref() {
+            // Remove authorization before persistence, then wait for socket
+            // writes that passed their final check before revocation. Queued
+            // frames not yet drained will fail their send-loop check.
+            self.broadcaster.revoke_scope_recipient(team_id, user_id);
+            if let Some(session) = self.sessions.get(team_id) {
+                session.session.revoke_event_user(user_id);
+            }
+            true
+        } else {
+            false
+        };
+        if revocation_started {
+            self.broadcaster.wait_for_scope_deliveries().await;
+        }
+        if let Err(error) = self
+            .repo
+            .remove_team_member(owner_user_id, team_id, membership_ref)
+            .await
+        {
+            self.refresh_session_event_users(team_id, owner_user_id).await;
+            return Err(error.into());
+        }
+        self.refresh_session_event_users(team_id, owner_user_id).await;
+        Ok(())
+    }
+
+    pub async fn list_team_mcp_allowlist(&self, owner_user_id: &str, team_id: &str) -> Result<Vec<String>, TeamError> {
+        let access = self.authorize_team(owner_user_id, team_id).await?;
+        if access.role != TeamAccessRole::Owner || access.sharing_mode != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        self.repo
+            .list_team_mcp_allowlist(owner_user_id, team_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn replace_team_mcp_allowlist(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        mcp_server_ids: Vec<String>,
+    ) -> Result<(), TeamError> {
+        let access = self.authorize_team(owner_user_id, team_id).await?;
+        if access.role != TeamAccessRole::Owner || access.sharing_mode != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let mut normalized = Vec::with_capacity(mcp_server_ids.len());
+        let mut unique = HashSet::with_capacity(mcp_server_ids.len());
+        for id in mcp_server_ids {
+            let id = id.trim();
+            if id.is_empty() || !unique.insert(id.to_owned()) {
+                return Err(TeamError::InvalidRequest(
+                    "MCP allowlist IDs must be non-empty and unique".into(),
+                ));
+            }
+            normalized.push(id.to_owned());
+        }
+
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = lock.lock().await;
+        self.load_owned_team_row(owner_user_id, team_id).await?;
+        if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        self.repo
+            .replace_team_mcp_allowlist(owner_user_id, team_id, &normalized)
+            .await?;
+        drop(guard);
+
+        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+            for agent in session.scheduler().list_agents().await {
+                self.refresh_member_mcp_binding(&session, owner_user_id, &agent).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_session_event_users(&self, team_id: &str, owner_user_id: &str) {
+        match self.repo.list_team_members(team_id).await {
+            Ok(members) => {
+                let user_ids = std::iter::once(owner_user_id.to_owned())
+                    .chain(members.into_iter().map(|member| member.user_id))
+                    .collect::<Vec<_>>();
+                self.broadcaster.replace_scope_recipients(team_id, user_ids.clone());
+                if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+                    session.set_authorized_event_users(user_ids);
+                }
+            }
+            Err(error) => {
+                warn!(team_id, error = %error, "team event recipient refresh failed; revoked recipients remain removed")
+            }
+        }
+    }
+
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
         let lock = self
             .add_agent_locks
@@ -863,17 +1118,32 @@ impl TeamSessionService {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
-        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
         // Project-bind side branch: lazily backfill binding only when a single
         // team is opened (never during list_teams / lease renew).
-        self.backfill_team_binding_best_effort(&row).await;
-        let team = Team::from_row(&row)?;
+        if access.role == TeamAccessRole::Owner {
+            self.backfill_team_binding_best_effort(&access.team).await;
+        }
+        let sharing_mode = self.repo.get_team_sharing_mode(team_id).await?;
+        let team = Team::from_row(&access.team)?;
         // Deliberately does NOT reconcile legacy model facts. That repair reads
         // three extra tables PER MEMBER, and this is a plain read endpoint the
         // frontend hits whenever a team is opened. Session start owns the repair
         // (`ensure_session`), which is the point where a stale roster would
         // actually feed a rebuilt runtime.
-        self.build_team_response(user_id, &team).await
+        self.build_team_response_for_access(
+            &access.execution_owner_id,
+            &team,
+            match sharing_mode {
+                TeamSharingMode::Private => aionui_api_types::TeamSharingMode::Private,
+                TeamSharingMode::Shared => aionui_api_types::TeamSharingMode::Shared,
+            },
+            match access.role {
+                TeamAccessRole::Owner => aionui_api_types::TeamAccessRole::Owner,
+                TeamAccessRole::Collaborator => aionui_api_types::TeamAccessRole::Collaborator,
+            },
+        )
+        .await
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
@@ -1408,6 +1678,13 @@ impl TeamSessionService {
             .clone();
         let membership_guard = membership_lock.lock().await;
 
+        // When a request supplies its authenticated actor, recheck membership
+        // under the same lock used by member removal. Startup restoration has
+        // no request actor and intentionally skips this check.
+        if let Some(actor_user_id) = requested_user_id {
+            self.authorize_team(actor_user_id, team_id).await?;
+        }
+
         let row = match self.repo.get_team_for_restore(team_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -1517,6 +1794,15 @@ impl TeamSessionService {
                 return Err(e);
             }
         };
+
+        match self.repo.list_team_members(team_id).await {
+            Ok(members) => session.set_authorized_event_users(
+                std::iter::once(user_id.clone()).chain(members.into_iter().map(|member| member.user_id)),
+            ),
+            Err(error) => {
+                warn!(team_id, error = %error, "team event recipients unavailable; keeping owner-only fanout")
+            }
+        }
 
         self.broadcast_session_status(
             &user_id,
@@ -2023,37 +2309,37 @@ impl TeamSessionService {
 
     fn broadcast_team_created(&self, user_id: &str, team_id: &str, team_name: &str) {
         info!(team_id = %team_id, event_name = TEAM_CREATED_EVENT, "team event broadcast");
-        self.broadcaster.broadcast(WebSocketMessage::new(
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()).broadcast_event(
             TEAM_CREATED_EVENT,
             serde_json::json!({ "user_id": user_id, "team_id": team_id, "team_name": team_name }),
-        ));
+        );
         self.broadcast_team_list_changed(user_id, team_id, "created");
     }
 
     fn broadcast_team_removed(&self, user_id: &str, team_id: &str) {
         info!(team_id = %team_id, event_name = TEAM_REMOVED_EVENT, "team event broadcast");
-        self.broadcaster.broadcast(WebSocketMessage::new(
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()).broadcast_event(
             TEAM_REMOVED_EVENT,
             serde_json::json!({ "user_id": user_id, "team_id": team_id }),
-        ));
+        );
         self.broadcast_team_list_changed(user_id, team_id, "removed");
     }
 
     fn broadcast_team_renamed(&self, user_id: &str, team_id: &str, team_name: &str) {
         info!(team_id = %team_id, event_name = TEAM_RENAMED_EVENT, "team event broadcast");
-        self.broadcaster.broadcast(WebSocketMessage::new(
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()).broadcast_event(
             TEAM_RENAMED_EVENT,
             serde_json::json!({ "user_id": user_id, "team_id": team_id, "team_name": team_name }),
-        ));
+        );
         self.broadcast_team_list_changed(user_id, team_id, "renamed");
     }
 
     fn broadcast_team_list_changed(&self, user_id: &str, team_id: &str, action: &str) {
         info!(team_id = %team_id, event_name = crate::events::TEAM_LIST_CHANGED_EVENT, action, "team event broadcast");
-        self.broadcaster.broadcast(WebSocketMessage::new(
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()).broadcast_event(
             crate::events::TEAM_LIST_CHANGED_EVENT,
             serde_json::json!({ "user_id": user_id, "team_id": team_id, "action": action }),
-        ));
+        );
     }
 
     pub(crate) fn broadcast_agent_runtime_status(
@@ -2227,7 +2513,7 @@ impl TeamSessionService {
     }
 
     pub async fn get_run_state(&self, user_id: &str, team_id: &str) -> Result<TeamRunStateResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        self.authorize_team(user_id, team_id).await?;
         let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
         let Some(session) = session else {
             return Ok(TeamRunStateResponse {
@@ -2511,13 +2797,26 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self
-            .resolve_message_attachments(user_id, is_local_admin, content, files)
+        let access = self.authorize_team(user_id, team_id).await?;
+        Self::reject_shared_team_attachments(&access, files.as_deref())?;
+        self.ensure_session_inner(team_id, Some(&access.execution_owner_id))
             .await?;
+        let (content, files) = self
+            .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
+            .await?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        // Serialize final membership validation and enqueue with member removal.
+        let _membership_guard = membership_lock.lock().await;
+        let current_access = self.authorize_team(user_id, team_id).await?;
+        if current_access.execution_owner_id != access.execution_owner_id {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
         let session = self.published_session(team_id)?;
-        session.send_message(&content, files).await
+        session.send_message_as_actor(user_id, &content, files).await
     }
 
     pub async fn send_message_to_agent(
@@ -2548,13 +2847,41 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self
-            .resolve_message_attachments(user_id, is_local_admin, content, files)
+        let access = self.authorize_team(user_id, team_id).await?;
+        if !can_send_direct_team_message(access.role, access.team.lead_agent_id.as_deref(), slot_id) {
+            return Err(TeamError::Forbidden(
+                "collaborators may only send directly to the shared Team Lead".into(),
+            ));
+        }
+        Self::reject_shared_team_attachments(&access, files.as_deref())?;
+        self.ensure_session_inner(team_id, Some(&access.execution_owner_id))
             .await?;
+        let (content, files) = self
+            .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
+            .await?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _membership_guard = membership_lock.lock().await;
+        let current_access = self.authorize_team(user_id, team_id).await?;
+        if current_access.execution_owner_id != access.execution_owner_id {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        if !can_send_direct_team_message(
+            current_access.role,
+            current_access.team.lead_agent_id.as_deref(),
+            slot_id,
+        ) {
+            return Err(TeamError::Forbidden(
+                "collaborators may only send directly to the shared Team Lead".into(),
+            ));
+        }
         let session = self.published_session(team_id)?;
-        session.send_message_to_agent(slot_id, &content, files).await
+        session
+            .send_message_to_agent_as_actor(user_id, slot_id, &content, files)
+            .await
     }
 
     pub async fn interrupt_agent(
@@ -2591,6 +2918,18 @@ impl TeamSessionService {
             .get(team_id)
             .map(|entry| Arc::clone(&entry.session))
             .ok_or_else(|| TeamError::SessionNotFound(team_id.to_owned()))
+    }
+
+    fn reject_shared_team_attachments(
+        access: &TeamAuthorizationContext,
+        files: Option<&[ChatFileRef]>,
+    ) -> Result<(), TeamError> {
+        if access.sharing_mode == TeamSharingMode::Shared && files.is_some_and(|files| !files.is_empty()) {
+            return Err(TeamError::InvalidRequest(
+                "Shared Team file attachments are unavailable until Team-scoped upload is configured".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn peek_agent_messages(
@@ -3537,6 +3876,7 @@ mod tests {
 
     fn two_agent_team_request(name: &str) -> aionui_api_types::CreateTeamRequest {
         aionui_api_types::CreateTeamRequest {
+            sharing_mode: Default::default(),
             name: name.into(),
             agents: vec![
                 aionui_api_types::TeamAgentInput {
@@ -5102,5 +5442,31 @@ mod tests {
             .expect_err("team config options must reject cross-user access");
 
         assert!(matches!(err, crate::error::TeamError::TeamNotFound(_)));
+    }
+
+    #[test]
+    fn collaborator_direct_message_target_is_limited_to_shared_lead() {
+        use aionui_db::models::TeamAccessRole;
+
+        assert!(super::can_send_direct_team_message(
+            TeamAccessRole::Collaborator,
+            Some("lead-slot"),
+            "lead-slot"
+        ));
+        assert!(!super::can_send_direct_team_message(
+            TeamAccessRole::Collaborator,
+            Some("lead-slot"),
+            "worker-slot"
+        ));
+        assert!(!super::can_send_direct_team_message(
+            TeamAccessRole::Collaborator,
+            None,
+            "worker-slot"
+        ));
+        assert!(super::can_send_direct_team_message(
+            TeamAccessRole::Owner,
+            Some("lead-slot"),
+            "worker-slot"
+        ));
     }
 }

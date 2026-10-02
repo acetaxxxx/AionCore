@@ -1,6 +1,7 @@
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use aionui_db::models::{MailboxMessageRow, TeamRow, TeamSharingMode, TeamTaskRow};
 use aionui_db::{ActivityCursor, DbError, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -9,6 +10,7 @@ pub struct MockState {
     pub tasks: Vec<TeamTaskRow>,
     pub fail_message_writes: bool,
     pub fail_task_lists: bool,
+    pub shared_teams: HashSet<String>,
 }
 
 pub struct MockTeamRepo {
@@ -51,6 +53,13 @@ impl ITeamRepository for MockTeamRepo {
     }
     async fn get_team(&self, _user_id: &str, _id: &str) -> Result<Option<TeamRow>, DbError> {
         Ok(None)
+    }
+    async fn get_team_sharing_mode(&self, team_id: &str) -> Result<TeamSharingMode, DbError> {
+        Ok(if self.state.lock().unwrap().shared_teams.contains(team_id) {
+            TeamSharingMode::Shared
+        } else {
+            TeamSharingMode::Private
+        })
     }
     async fn get_team_for_restore(&self, _id: &str) -> Result<Option<TeamRow>, DbError> {
         Ok(Some(TeamRow {
@@ -388,6 +397,7 @@ impl ITeamRepository for MockTeamRepo {
 
 #[cfg(test)]
 pub(crate) mod workspace_harness {
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     use aionui_ai_agent::{AgentError, IWorkerTaskManager};
@@ -615,6 +625,8 @@ pub(crate) mod workspace_harness {
     pub(crate) struct FullMockTeamRepo {
         teams: Mutex<Vec<TeamRow>>,
         messages: Mutex<Vec<aionui_db::models::MailboxMessageRow>>,
+        shared_teams: Mutex<HashSet<String>>,
+        collaborators: Mutex<HashMap<String, HashSet<String>>>,
     }
 
     impl FullMockTeamRepo {
@@ -622,6 +634,8 @@ pub(crate) mod workspace_harness {
             Self {
                 teams: Mutex::new(Vec::new()),
                 messages: Mutex::new(Vec::new()),
+                shared_teams: Mutex::new(HashSet::new()),
+                collaborators: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -631,6 +645,77 @@ pub(crate) mod workspace_harness {
         async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
             self.teams.lock().unwrap().push(row.clone());
             Ok(())
+        }
+
+        async fn create_team_with_sharing_mode(
+            &self,
+            row: &TeamRow,
+            mode: aionui_db::models::TeamSharingMode,
+        ) -> Result<(), DbError> {
+            self.create_team(row).await?;
+            if mode == aionui_db::models::TeamSharingMode::Shared {
+                self.shared_teams.lock().unwrap().insert(row.id.clone());
+            }
+            Ok(())
+        }
+
+        async fn get_team_sharing_mode(&self, team_id: &str) -> Result<aionui_db::models::TeamSharingMode, DbError> {
+            Ok(if self.shared_teams.lock().unwrap().contains(team_id) {
+                aionui_db::models::TeamSharingMode::Shared
+            } else {
+                aionui_db::models::TeamSharingMode::Private
+            })
+        }
+
+        async fn list_team_mcp_allowlist(&self, _owner_user_id: &str, _team_id: &str) -> Result<Vec<String>, DbError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_teams_by_member(&self, user_id: &str) -> Result<Vec<TeamRow>, DbError> {
+            let team_ids: HashSet<String> = self
+                .collaborators
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, members)| members.contains(user_id))
+                .map(|(team_id, _)| team_id.clone())
+                .collect();
+            Ok(self
+                .teams
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|team| team_ids.contains(&team.id))
+                .cloned()
+                .collect())
+        }
+
+        async fn team_access_role(
+            &self,
+            team_id: &str,
+            user_id: &str,
+        ) -> Result<Option<aionui_db::models::TeamAccessRole>, DbError> {
+            let team = self
+                .teams
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|team| team.id == team_id)
+                .cloned();
+            let Some(team) = team else {
+                return Ok(None);
+            };
+            if team.user_id == user_id {
+                return Ok(Some(aionui_db::models::TeamAccessRole::Owner));
+            }
+            let is_shared = self.shared_teams.lock().unwrap().contains(team_id);
+            let is_member = self
+                .collaborators
+                .lock()
+                .unwrap()
+                .get(team_id)
+                .is_some_and(|members| members.contains(user_id));
+            Ok((is_shared && is_member).then_some(aionui_db::models::TeamAccessRole::Collaborator))
         }
 
         async fn list_teams_for_restore(&self) -> Result<Vec<TeamRow>, DbError> {
@@ -1056,6 +1141,12 @@ pub(crate) mod workspace_harness {
                 .workspace_root
                 .join("conversations")
                 .join(format!("team-temp-{team_id}"));
+            std::fs::create_dir_all(&path).unwrap();
+            Ok(path.to_string_lossy().into_owned())
+        }
+
+        async fn create_shared_team_workspace(&self, team_id: &str) -> Result<String, TeamError> {
+            let path = self.workspace_root.join("teams").join(team_id);
             std::fs::create_dir_all(&path).unwrap();
             Ok(path.to_string_lossy().into_owned())
         }
@@ -1783,6 +1874,7 @@ pub(crate) mod workspace_harness {
 
     pub(crate) fn single_agent_team_request(name: &str) -> CreateTeamRequest {
         CreateTeamRequest {
+            sharing_mode: Default::default(),
             name: name.into(),
             agents: vec![aionui_api_types::TeamAgentInput {
                 name: "Lead".into(),

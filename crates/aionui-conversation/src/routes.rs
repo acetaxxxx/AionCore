@@ -4,6 +4,8 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
+use axum::middleware::{Next, from_fn_with_state};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
@@ -144,7 +146,41 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/active-count", get(active_count))
         .route("/api/conversations/clone", post(clone))
         .route("/api/messages/search", get(search_messages))
+        // Direct conversation APIs remain owner-scoped. Shared Team members
+        // use Team session routes; they must not gain access through these
+        // legacy conversation-ID endpoints after discovering an ID.
+        .route_layer(from_fn_with_state(state.clone(), direct_conversation_owner_guard))
         .with_state(state)
+}
+
+async fn direct_conversation_owner_guard(
+    State(state): State<ConversationRouterState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let Some(conversation_id) = conversation_id_from_route_path(request.uri().path()) else {
+        return next.run(request).await;
+    };
+    let Some(user) = request.extensions().get::<CurrentUser>() else {
+        return ApiError::Unauthorized("Authentication required".into()).into_response();
+    };
+    match state.service.ensure_owned_conversation(&user.id, conversation_id).await {
+        Ok(()) => next.run(request).await,
+        // Keep the legacy owner-scoped 404 detail stable. The ID is already
+        // caller-supplied; no message or other owner's data is included.
+        Err(error @ ConversationError::NotFound { .. }) => ApiError::from(error).into_response(),
+        Err(error) => ApiError::from(error).into_response(),
+    }
+}
+
+fn conversation_id_from_route_path(path: &str) -> Option<&str> {
+    let route = path.strip_prefix("/api/conversations/")?;
+    let id = route.split('/').next()?;
+    if id.is_empty() || matches!(id, "active-count" | "clone") {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -555,6 +591,26 @@ async fn active_count(
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn direct_conversation_guard_covers_id_routes_but_skips_collection_routes() {
+        for path in [
+            "/api/conversations/conv-1",
+            "/api/conversations/conv-1/messages",
+            "/api/conversations/conv-1/runtime/ensure",
+            "/api/conversations/conv-1/confirmations/call-1/confirm",
+        ] {
+            assert_eq!(conversation_id_from_route_path(path), Some("conv-1"));
+        }
+        for path in [
+            "/api/conversations",
+            "/api/conversations/active-count",
+            "/api/conversations/clone",
+            "/api/messages/search",
+        ] {
+            assert_eq!(conversation_id_from_route_path(path), None);
+        }
+    }
 
     #[test]
     fn conversation_not_found_maps_to_app_not_found() {

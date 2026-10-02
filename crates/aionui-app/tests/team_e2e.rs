@@ -122,8 +122,9 @@ async fn create_team(
     ensure_default_team_assistant(app, services, token, csrf).await;
     let req = json_with_token("POST", "/api/teams", two_agent_body(), token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    let status = resp.status();
     let json = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "team creation failed: {json}");
     assert!(json["success"].as_bool().unwrap());
     json["data"].clone()
 }
@@ -1662,8 +1663,9 @@ async fn context_reset_returns_structured_success_and_projects_a_semantic_notice
         &csrf,
     );
     let resp = app.oneshot(reset).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let status = resp.status();
     let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "response body: {body}");
     assert_eq!(body["data"]["reset_status"], "completed");
     assert_eq!(body["data"]["runtime_status"], "ready");
     assert_eq!(body["data"]["preserved_unread_count"], 1);
