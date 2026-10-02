@@ -25,6 +25,16 @@ pub enum TeamError {
     #[error("Wait at least one second before refreshing eligible collaborators")]
     RateLimited,
 
+    #[error(
+        "Too many collaborator choices are pending; wait up to five minutes for old references to expire, then retry"
+    )]
+    EligibleCollaboratorQuotaReached,
+
+    #[error(
+        "Too many active accounts for this picker; ask the host administrator to reduce the active account directory"
+    )]
+    EligibleCollaboratorCandidateLimitExceeded,
+
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 

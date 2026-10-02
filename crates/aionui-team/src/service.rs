@@ -75,7 +75,7 @@ pub const MAX_TASK_ID_LOOKUP: usize = 200;
 /// Account references can be used once within five minutes of being listed.
 const ELIGIBLE_ACCOUNT_REF_TTL_MS: TimestampMs = 5 * 60 * 1000;
 const ELIGIBLE_LIST_RATE_LIMIT: Duration = Duration::from_secs(1);
-const ELIGIBLE_LIST_RATE_LIMIT_RETENTION: Duration = Duration::from_secs(60);
+const MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER: usize = 2_000;
 /// Which item kinds the unified activity feed returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -158,74 +158,127 @@ struct EligibleAccountRef {
     expires_at: TimestampMs,
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct EligibleAccountRefScope {
-    owner_user_id: String,
-    team_id: String,
+#[derive(Default)]
+struct EligibleAccountRefStore {
+    /// Each authenticated owner has one aggregate ref budget across all Teams.
+    by_owner: DashMap<String, OwnerEligibleAccountRefs>,
 }
 
 #[derive(Default)]
-struct EligibleAccountRefStore {
-    /// At most one current grant set per owner+Team. Replacing a listing is a
-    /// single map insertion, so concurrent refreshes cannot accumulate refs.
-    by_scope: DashMap<EligibleAccountRefScope, HashMap<String, EligibleAccountRef>>,
+struct OwnerEligibleAccountRefs {
+    last_listing_at: Option<Instant>,
+    by_team: HashMap<String, HashMap<String, EligibleAccountRef>>,
 }
 
-impl EligibleAccountRefStore {
-    fn prune_expired(&self, now: TimestampMs) {
-        self.by_scope.retain(|_, refs| {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EligibleAccountRefStoreError {
+    OwnerQuotaReached,
+}
+
+fn ensure_candidate_count_supported(count: usize) -> Result<(), TeamError> {
+    if count > MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER {
+        return Err(TeamError::EligibleCollaboratorCandidateLimitExceeded);
+    }
+    Ok(())
+}
+
+impl OwnerEligibleAccountRefs {
+    fn prune_expired(&mut self, now: TimestampMs) {
+        self.by_team.retain(|_, refs| {
             refs.retain(|_, reference| reference.expires_at > now);
             !refs.is_empty()
         });
     }
+}
+
+impl EligibleAccountRefStore {
+    fn begin_listing(&self, owner_user_id: &str, now: Instant, now_ms: TimestampMs) -> bool {
+        let mut owner = self.by_owner.entry(owner_user_id.to_owned()).or_default();
+        owner.prune_expired(now_ms);
+        if owner
+            .last_listing_at
+            .is_some_and(|last| now.saturating_duration_since(last) < ELIGIBLE_LIST_RATE_LIMIT)
+        {
+            return false;
+        }
+        owner.last_listing_at = Some(now);
+        true
+    }
+
+    fn ensure_capacity(
+        &self,
+        owner_user_id: &str,
+        team_id: &str,
+        replacement_count: usize,
+        now_ms: TimestampMs,
+    ) -> Result<(), EligibleAccountRefStoreError> {
+        let mut owner = self.by_owner.entry(owner_user_id.to_owned()).or_default();
+        owner.prune_expired(now_ms);
+        Self::check_capacity(&owner, team_id, replacement_count)
+    }
 
     fn replace(
         &self,
-        scope: EligibleAccountRefScope,
+        owner_user_id: &str,
+        team_id: &str,
         refs: HashMap<String, EligibleAccountRef>,
-    ) {
-        self.by_scope.insert(scope, refs);
+        now_ms: TimestampMs,
+    ) -> Result<(), EligibleAccountRefStoreError> {
+        let mut owner = self.by_owner.entry(owner_user_id.to_owned()).or_default();
+        owner.prune_expired(now_ms);
+        Self::check_capacity(&owner, team_id, refs.len())?;
+        if refs.is_empty() {
+            owner.by_team.remove(team_id);
+        } else {
+            owner.by_team.insert(team_id.to_owned(), refs);
+        }
+        Ok(())
+    }
+
+    fn check_capacity(
+        owner: &OwnerEligibleAccountRefs,
+        team_id: &str,
+        replacement_count: usize,
+    ) -> Result<(), EligibleAccountRefStoreError> {
+        let other_team_refs = owner
+            .by_team
+            .iter()
+            .filter(|(existing_team_id, _)| existing_team_id.as_str() != team_id)
+            .map(|(_, refs)| refs.len())
+            .sum::<usize>();
+        if other_team_refs.saturating_add(replacement_count)
+            > MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER
+        {
+            return Err(EligibleAccountRefStoreError::OwnerQuotaReached);
+        }
+        Ok(())
     }
 
     fn take(
         &self,
-        scope: &EligibleAccountRefScope,
+        owner_user_id: &str,
+        team_id: &str,
         account_ref: &str,
+        now_ms: TimestampMs,
     ) -> Option<EligibleAccountRef> {
-        self.by_scope
-            .get_mut(scope)
-            .and_then(|mut refs| refs.remove(account_ref))
+        let mut owner = self.by_owner.get_mut(owner_user_id)?;
+        owner.prune_expired(now_ms);
+        let (reference, team_is_empty) = {
+            let team_refs = owner.by_team.get_mut(team_id)?;
+            let reference = team_refs.remove(account_ref);
+            (reference, team_refs.is_empty())
+        };
+        if team_is_empty {
+            owner.by_team.remove(team_id);
+        }
+        reference
     }
 
     #[cfg(test)]
-    fn len_for_scope(&self, scope: &EligibleAccountRefScope) -> usize {
-        self.by_scope.get(scope).map_or(0, |refs| refs.len())
-    }
-}
-
-#[derive(Default)]
-struct EligibleListRateLimiter {
-    last_request_by_scope: DashMap<EligibleAccountRefScope, Instant>,
-}
-
-impl EligibleListRateLimiter {
-    fn allow_at(&self, scope: &EligibleAccountRefScope, now: Instant) -> bool {
-        self.last_request_by_scope.retain(|_, last_request| {
-            now.saturating_duration_since(*last_request) < ELIGIBLE_LIST_RATE_LIMIT_RETENTION
-        });
-        match self.last_request_by_scope.entry(scope.clone()) {
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(now);
-                true
-            }
-            dashmap::mapref::entry::Entry::Occupied(mut entry)
-                if now.saturating_duration_since(*entry.get()) >= ELIGIBLE_LIST_RATE_LIMIT =>
-            {
-                entry.insert(now);
-                true
-            }
-            dashmap::mapref::entry::Entry::Occupied(_) => false,
-        }
+    fn len_for_owner(&self, owner_user_id: &str) -> usize {
+        self.by_owner
+            .get(owner_user_id)
+            .map_or(0, |owner| owner.by_team.values().map(HashMap::len).sum())
     }
 }
 
@@ -289,9 +342,6 @@ pub struct TeamSessionService {
     /// Short-lived, single-use account references scoped to the listing owner
     /// and Team. Raw Core user IDs never cross the API boundary.
     eligible_account_refs: EligibleAccountRefStore,
-    /// Limits candidate-list requests per owner+Team so repeated GETs cannot
-    /// amplify database work while independent Teams remain usable.
-    eligible_list_rate_limiter: EligibleListRateLimiter,
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -423,7 +473,6 @@ impl TeamSessionService {
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
             eligible_account_refs: EligibleAccountRefStore::default(),
-            eligible_list_rate_limiter: EligibleListRateLimiter::default(),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
@@ -1049,16 +1098,21 @@ impl TeamSessionService {
         if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        let scope = EligibleAccountRefScope {
-            owner_user_id: owner_user_id.to_owned(),
-            team_id: team_id.to_owned(),
-        };
-        if !self.eligible_list_rate_limiter.allow_at(&scope, Instant::now()) {
+        let started_at = Instant::now();
+        if !self
+            .eligible_account_refs
+            .begin_listing(owner_user_id, started_at, now_ms())
+        {
             return Err(TeamError::RateLimited);
         }
         let issued_at = now_ms();
-        self.eligible_account_refs.prune_expired(issued_at);
         let candidates = self.repo.list_eligible_team_users(owner_user_id, team_id).await?;
+        ensure_candidate_count_supported(candidates.len())?;
+        self.eligible_account_refs
+            .ensure_capacity(owner_user_id, team_id, candidates.len(), now_ms())
+            .map_err(|EligibleAccountRefStoreError::OwnerQuotaReached| {
+                TeamError::EligibleCollaboratorQuotaReached
+            })?;
         let mut labels = HashSet::new();
         let mut refs = HashMap::new();
         let mut response = Vec::with_capacity(candidates.len());
@@ -1084,7 +1138,9 @@ impl TeamSessionService {
                 display_name,
             });
         }
-        self.eligible_account_refs.replace(scope, refs);
+        self.eligible_account_refs
+            .replace(owner_user_id, team_id, refs, now_ms())
+            .map_err(|EligibleAccountRefStoreError::OwnerQuotaReached| TeamError::EligibleCollaboratorQuotaReached)?;
         Ok(response)
     }
 
@@ -1120,15 +1176,10 @@ impl TeamSessionService {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
         let now = now_ms();
-        self.eligible_account_refs.prune_expired(now);
         let invalid_ref = || TeamError::InvalidRequest("Invalid or expired account reference".into());
-        let scope = EligibleAccountRefScope {
-            owner_user_id: owner_user_id.to_owned(),
-            team_id: team_id.to_owned(),
-        };
         let Some(reference) = self
             .eligible_account_refs
-            .take(&scope, account_ref)
+            .take(owner_user_id, team_id, account_ref, now)
         else {
             return Err(invalid_ref());
         };
@@ -5640,13 +5691,6 @@ mod eligible_collaborator_reference_tests {
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn scope(owner: &str, team: &str) -> EligibleAccountRefScope {
-        EligibleAccountRefScope {
-            owner_user_id: owner.into(),
-            team_id: team.into(),
-        }
-    }
-
     fn reference(user: &str, expires_at: TimestampMs) -> EligibleAccountRef {
         EligibleAccountRef {
             user_id: user.into(),
@@ -5658,13 +5702,12 @@ mod eligible_collaborator_reference_tests {
     #[test]
     fn repeated_refresh_replaces_grants_without_growing_scope_storage() {
         let store = EligibleAccountRefStore::default();
-        let scope = scope("owner", "team");
-        let other_scope = scope("owner", "other-team");
-        let other_ref = "other-ref".to_owned();
         store.replace(
-            other_scope.clone(),
-            HashMap::from([(other_ref.clone(), reference("other-user", 10_000))]),
-        );
+            "owner",
+            "other-team",
+            HashMap::from([("other-ref".into(), reference("other-user", 10_000))]),
+            100,
+        ).unwrap();
 
         for refresh in 0..1_000 {
             let refs = (0..3)
@@ -5673,24 +5716,26 @@ mod eligible_collaborator_reference_tests {
                     (account_ref.clone(), reference(&account_ref, 10_000))
                 })
                 .collect();
-            store.replace(scope.clone(), refs);
-            assert_eq!(store.len_for_scope(&scope), 3);
-            assert_eq!(store.len_for_scope(&other_scope), 1);
+            store.replace("owner", "team", refs, 100).unwrap();
+            assert_eq!(store.len_for_owner("owner"), 4);
         }
 
-        assert!(store.take(&scope, "refresh-0-candidate-0").is_none());
-        assert!(store.take(&other_scope, &other_ref).is_some());
+        assert!(store.take("owner", "team", "refresh-0-candidate-0", 100).is_none());
+        assert!(store.take("owner", "other-team", "other-ref", 100).is_some());
+        assert_eq!(store.len_for_owner("owner"), 3);
+        assert_eq!(store.len_for_owner("another-owner"), 0);
     }
 
     #[test]
     fn concurrent_consumers_can_take_a_scoped_reference_only_once() {
         let store = Arc::new(EligibleAccountRefStore::default());
-        let scope = scope("owner", "team");
         let account_ref = "single-use-ref".to_owned();
         store.replace(
-            scope.clone(),
+            "owner",
+            "team",
             HashMap::from([(account_ref.clone(), reference("user", 10_000))]),
-        );
+            100,
+        ).unwrap();
 
         let workers = 8;
         let barrier = Arc::new(Barrier::new(workers));
@@ -5698,13 +5743,12 @@ mod eligible_collaborator_reference_tests {
         std::thread::scope(|threads| {
             for _ in 0..workers {
                 let store = Arc::clone(&store);
-                let scope = scope.clone();
                 let account_ref = account_ref.clone();
                 let barrier = Arc::clone(&barrier);
                 let successes = Arc::clone(&successes);
                 threads.spawn(move || {
                     barrier.wait();
-                    if store.take(&scope, &account_ref).is_some() {
+                    if store.take("owner", "team", &account_ref, 100).is_some() {
                         successes.fetch_add(1, Ordering::SeqCst);
                     }
                 });
@@ -5714,15 +5758,13 @@ mod eligible_collaborator_reference_tests {
     }
 
     #[test]
-    fn concurrent_refreshes_keep_one_bounded_grant_set_per_scope() {
+    fn concurrent_team_refreshes_share_the_owner_reference_budget() {
         let store = Arc::new(EligibleAccountRefStore::default());
-        let scope = scope("owner", "team");
         let workers = 16;
         let barrier = Arc::new(Barrier::new(workers));
         std::thread::scope(|threads| {
             for worker in 0..workers {
                 let store = Arc::clone(&store);
-                let scope = scope.clone();
                 let barrier = Arc::clone(&barrier);
                 threads.spawn(move || {
                     let refs = (0..4)
@@ -5732,62 +5774,110 @@ mod eligible_collaborator_reference_tests {
                         })
                         .collect();
                     barrier.wait();
-                    store.replace(scope, refs);
+                    store
+                        .replace("owner", &format!("team-{worker}"), refs, 100)
+                        .unwrap();
                 });
             }
         });
-        assert_eq!(store.len_for_scope(&scope), 4);
+        assert_eq!(store.len_for_owner("owner"), workers * 4);
     }
 
     #[test]
-    fn concurrent_listing_rate_gate_admits_only_one_request_per_scope() {
-        let limiter = Arc::new(EligibleListRateLimiter::default());
-        let scope = scope("owner", "team");
+    fn concurrent_cross_team_listings_share_one_owner_rate_gate() {
+        let store = Arc::new(EligibleAccountRefStore::default());
         let workers = 16;
         let barrier = Arc::new(Barrier::new(workers));
         let admitted = Arc::new(AtomicUsize::new(0));
         let request_time = Instant::now();
         std::thread::scope(|threads| {
             for _ in 0..workers {
-                let limiter = Arc::clone(&limiter);
-                let scope = scope.clone();
+                let store = Arc::clone(&store);
                 let barrier = Arc::clone(&barrier);
                 let admitted = Arc::clone(&admitted);
                 threads.spawn(move || {
                     barrier.wait();
-                    if limiter.allow_at(&scope, request_time) {
+                    if store.begin_listing("owner", request_time, 100) {
                         admitted.fetch_add(1, Ordering::SeqCst);
                     }
                 });
             }
         });
         assert_eq!(admitted.load(Ordering::SeqCst), 1);
+        assert!(store.begin_listing("owner", request_time + ELIGIBLE_LIST_RATE_LIMIT, 100));
+        assert!(store.begin_listing("another-owner", request_time, 100));
     }
 
     #[test]
-    fn expiration_boundary_is_exclusive_and_listing_gate_allows_at_interval() {
+    fn owner_quota_is_aggregate_across_teams_and_does_not_evict_existing_refs() {
         let store = EligibleAccountRefStore::default();
-        let current_scope = scope("owner", "team");
-        store.replace(
-            current_scope.clone(),
-            HashMap::from([("boundary-ref".into(), reference("user", 200))]),
+        let initial_refs = (0..MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER)
+            .map(|index| {
+                let account_ref = format!("initial-{index}");
+                (account_ref.clone(), reference(&account_ref, 200))
+            })
+            .collect();
+        store.replace("owner", "team-a", initial_refs, 100).unwrap();
+        let overflow = HashMap::from([("overflow-ref".into(), reference("overflow-user", 200))]);
+        assert!(store.replace("owner", "team-b", overflow, 100).is_err());
+        assert_eq!(
+            store.len_for_owner("owner"),
+            MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER
         );
-        store.prune_expired(199);
-        assert_eq!(store.len_for_scope(&current_scope), 1);
-        store.prune_expired(200);
-        assert_eq!(store.len_for_scope(&current_scope), 0);
+        assert!(store.take("owner", "team-a", "initial-0", 100).is_some());
+        assert_eq!(
+            store.len_for_owner("owner"),
+            MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER - 1
+        );
+        assert!(store.replace(
+            "owner",
+            "team-b",
+            HashMap::from([("overflow-ref".into(), reference("overflow-user", 200))]),
+            100,
+        ).is_ok());
+        assert!(store.take("owner", "team-b", "overflow-ref", 100).is_some());
+    }
 
-        let limiter = EligibleListRateLimiter::default();
-        let initial = Instant::now();
-        assert!(limiter.allow_at(&current_scope, initial));
-        for _ in 0..1_000 {
-            assert!(!limiter.allow_at(&current_scope, initial));
-        }
-        assert!(!limiter.allow_at(
-            &current_scope,
-            initial + ELIGIBLE_LIST_RATE_LIMIT - Duration::from_nanos(1)
+    #[test]
+    fn candidate_cap_rejects_lists_above_limit_without_truncating() {
+        assert!(ensure_candidate_count_supported(
+            MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER
+        )
+        .is_ok());
+        assert!(matches!(
+            ensure_candidate_count_supported(
+                MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER + 1
+            ),
+            Err(TeamError::EligibleCollaboratorCandidateLimitExceeded)
         ));
-        assert!(limiter.allow_at(&current_scope, initial + ELIGIBLE_LIST_RATE_LIMIT));
-        assert!(limiter.allow_at(&scope("owner", "another-team"), initial));
+    }
+
+    #[test]
+    fn expired_refs_release_quota_without_affecting_other_owners_or_teams() {
+        let store = EligibleAccountRefStore::default();
+        store.replace(
+            "owner",
+            "team-a",
+            HashMap::from([("expires-at-boundary".into(), reference("user-a", 200))]),
+            100,
+        ).unwrap();
+        store.replace(
+            "owner",
+            "team-b",
+            HashMap::from([("other-team-ref".into(), reference("user-b", 300))]),
+            100,
+        ).unwrap();
+        store.replace(
+            "other-owner",
+            "team-a",
+            HashMap::from([("other-owner-ref".into(), reference("user-c", 300))]),
+            100,
+        ).unwrap();
+
+        assert!(store.take("owner", "team-a", "expires-at-boundary", 200).is_none());
+        assert_eq!(store.len_for_owner("owner"), 1);
+        assert!(store.take("owner", "team-b", "other-team-ref", 200).is_some());
+        assert!(store.take("other-owner", "team-a", "other-owner-ref", 200).is_some());
+        assert_eq!(store.len_for_owner("other-owner"), 0);
     }
 }

@@ -9,11 +9,18 @@ check. `POST /api/teams/{id}/members` accepts only a server-issued
 `account_ref`; it never accepts a database user ID.
 
 Each listing issues an opaque, owner- and Team-scoped reference that expires
-after five minutes and can be used once. A new listing replaces outstanding
-references for that owner+Team atomically; other owners and Teams keep their
+after five minutes and can be used once. A successful new listing replaces
+outstanding references for that owner+Team atomically; other owners and Teams keep their
 own reference sets. Candidate listing is limited in each Core process to one
-request per second per owner+Team and returns an actionable HTTP 429 response
-when refreshed sooner.
+request per second per owner across all Teams. Each owner may hold at most
+2,000 outstanding collaborator references across all Teams. If a complete
+candidate list would exceed this budget, the API returns an actionable HTTP
+429 and does not truncate or replace the existing choices; wait up to five
+minutes for old references to expire and retry. The owner-level state is
+accessed directly, without a per-request scan of all owners or Teams.
+If the host's active account directory itself contains more than 2,000 eligible
+candidates, listing returns a distinct actionable HTTP 429 asking the host
+administrator to reduce that directory; it never silently omits candidates.
 Add-member resolves that reference in process memory, reloads the eligible DB
 users, then inserts through a single-statement owner-scoped query that
 rechecks Team ownership, Shared mode, active user status, and existing

@@ -63,6 +63,24 @@ impl From<TeamError> for ApiError {
                 "Wait at least one second before refreshing eligible collaborators",
                 None,
             ),
+            TeamError::EligibleCollaboratorQuotaReached => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_COLLABORATOR_REFERENCE_QUOTA_REACHED",
+                concat!(
+                    "Too many collaborator choices are pending; ",
+                    "wait up to five minutes for old references to expire, then retry"
+                ),
+                None,
+            ),
+            TeamError::EligibleCollaboratorCandidateLimitExceeded => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_COLLABORATOR_CANDIDATE_LIMIT_EXCEEDED",
+                concat!(
+                    "Too many active accounts for this picker; ",
+                    "ask the host administrator to reduce the active account directory"
+                ),
+                None,
+            ),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
@@ -861,6 +879,22 @@ mod tests {
         assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(err.error_code(), "TEAM_COLLABORATOR_LIST_RATE_LIMITED");
         assert!(err.to_string().contains("one second"));
+    }
+
+    #[test]
+    fn collaborator_reference_quota_maps_to_expiry_guidance_429() {
+        let err: ApiError = TeamError::EligibleCollaboratorQuotaReached.into();
+        assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.error_code(), "TEAM_COLLABORATOR_REFERENCE_QUOTA_REACHED");
+        assert!(err.to_string().contains("five minutes"));
+    }
+
+    #[test]
+    fn collaborator_candidate_limit_maps_to_actionable_429() {
+        let err: ApiError = TeamError::EligibleCollaboratorCandidateLimitExceeded.into();
+        assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.error_code(), "TEAM_COLLABORATOR_CANDIDATE_LIMIT_EXCEEDED");
+        assert!(err.to_string().contains("host administrator"));
     }
 
     #[test]
