@@ -1086,13 +1086,15 @@ impl ITeamRepository for FullMockTeamRepo {
             .get(team_id)
             .into_iter()
             .flat_map(|members| members.iter())
-            .map(|(user_id, (membership_ref, display_name))| aionui_db::models::TeamMembershipRow {
-                membership_ref: membership_ref.clone(),
-                team_id: team_id.to_owned(),
-                user_id: user_id.clone(),
-                display_name: display_name.clone(),
-                created_at: aionui_common::now_ms(),
-            })
+            .map(
+                |(user_id, (membership_ref, display_name))| aionui_db::models::TeamMembershipRow {
+                    membership_ref: membership_ref.clone(),
+                    team_id: team_id.to_owned(),
+                    user_id: user_id.clone(),
+                    display_name: display_name.clone(),
+                    created_at: aionui_common::now_ms(),
+                },
+            )
             .collect())
     }
     async fn list_teams_by_member(&self, user_id: &str) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
@@ -1200,7 +1202,10 @@ impl ITeamRepository for FullMockTeamRepo {
             .unwrap()
             .entry(row.team_id.clone())
             .or_default()
-            .insert(row.user_id.clone(), (row.membership_ref.clone(), row.display_name.clone()));
+            .insert(
+                row.user_id.clone(),
+                (row.membership_ref.clone(), row.display_name.clone()),
+            );
         Ok(())
     }
 
