@@ -9981,7 +9981,8 @@ mod session_mentions_integration {
         // Authenticated local refs are limited to the caller's persisted data
         // tree. This fixture mirrors an uploaded conversation attachment and
         // needs no upload root or project binding.
-        let attachment_root = work_root.path().join("conversations/users/user_1/attachments");
+        let user_dir = aionui_common::user_dir_name("user_1").unwrap();
+        let attachment_root = work_root.path().join("conversations/users").join(user_dir).join("attachments");
         std::fs::create_dir_all(&attachment_root).unwrap();
         let attachment = attachment_root.join("auth.rs");
         std::fs::write(&attachment, "fn main() {}").unwrap();
