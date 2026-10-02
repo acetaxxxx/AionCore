@@ -7,7 +7,9 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, build_app_with_file_roots, json_with_token, setup_and_login};
+use common::{
+    body_json, build_app, build_app_with_file_roots, build_app_with_skill_paths, json_with_token, setup_and_login,
+};
 
 // ===========================================================================
 // Auth guard
@@ -384,6 +386,65 @@ async fn image_base64_with_workspace_field_accepts_non_home_path() {
 
     let json = body_json(resp).await;
     assert!(json["data"].as_str().unwrap().starts_with("data:image/png;base64,"));
+}
+
+#[tokio::test]
+async fn image_base64_personal_workspace_allows_owner_and_denies_other_user() {
+    let data_root = tempfile::tempdir().unwrap();
+    let (mut app, services, _) = build_app_with_skill_paths(data_root.path()).await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "image-owner", "StrongP@ss1").await;
+    let owner = services
+        .user_repo
+        .find_by_username("image-owner")
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace = data_root
+        .path()
+        .join("conversations/users")
+        .join(&owner.id)
+        .join("personal-workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let image_path = workspace.join("preview.png");
+    std::fs::write(&image_path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+    let request_body = json!({
+        "path": image_path.to_string_lossy(),
+        "workspace": workspace.to_string_lossy(),
+    });
+
+    let owner_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/image-base64",
+            request_body.clone(),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner_response.status(), StatusCode::OK);
+    let owner_json = body_json(owner_response).await;
+    assert!(
+        owner_json["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
+
+    let (collaborator_token, collaborator_csrf) =
+        setup_and_login(&mut app, &services, "image-collaborator", "StrongP@ss1").await;
+    let collaborator_response = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/image-base64",
+            request_body,
+            &collaborator_token,
+            &collaborator_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(collaborator_response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
