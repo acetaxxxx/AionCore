@@ -1,6 +1,6 @@
 use crate::error::DbError;
 use crate::models::{
-    EligibleTeamUserRow, MAX_ELIGIBLE_TEAM_USERS, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow,
+    EligibleTeamUserRow, MailboxMessageRow, TeamAccessRole, TeamMembershipRow, TeamRow,
     TeamSharingMode, TeamTaskRow,
 };
 
