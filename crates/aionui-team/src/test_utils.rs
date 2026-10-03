@@ -1330,6 +1330,36 @@ pub(crate) mod workspace_harness {
             self.repo.delete(user_id, conversation_id).await?;
             Ok(())
         }
+
+        async fn lookup_team_binding_by_conversation(
+            &self,
+            conversation_id: &str,
+        ) -> Result<Option<TeamConversationBindingLookup>, TeamError> {
+            let Some(user_id) = self.repo.owner_user_id(conversation_id).await? else {
+                return Ok(None);
+            };
+            let Some(row) = self.repo.get(&user_id, conversation_id).await? else {
+                return Ok(None);
+            };
+            let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+            let Some(team_id) = extra
+                .get("teamId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(TeamConversationBindingLookup {
+                conversation_id: row.id,
+                user_id: row.user_id,
+                team_id: Some(team_id),
+                slot_id: extra
+                    .get("slot_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                role: extra.get("role").and_then(serde_json::Value::as_str).map(str::to_owned),
+            }))
+        }
     }
 
     #[async_trait]
