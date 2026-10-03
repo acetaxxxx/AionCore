@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse, McpRuntimeSnapshot,
-    SetConfigOptionRequest, SetConfigOptionResponse, TeamMcpSelection,
+    AskQuestionAnswer, AssistantConversationRequest, ConfirmationListResponse, ConversationArtifactListResponse,
+    ConversationResponse, CreateConversationRequest, GetConfigOptionsResponse, ListMessagesQuery, McpRuntimeSnapshot,
+    MessageListResponse, MessageResponse, SetConfigOptionRequest, SetConfigOptionResponse, SlashCommandItem,
+    TeamMcpSelection,
 };
 use aionui_common::{AgentType, now_ms};
 use aionui_conversation::{
@@ -536,6 +538,100 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned))
+    }
+
+    async fn get_team_conversation(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationResponse, TeamError> {
+        self.conversation_service
+            .get(owner_user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn list_team_conversation_messages(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+        query: ListMessagesQuery,
+    ) -> Result<MessageListResponse, TeamError> {
+        self.conversation_service
+            .list_messages(owner_user_id, conversation_id, query)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn latest_team_conversation_message(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+        message_type: &str,
+    ) -> Result<Option<MessageResponse>, TeamError> {
+        self.conversation_service
+            .latest_message_of_type(owner_user_id, conversation_id, message_type)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn list_team_conversation_artifacts(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationArtifactListResponse, TeamError> {
+        self.conversation_service
+            .list_artifacts(owner_user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn team_conversation_slash_commands(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<SlashCommandItem>, TeamError> {
+        self.conversation_service
+            .get_slash_commands(owner_user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn team_conversation_usage(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<serde_json::Value>, TeamError> {
+        self.conversation_service
+            .get_usage(owner_user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn list_team_conversation_confirmations(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<ConfirmationListResponse, TeamError> {
+        self.conversation_service
+            .list_confirmations(owner_user_id, conversation_id, task_manager)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn answer_team_conversation_ask(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+        request_id: &str,
+        answers: Option<Vec<AskQuestionAnswer>>,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), TeamError> {
+        self.conversation_service
+            .answer_ask(owner_user_id, conversation_id, request_id, answers, task_manager)
+            .await
+            .map_err(map_conversation_update_error)
     }
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {

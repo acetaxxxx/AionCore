@@ -896,13 +896,40 @@ impl ConversationService {
         let Ok(root) = self.workspace_root.canonicalize() else {
             return false;
         };
-        let Ok(expected) = root.join("teams").join(team_id).canonicalize() else {
+        let teams_root = root.join("teams");
+        let Ok(teams_metadata) = std::fs::symlink_metadata(&teams_root) else {
+            return false;
+        };
+        if teams_metadata.file_type().is_symlink() || !teams_metadata.is_dir() {
+            return false;
+        }
+        let team_workspace = teams_root.join(team_id);
+        let Ok(team_metadata) = std::fs::symlink_metadata(&team_workspace) else {
+            return false;
+        };
+        if team_metadata.file_type().is_symlink() || !team_metadata.is_dir() {
+            return false;
+        }
+        let Ok(expected) = team_workspace.canonicalize() else {
             return false;
         };
         let Ok(candidate) = std::path::Path::new(candidate).canonicalize() else {
             return false;
         };
-        expected == candidate && candidate.starts_with(root.join("teams"))
+        // Recheck after canonicalization so a replaced Team directory symlink cannot
+        // make a sibling Team workspace appear to be this Team's workspace.
+        let Ok(teams_metadata) = std::fs::symlink_metadata(&teams_root) else {
+            return false;
+        };
+        let Ok(team_metadata) = std::fs::symlink_metadata(&team_workspace) else {
+            return false;
+        };
+        !teams_metadata.file_type().is_symlink()
+            && teams_metadata.is_dir()
+            && !team_metadata.file_type().is_symlink()
+            && team_metadata.is_dir()
+            && expected == candidate
+            && candidate.starts_with(teams_root)
     }
 
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
