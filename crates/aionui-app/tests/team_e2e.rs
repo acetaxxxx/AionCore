@@ -1118,6 +1118,414 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
 }
 
 #[tokio::test]
+async fn shared_team_file_endpoints_allow_active_members_and_reject_other_workspace_access() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (invitee_token, invitee_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss2").await;
+    let (outsider_token, outsider_csrf) = setup_and_login(&mut app, &services, "bob", "StrongP@ss3").await;
+    ensure_default_team_assistant(&mut app, &services, &owner_token, &owner_csrf).await;
+
+    let mut shared_body = two_agent_body();
+    shared_body["sharing_mode"] = json!("shared");
+    let created = app
+        .clone()
+        .oneshot(json_with_token("POST", "/api/teams", shared_body, &owner_token, &owner_csrf))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let team = body_json(created).await["data"].clone();
+    let team_id = team["id"].as_str().unwrap();
+    let workspace = team["workspace"].as_str().unwrap();
+    assert!(team.get("project_id").is_none());
+
+    let eligible = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/teams/eligible-collaborators?team_id={team_id}"),
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(eligible.status(), StatusCode::OK);
+    let account_ref = body_json(eligible).await["data"][0]["account_ref"]
+        .as_str()
+        .unwrap();
+    let added = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/members"),
+            json!({ "account_ref": account_ref }),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::CREATED);
+
+    let invitee_team = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &invitee_token))
+        .await
+        .unwrap();
+    assert_eq!(invitee_team.status(), StatusCode::OK);
+    let invitee_team = body_json(invitee_team).await["data"].clone();
+    assert_eq!(invitee_team["role"], "collaborator");
+    assert_eq!(invitee_team["workspace"], workspace);
+    assert!(invitee_team.get("project_id").is_none());
+
+    let workspace_path = std::path::Path::new(workspace);
+    std::fs::create_dir_all(workspace_path.join("docs")).unwrap();
+    std::fs::write(workspace_path.join("docs/readme.md"), "shared Team preview").unwrap();
+
+    let (project_id,): (String,) =
+        sqlx::query_as("SELECT project_id FROM teams WHERE id = ? AND project_id IS NOT NULL")
+            .bind(team_id)
+            .fetch_one(services.database.pool())
+            .await
+            .expect("Team has persisted project binding");
+    let owner_project = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/projects/{project_id}"), &owner_token))
+        .await
+        .unwrap();
+    assert_eq!(owner_project.status(), StatusCode::OK);
+    let pe_id = body_json(owner_project).await["data"]["explorer"]["workspace_pe_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    for (token, csrf) in [(&owner_token, &owner_csrf), (&invitee_token, &invitee_csrf)] {
+        let listing = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/fs/dir",
+                json!({ "dir": workspace, "root": workspace }),
+                token,
+                csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listing.status(), StatusCode::OK);
+        let listing_body = body_json(listing).await;
+        assert!(listing_body.to_string().contains("docs"));
+        assert!(listing_body.to_string().contains("readme.md"));
+
+        let flat_list = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/fs/list",
+                json!({ "root": workspace }),
+                token,
+                csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(flat_list.status(), StatusCode::OK);
+        assert!(body_json(flat_list).await.to_string().contains("docs/readme.md"));
+
+        let preview = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/fs/content",
+                json!({
+                    "file": {
+                        "kind": "local",
+                        "path": workspace_path.join("docs/readme.md").to_string_lossy().to_string()
+                    },
+                    "encoding": "utf8"
+                }),
+                token,
+                csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        assert_eq!(body_json(preview).await["data"], "shared Team preview");
+    }
+
+    // Owner project IDs and PE-addressed routes remain owner-only.
+    let project_denied = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/projects/{project_id}"), &invitee_token))
+        .await
+        .unwrap();
+    assert_eq!(project_denied.status(), StatusCode::NOT_FOUND);
+    let project_file_denied = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/content",
+            json!({
+                "file": { "kind": "project", "pe_id": pe_id, "relative_path": "docs/readme.md" },
+                "encoding": "utf8"
+            }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(project_file_denied.status(), StatusCode::NOT_FOUND);
+
+    let outsider_listing = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/dir",
+            json!({ "dir": workspace, "root": workspace }),
+            &outsider_token,
+            &outsider_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(outsider_listing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(outsider_listing).await["code"], "FORBIDDEN");
+    let outsider_flat_list = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/list",
+            json!({ "root": workspace }),
+            &outsider_token,
+            &outsider_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(outsider_flat_list.status(), StatusCode::FORBIDDEN);
+
+    let private_team = app
+        .clone()
+        .oneshot(json_with_token("POST", "/api/teams", two_agent_body(), &owner_token, &owner_csrf))
+        .await
+        .unwrap();
+    assert_eq!(private_team.status(), StatusCode::CREATED);
+    let private_workspace = body_json(private_team).await["data"]["workspace"].as_str().unwrap().to_owned();
+    std::fs::write(std::path::Path::new(&private_workspace).join("private.txt"), "private Team file").unwrap();
+    let private_access = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/dir",
+            json!({ "dir": private_workspace, "root": private_workspace }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(private_access.status(), StatusCode::FORBIDDEN);
+    let private_preview = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/content",
+            json!({
+                "file": {
+                    "kind": "local",
+                    "path": std::path::Path::new(&private_workspace)
+                        .join("private.txt")
+                        .to_string_lossy()
+                        .to_string()
+                },
+                "encoding": "utf8"
+            }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(private_preview.status(), StatusCode::FORBIDDEN);
+
+    // An active member of one Shared Team cannot use the same API against a different Shared Team.
+    let mut other_shared_body = two_agent_body();
+    other_shared_body["sharing_mode"] = json!("shared");
+    let other_team = app
+        .clone()
+        .oneshot(json_with_token("POST", "/api/teams", other_shared_body, &owner_token, &owner_csrf))
+        .await
+        .unwrap();
+    assert_eq!(other_team.status(), StatusCode::CREATED);
+    let other_workspace = body_json(other_team).await["data"]["workspace"].as_str().unwrap().to_owned();
+    std::fs::write(std::path::Path::new(&other_workspace).join("other-team.txt"), "other Team file").unwrap();
+    let wrong_team = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/dir",
+            json!({ "dir": other_workspace, "root": other_workspace }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_team.status(), StatusCode::FORBIDDEN);
+    let wrong_team_preview = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/content",
+            json!({
+                "file": {
+                    "kind": "local",
+                    "path": std::path::Path::new(&other_workspace)
+                        .join("other-team.txt")
+                        .to_string_lossy()
+                        .to_string()
+                },
+                "encoding": "utf8"
+            }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_team_preview.status(), StatusCode::FORBIDDEN);
+
+    // Tampering with the persisted Team workspace binding revokes path authorization.
+    sqlx::query("UPDATE teams SET workspace = '/tmp/not-this-team' WHERE id = ?")
+        .bind(team_id)
+        .execute(services.database.pool())
+        .await
+        .expect("corrupt persisted workspace binding");
+    let binding_mismatch = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/dir",
+            json!({ "dir": workspace, "root": workspace }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(binding_mismatch.status(), StatusCode::FORBIDDEN);
+    let binding_mismatch_preview = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/content",
+            json!({
+                "file": {
+                    "kind": "local",
+                    "path": workspace_path.join("docs/readme.md").to_string_lossy().to_string()
+                },
+                "encoding": "utf8"
+            }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(binding_mismatch_preview.status(), StatusCode::FORBIDDEN);
+    sqlx::query("UPDATE teams SET workspace = ? WHERE id = ?")
+        .bind(workspace)
+        .bind(team_id)
+        .execute(services.database.pool())
+        .await
+        .expect("restore Team workspace binding");
+
+    #[cfg(unix)]
+    {
+        let outside = workspace_path.parent().unwrap().join("foreign-team-secret.txt");
+        std::fs::write(&outside, "must remain outside the Team workspace").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace_path.join("outside-link.txt")).unwrap();
+        let listing = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/fs/dir",
+                json!({ "dir": workspace, "root": workspace }),
+                &invitee_token,
+                &invitee_csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listing.status(), StatusCode::OK);
+        assert!(!body_json(listing).await.to_string().contains("outside-link.txt"));
+        let preview = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/fs/content",
+                json!({
+                    "file": {
+                        "kind": "local",
+                        "path": workspace_path.join("outside-link.txt").to_string_lossy().to_string()
+                    }
+                }),
+                &invitee_token,
+                &invitee_csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::FORBIDDEN);
+    }
+
+    let members = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}/members"), &owner_token))
+        .await
+        .unwrap();
+    let membership_ref = body_json(members).await["data"][0]["membership_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let revoked = app
+        .clone()
+        .oneshot(delete_with_token(
+            &format!("/api/teams/{team_id}/members/{membership_ref}"),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let revoked_listing = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/dir",
+            json!({ "dir": workspace, "root": workspace }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked_listing.status(), StatusCode::FORBIDDEN);
+    let revoked_flat_list = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/list",
+            json!({ "root": workspace }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked_flat_list.status(), StatusCode::FORBIDDEN);
+    let revoked_preview = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/content",
+            json!({
+                "file": {
+                    "kind": "local",
+                    "path": workspace_path.join("docs/readme.md").to_string_lossy().to_string()
+                },
+                "encoding": "utf8"
+            }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked_preview.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn shared_team_ask_answers_are_scoped_to_active_lead_membership() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

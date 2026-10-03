@@ -135,6 +135,16 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
         let entry = entry.map_err(|e| FileError::Internal(format!("error reading directory entry: {e}")))?;
 
         let path = entry.path();
+        // The route authorizes the requested directory, not each child entry.
+        // Do not follow links while enumerating: a symlink could expose names
+        // from outside the authorized root in this tree response.
+        if entry
+            .file_type()
+            .map_err(|e| FileError::Internal(format!("cannot read directory entry type: {e}")))?
+            .is_symlink()
+        {
+            continue;
+        }
         let metadata = entry
             .metadata()
             .map_err(|e| FileError::Internal(format!("cannot read metadata for '{}': {e}", path.display())))?;
@@ -184,6 +194,12 @@ fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileErr
         };
 
         let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
         let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
 
         let name = entry.file_name().to_string_lossy().into_owned();
