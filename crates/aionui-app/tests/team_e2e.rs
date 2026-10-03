@@ -654,7 +654,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
             &invitee_csrf,
         ))
         .await
-    .unwrap();
+        .unwrap();
     assert_eq!(active_lease.status(), StatusCode::OK);
 
     let mut lead_extra: Value = serde_json::from_str(
@@ -733,11 +733,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
     assert_eq!(invitee_team["role"], "collaborator");
     assert_eq!(invitee_team["sharing_mode"], "shared");
 
-    let (
-        stored_team_workspace,
-        stored_team_agents,
-        team_execution_owner_id,
-    ): (String, String, String) =
+    let (stored_team_workspace, stored_team_agents, team_execution_owner_id): (String, String, String) =
         sqlx::query_as("SELECT workspace, agents, user_id FROM teams WHERE id = ?")
             .bind(team_id)
             .fetch_one(services.database.pool())
@@ -774,12 +770,11 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
             .is_shared_team_workspace(team_id, lead_workspace),
         "persisted Lead workspace must authorize as this exact Team's shared workspace"
     );
-    let conversation_execution_owner_id: String =
-        sqlx::query_scalar("SELECT user_id FROM conversations WHERE id = ?")
-            .bind(lead_conversation_id)
-            .fetch_one(services.database.pool())
-            .await
-            .expect("reload Lead execution owner before collaborator read");
+    let conversation_execution_owner_id: String = sqlx::query_scalar("SELECT user_id FROM conversations WHERE id = ?")
+        .bind(lead_conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .expect("reload Lead execution owner before collaborator read");
     assert_eq!(
         conversation_execution_owner_id, team_execution_owner_id,
         "Lead conversation binding must belong to the Team execution owner"
@@ -2020,9 +2015,7 @@ async fn es1c_team_conversations_carry_assistant_bound_mcp_snapshot() {
     let ensure_resp = app.clone().oneshot(ensure_req).await.unwrap();
     assert_eq!(ensure_resp.status(), StatusCode::OK);
 
-    // The noop agent fixture reports `/tmp/test` as its runtime workspace,
-    // which the first warmup persists and Windows cannot reuse on restart.
-    // Restore an existing path so this test keeps exercising MCP refresh.
+    // Restore an existing path before restart so this test keeps exercising MCP refresh.
     let valid_workspace = std::env::current_dir()
         .expect("current workspace")
         .to_string_lossy()

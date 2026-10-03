@@ -829,10 +829,7 @@ impl TeamSessionService {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
         if access.role == TeamAccessRole::Collaborator {
-            let Some(conversation_workspace) = self
-                .conversation_port
-                .conversation_workspace(conversation_id)
-                .await?
+            let Some(conversation_workspace) = self.conversation_port.conversation_workspace(conversation_id).await?
             else {
                 return Err(TeamError::TeamNotFound(team_id.to_owned()));
             };

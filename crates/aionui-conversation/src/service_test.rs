@@ -2060,19 +2060,14 @@ fn shared_team_workspace_authorization_rejects_symlinked_team_directory() {
 
     let temp = tempfile::tempdir().unwrap();
     let workspace_root = temp.path().join("aionui-data");
-    let (svc, _broadcaster, _repo, _task_mgr) =
-        make_service_with_workspace_root(workspace_root.clone());
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
 
     let team_workspace = svc.create_shared_team_workspace("team_123").unwrap();
     let sibling_workspace = svc.create_shared_team_workspace("team_456").unwrap();
     assert!(svc.is_shared_team_workspace("team_123", &team_workspace));
     assert!(svc.is_shared_team_workspace("team_123", &format!("{team_workspace}/.")));
 
-    let foreign_root_workspace = temp
-        .path()
-        .join("foreign-root")
-        .join("teams")
-        .join("team_123");
+    let foreign_root_workspace = temp.path().join("foreign-root").join("teams").join("team_123");
     std::fs::create_dir_all(&foreign_root_workspace).unwrap();
     let foreign_root_workspace = foreign_root_workspace.to_string_lossy();
     assert!(!svc.is_shared_team_workspace("team_123", &foreign_root_workspace));
@@ -2082,17 +2077,13 @@ fn shared_team_workspace_authorization_rejects_symlinked_team_directory() {
     assert!(!svc.is_shared_team_workspace("team_123", &sibling_workspace));
 
     let linked_root = temp.path().join("linked-data");
-    let (linked_svc, _broadcaster, _repo, _task_mgr) =
-        make_service_with_workspace_root(linked_root.clone());
+    let (linked_svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(linked_root.clone());
     linked_svc.create_shared_team_workspace("team_789").unwrap();
     let external_teams = temp.path().join("external-teams");
     std::fs::create_dir_all(external_teams.join("team_789")).unwrap();
     std::fs::rename(linked_root.join("teams"), linked_root.join("real-teams")).unwrap();
     symlink(&external_teams, linked_root.join("teams")).unwrap();
-    assert!(!linked_svc.is_shared_team_workspace(
-        "team_789",
-        &external_teams.join("team_789").to_string_lossy(),
-    ));
+    assert!(!linked_svc.is_shared_team_workspace("team_789", &external_teams.join("team_789").to_string_lossy(),));
 }
 
 #[cfg(unix)]
