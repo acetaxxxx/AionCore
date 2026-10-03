@@ -828,15 +828,31 @@ impl TeamSessionService {
         {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        if access.role == TeamAccessRole::Collaborator
-            && self
+        if access.role == TeamAccessRole::Collaborator {
+            let Some(conversation_workspace) = self
                 .conversation_port
                 .conversation_workspace(conversation_id)
                 .await?
-                .as_deref()
-                != Some(access.team.workspace.as_str())
-        {
-            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+            else {
+                return Err(TeamError::TeamNotFound(team_id.to_owned()));
+            };
+            // Creation may preserve an equivalent lexical alias in the
+            // conversation extra while the Team row stores the canonical
+            // path returned by shared-workspace provisioning. Authorize only
+            // when both values resolve to this Team's exact dedicated path.
+            // This keeps path identity strict without rejecting harmless
+            // aliases such as a trailing `/.`.
+            if !self
+                .conversation_port
+                .is_shared_team_workspace(team_id, &conversation_workspace)
+                .await?
+                || !self
+                    .conversation_port
+                    .is_shared_team_workspace(team_id, &access.team.workspace)
+                    .await?
+            {
+                return Err(TeamError::TeamNotFound(team_id.to_owned()));
+            }
         }
         Ok(access)
     }

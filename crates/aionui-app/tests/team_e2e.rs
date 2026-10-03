@@ -675,6 +675,10 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         json!([{ "headers": { "Authorization": "SELECTED_MCP_HEADER_SENTINEL" } }]);
     lead_extra["env"] = json!({ "TOKEN": "EXTRA_ENV_SENTINEL" });
     lead_extra["headers"] = json!({ "Authorization": "EXTRA_HEADER_SENTINEL" });
+    let team_workspace = team_data["workspace"].as_str().unwrap();
+    let equivalent_workspace_alias = format!("{team_workspace}/.");
+    assert_ne!(equivalent_workspace_alias, team_workspace);
+    lead_extra["workspace"] = json!(equivalent_workspace_alias);
     sqlx::query("UPDATE conversations SET extra = ? WHERE id = ?")
         .bind(lead_extra.to_string())
         .bind(lead_conversation_id)
@@ -734,7 +738,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
     let team_conversation_body = body_json(team_conversation).await;
     let conversation = team_conversation_body["data"].clone();
     assert_eq!(conversation["id"], lead_conversation_id);
-    assert_eq!(conversation["extra"]["workspace"], team_data["workspace"]);
+    assert_eq!(conversation["extra"]["workspace"], equivalent_workspace_alias);
     for sentinel in [
         "TEAM_MCP_BEARER_SENTINEL",
         "TEAM_MCP_ENV_SENTINEL",
