@@ -1129,7 +1129,13 @@ async fn shared_team_file_endpoints_allow_active_members_and_reject_other_worksp
     shared_body["sharing_mode"] = json!("shared");
     let created = app
         .clone()
-        .oneshot(json_with_token("POST", "/api/teams", shared_body, &owner_token, &owner_csrf))
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            shared_body,
+            &owner_token,
+            &owner_csrf,
+        ))
         .await
         .unwrap();
     assert_eq!(created.status(), StatusCode::CREATED);
@@ -1147,9 +1153,7 @@ async fn shared_team_file_endpoints_allow_active_members_and_reject_other_worksp
         .await
         .unwrap();
     assert_eq!(eligible.status(), StatusCode::OK);
-    let account_ref = body_json(eligible).await["data"][0]["account_ref"]
-        .as_str()
-        .unwrap();
+    let account_ref = body_json(eligible).await["data"][0]["account_ref"].as_str().unwrap();
     let added = app
         .clone()
         .oneshot(json_with_token(
@@ -1298,12 +1302,25 @@ async fn shared_team_file_endpoints_allow_active_members_and_reject_other_worksp
 
     let private_team = app
         .clone()
-        .oneshot(json_with_token("POST", "/api/teams", two_agent_body(), &owner_token, &owner_csrf))
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            two_agent_body(),
+            &owner_token,
+            &owner_csrf,
+        ))
         .await
         .unwrap();
     assert_eq!(private_team.status(), StatusCode::CREATED);
-    let private_workspace = body_json(private_team).await["data"]["workspace"].as_str().unwrap().to_owned();
-    std::fs::write(std::path::Path::new(&private_workspace).join("private.txt"), "private Team file").unwrap();
+    let private_workspace = body_json(private_team).await["data"]["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::fs::write(
+        std::path::Path::new(&private_workspace).join("private.txt"),
+        "private Team file",
+    )
+    .unwrap();
     let private_access = app
         .clone()
         .oneshot(json_with_token(
@@ -1343,12 +1360,25 @@ async fn shared_team_file_endpoints_allow_active_members_and_reject_other_worksp
     other_shared_body["sharing_mode"] = json!("shared");
     let other_team = app
         .clone()
-        .oneshot(json_with_token("POST", "/api/teams", other_shared_body, &owner_token, &owner_csrf))
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            other_shared_body,
+            &owner_token,
+            &owner_csrf,
+        ))
         .await
         .unwrap();
     assert_eq!(other_team.status(), StatusCode::CREATED);
-    let other_workspace = body_json(other_team).await["data"]["workspace"].as_str().unwrap().to_owned();
-    std::fs::write(std::path::Path::new(&other_workspace).join("other-team.txt"), "other Team file").unwrap();
+    let other_workspace = body_json(other_team).await["data"]["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::fs::write(
+        std::path::Path::new(&other_workspace).join("other-team.txt"),
+        "other Team file",
+    )
+    .unwrap();
     let wrong_team = app
         .clone()
         .oneshot(json_with_token(
