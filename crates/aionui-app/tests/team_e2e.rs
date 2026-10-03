@@ -648,6 +648,31 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         .unwrap();
     assert_eq!(active_lease.status(), StatusCode::OK);
 
+    let mut lead_extra: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>("SELECT extra FROM conversations WHERE id = ?")
+            .bind(lead_conversation_id)
+            .fetch_one(services.database.pool())
+            .await
+            .expect("load Team Lead conversation extra after runtime startup"),
+    )
+    .expect("parse Team Lead conversation extra");
+    lead_extra["team_mcp_stdio_config"] = json!({
+        "token": "TEAM_MCP_BEARER_SENTINEL",
+        "env": { "TOKEN": "TEAM_MCP_ENV_SENTINEL" },
+        "headers": { "Authorization": "TEAM_MCP_HEADER_SENTINEL" }
+    });
+    lead_extra["session_mcp_servers"] = json!([{ "env": { "TOKEN": "SESSION_MCP_ENV_SENTINEL" } }]);
+    lead_extra["selected_session_mcp_servers"] =
+        json!([{ "headers": { "Authorization": "SELECTED_MCP_HEADER_SENTINEL" } }]);
+    lead_extra["env"] = json!({ "TOKEN": "EXTRA_ENV_SENTINEL" });
+    lead_extra["headers"] = json!({ "Authorization": "EXTRA_HEADER_SENTINEL" });
+    sqlx::query("UPDATE conversations SET extra = ? WHERE id = ?")
+        .bind(lead_extra.to_string())
+        .bind(lead_conversation_id)
+        .execute(services.database.pool())
+        .await
+        .expect("seed secret-bearing Team runtime extra");
+
     let config_options = app
         .clone()
         .oneshot(get_with_token(
@@ -667,9 +692,36 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         .await
         .unwrap();
     assert_eq!(team_conversation.status(), StatusCode::OK);
-    let conversation = body_json(team_conversation).await["data"].clone();
+    let team_conversation_body = body_json(team_conversation).await;
+    let conversation = team_conversation_body["data"].clone();
     assert_eq!(conversation["id"], lead_conversation_id);
     assert_eq!(conversation["extra"]["workspace"], team_data["workspace"]);
+    for sentinel in [
+        "TEAM_MCP_BEARER_SENTINEL",
+        "TEAM_MCP_ENV_SENTINEL",
+        "TEAM_MCP_HEADER_SENTINEL",
+        "SESSION_MCP_ENV_SENTINEL",
+        "SELECTED_MCP_HEADER_SENTINEL",
+        "EXTRA_ENV_SENTINEL",
+        "EXTRA_HEADER_SENTINEL",
+        "team_mcp_stdio_config",
+        "session_mcp_servers",
+        "selected_session_mcp_servers",
+    ] {
+        assert!(!team_conversation_body.to_string().contains(sentinel), "Team response leaked {sentinel}");
+    }
+
+    let worker_conversation_id = team_data["assistants"][1]["conversation_id"].as_str().unwrap();
+    let worker_conversation = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/teams/{team_id}/conversations/{worker_conversation_id}"),
+            &invitee_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(worker_conversation.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(worker_conversation).await["code"], "NOT_FOUND");
 
     let team_messages = app
         .clone()
@@ -722,6 +774,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         .await
         .unwrap();
     assert_eq!(direct_conversation.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(direct_conversation).await["code"], "NOT_FOUND");
     let direct_confirmations = app
         .clone()
         .oneshot(get_with_token(
@@ -731,6 +784,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         .await
         .unwrap();
     assert_eq!(direct_confirmations.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(direct_confirmations).await["code"], "NOT_FOUND");
 
     let owner_setting_mutation = app
         .clone()
@@ -744,6 +798,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         .await
         .unwrap();
     assert_eq!(owner_setting_mutation.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(owner_setting_mutation).await["code"], "NOT_FOUND");
 
     let denied_team = app
         .clone()
@@ -751,6 +806,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         .await
         .unwrap();
     assert_eq!(denied_team.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(denied_team).await["code"], "NOT_FOUND");
     let denied_conversation = app
         .clone()
         .oneshot(get_with_token(
@@ -760,10 +816,12 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         .await
         .unwrap();
     assert_eq!(denied_conversation.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(denied_conversation).await["code"], "NOT_FOUND");
     for suffix in ["/messages", "/messages/latest?type=user", "/confirmations", "/artifacts"] {
         let path = format!("/api/teams/{team_id}/conversations/{lead_conversation_id}{suffix}");
         let response = app.clone().oneshot(get_with_token(&path, &nonmember_token)).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "outsider read leaked at {path}");
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND", "unstable error code at {path}");
     }
     let denied_session = app
         .clone()
@@ -838,6 +896,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         );
         let response = app.clone().oneshot(get_with_token(&path, &invitee_token)).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "private Team read leaked at {path}");
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND", "unstable error code at {path}");
     }
     for suffix in [
         "",
@@ -850,6 +909,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         let path = format!("/api/teams/{team_id}/conversations/{private_lead_conversation_id}{suffix}");
         let response = app.clone().oneshot(get_with_token(&path, &invitee_token)).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "cross-Team read leaked at {path}");
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND", "unstable error code at {path}");
     }
 
     let member_response = app
@@ -893,6 +953,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         };
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "revoked collaborator retained access to {uri}");
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND", "unstable error code at {uri}");
     }
 }
 

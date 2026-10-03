@@ -424,6 +424,13 @@ pub struct TeamSessionService {
 }
 
 impl TeamSessionService {
+    fn team_membership_lock(&self, team_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<dyn ITeamRepository>,
@@ -835,6 +842,19 @@ impl TeamSessionService {
         Ok(access)
     }
 
+    async fn lock_authorized_rostered_conversation(
+        &self,
+        actor_user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, TeamAuthorizationContext), TeamError> {
+        let guard = self.team_membership_lock(team_id).lock_owned().await;
+        let access = self
+            .authorize_rostered_conversation(actor_user_id, team_id, conversation_id)
+            .await?;
+        Ok((guard, access))
+    }
+
     pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
         let row = self
             .repo
@@ -1013,12 +1033,7 @@ impl TeamSessionService {
         team_id: &str,
         active_leases: &ActiveLeaseRegistry,
     ) -> Result<(), TeamError> {
-        let membership_lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _membership_guard = membership_lock.lock().await;
+        let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let access = self.authorize_team(user_id, team_id).await?;
         let team = Team::from_row(&access.team)?;
 
@@ -1346,12 +1361,7 @@ impl TeamSessionService {
         membership_ref: &str,
     ) -> Result<(), TeamError> {
         self.load_owned_team_row(owner_user_id, team_id).await?;
-        let membership_lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _membership_guard = membership_lock.lock().await;
+        let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let member_user_id = self
             .repo
             .list_team_members(team_id)
@@ -2018,12 +2028,7 @@ impl TeamSessionService {
     }
 
     async fn ensure_session_inner(&self, team_id: &str, requested_user_id: Option<&str>) -> Result<(), TeamError> {
-        let membership_lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let membership_guard = membership_lock.lock().await;
+        let membership_guard = self.team_membership_lock(team_id).lock_owned().await;
 
         // When a request supplies its authenticated actor, recheck membership
         // under the same lock used by member removal. Startup restoration has
@@ -2399,12 +2404,7 @@ impl TeamSessionService {
         )
         .await;
 
-        let membership_lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _membership_guard = membership_lock.lock().await;
+        let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let current_agents = match self.repo.get_team(user_id, team_id).await? {
             Some(row) => Team::from_row(&row)?.agents,
             None => return Err(TeamError::TeamNotFound(team_id.to_owned())),
@@ -2495,8 +2495,8 @@ impl TeamSessionService {
         team_id: &str,
         conversation_id: &str,
     ) -> Result<GetConfigOptionsResponse, TeamError> {
-        let access = self
-            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+        let (_membership_guard, access) = self
+            .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
         let team = Team::from_row(&access.team)?;
         let member = team
@@ -2517,12 +2517,14 @@ impl TeamSessionService {
         team_id: &str,
         conversation_id: &str,
     ) -> Result<ConversationResponse, TeamError> {
-        let access = self
-            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+        let (_membership_guard, access) = self
+            .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
-        self.conversation_port
+        let conversation = self
+            .conversation_port
             .get_team_conversation(&access.execution_owner_id, conversation_id)
-            .await
+            .await?;
+        Ok(safe_team_conversation_projection(conversation, team_id))
     }
 
     pub async fn list_team_conversation_messages(
@@ -2532,8 +2534,8 @@ impl TeamSessionService {
         conversation_id: &str,
         query: ListMessagesQuery,
     ) -> Result<MessageListResponse, TeamError> {
-        let access = self
-            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+        let (_membership_guard, access) = self
+            .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
         self.conversation_port
             .list_team_conversation_messages(&access.execution_owner_id, conversation_id, query)
@@ -2547,8 +2549,8 @@ impl TeamSessionService {
         conversation_id: &str,
         message_type: &str,
     ) -> Result<Option<MessageResponse>, TeamError> {
-        let access = self
-            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+        let (_membership_guard, access) = self
+            .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
         self.conversation_port
             .latest_team_conversation_message(&access.execution_owner_id, conversation_id, message_type)
@@ -2561,8 +2563,8 @@ impl TeamSessionService {
         team_id: &str,
         conversation_id: &str,
     ) -> Result<ConversationArtifactListResponse, TeamError> {
-        let access = self
-            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+        let (_membership_guard, access) = self
+            .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
         self.conversation_port
             .list_team_conversation_artifacts(&access.execution_owner_id, conversation_id)
@@ -2575,8 +2577,8 @@ impl TeamSessionService {
         team_id: &str,
         conversation_id: &str,
     ) -> Result<Vec<SlashCommandItem>, TeamError> {
-        let access = self
-            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+        let (_membership_guard, access) = self
+            .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
         self.conversation_port
             .team_conversation_slash_commands(&access.execution_owner_id, conversation_id)
@@ -2589,8 +2591,8 @@ impl TeamSessionService {
         team_id: &str,
         conversation_id: &str,
     ) -> Result<Option<serde_json::Value>, TeamError> {
-        let access = self
-            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+        let (_membership_guard, access) = self
+            .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
         self.conversation_port
             .team_conversation_usage(&access.execution_owner_id, conversation_id)
@@ -2603,8 +2605,8 @@ impl TeamSessionService {
         team_id: &str,
         conversation_id: &str,
     ) -> Result<ConfirmationListResponse, TeamError> {
-        let access = self
-            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+        let (_membership_guard, access) = self
+            .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
         self.conversation_port
             .list_team_conversation_confirmations(
@@ -2905,12 +2907,7 @@ impl TeamSessionService {
     }
 
     pub(crate) async fn refresh_member_runtime_status(&self, expected: &TeamSession) {
-        let membership_lock = self
-            .add_agent_locks
-            .entry(expected.team_id().to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _membership_guard = membership_lock.lock().await;
+        let _membership_guard = self.team_membership_lock(expected.team_id()).lock_owned().await;
         let Ok(Some(row)) = self.repo.get_team(expected.user_id(), expected.team_id()).await else {
             return;
         };
@@ -3256,13 +3253,8 @@ impl TeamSessionService {
         let (content, files) = self
             .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
             .await?;
-        let membership_lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
         // Serialize final membership validation and enqueue with member removal.
-        let _membership_guard = membership_lock.lock().await;
+        let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let current_access = self.authorize_team(user_id, team_id).await?;
         if current_access.execution_owner_id != access.execution_owner_id {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
@@ -3311,12 +3303,7 @@ impl TeamSessionService {
         let (content, files) = self
             .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
             .await?;
-        let membership_lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _membership_guard = membership_lock.lock().await;
+        let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let current_access = self.authorize_team(user_id, team_id).await?;
         if current_access.execution_owner_id != access.execution_owner_id {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
@@ -4067,6 +4054,62 @@ impl TeamSessionService {
             .wake_leader_after_recovery_message(source_slot_id, source)
             .await
     }
+}
+
+fn safe_team_conversation_projection(
+    mut conversation: ConversationResponse,
+    team_id: &str,
+) -> ConversationResponse {
+    let mut safe_extra = serde_json::Map::new();
+
+    // Keep only the scalar display/runtime metadata consumed by Team UI. Never
+    // copy arbitrary nested values out of the persisted `extra` object: it also
+    // stores MCP credentials and per-session environment/header configuration.
+    for key in ["workspace", "session_mode", "backend", "agent_name", "current_model_id", "current_model_label"] {
+        if let Some(value) = conversation.extra.get(key).and_then(serde_json::Value::as_str) {
+            safe_extra.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+        }
+    }
+    for key in ["skills", "mcp_servers"] {
+        if let Some(values) = conversation.extra.get(key).and_then(serde_json::Value::as_array) {
+            let safe_values = values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|value| serde_json::Value::String(value.to_owned()))
+                .collect();
+            safe_extra.insert(key.to_owned(), serde_json::Value::Array(safe_values));
+        }
+    }
+    if let Some(value) = conversation
+        .extra
+        .get("is_temporary_workspace")
+        .and_then(serde_json::Value::as_bool)
+    {
+        safe_extra.insert("is_temporary_workspace".to_owned(), serde_json::Value::Bool(value));
+    }
+    if let Some(statuses) = conversation.extra.get("mcp_statuses").and_then(serde_json::Value::as_array) {
+        let safe_statuses = statuses
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .map(|status| {
+                let mut safe_status = serde_json::Map::new();
+                for key in ["id", "name", "status"] {
+                    if let Some(value) = status.get(key).and_then(serde_json::Value::as_str) {
+                        safe_status.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+                    }
+                }
+                serde_json::Value::Object(safe_status)
+            })
+            .collect();
+        safe_extra.insert("mcp_statuses".to_owned(), serde_json::Value::Array(safe_statuses));
+    }
+    safe_extra.insert("team_id".to_owned(), serde_json::Value::String(team_id.to_owned()));
+    safe_extra.insert("teamId".to_owned(), serde_json::Value::String(team_id.to_owned()));
+    conversation.extra = serde_json::Value::Object(safe_extra);
+    conversation.project_id = None;
+    conversation.fork_capability = None;
+    conversation.prompt_capability = None;
+    conversation
 }
 
 async fn set_active_agent_session_mode(instance: &AgentInstance, mode: &str) -> Result<(), AgentError> {
@@ -5894,6 +5937,28 @@ mod tests {
             .expect_err("team config options must reject cross-user access");
 
         assert!(matches!(err, crate::error::TeamError::TeamNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn team_membership_lock_serializes_rostered_reads_with_revoke() {
+        let (service, _repo, _task_manager, _conversation_repo) =
+            setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let revoke_lock = service.team_membership_lock("team-serial");
+        let read_lock = service.team_membership_lock("team-serial");
+        assert!(Arc::ptr_eq(&revoke_lock, &read_lock));
+
+        let revoke_guard = revoke_lock.lock_owned().await;
+        let (read_acquired_tx, mut read_acquired_rx) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            let _read_guard = read_lock.lock_owned().await;
+            read_acquired_tx.send(()).unwrap();
+        });
+
+        tokio::task::yield_now().await;
+        assert!(read_acquired_rx.try_recv().is_err(), "read must wait while revoke owns the Team lock");
+        drop(revoke_guard);
+        read_acquired_rx.await.unwrap();
+        reader.await.unwrap();
     }
 
     #[test]
