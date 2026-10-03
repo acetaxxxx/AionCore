@@ -759,6 +759,21 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
     assert_eq!(current_lead_extra["teamId"], team_id);
     assert_eq!(current_lead_extra["role"], "lead");
     assert_eq!(current_lead_extra["workspace"], stored_team_workspace);
+    let lead_workspace = current_lead_extra["workspace"]
+        .as_str()
+        .expect("Lead binding contains its persisted workspace");
+    assert!(
+        services
+            .conversation_service
+            .is_shared_team_workspace(team_id, &stored_team_workspace),
+        "persisted Team workspace must authorize as this exact Team's shared workspace"
+    );
+    assert!(
+        services
+            .conversation_service
+            .is_shared_team_workspace(team_id, lead_workspace),
+        "persisted Lead workspace must authorize as this exact Team's shared workspace"
+    );
     let conversation_execution_owner_id: String =
         sqlx::query_scalar("SELECT user_id FROM conversations WHERE id = ?")
             .bind(lead_conversation_id)
@@ -769,6 +784,19 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         conversation_execution_owner_id, team_execution_owner_id,
         "Lead conversation binding must belong to the Team execution owner"
     );
+    let owner_backed_lookup_user_id = services
+        .conversation_repo
+        .owner_user_id(lead_conversation_id)
+        .await
+        .expect("resolve Lead owner for binding lookup")
+        .expect("Lead owner exists for binding lookup");
+    assert_eq!(owner_backed_lookup_user_id, team_execution_owner_id);
+    let owner_backed_conversation = services
+        .conversation_repo
+        .get(&owner_backed_lookup_user_id, lead_conversation_id)
+        .await
+        .expect("load Lead through the owner-backed binding lookup");
+    assert!(owner_backed_conversation.is_some());
 
     let team_conversation = app
         .clone()
