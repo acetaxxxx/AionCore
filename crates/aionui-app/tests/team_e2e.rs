@@ -733,8 +733,12 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
     assert_eq!(invitee_team["role"], "collaborator");
     assert_eq!(invitee_team["sharing_mode"], "shared");
 
-    let (stored_team_workspace, stored_team_agents): (String, String) =
-        sqlx::query_as("SELECT workspace, agents FROM teams WHERE id = ?")
+    let (
+        stored_team_workspace,
+        stored_team_agents,
+        team_execution_owner_id,
+    ): (String, String, String) =
+        sqlx::query_as("SELECT workspace, agents, user_id FROM teams WHERE id = ?")
             .bind(team_id)
             .fetch_one(services.database.pool())
             .await
@@ -755,6 +759,16 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
     assert_eq!(current_lead_extra["teamId"], team_id);
     assert_eq!(current_lead_extra["role"], "lead");
     assert_eq!(current_lead_extra["workspace"], stored_team_workspace);
+    let conversation_execution_owner_id: String =
+        sqlx::query_scalar("SELECT user_id FROM conversations WHERE id = ?")
+            .bind(lead_conversation_id)
+            .fetch_one(services.database.pool())
+            .await
+            .expect("reload Lead execution owner before collaborator read");
+    assert_eq!(
+        conversation_execution_owner_id, team_execution_owner_id,
+        "Lead conversation binding must belong to the Team execution owner"
+    );
 
     let team_conversation = app
         .clone()
