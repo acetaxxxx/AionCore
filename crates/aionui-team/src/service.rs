@@ -5938,7 +5938,7 @@ mod tests {
             .await
             .expect_err("non-member conversation must be rejected");
 
-        assert!(matches!(err, crate::error::TeamError::AgentNotFound(_)));
+        assert!(matches!(err, crate::error::TeamError::TeamNotFound(_)));
     }
 
     #[tokio::test]
