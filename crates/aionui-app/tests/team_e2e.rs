@@ -701,6 +701,18 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         "mock-model"
     );
 
+    let owner_team_conversation = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/teams/{team_id}/conversations/{lead_conversation_id}"),
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner_team_conversation.status(), StatusCode::OK);
+    let owner_team_conversation = body_json(owner_team_conversation).await;
+    assert_eq!(owner_team_conversation["data"]["id"], lead_conversation_id);
+
     let team_conversation = app
         .clone()
         .oneshot(get_with_token(
