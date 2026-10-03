@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, EligibleTeamCollaboratorResponse,
-    GetConfigOptionsResponse, InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse,
+    AddAgentRequest, AssistantMcpBindingChanged, ConfirmationListResponse, ConversationArtifactListResponse,
+    ConversationResponse, CreateTeamRequest, EligibleTeamCollaboratorResponse, GetConfigOptionsResponse,
+    InterruptTeamAgentRequest, ListMessagesQuery, MessageListResponse, MessageResponse, SetConfigOptionRequest,
+    SetConfigOptionResponse, SlashCommandItem,
     TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamContextResetAvailability, TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus,
     TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamMemberResponse, TeamResponse, TeamRunAckResponse,
@@ -787,6 +789,52 @@ impl TeamSessionService {
         })
     }
 
+    async fn authorize_rostered_conversation(
+        &self,
+        actor_user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+    ) -> Result<TeamAuthorizationContext, TeamError> {
+        let access = self.authorize_team(actor_user_id, team_id).await?;
+        let team = Team::from_row(&access.team)?;
+        let Some(agent) = team
+            .agents
+            .iter()
+            .find(|agent| agent.conversation_id == conversation_id)
+        else {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        };
+        if access.role == TeamAccessRole::Collaborator && agent.role != TeammateRole::Lead {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let Some(binding) = self
+            .conversation_port
+            .lookup_team_binding_by_conversation(conversation_id)
+            .await?
+        else {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        };
+        let expected_role = agent.role.to_string();
+        if binding.user_id != access.execution_owner_id
+            || binding.team_id.as_deref() != Some(team_id)
+            || binding.slot_id.as_deref() != Some(agent.slot_id.as_str())
+            || binding.role.as_deref() != Some(expected_role.as_str())
+        {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        if access.role == TeamAccessRole::Collaborator
+            && self
+                .conversation_port
+                .conversation_workspace(conversation_id)
+                .await?
+                .as_deref()
+                != Some(access.team.workspace.as_str())
+        {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        Ok(access)
+    }
+
     pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
         let row = self
             .repo
@@ -965,7 +1013,14 @@ impl TeamSessionService {
         team_id: &str,
         active_leases: &ActiveLeaseRegistry,
     ) -> Result<(), TeamError> {
-        let team = self.load_owned_team(user_id, team_id).await?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _membership_guard = membership_lock.lock().await;
+        let access = self.authorize_team(user_id, team_id).await?;
+        let team = Team::from_row(&access.team)?;
 
         let conversation_ids = team
             .agents
@@ -1959,7 +2014,6 @@ impl TeamSessionService {
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
     pub async fn ensure_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
-        self.load_owned_team_row(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await
     }
 
@@ -2441,19 +2495,124 @@ impl TeamSessionService {
         team_id: &str,
         conversation_id: &str,
     ) -> Result<GetConfigOptionsResponse, TeamError> {
-        let row = self.load_owned_team_row(user_id, team_id).await?;
-
-        let team = Team::from_row(&row)?;
+        let access = self
+            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+            .await?;
+        let team = Team::from_row(&access.team)?;
         let member = team
             .agents
             .iter()
             .find(|agent| agent.conversation_id == conversation_id)
-            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
         if self.member_runtime_is_starting(team_id, &member.slot_id) {
             return Err(Self::member_runtime_starting_error(team_id, member));
         }
 
         self.conversation_port.get_config_options(conversation_id).await
+    }
+
+    pub async fn get_team_conversation(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationResponse, TeamError> {
+        let access = self
+            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+            .await?;
+        self.conversation_port
+            .get_team_conversation(&access.execution_owner_id, conversation_id)
+            .await
+    }
+
+    pub async fn list_team_conversation_messages(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+        query: ListMessagesQuery,
+    ) -> Result<MessageListResponse, TeamError> {
+        let access = self
+            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+            .await?;
+        self.conversation_port
+            .list_team_conversation_messages(&access.execution_owner_id, conversation_id, query)
+            .await
+    }
+
+    pub async fn latest_team_conversation_message(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+        message_type: &str,
+    ) -> Result<Option<MessageResponse>, TeamError> {
+        let access = self
+            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+            .await?;
+        self.conversation_port
+            .latest_team_conversation_message(&access.execution_owner_id, conversation_id, message_type)
+            .await
+    }
+
+    pub async fn list_team_conversation_artifacts(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationArtifactListResponse, TeamError> {
+        let access = self
+            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+            .await?;
+        self.conversation_port
+            .list_team_conversation_artifacts(&access.execution_owner_id, conversation_id)
+            .await
+    }
+
+    pub async fn team_conversation_slash_commands(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<SlashCommandItem>, TeamError> {
+        let access = self
+            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+            .await?;
+        self.conversation_port
+            .team_conversation_slash_commands(&access.execution_owner_id, conversation_id)
+            .await
+    }
+
+    pub async fn team_conversation_usage(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<serde_json::Value>, TeamError> {
+        let access = self
+            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+            .await?;
+        self.conversation_port
+            .team_conversation_usage(&access.execution_owner_id, conversation_id)
+            .await
+    }
+
+    pub async fn list_team_conversation_confirmations(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConfirmationListResponse, TeamError> {
+        let access = self
+            .authorize_rostered_conversation(user_id, team_id, conversation_id)
+            .await?;
+        self.conversation_port
+            .list_team_conversation_confirmations(
+                &access.execution_owner_id,
+                conversation_id,
+                &self.task_manager,
+            )
+            .await
     }
 
     pub async fn set_conversation_config_option(

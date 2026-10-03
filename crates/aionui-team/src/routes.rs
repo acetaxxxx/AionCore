@@ -11,7 +11,8 @@ use axum::routing::{get, post, put};
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, AddTeamMemberRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest,
-    CreateTeamRequest, EligibleTeamCollaboratorResponse, GetConfigOptionsResponse, InterruptTeamAgentRequest,
+    ConfirmationListResponse, ConversationResponse, CreateTeamRequest, EligibleTeamCollaboratorResponse,
+    GetConfigOptionsResponse, InterruptTeamAgentRequest, ListMessagesQuery,
     PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, ReplaceTeamMcpAllowlistRequest,
     SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
@@ -252,6 +253,34 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options",
             get(get_conversation_config_options),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}",
+            get(get_team_conversation),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/confirmations",
+            get(list_team_conversation_confirmations),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/messages",
+            get(list_team_conversation_messages),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/messages/latest",
+            get(latest_team_conversation_message),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/artifacts",
+            get(list_team_conversation_artifacts),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/slash-commands",
+            get(team_conversation_slash_commands),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/usage",
+            get(team_conversation_usage),
         )
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options/{option_id}",
@@ -756,6 +785,97 @@ async fn get_conversation_config_options(
             .get_conversation_config_options(&user.id, &id, &conversation_id)
             .await?,
     )))
+}
+
+async fn get_team_conversation(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<ConversationResponse>>, ApiError> {
+    let conversation = state
+        .service
+        .get_team_conversation(&user.id, &id, &conversation_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(conversation)))
+}
+
+async fn list_team_conversation_confirmations(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<ConfirmationListResponse>>, ApiError> {
+    let confirmations = state
+        .service
+        .list_team_conversation_confirmations(&user.id, &id, &conversation_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(confirmations)))
+}
+
+async fn list_team_conversation_messages(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id)): Path<(String, String)>,
+    Query(query): Query<ListMessagesQuery>,
+) -> Result<Json<ApiResponse<aionui_api_types::MessageListResponse>>, ApiError> {
+    let messages = state
+        .service
+        .list_team_conversation_messages(&user.id, &id, &conversation_id, query)
+        .await?;
+    Ok(Json(ApiResponse::ok(messages)))
+}
+
+#[derive(serde::Deserialize)]
+struct LatestTeamConversationMessageQuery {
+    r#type: String,
+}
+
+async fn latest_team_conversation_message(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id)): Path<(String, String)>,
+    Query(query): Query<LatestTeamConversationMessageQuery>,
+) -> Result<Json<ApiResponse<Option<aionui_api_types::MessageResponse>>>, ApiError> {
+    let message = state
+        .service
+        .latest_team_conversation_message(&user.id, &id, &conversation_id, &query.r#type)
+        .await?;
+    Ok(Json(ApiResponse::ok(message)))
+}
+
+async fn list_team_conversation_artifacts(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<aionui_api_types::ConversationArtifactListResponse>>, ApiError> {
+    let artifacts = state
+        .service
+        .list_team_conversation_artifacts(&user.id, &id, &conversation_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(artifacts)))
+}
+
+async fn team_conversation_slash_commands(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<Vec<aionui_api_types::SlashCommandItem>>>, ApiError> {
+    let commands = state
+        .service
+        .team_conversation_slash_commands(&user.id, &id, &conversation_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(commands)))
+}
+
+async fn team_conversation_usage(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<Option<serde_json::Value>>>, ApiError> {
+    let usage = state
+        .service
+        .team_conversation_usage(&user.id, &id, &conversation_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(usage)))
 }
 
 async fn set_conversation_config_option(

@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    AddAgentRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, SetConfigOptionRequest, SetConfigOptionResponse,
-    TeamAgentInput, TeamMcpSelection, TeamToolTransport, assistant_mcp_binding_fingerprint,
+    AddAgentRequest, ConfirmationListResponse, ConversationArtifactListResponse, ConversationResponse,
+    GetConfigOptionsResponse, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
+    SetConfigOptionRequest, SetConfigOptionResponse, SlashCommandItem, TeamAgentInput, TeamMcpSelection,
+    TeamToolTransport, assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow, TeamSharingMode};
@@ -150,6 +152,81 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     ) -> Result<TeamConversationCreateResult, TeamError>;
 
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
+
+    /// Reads a Team-owned conversation as its execution owner after the Team
+    /// service has authorized the actor and verified the exact roster binding.
+    async fn get_team_conversation(
+        &self,
+        _owner_user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<ConversationResponse, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "Team conversation reads are unavailable".to_owned(),
+        ))
+    }
+
+    async fn list_team_conversation_messages(
+        &self,
+        _owner_user_id: &str,
+        _conversation_id: &str,
+        _query: ListMessagesQuery,
+    ) -> Result<MessageListResponse, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "Team conversation message reads are unavailable".to_owned(),
+        ))
+    }
+
+    async fn latest_team_conversation_message(
+        &self,
+        _owner_user_id: &str,
+        _conversation_id: &str,
+        _message_type: &str,
+    ) -> Result<Option<MessageResponse>, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "Team conversation message reads are unavailable".to_owned(),
+        ))
+    }
+
+    async fn list_team_conversation_artifacts(
+        &self,
+        _owner_user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<ConversationArtifactListResponse, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "Team conversation artifact reads are unavailable".to_owned(),
+        ))
+    }
+
+    async fn team_conversation_slash_commands(
+        &self,
+        _owner_user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<Vec<SlashCommandItem>, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "Team conversation command reads are unavailable".to_owned(),
+        ))
+    }
+
+    async fn team_conversation_usage(
+        &self,
+        _owner_user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<Option<serde_json::Value>, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "Team conversation usage reads are unavailable".to_owned(),
+        ))
+    }
+
+    async fn list_team_conversation_confirmations(
+        &self,
+        _owner_user_id: &str,
+        _conversation_id: &str,
+        _task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<ConfirmationListResponse, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "Team conversation confirmation reads are unavailable".to_owned(),
+        ))
+    }
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
