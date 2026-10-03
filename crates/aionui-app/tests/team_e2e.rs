@@ -681,7 +681,25 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         ))
         .await
         .unwrap();
-    assert_eq!(config_options.status(), StatusCode::OK);
+    assert_eq!(config_options.status(), StatusCode::NOT_FOUND);
+    let denied_config_options = body_json(config_options).await;
+    assert_eq!(denied_config_options["code"], "NOT_FOUND");
+    assert!(!denied_config_options.to_string().contains("mock-model"));
+
+    let owner_config_options = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/teams/{team_id}/conversations/{lead_conversation_id}/config-options"),
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner_config_options.status(), StatusCode::OK);
+    let owner_config_options = body_json(owner_config_options).await;
+    assert_eq!(
+        owner_config_options["data"]["config_options"][0]["current_value"],
+        "mock-model"
+    );
 
     let team_conversation = app
         .clone()

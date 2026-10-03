@@ -2498,6 +2498,9 @@ impl TeamSessionService {
         let (_membership_guard, access) = self
             .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
+        if access.role != TeamAccessRole::Owner {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
         let team = Team::from_row(&access.team)?;
         let member = team
             .agents
