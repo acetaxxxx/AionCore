@@ -228,6 +228,19 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         ))
     }
 
+    async fn answer_team_conversation_ask(
+        &self,
+        _owner_user_id: &str,
+        _conversation_id: &str,
+        _request_id: &str,
+        _answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+        _task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), TeamError> {
+        Err(TeamError::InvalidRequest(
+            "Team conversation AskUser answers are unavailable".to_owned(),
+        ))
+    }
+
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;

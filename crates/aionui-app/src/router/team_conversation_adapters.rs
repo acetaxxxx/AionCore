@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    AssistantConversationRequest, ConfirmationListResponse, ConversationArtifactListResponse, ConversationResponse,
-    CreateConversationRequest, GetConfigOptionsResponse, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse,
-    MessageResponse, SetConfigOptionRequest, SetConfigOptionResponse, SlashCommandItem, TeamMcpSelection,
+    AskQuestionAnswer, AssistantConversationRequest, ConfirmationListResponse, ConversationArtifactListResponse,
+    ConversationResponse, CreateConversationRequest, GetConfigOptionsResponse, ListMessagesQuery, McpRuntimeSnapshot,
+    MessageListResponse, MessageResponse, SetConfigOptionRequest, SetConfigOptionResponse, SlashCommandItem,
+    TeamMcpSelection,
 };
 use aionui_common::{AgentType, now_ms};
 use aionui_conversation::{
@@ -615,6 +616,20 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     ) -> Result<ConfirmationListResponse, TeamError> {
         self.conversation_service
             .list_confirmations(owner_user_id, conversation_id, task_manager)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn answer_team_conversation_ask(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+        request_id: &str,
+        answers: Option<Vec<AskQuestionAnswer>>,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), TeamError> {
+        self.conversation_service
+            .answer_ask(owner_user_id, conversation_id, request_id, answers, task_manager)
             .await
             .map_err(map_conversation_update_error)
     }

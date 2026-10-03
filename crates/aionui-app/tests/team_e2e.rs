@@ -1118,6 +1118,217 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
 }
 
 #[tokio::test]
+async fn shared_team_ask_answers_are_scoped_to_active_lead_membership() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (invitee_token, invitee_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss2").await;
+    let (outsider_token, outsider_csrf) = setup_and_login(&mut app, &services, "bob", "StrongP@ss3").await;
+    ensure_default_team_assistant(&mut app, &services, &owner_token, &owner_csrf).await;
+
+    let mut shared_request = two_agent_body();
+    shared_request["sharing_mode"] = json!("shared");
+    let shared_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            shared_request,
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(shared_response.status(), StatusCode::CREATED);
+    let shared_team = body_json(shared_response).await["data"].clone();
+    let team_id = shared_team["id"].as_str().unwrap();
+    let lead_conversation_id = shared_team["assistants"][0]["conversation_id"].as_str().unwrap();
+    let worker_conversation_id = shared_team["assistants"][1]["conversation_id"].as_str().unwrap();
+
+    let eligible_response = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/teams/eligible-collaborators?team_id={team_id}"),
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(eligible_response.status(), StatusCode::OK);
+    let account_ref = body_json(eligible_response).await["data"][0]["account_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let add_member = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/members"),
+            json!({ "account_ref": account_ref }),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(add_member.status(), StatusCode::CREATED);
+
+    let start_session = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/session"),
+            json!({}),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start_session.status(), StatusCode::OK);
+
+    let team_ask_path = |request_id: &str, conversation_id: &str| {
+        format!("/api/teams/{team_id}/conversations/{conversation_id}/asks/{request_id}/answer")
+    };
+    for (token, csrf, request_id) in [
+        (&owner_token, &owner_csrf, "owner-ask-request"),
+        (&invitee_token, &invitee_csrf, "invitee-ask-request"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                &team_ask_path(request_id, lead_conversation_id),
+                json!({ "answers": [{ "question": "Choose a color", "labels": ["blue"] }] }),
+                token,
+                csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_json(response).await["success"].as_bool().unwrap());
+    }
+
+    let legacy_direct_answer = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/conversations/{lead_conversation_id}/asks/legacy-request/answer"),
+            json!({ "answers": [{ "question": "Choose a color", "labels": ["blue"] }] }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy_direct_answer.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(legacy_direct_answer).await["code"], "NOT_FOUND");
+
+    for (token, csrf, conversation_id, request_id) in [
+        (&outsider_token, &outsider_csrf, lead_conversation_id, "outsider-ask"),
+        (&owner_token, &owner_csrf, worker_conversation_id, "owner-worker-ask"),
+        (&invitee_token, &invitee_csrf, worker_conversation_id, "invitee-worker-ask"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                &team_ask_path(request_id, conversation_id),
+                json!({ "answers": [{ "question": "Choose a color", "labels": ["blue"] }] }),
+                token,
+                csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    let private_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            two_agent_body(),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(private_response.status(), StatusCode::CREATED);
+    let private_team = body_json(private_response).await["data"].clone();
+    let private_team_id = private_team["id"].as_str().unwrap();
+    let private_lead_id = private_team["assistants"][0]["conversation_id"].as_str().unwrap();
+    let wrong_team = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &team_ask_path("wrong-team-ask", private_lead_id),
+            json!({ "answers": [{ "question": "Choose a color", "labels": ["blue"] }] }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_team.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(wrong_team).await["code"], "NOT_FOUND");
+    for (path, token, csrf) in [
+        (
+            format!("/api/teams/{private_team_id}/conversations/{private_lead_id}/asks/private-ask/answer"),
+            &owner_token,
+            &owner_csrf,
+        ),
+        (
+            format!("/api/teams/{private_team_id}/conversations/{private_lead_id}/asks/private-invitee-ask/answer"),
+            &invitee_token,
+            &invitee_csrf,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                &path,
+                json!({ "answers": [{ "question": "Choose a color", "labels": ["blue"] }] }),
+                token,
+                csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    let members = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}/members"), &owner_token))
+        .await
+        .unwrap();
+    let membership_ref = body_json(members).await["data"][0]["membership_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let revoke = app
+        .clone()
+        .oneshot(delete_with_token(
+            &format!("/api/teams/{team_id}/members/{membership_ref}"),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+    let revoked_answer = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &team_ask_path("revoked-ask", lead_conversation_id),
+            json!({ "answers": [{ "question": "Choose a color", "labels": ["blue"] }] }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked_answer.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(revoked_answer).await["code"], "NOT_FOUND");
+}
+
+#[tokio::test]
 async fn pause_team_slot_endpoint_requires_owned_team_and_active_run() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

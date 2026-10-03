@@ -2526,6 +2526,40 @@ impl TeamSessionService {
         self.conversation_port.get_config_options(conversation_id).await
     }
 
+    pub async fn answer_team_conversation_ask(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), TeamError> {
+        let (_membership_guard, access) = self
+            .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
+            .await?;
+        if access.sharing_mode != TeamSharingMode::Shared {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let team = Team::from_row(&access.team)?;
+        let member = team
+            .agents
+            .iter()
+            .find(|agent| agent.conversation_id == conversation_id)
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if member.role != TeammateRole::Lead {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        self.conversation_port
+            .answer_team_conversation_ask(
+                &access.execution_owner_id,
+                conversation_id,
+                request_id,
+                answers,
+                &self.task_manager,
+            )
+            .await
+    }
+
     pub async fn get_team_conversation(
         &self,
         user_id: &str,

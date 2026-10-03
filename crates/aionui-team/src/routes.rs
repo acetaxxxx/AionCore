@@ -10,14 +10,15 @@ use axum::routing::{get, post, put};
 
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
-    AddAgentRequest, AddTeamMemberRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest,
-    ConfirmationListResponse, ConversationResponse, CreateTeamRequest, EligibleTeamCollaboratorResponse,
-    GetConfigOptionsResponse, InterruptTeamAgentRequest, ListMessagesQuery, PauseTeamSlotRequest, RenameAgentRequest,
-    RenameTeamRequest, ReplaceTeamMcpAllowlistRequest, SendAgentMessageRequest, SendTeamMessageRequest,
-    SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest, SetModelRequest, TeamActivityPageResponse,
-    TeamAgentResponse, TeamContextResetAvailability, TeamContextResetResponse, TeamInterruptAgentResponse,
-    TeamListResponse, TeamMailboxMessageResponse, TeamMcpAllowlistResponse, TeamMemberListResponse, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    AddAgentRequest, AddTeamMemberRequest, ApiResponse, AskAnswerRequest, CancelTeamChildTurnRequest,
+    CancelTeamRunRequest, ConfirmationListResponse, ConversationResponse, CreateTeamRequest,
+    EligibleTeamCollaboratorResponse, GetConfigOptionsResponse, InterruptTeamAgentRequest, ListMessagesQuery,
+    PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, ReplaceTeamMcpAllowlistRequest,
+    SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
+    SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
+    TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse,
+    TeamMcpAllowlistResponse, TeamMemberListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -252,6 +253,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options",
             get(get_conversation_config_options),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/asks/{request_id}/answer",
+            post(answer_team_conversation_ask),
         )
         .route(
             "/api/teams/{id}/conversations/{conversation_id}",
@@ -784,6 +789,38 @@ async fn get_conversation_config_options(
             .get_conversation_config_options(&user.id, &id, &conversation_id)
             .await?,
     )))
+}
+
+async fn answer_team_conversation_ask(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id, request_id)): Path<(String, String, String)>,
+    body: Result<Json<AskAnswerRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let answers = if req.decline {
+        if !req.answers.is_empty() {
+            return Err(ApiError::BadRequest(
+                "decline and answers are mutually exclusive".into(),
+            ));
+        }
+        None
+    } else {
+        if req.answers.is_empty() {
+            return Err(ApiError::BadRequest(
+                "answers must not be empty unless decline is true".into(),
+            ));
+        }
+        if req.answers.iter().any(|answer| answer.question.trim().is_empty()) {
+            return Err(ApiError::BadRequest("every answer must name its question".into()));
+        }
+        Some(req.answers)
+    };
+    state
+        .service
+        .answer_team_conversation_ask(&user.id, &id, &conversation_id, &request_id, answers)
+        .await?;
+    Ok(Json(ApiResponse::success()))
 }
 
 async fn get_team_conversation(

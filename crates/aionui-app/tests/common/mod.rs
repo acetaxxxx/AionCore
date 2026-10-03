@@ -188,6 +188,13 @@ impl IAgentTask for NoopMockAgent {
     ) -> Result<(), aionui_ai_agent::AgentSendError> {
         Ok(())
     }
+    fn answer_ask(
+        &self,
+        _request_id: &str,
+        _answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), aionui_ai_agent::AgentError> {
+        Ok(())
+    }
     async fn cancel(&self) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
