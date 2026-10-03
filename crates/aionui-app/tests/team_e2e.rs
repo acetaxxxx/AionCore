@@ -1222,7 +1222,12 @@ async fn shared_team_ask_answers_are_scoped_to_active_lead_membership() {
     for (token, csrf, conversation_id, request_id) in [
         (&outsider_token, &outsider_csrf, lead_conversation_id, "outsider-ask"),
         (&owner_token, &owner_csrf, worker_conversation_id, "owner-worker-ask"),
-        (&invitee_token, &invitee_csrf, worker_conversation_id, "invitee-worker-ask"),
+        (
+            &invitee_token,
+            &invitee_csrf,
+            worker_conversation_id,
+            "invitee-worker-ask",
+        ),
     ] {
         let response = app
             .clone()
