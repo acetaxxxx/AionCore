@@ -1153,7 +1153,10 @@ async fn shared_team_file_endpoints_allow_active_members_and_reject_other_worksp
         .await
         .unwrap();
     assert_eq!(eligible.status(), StatusCode::OK);
-    let account_ref = body_json(eligible).await["data"][0]["account_ref"].as_str().unwrap();
+    let account_ref = body_json(eligible).await["data"][0]["account_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let added = app
         .clone()
         .oneshot(json_with_token(
