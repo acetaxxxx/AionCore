@@ -654,7 +654,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
             &invitee_csrf,
         ))
         .await
-        .unwrap();
+    .unwrap();
     assert_eq!(active_lease.status(), StatusCode::OK);
 
     let mut lead_extra: Value = serde_json::from_str(
@@ -665,6 +665,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
             .expect("load Team Lead conversation extra after runtime startup"),
     )
     .expect("parse Team Lead conversation extra");
+
     lead_extra["team_mcp_stdio_config"] = json!({
         "token": "TEAM_MCP_BEARER_SENTINEL",
         "env": { "TOKEN": "TEAM_MCP_ENV_SENTINEL" },
@@ -675,10 +676,6 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         json!([{ "headers": { "Authorization": "SELECTED_MCP_HEADER_SENTINEL" } }]);
     lead_extra["env"] = json!({ "TOKEN": "EXTRA_ENV_SENTINEL" });
     lead_extra["headers"] = json!({ "Authorization": "EXTRA_HEADER_SENTINEL" });
-    let team_workspace = team_data["workspace"].as_str().unwrap();
-    let equivalent_workspace_alias = format!("{team_workspace}/.");
-    assert_ne!(equivalent_workspace_alias, team_workspace);
-    lead_extra["workspace"] = json!(equivalent_workspace_alias);
     sqlx::query("UPDATE conversations SET extra = ? WHERE id = ?")
         .bind(lead_extra.to_string())
         .bind(lead_conversation_id)
@@ -726,6 +723,39 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
     let owner_team_conversation = body_json(owner_team_conversation).await;
     assert_eq!(owner_team_conversation["data"]["id"], lead_conversation_id);
 
+    let invitee_team = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &invitee_token))
+        .await
+        .unwrap();
+    assert_eq!(invitee_team.status(), StatusCode::OK);
+    let invitee_team = body_json(invitee_team).await["data"].clone();
+    assert_eq!(invitee_team["role"], "collaborator");
+    assert_eq!(invitee_team["sharing_mode"], "shared");
+
+    let (stored_team_workspace, stored_team_agents): (String, String) =
+        sqlx::query_as("SELECT workspace, agents FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_one(services.database.pool())
+            .await
+            .expect("reload persisted Team authorization data before collaborator read");
+    let stored_team_agents: Value =
+        serde_json::from_str(&stored_team_agents).expect("parse persisted Team roster before collaborator read");
+    let current_lead_extra: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>("SELECT extra FROM conversations WHERE id = ?")
+            .bind(lead_conversation_id)
+            .fetch_one(services.database.pool())
+            .await
+            .expect("reload Lead binding before collaborator read"),
+    )
+    .expect("parse current Lead binding before collaborator read");
+    assert_eq!(stored_team_agents[0]["conversation_id"], lead_conversation_id);
+    assert_eq!(stored_team_agents[0]["role"], "lead");
+    assert_eq!(stored_team_agents[0]["slot_id"], current_lead_extra["slot_id"]);
+    assert_eq!(current_lead_extra["teamId"], team_id);
+    assert_eq!(current_lead_extra["role"], "lead");
+    assert_eq!(current_lead_extra["workspace"], stored_team_workspace);
+
     let team_conversation = app
         .clone()
         .oneshot(get_with_token(
@@ -738,7 +768,7 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
     let team_conversation_body = body_json(team_conversation).await;
     let conversation = team_conversation_body["data"].clone();
     assert_eq!(conversation["id"], lead_conversation_id);
-    assert_eq!(conversation["extra"]["workspace"], equivalent_workspace_alias);
+    assert_eq!(conversation["extra"]["workspace"], team_data["workspace"]);
     for sentinel in [
         "TEAM_MCP_BEARER_SENTINEL",
         "TEAM_MCP_ENV_SENTINEL",
