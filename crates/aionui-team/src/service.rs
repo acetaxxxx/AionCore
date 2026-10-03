@@ -13,13 +13,12 @@ use aionui_api_types::{
     AddAgentRequest, AssistantMcpBindingChanged, ConfirmationListResponse, ConversationArtifactListResponse,
     ConversationResponse, CreateTeamRequest, EligibleTeamCollaboratorResponse, GetConfigOptionsResponse,
     InterruptTeamAgentRequest, ListMessagesQuery, MessageListResponse, MessageResponse, SetConfigOptionRequest,
-    SetConfigOptionResponse, SlashCommandItem,
-    TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamContextResetAvailability, TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus,
-    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamMemberResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
-    TeamToolTransport, WebSocketMessage,
+    SetConfigOptionResponse, SlashCommandItem, TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse,
+    TeamAgentRuntimeStatus, TeamContextResetAvailability, TeamContextResetResponse, TeamContextResetRuntimeStatus,
+    TeamContextResetStatus, TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamMemberResponse, TeamResponse,
+    TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
+    TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode,
+    TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::{MAX_ELIGIBLE_TEAM_USERS, TeamAccessRole, TeamRow, TeamSharingMode};
@@ -2612,11 +2611,7 @@ impl TeamSessionService {
             .lock_authorized_rostered_conversation(user_id, team_id, conversation_id)
             .await?;
         self.conversation_port
-            .list_team_conversation_confirmations(
-                &access.execution_owner_id,
-                conversation_id,
-                &self.task_manager,
-            )
+            .list_team_conversation_confirmations(&access.execution_owner_id, conversation_id, &self.task_manager)
             .await
     }
 
@@ -4059,16 +4054,20 @@ impl TeamSessionService {
     }
 }
 
-fn safe_team_conversation_projection(
-    mut conversation: ConversationResponse,
-    team_id: &str,
-) -> ConversationResponse {
+fn safe_team_conversation_projection(mut conversation: ConversationResponse, team_id: &str) -> ConversationResponse {
     let mut safe_extra = serde_json::Map::new();
 
     // Keep only the scalar display/runtime metadata consumed by Team UI. Never
     // copy arbitrary nested values out of the persisted `extra` object: it also
     // stores MCP credentials and per-session environment/header configuration.
-    for key in ["workspace", "session_mode", "backend", "agent_name", "current_model_id", "current_model_label"] {
+    for key in [
+        "workspace",
+        "session_mode",
+        "backend",
+        "agent_name",
+        "current_model_id",
+        "current_model_label",
+    ] {
         if let Some(value) = conversation.extra.get(key).and_then(serde_json::Value::as_str) {
             safe_extra.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
         }
@@ -4090,7 +4089,11 @@ fn safe_team_conversation_projection(
     {
         safe_extra.insert("is_temporary_workspace".to_owned(), serde_json::Value::Bool(value));
     }
-    if let Some(statuses) = conversation.extra.get("mcp_statuses").and_then(serde_json::Value::as_array) {
+    if let Some(statuses) = conversation
+        .extra
+        .get("mcp_statuses")
+        .and_then(serde_json::Value::as_array)
+    {
         let safe_statuses = statuses
             .iter()
             .filter_map(serde_json::Value::as_object)
@@ -5958,7 +5961,10 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        assert!(read_acquired_rx.try_recv().is_err(), "read must wait while revoke owns the Team lock");
+        assert!(
+            read_acquired_rx.try_recv().is_err(),
+            "read must wait while revoke owns the Team lock"
+        );
         drop(revoke_guard);
         read_acquired_rx.await.unwrap();
         reader.await.unwrap();

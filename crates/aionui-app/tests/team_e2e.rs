@@ -572,7 +572,13 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
     create_body["sharing_mode"] = json!("shared");
     let create_response = app
         .clone()
-        .oneshot(json_with_token("POST", "/api/teams", create_body, &owner_token, &owner_csrf))
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            create_body,
+            &owner_token,
+            &owner_csrf,
+        ))
         .await
         .unwrap();
     assert_eq!(create_response.status(), StatusCode::CREATED);
@@ -617,7 +623,10 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
 
     let run_state = app
         .clone()
-        .oneshot(get_with_token(&format!("/api/teams/{team_id}/run-state"), &invitee_token))
+        .oneshot(get_with_token(
+            &format!("/api/teams/{team_id}/run-state"),
+            &invitee_token,
+        ))
         .await
         .unwrap();
     assert_eq!(run_state.status(), StatusCode::OK);
@@ -738,7 +747,10 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         "session_mcp_servers",
         "selected_session_mcp_servers",
     ] {
-        assert!(!team_conversation_body.to_string().contains(sentinel), "Team response leaked {sentinel}");
+        assert!(
+            !team_conversation_body.to_string().contains(sentinel),
+            "Team response leaked {sentinel}"
+        );
     }
 
     let worker_conversation_id = team_data["assistants"][1]["conversation_id"].as_str().unwrap();
@@ -847,11 +859,28 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         .unwrap();
     assert_eq!(denied_conversation.status(), StatusCode::NOT_FOUND);
     assert_eq!(body_json(denied_conversation).await["code"], "NOT_FOUND");
-    for suffix in ["/messages", "/messages/latest?type=user", "/confirmations", "/artifacts"] {
+    for suffix in [
+        "/messages",
+        "/messages/latest?type=user",
+        "/confirmations",
+        "/artifacts",
+    ] {
         let path = format!("/api/teams/{team_id}/conversations/{lead_conversation_id}{suffix}");
-        let response = app.clone().oneshot(get_with_token(&path, &nonmember_token)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "outsider read leaked at {path}");
-        assert_eq!(body_json(response).await["code"], "NOT_FOUND", "unstable error code at {path}");
+        let response = app
+            .clone()
+            .oneshot(get_with_token(&path, &nonmember_token))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "outsider read leaked at {path}"
+        );
+        assert_eq!(
+            body_json(response).await["code"],
+            "NOT_FOUND",
+            "unstable error code at {path}"
+        );
     }
     let denied_session = app
         .clone()
@@ -921,12 +950,22 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         "/slash-commands",
         "/usage",
     ] {
-        let path = format!(
-            "/api/teams/{private_team_id}/conversations/{private_lead_conversation_id}{suffix}"
+        let path = format!("/api/teams/{private_team_id}/conversations/{private_lead_conversation_id}{suffix}");
+        let response = app
+            .clone()
+            .oneshot(get_with_token(&path, &invitee_token))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "private Team read leaked at {path}"
         );
-        let response = app.clone().oneshot(get_with_token(&path, &invitee_token)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "private Team read leaked at {path}");
-        assert_eq!(body_json(response).await["code"], "NOT_FOUND", "unstable error code at {path}");
+        assert_eq!(
+            body_json(response).await["code"],
+            "NOT_FOUND",
+            "unstable error code at {path}"
+        );
     }
     for suffix in [
         "",
@@ -937,9 +976,21 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
         "/usage",
     ] {
         let path = format!("/api/teams/{team_id}/conversations/{private_lead_conversation_id}{suffix}");
-        let response = app.clone().oneshot(get_with_token(&path, &invitee_token)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "cross-Team read leaked at {path}");
-        assert_eq!(body_json(response).await["code"], "NOT_FOUND", "unstable error code at {path}");
+        let response = app
+            .clone()
+            .oneshot(get_with_token(&path, &invitee_token))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "cross-Team read leaked at {path}"
+        );
+        assert_eq!(
+            body_json(response).await["code"],
+            "NOT_FOUND",
+            "unstable error code at {path}"
+        );
     }
 
     let member_response = app
@@ -982,8 +1033,16 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
             get_with_token(&uri, &invitee_token)
         };
         let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "revoked collaborator retained access to {uri}");
-        assert_eq!(body_json(response).await["code"], "NOT_FOUND", "unstable error code at {uri}");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "revoked collaborator retained access to {uri}"
+        );
+        assert_eq!(
+            body_json(response).await["code"],
+            "NOT_FOUND",
+            "unstable error code at {uri}"
+        );
     }
 }
 
