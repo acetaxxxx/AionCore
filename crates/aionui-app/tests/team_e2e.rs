@@ -1623,15 +1623,13 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
     );
     let (body_started_tx, mut body_started_rx) = tokio::sync::mpsc::unbounded_channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let pending_upload = app
-        .clone()
-        .oneshot(team_upload_request_with_paused_body(
-            team_id,
-            &owner_token,
-            &owner_csrf,
-            release_rx,
-            body_started_tx,
-        ));
+    let pending_upload = app.clone().oneshot(team_upload_request_with_paused_body(
+        team_id,
+        &owner_token,
+        &owner_csrf,
+        release_rx,
+        body_started_tx,
+    ));
     let pending_upload = tokio::spawn(pending_upload);
     tokio::time::timeout(std::time::Duration::from_secs(10), body_started_rx.recv())
         .await
