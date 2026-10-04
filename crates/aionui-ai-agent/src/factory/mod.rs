@@ -5,6 +5,7 @@ mod acp_launch_policy;
 pub(crate) mod aionrs;
 mod antigravity;
 mod context;
+mod workspace_preview;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -181,7 +182,8 @@ pub(crate) async fn compose_injected_prefix_for(
 }
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
-    let context = options.context;
+    let mut context = options.context;
+    workspace_preview::configure_from_env(&mut context).await?;
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {
