@@ -375,6 +375,13 @@ pub async fn build_module_states(
         .recover_stale_runtime_state_on_startup()
         .await;
 
+    if let Err(error) = states.team.service.reconcile_team_upload_tombstones().await {
+        tracing::warn!(
+            error = %error,
+            "Team upload tombstone reconciliation was incomplete; remaining entries will be retried next startup"
+        );
+    }
+
     Ok((states, channel_components))
 }
 

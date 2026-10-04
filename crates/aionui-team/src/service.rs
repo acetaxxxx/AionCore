@@ -72,6 +72,11 @@ pub(crate) const TEAM_UPLOAD_MAX_FILE_BYTES: usize = aionui_common::constants::U
 const TEAM_UPLOAD_MAX_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 const TEAM_UPLOAD_MAX_FILE_COUNT: usize = 100;
 const TEAM_UPLOAD_MAX_IN_FLIGHT: usize = 4;
+const TEAM_UPLOAD_MAX_TOMBSTONES: usize = 8;
+const TEAM_UPLOAD_MAX_TOMBSTONE_STORAGE_BYTES: u64 = TEAM_UPLOAD_MAX_STORAGE_BYTES * TEAM_UPLOAD_MAX_TOMBSTONES as u64;
+// Coordinates tombstone quota accounting within one Core process. Deployments
+// must keep a single Core writer for a data_dir; this is not cross-process.
+static TEAM_UPLOAD_TOMBSTONE_STAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const TEAM_UPLOAD_RATE_BURST: f64 = 20.0;
 const TEAM_UPLOAD_RATE_REFILL_PER_SECOND: f64 = 1.0;
 const TEAM_UPLOAD_RATE_STATE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -1187,6 +1192,50 @@ impl TeamSessionService {
         }
     }
 
+    /// Reconcile Team upload deletion tombstones before the app serves requests.
+    /// Failed rows are logged and retried on the next startup; the tombstone
+    /// count and aggregate bytes are capped before any new Team deletion stages.
+    pub async fn reconcile_team_upload_tombstones(&self) -> Result<(), TeamError> {
+        let storage_root = self
+            .team_upload_storage_root
+            .read()
+            .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?
+            .clone();
+        let Some(storage_root) = storage_root else {
+            return Ok(());
+        };
+        let (team_ids, truncated) = TeamUploadDirectory::list_tombstones(&storage_root)?;
+        let mut failed = truncated;
+        if truncated {
+            warn!(
+                max_tombstones = TEAM_UPLOAD_MAX_TOMBSTONES,
+                "Team upload tombstone scan was capped; remaining entries will be retried next startup"
+            );
+        }
+
+        for team_id in team_ids {
+            let team_exists = match self.repo.get_team_for_restore(&team_id).await {
+                Ok(team) => team.is_some(),
+                Err(error) => {
+                    failed = true;
+                    warn!(team_id = %team_id, error = %error, "failed to look up Team upload tombstone during startup");
+                    continue;
+                }
+            };
+
+            if let Err(error) = TeamUploadDirectory::reconcile_tombstone(&storage_root, &team_id, team_exists) {
+                failed = true;
+                warn!(team_id = %team_id, error = %error, "failed to reconcile Team upload tombstone; retrying on next startup");
+            }
+        }
+
+        if failed {
+            Err(TeamError::TeamUploadStorageCleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
+
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
         if req.agents.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
@@ -1635,7 +1684,7 @@ impl TeamSessionService {
             .read()
             .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?
             .clone();
-        with_staged_team_upload_deletion(storage_root.as_deref(), team_id, || async {
+        let (_, storage_cleanup_error) = with_staged_team_upload_deletion(storage_root.as_deref(), team_id, || async {
             self.repo
                 .delete_mailbox_by_team(user_id, team_id)
                 .await
@@ -1644,10 +1693,7 @@ impl TeamSessionService {
                 .delete_tasks_by_team(user_id, team_id)
                 .await
                 .map_err(TeamError::from)?;
-            self.repo
-                .delete_team(user_id, team_id)
-                .await
-                .map_err(TeamError::from)?;
+            self.repo.delete_team(user_id, team_id).await.map_err(TeamError::from)?;
             Ok(())
         })
         .await?;
@@ -1664,6 +1710,10 @@ impl TeamSessionService {
 
         info!(team_id = %team_id, "Team removed");
         self.broadcast_team_removed(user_id, team_id);
+        if let Some(error) = storage_cleanup_error {
+            warn!(team_id = %team_id, error = %error, "Team was deleted but upload tombstone cleanup is pending");
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -3568,30 +3618,74 @@ struct TeamUploadTombstone {
 
 impl TeamUploadTombstone {
     fn restore(mut self) -> Result<(), TeamError> {
+        restore_team_upload_directory(&self.tombstone_path, &self.original_path)?;
         self.restore_on_drop = false;
-        if std::fs::symlink_metadata(&self.original_path).is_ok()
-            || std::fs::rename(&self.tombstone_path, &self.original_path).is_err()
-        {
-            return Err(TeamError::TeamUploadStorageCleanupFailed);
-        }
         Ok(())
     }
 
-    fn purge(mut self) -> Result<(), TeamError> {
+    fn purge_with(mut self, purge: fn(&Path) -> Result<(), TeamError>) -> Result<(), TeamError> {
         // Once the Team row has been deleted, restoring the directory would
         // recreate storage for a nonexistent Team. Leave a hidden tombstone if
         // cleanup fails so it can be diagnosed without making it addressable.
         self.restore_on_drop = false;
-        std::fs::remove_dir_all(&self.tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)
+        purge(&self.tombstone_path)
     }
+}
+
+fn restore_team_upload_directory(tombstone_path: &Path, original_path: &Path) -> Result<(), TeamError> {
+    let tombstone_metadata = std::fs::symlink_metadata(tombstone_path)
+        .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+    if tombstone_metadata.file_type().is_symlink() || !tombstone_metadata.is_dir() {
+        return Err(TeamError::TeamUploadStorageCleanupFailed);
+    }
+
+    match std::fs::symlink_metadata(original_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::rename(tombstone_path, original_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            if let Some(parent) = tombstone_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+            Ok(())
+        }
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
+            // A previous restoration may have moved some files before failing.
+            // Complete it idempotently, refusing symlinks and collisions.
+            for entry in std::fs::read_dir(tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)? {
+                let entry = entry.map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+                let metadata = std::fs::symlink_metadata(entry.path())
+                    .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(TeamError::TeamUploadStorageCleanupFailed);
+                }
+                let destination = original_path.join(entry.file_name());
+                if std::fs::symlink_metadata(&destination).is_ok() {
+                    return Err(TeamError::TeamUploadStorageCleanupFailed);
+                }
+                std::fs::rename(entry.path(), destination).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            }
+            std::fs::remove_dir(tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            if let Some(parent) = tombstone_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+            Ok(())
+        }
+        _ => Err(TeamError::TeamUploadStorageCleanupFailed),
+    }
+}
+
+fn purge_team_upload_tombstone(tombstone_path: &Path) -> Result<(), TeamError> {
+    let metadata = std::fs::symlink_metadata(tombstone_path)
+        .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(TeamError::TeamUploadStorageCleanupFailed);
+    }
+    std::fs::remove_dir_all(tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)
 }
 
 impl Drop for TeamUploadTombstone {
     fn drop(&mut self) {
-        if self.restore_on_drop
-            && std::fs::symlink_metadata(&self.original_path).is_err()
-        {
-            let _ = std::fs::rename(&self.tombstone_path, &self.original_path);
+        if self.restore_on_drop {
+            let _ = restore_team_upload_directory(&self.tombstone_path, &self.original_path);
         }
     }
 }
@@ -3629,6 +3723,9 @@ impl TeamUploadDirectory {
     }
 
     fn stage_team_removal(storage_root: &Path, team_id: &str) -> Result<Option<TeamUploadTombstone>, TeamError> {
+        let _stage_guard = TEAM_UPLOAD_TOMBSTONE_STAGE_LOCK
+            .lock()
+            .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
         Self::validate_team_id(team_id)?;
 
         let root_metadata = match std::fs::symlink_metadata(storage_root) {
@@ -3650,7 +3747,27 @@ impl TeamUploadDirectory {
             return Err(TeamError::TeamUploadStorageCleanupFailed);
         }
 
-        let tombstone_path = storage_root.join(format!(".deleting-{team_id}-{}", generate_id()));
+        let team_usage = team_upload_usage(&team_path, team_id)
+            .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?
+            .0;
+        let deletion_root = storage_root.join(".deleting");
+        match std::fs::symlink_metadata(&deletion_root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(TeamError::TeamUploadStorageCleanupFailed);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&deletion_root).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            }
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        }
+        let (tombstone_count, tombstone_bytes) = Self::tombstone_storage_usage(&deletion_root)?;
+        if tombstone_count >= TEAM_UPLOAD_MAX_TOMBSTONES
+            || tombstone_bytes.saturating_add(team_usage) > TEAM_UPLOAD_MAX_TOMBSTONE_STORAGE_BYTES
+        {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+        let tombstone_path = deletion_root.join(team_id);
         if std::fs::symlink_metadata(&tombstone_path).is_ok() {
             return Err(TeamError::TeamUploadStorageCleanupFailed);
         }
@@ -3660,6 +3777,117 @@ impl TeamUploadDirectory {
             tombstone_path,
             restore_on_drop: true,
         }))
+    }
+
+    fn list_tombstones(storage_root: &Path) -> Result<(Vec<String>, bool), TeamError> {
+        let deletion_root = storage_root.join(".deleting");
+        let metadata = match std::fs::symlink_metadata(&deletion_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+
+        let mut team_ids = Vec::new();
+        for entry in std::fs::read_dir(&deletion_root).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)? {
+            if team_ids.len() > TEAM_UPLOAD_MAX_TOMBSTONES {
+                break;
+            }
+            let entry = entry.map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            let team_id = entry.file_name().to_string_lossy().into_owned();
+            Self::validate_team_id(&team_id)?;
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(TeamError::TeamUploadStorageCleanupFailed);
+            }
+            team_ids.push(team_id);
+        }
+        team_ids.sort();
+        let truncated = team_ids.len() > TEAM_UPLOAD_MAX_TOMBSTONES;
+        team_ids.truncate(TEAM_UPLOAD_MAX_TOMBSTONES);
+        Ok((team_ids, truncated))
+    }
+
+    fn tombstone_storage_usage(deletion_root: &Path) -> Result<(usize, u64), TeamError> {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for team_id in Self::list_tombstones_from_root(deletion_root)? {
+            let path = deletion_root.join(&team_id);
+            let (team_bytes, _) = team_upload_usage(&path, &team_id)
+                .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(team_bytes);
+        }
+        Ok((count, bytes))
+    }
+
+    fn list_tombstones_from_root(deletion_root: &Path) -> Result<Vec<String>, TeamError> {
+        let mut team_ids = Vec::new();
+        for entry in std::fs::read_dir(deletion_root).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)? {
+            if team_ids.len() >= TEAM_UPLOAD_MAX_TOMBSTONES {
+                return Err(TeamError::TeamUploadStorageCleanupFailed);
+            }
+            let entry = entry.map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            let team_id = entry.file_name().to_string_lossy().into_owned();
+            Self::validate_team_id(&team_id)?;
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(TeamError::TeamUploadStorageCleanupFailed);
+            }
+            team_ids.push(team_id);
+        }
+        Ok(team_ids)
+    }
+
+    fn reconcile_tombstone(storage_root: &Path, team_id: &str, team_exists: bool) -> Result<(), TeamError> {
+        Self::reconcile_tombstone_with(
+            storage_root,
+            team_id,
+            team_exists,
+            restore_team_upload_directory,
+            purge_team_upload_tombstone,
+        )
+    }
+
+    fn reconcile_tombstone_with<R, P>(
+        storage_root: &Path,
+        team_id: &str,
+        team_exists: bool,
+        restore: R,
+        purge: P,
+    ) -> Result<(), TeamError>
+    where
+        R: FnOnce(&Path, &Path) -> Result<(), TeamError>,
+        P: FnOnce(&Path) -> Result<(), TeamError>,
+    {
+        Self::validate_team_id(team_id)?;
+        let deletion_root = storage_root.join(".deleting");
+        let deletion_metadata = std::fs::symlink_metadata(&deletion_root)
+            .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+        if deletion_metadata.file_type().is_symlink() || !deletion_metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+        let tombstone_path = deletion_root.join(team_id);
+        let metadata = match std::fs::symlink_metadata(&tombstone_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+
+        if team_exists {
+            restore(&tombstone_path, &storage_root.join(team_id))?;
+        } else {
+            purge(&tombstone_path)?;
+        }
+        let _ = std::fs::remove_dir(deletion_root);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -3786,7 +4014,21 @@ async fn with_staged_team_upload_deletion<T, F, Fut>(
     storage_root: Option<&Path>,
     team_id: &str,
     delete_team_rows: F,
-) -> Result<T, TeamError>
+) -> Result<(T, Option<TeamError>), TeamError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, TeamError>>,
+{
+    with_staged_team_upload_deletion_using_purge(storage_root, team_id, delete_team_rows, purge_team_upload_tombstone)
+        .await
+}
+
+async fn with_staged_team_upload_deletion_using_purge<T, F, Fut>(
+    storage_root: Option<&Path>,
+    team_id: &str,
+    delete_team_rows: F,
+    purge: fn(&Path) -> Result<(), TeamError>,
+) -> Result<(T, Option<TeamError>), TeamError>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, TeamError>>,
@@ -3798,10 +4040,8 @@ where
 
     match delete_team_rows().await {
         Ok(result) => {
-            if let Some(tombstone) = tombstone {
-                tombstone.purge()?;
-            }
-            Ok(result)
+            let cleanup_error = tombstone.and_then(|tombstone| tombstone.purge_with(purge).err());
+            Ok((result, cleanup_error))
         }
         Err(delete_error) => {
             if let Some(tombstone) = tombstone {
@@ -6775,10 +7015,7 @@ mod tests {
             b"team image bytes"
         );
         assert_eq!(
-            std::fs::read_dir(&storage_root)
-                .unwrap()
-                .filter_map(Result::ok)
-                .count(),
+            std::fs::read_dir(&storage_root).unwrap().filter_map(Result::ok).count(),
             1,
             "rollback should leave the restored Team directory and no tombstone"
         );
@@ -6809,6 +7046,83 @@ mod tests {
             std::fs::read(team_directory.join("image.png")).unwrap(),
             b"team image bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_post_delete_purge_returns_after_row_operation_and_reconciles() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_root = temp_dir.path().join("team-uploads");
+        let team_directory = storage_root.join("team-purge-retry");
+        std::fs::create_dir_all(&team_directory).unwrap();
+        std::fs::write(team_directory.join("image.png"), b"team image bytes").unwrap();
+
+        let (deleted, cleanup_error) = super::with_staged_team_upload_deletion_using_purge(
+            Some(&storage_root),
+            "team-purge-retry",
+            || async { Ok::<_, super::TeamError>("rows deleted") },
+            |_| Err(super::TeamError::TeamUploadStorageCleanupFailed),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(deleted, "rows deleted");
+        assert!(matches!(cleanup_error, Some(super::TeamError::TeamUploadStorageCleanupFailed)));
+        let tombstone = storage_root.join(".deleting/team-purge-retry");
+        assert!(tombstone.join("image.png").exists());
+        super::TeamUploadDirectory::reconcile_tombstone(&storage_root, "team-purge-retry", false).unwrap();
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn failed_restore_and_reconciliation_are_retryable() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_root = temp_dir.path().join("team-uploads");
+        let deletion_root = storage_root.join(".deleting");
+        let tombstone = deletion_root.join("team-restore-retry");
+        std::fs::create_dir_all(&tombstone).unwrap();
+        std::fs::write(tombstone.join("image.png"), b"team image bytes").unwrap();
+
+        let failed_restore = super::TeamUploadDirectory::reconcile_tombstone_with(
+            &storage_root,
+            "team-restore-retry",
+            true,
+            |_, _| Err(super::TeamError::TeamUploadStorageCleanupFailed),
+            |_| Ok(()),
+        );
+        assert!(matches!(failed_restore, Err(super::TeamError::TeamUploadStorageCleanupFailed)));
+        assert!(tombstone.join("image.png").exists());
+        super::TeamUploadDirectory::reconcile_tombstone(&storage_root, "team-restore-retry", true).unwrap();
+        assert_eq!(
+            std::fs::read(storage_root.join("team-restore-retry/image.png")).unwrap(),
+            b"team image bytes"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let invalid_tombstone = deletion_root.join("team-invalid");
+            symlink(temp_dir.path(), &invalid_tombstone).unwrap();
+            assert!(matches!(
+                super::TeamUploadDirectory::reconcile_tombstone(&storage_root, "team-invalid", false),
+                Err(super::TeamError::TeamUploadStorageCleanupFailed)
+            ));
+            assert!(std::fs::symlink_metadata(invalid_tombstone).unwrap().file_type().is_symlink());
+        }
+    }
+
+    #[test]
+    fn startup_tombstone_scan_is_capped_and_reports_remaining_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_root = temp_dir.path().join("team-uploads");
+        let deletion_root = storage_root.join(".deleting");
+        std::fs::create_dir_all(&deletion_root).unwrap();
+        for index in 0..(super::TEAM_UPLOAD_MAX_TOMBSTONES + 2) {
+            std::fs::create_dir(deletion_root.join(format!("team-tombstone-{index}"))).unwrap();
+        }
+
+        let (team_ids, truncated) = super::TeamUploadDirectory::list_tombstones(&storage_root).unwrap();
+        assert_eq!(team_ids.len(), super::TEAM_UPLOAD_MAX_TOMBSTONES);
+        assert!(truncated);
     }
 
     #[test]
