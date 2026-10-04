@@ -1273,7 +1273,7 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
     assert_eq!(missing_file.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body_json(missing_file).await["code"], "TEAM_UPLOAD_FILE_REQUIRED");
 
-    let oversized_bytes = vec![0u8; 10 * 1024 * 1024 + 1];
+    let oversized_bytes = vec![0u8; 30 * 1024 * 1024 + 1];
     let oversized = app
         .clone()
         .oneshot(team_upload_request_with_bytes(

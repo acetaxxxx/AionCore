@@ -105,7 +105,7 @@ impl From<TeamError> for ApiError {
             TeamError::TeamUploadFileTooLarge => ApiError::coded(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "TEAM_UPLOAD_FILE_TOO_LARGE",
-                "Team upload exceeds the 10 MiB per-file limit",
+                "Team upload exceeds the 30 MiB per-file limit",
                 None,
             ),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
@@ -233,7 +233,7 @@ const MAX_TEAM_UPLOAD_MULTIPART_OVERHEAD: usize = 64 * 1024;
 
 pub fn team_routes(state: TeamRouterState) -> Router {
     // Multipart overhead sits outside the per-file limit. Scope the larger
-    // extractor bound to this route so the global 10 MiB JSON limit does not
+    // extractor bound to this route so the global request limit does not
     // preempt the upload handler's stable TEAM_UPLOAD_FILE_TOO_LARGE response.
     let team_upload_routes = Router::new()
         .route("/api/teams/{id}/uploads", post(upload_team_file))
@@ -718,7 +718,7 @@ async fn extract_team_upload_multipart(mut multipart: Multipart) -> Result<TeamU
                     return Err(ApiError::coded(
                         StatusCode::PAYLOAD_TOO_LARGE,
                         "TEAM_UPLOAD_FILE_TOO_LARGE",
-                        "Team upload exceeds the 10 MiB per-file limit",
+                        "Team upload exceeds the 30 MiB per-file limit",
                         None,
                     ));
                 }

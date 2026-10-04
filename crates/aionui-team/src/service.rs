@@ -67,7 +67,7 @@ use crate::work_coordinator::{
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
-pub(crate) const TEAM_UPLOAD_MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const TEAM_UPLOAD_MAX_FILE_BYTES: usize = aionui_common::constants::UPLOAD_MAX_SIZE;
 const TEAM_UPLOAD_MAX_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 const TEAM_UPLOAD_MAX_FILE_COUNT: usize = 100;
 const TEAM_UPLOAD_RATE_BURST: f64 = 20.0;
