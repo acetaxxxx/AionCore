@@ -44,6 +44,9 @@ pub enum TeamError {
     #[error("Team upload rate limit exceeded")]
     TeamUploadRateLimited,
 
+    #[error("Too many Team uploads are in progress")]
+    TeamUploadConcurrencyLimited,
+
     #[error("Team upload file exceeds its size limit")]
     TeamUploadFileTooLarge,
 

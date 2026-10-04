@@ -170,6 +170,7 @@ dependencies = [
  "dirs",
  "glob",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

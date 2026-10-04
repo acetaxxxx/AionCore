@@ -102,6 +102,12 @@ impl From<TeamError> for ApiError {
                 "Team upload rate limit exceeded; retry shortly",
                 None,
             ),
+            TeamError::TeamUploadConcurrencyLimited => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_UPLOAD_CONCURRENCY_LIMITED",
+                "Too many Team uploads are in progress; retry shortly",
+                None,
+            ),
             TeamError::TeamUploadFileTooLarge => ApiError::coded(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "TEAM_UPLOAD_FILE_TOO_LARGE",
@@ -756,6 +762,7 @@ async fn upload_team_file(
     let access = state.service.authorize_team(&user.id, &id).await?;
     state.service.verify_and_resolve_team_workspace(&access).await?;
     state.service.check_team_upload_rate_limit(&id)?;
+    let _in_flight_permit = state.service.try_acquire_team_upload_slot()?;
 
     let upload_data = extract_team_upload_multipart(multipart).await?;
     let resp = state.service.upload_team_file(&user.id, &id, upload_data).await?;
