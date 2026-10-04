@@ -308,7 +308,10 @@ mod tests {
                 mark_team(&mut context, marker);
                 let mut env = HashMap::new();
                 bind_team_scope(&context, &mut env);
-                assert_eq!(env.get("AIONUI_PREVIEW_TEAM_ID").map(String::as_str), Some("shared-team"));
+                assert_eq!(
+                    env.get("AIONUI_PREVIEW_TEAM_ID").map(String::as_str),
+                    Some("shared-team")
+                );
             }
         }
     }

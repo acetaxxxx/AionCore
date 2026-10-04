@@ -1770,6 +1770,7 @@ pub async fn build_antigravity_instance(
         }
         None => Vec::new(),
     };
+    crate::mcp_resolve::prefer_preview_snapshot(&mut neutral, &config.session_mcp_servers);
     neutral.extend(config.session_mcp_servers.iter().cloned());
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
@@ -1903,6 +1904,7 @@ pub async fn build_session_instance(
         None => Vec::new(),
     };
     neutral.retain(|server| server.name != TEAM_MCP_SERVER_NAME);
+    crate::mcp_resolve::prefer_preview_snapshot(&mut neutral, &config.session_mcp_servers);
     neutral.extend(
         config
             .session_mcp_servers
@@ -4961,8 +4963,17 @@ mod build_mapping_tests {
             .into_owned();
         let config = AcpBuildExtra {
             backend: Some("claude".into()),
-            mcp_server_ids: Some(vec!["mcp-docs".into(), "mcp-reserved".into()]),
+            mcp_server_ids: Some(vec!["mcp-docs".into(), "mcp-reserved".into(), "mcp-preview".into()]),
             session_mcp_servers: vec![
+                SessionMcpServer {
+                    id: "mcp-preview".into(),
+                    name: "workspace-preview".into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: executable.clone(),
+                        args: vec!["/runtime-preview-bridge.mjs".into()],
+                        env: Default::default(),
+                    },
+                },
                 SessionMcpServer {
                     id: "mcp-chrome".into(),
                     name: "chrome-devtools".into(),
@@ -4995,6 +5006,7 @@ mod build_mapping_tests {
             rows: vec![
                 direct_mcp_row("mcp-docs", "mcp-docs"),
                 direct_mcp_row("mcp-reserved", TEAM_MCP_SERVER_NAME),
+                direct_mcp_row("mcp-preview", "workspace-preview"),
             ],
         });
         let metadata = test_metadata(Some("claude"), None);
@@ -5043,9 +5055,14 @@ mod build_mapping_tests {
             serde_json::from_str(&command.args[mcp_flag + 1]).expect("valid inline MCP config");
         let servers = config_json["mcpServers"].as_object().expect("MCP server map");
 
-        assert_eq!(servers.len(), 3);
+        assert_eq!(servers.len(), 4);
         assert!(servers.contains_key("mcp-docs"));
         assert!(servers.contains_key("chrome-devtools"));
+        assert_eq!(
+            servers["workspace-preview"]["args"],
+            serde_json::json!(["/runtime-preview-bridge.mjs"])
+        );
+        assert!(servers["workspace-preview"].get("url").is_none());
         assert_eq!(
             servers[TEAM_MCP_SERVER_NAME]["command"],
             serde_json::json!("/usr/bin/team-coordinator"),

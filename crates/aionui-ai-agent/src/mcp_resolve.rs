@@ -21,6 +21,14 @@ use aionui_realtime::EventBroadcaster;
 use aionui_runtime::ensure_runtime_command;
 use tracing::{info, warn};
 
+/// The self-host runtime bridge replaces the imported preview transport.
+/// Preserve the selected ID in configuration while avoiding duplicate delivery.
+pub(crate) fn prefer_preview_snapshot(repo_servers: &mut Vec<SessionMcpServer>, snapshot: &[SessionMcpServer]) {
+    if snapshot.iter().any(|server| server.name == "workspace-preview") {
+        repo_servers.retain(|server| server.name != "workspace-preview");
+    }
+}
+
 /// Resolve a conversation's user-configured MCP servers into neutral
 /// [`SessionMcpServer`]s. `selected_ids = Some` → that frozen snapshot defines the
 /// session (injected regardless of the row's global `enabled` flag); `None` → all
@@ -186,6 +194,36 @@ fn parse_headers(value: Option<&serde_json::Value>) -> std::collections::HashMap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_preview_snapshot_removes_only_repo_preview_duplicates() {
+        let imported = SessionMcpServer {
+            id: "imported-preview".into(),
+            name: "workspace-preview".into(),
+            transport: SessionMcpTransport::Http {
+                url: "http://registered-placeholder/mcp".into(),
+                headers: Default::default(),
+            },
+        };
+        let mut unrelated = imported.clone();
+        unrelated.id = "docs".into();
+        unrelated.name = "docs".into();
+        let mut repo = vec![imported.clone(), unrelated.clone()];
+        prefer_preview_snapshot(&mut repo, &[]);
+        assert_eq!(repo, vec![imported.clone(), unrelated.clone()]);
+
+        let runtime = SessionMcpServer {
+            transport: SessionMcpTransport::Stdio {
+                command: "/runtime-node".into(),
+                args: vec!["/preview-bridge.mjs".into()],
+                env: Default::default(),
+            },
+            ..imported
+        };
+        prefer_preview_snapshot(&mut repo, std::slice::from_ref(&runtime));
+        repo.push(runtime.clone());
+        assert_eq!(repo, vec![unrelated, runtime]);
+    }
     use aionui_db::models::McpServerRow;
 
     const TEST_USER_ID: &str = "user-1";

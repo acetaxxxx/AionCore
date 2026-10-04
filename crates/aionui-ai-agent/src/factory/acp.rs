@@ -44,6 +44,16 @@ const CONFIGURED_NON_ACP_ROUTES: &[(&str, BackendRoute)] = &[
     ("codex", BackendRoute::DirectCli),
 ];
 
+fn prefer_preview_snapshot(repo_servers: &mut Vec<McpServer>, snapshot: &[SessionMcpServer]) {
+    if snapshot.iter().any(|server| server.name == "workspace-preview") {
+        repo_servers.retain(|server| {
+            !matches!(server, McpServer::Stdio(config) if config.name == "workspace-preview")
+                && !matches!(server, McpServer::Http(config) if config.name == "workspace-preview")
+                && !matches!(server, McpServer::Sse(config) if config.name == "workspace-preview")
+        });
+    }
+}
+
 fn configured_non_acp_routes() -> &'static [(&'static str, BackendRoute)] {
     CONFIGURED_NON_ACP_ROUTES
 }
@@ -232,6 +242,7 @@ pub(super) async fn build(
         None => Vec::new(),
     };
     let mut session_mcp_servers = user_mcp_servers;
+    prefer_preview_snapshot(&mut session_mcp_servers, &config.session_mcp_servers);
     for server in &config.session_mcp_servers {
         // Reserved name defense: the team coordination MCP must win.
         if server.name == TEAM_MCP_SERVER_NAME {
@@ -639,6 +650,30 @@ fn session_server_supported_by_capabilities(server: &SessionMcpServer, capabilit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preview_snapshot_replaces_repo_preview_in_acp_delivery() {
+        let imported = SessionMcpServer {
+            id: "imported-preview".into(),
+            name: "workspace-preview".into(),
+            transport: SessionMcpTransport::Http {
+                url: "http://registered-placeholder/mcp".into(),
+                headers: Default::default(),
+            },
+        };
+        let mut unrelated = imported.clone();
+        unrelated.id = "docs".into();
+        unrelated.name = "docs".into();
+        let unrelated_sdk = session_server_to_sdk_mcp_server(&unrelated).await.unwrap();
+        let mut repo = vec![
+            session_server_to_sdk_mcp_server(&imported).await.unwrap(),
+            unrelated_sdk.clone(),
+        ];
+        prefer_preview_snapshot(&mut repo, &[]);
+        assert_eq!(repo.len(), 2);
+        prefer_preview_snapshot(&mut repo, std::slice::from_ref(&imported));
+        assert_eq!(repo, vec![unrelated_sdk]);
+    }
     use aionui_api_types::AcpBuildExtra;
     use aionui_db::{
         IAgentMetadataRepository, SqliteAgentMetadataRepository, UpsertAgentMetadataParams, init_database_memory,
