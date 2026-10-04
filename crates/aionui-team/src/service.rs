@@ -450,7 +450,7 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing membership mutations with session startup so
     /// callers cannot read-modify-write the `agents` JSON or rebuild a runtime
     /// session from a stale roster snapshot.
-    add_agent_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    add_agent_locks: Arc<DashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -483,10 +483,38 @@ pub struct TeamSessionService {
 
 impl TeamSessionService {
     fn team_membership_lock(&self, team_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        match self.add_agent_locks.entry(team_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if let Some(lock) = entry.get().upgrade() {
+                    lock
+                } else {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    entry.insert(Arc::downgrade(&lock));
+                    lock
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                entry.insert(Arc::downgrade(&lock));
+                lock
+            }
+        }
+    }
+
+    fn prune_team_membership_lock(&self, team_id: &str, lock: &Arc<tokio::sync::Mutex<()>>) {
+        {
+            let entry = self.add_agent_locks.entry(team_id.to_owned());
+            if let dashmap::mapref::entry::Entry::Occupied(entry) = entry
+                && entry.get().ptr_eq(&Arc::downgrade(lock))
+                && Arc::strong_count(lock) == 1
+            {
+                entry.remove();
+            }
+        }
+
+        // Weak entries do not retain mutexes, but pruning expired keys here
+        // keeps the registry from growing with deleted Team IDs.
+        self.add_agent_locks.retain(|_, lock| lock.strong_count() > 0);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1443,6 +1471,7 @@ impl TeamSessionService {
     ) -> Result<(), TeamError> {
         self.load_owned_team_row(owner_user_id, team_id).await?;
         let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
+        self.load_owned_team_row(owner_user_id, team_id).await?;
         let member_user_id = self
             .repo
             .list_team_members(team_id)
@@ -1510,11 +1539,7 @@ impl TeamSessionService {
             normalized.push(id.to_owned());
         }
 
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let guard = lock.lock().await;
         self.load_owned_team_row(owner_user_id, team_id).await?;
         if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
@@ -1551,11 +1576,7 @@ impl TeamSessionService {
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let _guard = lock.lock().await;
         let access = self.authorize_team(user_id, team_id).await?;
         // Project-bind side branch: lazily backfill binding only when a single
@@ -1589,7 +1610,8 @@ impl TeamSessionService {
         // Upload requests reauthorize and persist under this same lock. Holding
         // it across cleanup prevents a buffered request from recreating the
         // Team's upload directory after deletion.
-        let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
+        let membership_lock = self.team_membership_lock(team_id);
+        let membership_guard = Arc::clone(&membership_lock).lock_owned().await;
         let team = self.load_owned_team(user_id, team_id).await?;
 
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamDeleted)
@@ -1618,8 +1640,9 @@ impl TeamSessionService {
         // the live aggregate), so it never blocks deletion.
         self.remove_team_order_row(user_id, team_id).await;
 
-        // Keep the lock entry: a queued caller may still hold an Arc to this
-        // mutex, and removing it could let a later request create a second lock.
+        drop(membership_guard);
+        self.prune_team_membership_lock(team_id, &membership_lock);
+
         info!(team_id = %team_id, "Team removed");
         self.broadcast_team_removed(user_id, team_id);
         Ok(())
@@ -1680,11 +1703,7 @@ impl TeamSessionService {
         team_id: &str,
         req: AddAgentRequest,
     ) -> Result<TeamAgentResponse, TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let _guard = lock.lock().await;
 
         let row = self.load_owned_team_row(user_id, team_id).await?;
@@ -1736,11 +1755,7 @@ impl TeamSessionService {
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let (removed, session, removal_lease) = {
             let _guard = lock.lock().await;
             let team = self.load_owned_team(user_id, team_id).await?;
@@ -1896,11 +1911,7 @@ impl TeamSessionService {
     }
 
     pub async fn rename_agent(&self, user_id: &str, team_id: &str, slot_id: &str, name: &str) -> Result<(), TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let _guard = lock.lock().await;
 
         let mut team = self.load_owned_team(user_id, team_id).await?;
@@ -1979,11 +1990,7 @@ impl TeamSessionService {
         model: &str,
         trigger: ModelPersistTrigger,
     ) -> Result<(), TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let _guard = lock.lock().await;
         let mut team = self.load_owned_team(user_id, team_id).await?;
         let target = team
@@ -6609,6 +6616,40 @@ mod tests {
         drop(revoke_guard);
         read_acquired_rx.await.unwrap();
         reader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn team_membership_lock_pruning_preserves_live_waiters_and_drops_idle_entries() {
+        let (service, _repo, _task_manager, _conversation_repo) =
+            setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let lock = service.team_membership_lock("team-prune");
+        let guard = Arc::clone(&lock).lock_owned().await;
+        let waiter_lock = service.team_membership_lock("team-prune");
+        let (waiter_started_tx, waiter_started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            waiter_started_tx.send(()).unwrap();
+            let _guard = waiter_lock.lock_owned().await;
+        });
+        waiter_started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+
+        // A queued caller still owns an Arc, so pruning must leave the shared
+        // mutex discoverable until every holder has finished.
+        service.prune_team_membership_lock("team-prune", &lock);
+        let current_lock = service.team_membership_lock("team-prune");
+        assert!(Arc::ptr_eq(&lock, &current_lock));
+        assert!(service.add_agent_locks.contains_key("team-prune"));
+
+        drop(guard);
+        waiter.await.unwrap();
+        drop(current_lock);
+        service.prune_team_membership_lock("team-prune", &lock);
+        assert!(!service.add_agent_locks.contains_key("team-prune"));
+
+        // A later request may create a fresh mutex only after the old mutex
+        // has no guard or queued caller.
+        let replacement = service.team_membership_lock("team-prune");
+        assert!(!Arc::ptr_eq(&lock, &replacement));
     }
 
     #[test]
