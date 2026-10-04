@@ -483,6 +483,11 @@ pub struct TeamSessionService {
 
 impl TeamSessionService {
     fn team_membership_lock(&self, team_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        // DashMap retain and entry operations take the same shard locks, so a
+        // live caller cannot race this removal with upgrading its Weak entry.
+        // Weak entries with no strong references have no holders or waiters.
+        self.add_agent_locks.retain(|_, lock| lock.strong_count() > 0);
+
         match self.add_agent_locks.entry(team_id.to_owned()) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 if let Some(lock) = entry.get().upgrade() {
@@ -6650,6 +6655,21 @@ mod tests {
         // has no guard or queued caller.
         let replacement = service.team_membership_lock("team-prune");
         assert!(!Arc::ptr_eq(&lock, &replacement));
+    }
+
+    #[test]
+    fn team_membership_lock_prunes_weak_entries_during_team_id_churn() {
+        let (service, _repo, _task_manager, _conversation_repo) =
+            setup_with_factory_metadata_team_repo_and_conversation_repo();
+
+        for index in 0..1_000 {
+            let lock = service.team_membership_lock(&format!("missing-team-{index}"));
+            drop(lock);
+            assert!(
+                service.add_agent_locks.len() <= 1,
+                "expired Team lock entries should be pruned during lookup"
+            );
+        }
     }
 
     #[test]
