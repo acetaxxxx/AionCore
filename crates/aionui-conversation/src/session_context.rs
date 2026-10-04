@@ -1162,7 +1162,10 @@ mod tests {
             assert!(belongs_to_team);
             assert_eq!(team.as_ref().unwrap().team_id, "shared-team");
             assert_eq!(*ids, Some(vec!["owner-imported-preview-row".into()]));
-            assert!(servers.is_empty(), "imported rows are resolved by the factory repository");
+            assert!(
+                servers.is_empty(),
+                "imported rows are resolved by the factory repository"
+            );
         }
     }
 

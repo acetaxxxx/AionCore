@@ -60,9 +60,7 @@ pub(super) async fn configure_from_env(
         context.conversation.conversation_id.clone(),
     );
     env.insert("AIONUI_USER_ID".into(), context.conversation.user_id.clone());
-    if let Some(team) = context.team.as_ref() {
-        env.insert("AIONUI_PREVIEW_TEAM_ID".into(), team.team_id.clone());
-    }
+    bind_team_scope(context, &mut env);
     let server = SessionMcpServer {
         id: server_id,
         name: NAME.into(),
@@ -86,6 +84,17 @@ fn append_instructions(prompt: &mut Option<String>) {
         Some(existing) => format!("{existing}\n\n{INSTRUCTIONS}"),
         None => INSTRUCTIONS.to_owned(),
     });
+}
+
+fn bind_team_scope(context: &AgentSessionContext, env: &mut HashMap<String, String>) {
+    let backend_team = match &context.kind {
+        AgentSessionKind::Acp(build) => build.team.as_ref(),
+        AgentSessionKind::Antigravity(build) => build.team.as_ref(),
+        AgentSessionKind::Aionrs(build) => build.team.as_ref(),
+    };
+    if let Some(team) = context.team.as_ref().or(backend_team) {
+        env.insert("AIONUI_PREVIEW_TEAM_ID".into(), team.team_id.clone());
+    }
 }
 
 async fn install(
@@ -288,6 +297,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn binding_only_team_contexts_keep_team_scope_in_preview_runtime_env() {
+        for kind in kinds() {
+            let mut personal_env = HashMap::new();
+            bind_team_scope(&context(kind.clone()), &mut personal_env);
+            assert!(!personal_env.contains_key("AIONUI_PREVIEW_TEAM_ID"));
+            for marker in [1, 2] {
+                let mut context = context(kind.clone());
+                mark_team(&mut context, marker);
+                let mut env = HashMap::new();
+                bind_team_scope(&context, &mut env);
+                assert_eq!(env.get("AIONUI_PREVIEW_TEAM_ID").map(String::as_str), Some("shared-team"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn personal_preview_is_automatic_for_all_backends_and_selection_states() {
         let runtime = server("self-host-workspace-preview");
@@ -469,6 +494,10 @@ mod tests {
 
         db.pool().close().await;
         let error = install(&mut deleted, runtime, Some(&repo)).await.unwrap_err();
-        assert!(error.to_string().contains("workspace preview authorization lookup failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("workspace preview authorization lookup failed")
+        );
     }
 }
