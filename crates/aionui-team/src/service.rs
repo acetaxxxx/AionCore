@@ -18,7 +18,7 @@ use aionui_api_types::{
     TeamContextResetStatus, TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamMemberResponse, TeamResponse,
     TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
     TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode,
-    TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
+    TeamToolErrorPayload, TeamToolTransport, TeamUploadResponse, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::{MAX_ELIGIBLE_TEAM_USERS, TeamAccessRole, TeamRow, TeamSharingMode};
@@ -3292,11 +3292,10 @@ impl TeamSessionService {
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         let access = self.authorize_team(user_id, team_id).await?;
-        Self::reject_shared_team_attachments(&access, files.as_deref())?;
         self.ensure_session_inner(team_id, Some(&access.execution_owner_id))
             .await?;
         let (content, files) = self
-            .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
+            .resolve_team_message_attachments(&access, is_local_admin, content, files)
             .await?;
         // Serialize final membership validation and enqueue with member removal.
         let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
@@ -3342,11 +3341,10 @@ impl TeamSessionService {
                 "collaborators may only send directly to the shared Team Lead".into(),
             ));
         }
-        Self::reject_shared_team_attachments(&access, files.as_deref())?;
         self.ensure_session_inner(team_id, Some(&access.execution_owner_id))
             .await?;
         let (content, files) = self
-            .resolve_message_attachments(&access.execution_owner_id, is_local_admin, content, files)
+            .resolve_team_message_attachments(&access, is_local_admin, content, files)
             .await?;
         let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let current_access = self.authorize_team(user_id, team_id).await?;
@@ -3404,18 +3402,6 @@ impl TeamSessionService {
             .ok_or_else(|| TeamError::SessionNotFound(team_id.to_owned()))
     }
 
-    fn reject_shared_team_attachments(
-        access: &TeamAuthorizationContext,
-        files: Option<&[ChatFileRef]>,
-    ) -> Result<(), TeamError> {
-        if access.sharing_mode == TeamSharingMode::Shared && files.is_some_and(|files| !files.is_empty()) {
-            return Err(TeamError::InvalidRequest(
-                "Shared Team file attachments are unavailable until Team-scoped upload is configured".into(),
-            ));
-        }
-        Ok(())
-    }
-
     pub(crate) async fn peek_agent_messages(
         &self,
         team_id: &str,
@@ -3436,12 +3422,154 @@ impl TeamSessionService {
             .await
     }
 
-    /// Resolve a send's attachments to absolute paths and re-inline them into
-    /// the content (`[[AION_FILES]]` form) at the team send boundary. Atomic;
-    /// empty/absent `files` is a no-op needing no project service.
-    async fn resolve_message_attachments(
+    pub async fn upload_team_file(
         &self,
         user_id: &str,
+        team_id: &str,
+        file_bytes: Vec<u8>,
+    ) -> Result<TeamUploadResponse, TeamError> {
+        let access = self.authorize_team(user_id, team_id).await?;
+        let canonical_workspace = self.verify_and_resolve_team_workspace(&access).await?;
+
+        let aionui_dir = canonical_workspace.join(".aionui");
+        if aionui_dir.exists() {
+            let meta = std::fs::symlink_metadata(&aionui_dir)
+                .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(TeamError::TeamNotFound(team_id.to_owned()));
+            }
+        }
+        let uploads_dir = aionui_dir.join("uploads");
+        if uploads_dir.exists() {
+            let meta = std::fs::symlink_metadata(&uploads_dir)
+                .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(TeamError::TeamNotFound(team_id.to_owned()));
+            }
+        } else {
+            std::fs::create_dir_all(&uploads_dir)
+                .map_err(|e| TeamError::InvalidRequest(format!("failed to create uploads dir: {e}")))?;
+        }
+
+        let canonical_uploads_dir = uploads_dir
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if !canonical_uploads_dir.starts_with(&canonical_workspace) {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+
+        let upload_id = generate_id();
+        let target_path = canonical_uploads_dir.join(&upload_id);
+        std::fs::write(&target_path, file_bytes)
+            .map_err(|e| TeamError::InvalidRequest(format!("failed to write uploaded file: {e}")))?;
+
+        let meta = std::fs::symlink_metadata(&target_path)
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            let _ = std::fs::remove_file(&target_path);
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+
+        let canonical_target = target_path
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if !canonical_target.starts_with(&canonical_uploads_dir)
+            || !canonical_target.starts_with(&canonical_workspace)
+        {
+            let _ = std::fs::remove_file(&target_path);
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+
+        Ok(TeamUploadResponse { upload_id })
+    }
+
+    async fn verify_and_resolve_team_workspace(
+        &self,
+        access: &TeamAuthorizationContext,
+    ) -> Result<PathBuf, TeamError> {
+        let raw_workspace = access.team.workspace.trim();
+        if raw_workspace.is_empty() {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+
+        if access.sharing_mode == TeamSharingMode::Shared
+            && !self
+                .conversation_port
+                .is_shared_team_workspace(&access.team.id, raw_workspace)
+                .await?
+        {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+
+        let canonical_workspace = Path::new(raw_workspace)
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        let ws_meta = std::fs::symlink_metadata(&canonical_workspace)
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        if ws_meta.file_type().is_symlink() || !ws_meta.is_dir() {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+
+        if access.sharing_mode == TeamSharingMode::Shared
+            && !self
+                .conversation_port
+                .is_shared_team_workspace(&access.team.id, &canonical_workspace.to_string_lossy())
+                .await?
+        {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+
+        Ok(canonical_workspace)
+    }
+
+    async fn resolve_team_upload_file(
+        &self,
+        access: &TeamAuthorizationContext,
+        upload_id: &str,
+    ) -> Result<String, TeamError> {
+        if upload_id.is_empty()
+            || !upload_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+
+        let canonical_workspace = self.verify_and_resolve_team_workspace(access).await?;
+        let uploads_dir = canonical_workspace.join(".aionui").join("uploads");
+        let uploads_meta = std::fs::symlink_metadata(&uploads_dir)
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        if uploads_meta.file_type().is_symlink() || !uploads_meta.is_dir() {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+        let canonical_uploads_dir = uploads_dir
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        if !canonical_uploads_dir.starts_with(&canonical_workspace) {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+
+        let file_path = canonical_uploads_dir.join(upload_id);
+        let file_meta = std::fs::symlink_metadata(&file_path)
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        if file_meta.file_type().is_symlink() || !file_meta.is_file() {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+        let canonical_file = file_path
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        if !canonical_file.starts_with(&canonical_uploads_dir)
+            || !canonical_file.starts_with(&canonical_workspace)
+        {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+
+        Ok(canonical_file.to_string_lossy().into_owned())
+    }
+
+    async fn resolve_team_message_attachments(
+        &self,
+        access: &TeamAuthorizationContext,
         is_local_admin: bool,
         content: &str,
         files: Option<Vec<ChatFileRef>>,
@@ -3450,25 +3578,81 @@ impl TeamSessionService {
             Some(files) if !files.is_empty() => files,
             _ => return Ok((content.to_owned(), None)),
         };
-        let project = self
-            .project_service
-            .read()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .ok_or_else(|| {
-                TeamError::InvalidRequest("project service unavailable; cannot resolve file attachments".into())
-            })?;
-        let upload_root = std::env::temp_dir().join("aionui");
-        let resolved = project
-            .resolve_chat_message_with_local_admin(user_id, is_local_admin, content, &files, &upload_root)
-            .await
-            .map_err(|err| match err {
-                aionui_project::ProjectError::LocalPathForbidden => {
-                    TeamError::Forbidden("local file access is not authorized".to_owned())
+
+        if access.role == TeamAccessRole::Collaborator {
+            for file in &files {
+                match file {
+                    ChatFileRef::TeamUpload { .. } => {}
+                    _ => {
+                        return Err(TeamError::InvalidRequest(
+                            "arbitrary file paths are not allowed for team collaborators".into(),
+                        ));
+                    }
                 }
-                err => TeamError::InvalidRequest(err.to_string()),
-            })?;
-        Ok((resolved.content, Some(resolved.files)))
+            }
+        }
+
+        let mut resolved_paths = Vec::with_capacity(files.len());
+        let mut generic_refs = Vec::new();
+        let mut generic_indices = Vec::new();
+
+        for (idx, file) in files.into_iter().enumerate() {
+            match file {
+                ChatFileRef::TeamUpload { upload_id } => {
+                    let path = self.resolve_team_upload_file(access, &upload_id).await?;
+                    resolved_paths.push((idx, path));
+                }
+                other => {
+                    generic_refs.push(other);
+                    generic_indices.push(idx);
+                }
+            }
+        }
+
+        if !generic_refs.is_empty() {
+            let project = self
+                .project_service
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .ok_or_else(|| {
+                    TeamError::InvalidRequest("project service unavailable; cannot resolve file attachments".into())
+                })?;
+            let upload_root = std::env::temp_dir().join("aionui");
+            for (file, idx) in generic_refs.into_iter().zip(generic_indices) {
+                let resolved = project
+                    .resolve_chat_file_ref_with_local_admin(
+                        &access.execution_owner_id,
+                        is_local_admin,
+                        &file,
+                        &upload_root,
+                        aionui_project::FileOp::Read,
+                    )
+                    .await
+                    .map_err(|err| match err {
+                        aionui_project::ProjectError::LocalPathForbidden => {
+                            TeamError::Forbidden("local file access is not authorized".to_owned())
+                        }
+                        err => TeamError::InvalidRequest(err.to_string()),
+                    })?;
+                resolved_paths.push((idx, resolved));
+            }
+        }
+
+        resolved_paths.sort_by_key(|(idx, _)| *idx);
+        let paths: Vec<String> = resolved_paths.into_iter().map(|(_, p)| p).collect();
+
+        let formatted_content = if paths.is_empty() {
+            content.to_owned()
+        } else {
+            format!(
+                "{content}\n\n{}\n{}",
+                aionui_common::constants::AIONUI_FILES_MARKER,
+                paths.join("\n")
+            )
+        };
+
+        Ok((formatted_content, Some(paths)))
     }
 
     /// Directed retry/wakeup for a single member runtime (dormant or failed),

@@ -169,6 +169,7 @@ impl ProjectService {
                 authorize_local_data_path(user_id, is_local_admin, self.user_data_root(), &canonical)?;
                 Ok(canonical.to_string_lossy().into_owned())
             }
+            ChatFileRef::TeamUpload { .. } => Err(ProjectError::LocalPathForbidden),
         }
     }
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, Query, State};
+use axum::extract::{Extension, Json, Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 
@@ -18,7 +18,7 @@ use aionui_api_types::{
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse,
     TeamMcpAllowlistResponse, TeamMemberListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
-    TeamTaskResponse,
+    TeamTaskResponse, TeamUploadResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -239,6 +239,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             axum::routing::patch(update_agent_model),
         )
         .route("/api/teams/{id}/messages", post(send_message))
+        .route("/api/teams/{id}/uploads", post(upload_team_file))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
         .route("/api/teams/{id}/agents/{slot_id}/interrupt", post(interrupt_agent))
         .route("/api/teams/{id}/agents/{slot_id}/attach", post(attach_agent))
@@ -647,6 +648,40 @@ async fn reset_agent_context(
         .clear_agent_context(&user.id, &params.id, &params.slot_id)
         .await?;
     Ok(Json(ApiResponse::ok(outcome)))
+}
+
+async fn extract_team_upload_multipart(mut multipart: Multipart) -> Result<Vec<u8>, ApiError> {
+    let mut file_data: Option<Vec<u8>> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("multipart error: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_owned();
+        if name == "file" {
+            file_data = Some(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("failed to read file: {e}")))?
+                    .to_vec(),
+            );
+        }
+    }
+
+    file_data.ok_or_else(|| ApiError::BadRequest("missing 'file' field".to_owned()))
+}
+
+async fn upload_team_file(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    multipart: Multipart,
+) -> Result<Json<ApiResponse<TeamUploadResponse>>, ApiError> {
+    let file_bytes = extract_team_upload_multipart(multipart).await?;
+    let resp = state.service.upload_team_file(&user.id, &id, file_bytes).await?;
+    Ok(Json(ApiResponse::ok(resp)))
 }
 
 async fn send_message(
