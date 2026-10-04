@@ -46,10 +46,7 @@ mod tests {
             upload_id: "test-upload-123".into(),
         };
         let serialized = serde_json::to_string(&file_ref).unwrap();
-        assert_eq!(
-            serialized,
-            r#"{"kind":"team_upload","upload_id":"test-upload-123"}"#
-        );
+        assert_eq!(serialized, r#"{"kind":"team_upload","upload_id":"test-upload-123"}"#);
         let deserialized: ChatFileRef = serde_json::from_str(&serialized).unwrap();
         assert_eq!(file_ref, deserialized);
     }

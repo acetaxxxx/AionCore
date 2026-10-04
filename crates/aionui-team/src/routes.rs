@@ -706,10 +706,7 @@ async fn upload_team_file(
     state.service.verify_and_resolve_team_workspace(&access).await?;
 
     let upload_data = extract_team_upload_multipart(multipart).await?;
-    let resp = state
-        .service
-        .upload_team_file(&user.id, &id, upload_data)
-        .await?;
+    let resp = state.service.upload_team_file(&user.id, &id, upload_data).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 
