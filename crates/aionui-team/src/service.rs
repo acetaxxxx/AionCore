@@ -67,6 +67,10 @@ use crate::work_coordinator::{
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
+pub(crate) const TEAM_UPLOAD_MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+const TEAM_UPLOAD_MAX_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
+const TEAM_UPLOAD_MAX_FILE_COUNT: usize = 100;
+
 /// Default number of activity items returned when the client omits `limit`.
 pub const DEFAULT_ACTIVITY_LIMIT: i64 = 500;
 /// Hard upper bound for the activity `limit` query parameter.
@@ -3445,11 +3449,40 @@ pub struct TeamUploadStreamData {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct TeamUploadMetadata {
     pub upload_id: String,
-    pub original_file_name: Option<String>,
     pub extension: Option<String>,
     pub content_type: String,
     pub size_bytes: usize,
     pub created_at: TimestampMs,
+}
+
+fn team_upload_usage(uploads_dir: &Path, team_id: &str) -> Result<(u64, usize), TeamError> {
+    let entries = std::fs::read_dir(uploads_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+    let mut total_bytes = 0u64;
+    let mut file_count = 0usize;
+    let mut entry_count = 0usize;
+
+    for entry in entries {
+        let entry = entry.map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let metadata = std::fs::symlink_metadata(entry.path())
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+
+        entry_count = entry_count.saturating_add(1);
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if !entry.file_name().to_string_lossy().ends_with(".meta.json") {
+            file_count = file_count.saturating_add(1);
+        }
+        if total_bytes > TEAM_UPLOAD_MAX_STORAGE_BYTES
+            || file_count > TEAM_UPLOAD_MAX_FILE_COUNT
+            || entry_count > TEAM_UPLOAD_MAX_FILE_COUNT * 2
+        {
+            return Err(TeamError::TeamUploadQuotaExceeded);
+        }
+    }
+
+    Ok((total_bytes, file_count))
 }
 
 fn extract_sanitized_extension(file_name: Option<&str>, content_type: Option<&str>) -> Option<String> {
@@ -3494,6 +3527,10 @@ impl TeamSessionService {
         canonical_workspace: &Path,
         upload_data: TeamUploadStreamData,
     ) -> Result<TeamUploadResponse, TeamError> {
+        if upload_data.file_bytes.len() > TEAM_UPLOAD_MAX_FILE_BYTES {
+            return Err(TeamError::TeamUploadFileTooLarge);
+        }
+
         let aionui_dir = canonical_workspace.join(".aionui");
         if aionui_dir.exists() {
             let meta =
@@ -3537,7 +3574,6 @@ impl TeamSessionService {
 
         let metadata = TeamUploadMetadata {
             upload_id: upload_id.clone(),
-            original_file_name: upload_data.file_name,
             extension,
             content_type,
             size_bytes: upload_data.file_bytes.len(),
@@ -3545,6 +3581,14 @@ impl TeamSessionService {
         };
         let meta_bytes = serde_json::to_vec_pretty(&metadata)
             .map_err(|e| TeamError::InvalidRequest(format!("failed to serialize upload metadata: {e}")))?;
+
+        let (used_bytes, used_files) = team_upload_usage(&canonical_uploads_dir, &access.team.id)?;
+        let incoming_bytes = (upload_data.file_bytes.len() as u64).saturating_add(meta_bytes.len() as u64);
+        if used_files >= TEAM_UPLOAD_MAX_FILE_COUNT
+            || used_bytes.saturating_add(incoming_bytes) > TEAM_UPLOAD_MAX_STORAGE_BYTES
+        {
+            return Err(TeamError::TeamUploadQuotaExceeded);
+        }
 
         let mut target_file = std::fs::OpenOptions::new()
             .write(true)

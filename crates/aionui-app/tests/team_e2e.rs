@@ -49,6 +49,15 @@ impl UploadMultipart {
         self
     }
 
+    fn add_text(mut self, name: &str, value: &str) -> Self {
+        self.parts
+            .extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
+        self.parts.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes(),
+        );
+        self
+    }
+
     fn build(mut self) -> (String, Vec<u8>) {
         self.parts
             .extend_from_slice(format!("--{}--\r\n", self.boundary).as_bytes());
@@ -57,9 +66,37 @@ impl UploadMultipart {
 }
 
 fn team_upload_request(team_id: &str, token: &str, csrf: &str) -> axum::http::Request<axum::body::Body> {
+    team_upload_request_with_bytes(team_id, token, csrf, TEST_PNG)
+}
+
+fn team_upload_request_with_bytes(
+    team_id: &str,
+    token: &str,
+    csrf: &str,
+    bytes: &[u8],
+) -> axum::http::Request<axum::body::Body> {
     let (content_type, body) = UploadMultipart::new()
-        .add_file("file", "shared.png", "image/png", TEST_PNG)
+        .add_file("file", "shared.png", "image/png", bytes)
         .build();
+    team_upload_request_with_body(team_id, token, csrf, content_type, body)
+}
+
+fn team_upload_request_without_file(
+    team_id: &str,
+    token: &str,
+    csrf: &str,
+) -> axum::http::Request<axum::body::Body> {
+    let (content_type, body) = UploadMultipart::new().add_text("note", "no file supplied").build();
+    team_upload_request_with_body(team_id, token, csrf, content_type, body)
+}
+
+fn team_upload_request_with_body(
+    team_id: &str,
+    token: &str,
+    csrf: &str,
+    content_type: String,
+    body: Vec<u8>,
+) -> axum::http::Request<axum::body::Body> {
     let content_length = body.len();
     axum::http::Request::builder()
         .method("POST")
@@ -1224,6 +1261,32 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         .unwrap();
     assert_eq!(added.status(), StatusCode::CREATED);
 
+    let missing_file = app
+        .clone()
+        .oneshot(team_upload_request_without_file(
+            team_id,
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_file.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(missing_file).await["code"], "TEAM_UPLOAD_FILE_REQUIRED");
+
+    let oversized_bytes = vec![0u8; 10 * 1024 * 1024 + 1];
+    let oversized = app
+        .clone()
+        .oneshot(team_upload_request_with_bytes(
+            team_id,
+            &invitee_token,
+            &invitee_csrf,
+            &oversized_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(oversized).await["code"], "TEAM_UPLOAD_FILE_TOO_LARGE");
+
     let upload_response = app
         .clone()
         .oneshot(team_upload_request(team_id, &invitee_token, &invitee_csrf))
@@ -1284,6 +1347,32 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         !received_path.contains(".."),
         "resolved path must be canonical without traversal"
     );
+
+    // The quota is recomputed from durable workspace files, not process memory.
+    let uploads_dir = std::path::Path::new(team["workspace"].as_str().unwrap())
+        .join(".aionui")
+        .join("uploads");
+    let quota_marker = uploads_dir.join("quota-fixture.bin");
+    let quota_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&quota_marker)
+        .unwrap();
+    quota_file.set_len(100 * 1024 * 1024).unwrap();
+    drop(quota_file);
+    let over_quota = app
+        .clone()
+        .oneshot(team_upload_request_with_bytes(
+            team_id,
+            &invitee_token,
+            &invitee_csrf,
+            b"x",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(over_quota.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(over_quota).await["code"], "TEAM_UPLOAD_QUOTA_EXCEEDED");
+    std::fs::remove_file(quota_marker).unwrap();
 
     let lead_slot_id = team["assistants"][0]["slot_id"].as_str().unwrap();
     let denied_direct = app
