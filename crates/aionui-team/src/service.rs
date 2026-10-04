@@ -3558,8 +3558,8 @@ impl TeamUploadDirectory {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
         std::fs::create_dir_all(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-        let root_metadata = std::fs::symlink_metadata(storage_root)
-            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let root_metadata =
+            std::fs::symlink_metadata(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
         if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
@@ -3575,7 +3575,10 @@ impl TeamUploadDirectory {
         if !canonical_path.starts_with(&canonical_root) {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        Ok(Self { path: canonical_path, handle })
+        Ok(Self {
+            path: canonical_path,
+            handle,
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -3599,8 +3602,8 @@ impl TeamUploadDirectory {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
         std::fs::create_dir_all(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-        let root_metadata = std::fs::symlink_metadata(storage_root)
-            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let root_metadata =
+            std::fs::symlink_metadata(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
         if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
