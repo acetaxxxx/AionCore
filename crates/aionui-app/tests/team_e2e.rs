@@ -9,12 +9,70 @@ use tower::ServiceExt;
 use aionui_api_types::TeamMcpStdioConfig;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use common::{
-    body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
-    setup_and_login,
+    body_json, build_app, build_app_with_captured_mock_agent_files, build_app_with_mock_agents, delete_with_token,
+    get_request, get_with_token, json_with_token, setup_and_login,
 };
 
 const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
 const DEFAULT_TEAM_AGENT_ID: &str = "2d23ff1c";
+
+const TEST_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+    0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2,
+    0x21, 0xBC, 0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+struct UploadMultipart {
+    boundary: String,
+    parts: Vec<u8>,
+}
+
+impl UploadMultipart {
+    fn new() -> Self {
+        Self {
+            boundary: "----SharedTeamUploadBoundary".to_owned(),
+            parts: Vec::new(),
+        }
+    }
+
+    fn add_file(mut self, name: &str, filename: &str, mime: &str, bytes: &[u8]) -> Self {
+        self.parts
+            .extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
+        self.parts.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n")
+                .as_bytes(),
+        );
+        self.parts
+            .extend_from_slice(format!("Content-Type: {mime}\r\n\r\n").as_bytes());
+        self.parts.extend_from_slice(bytes);
+        self.parts.extend_from_slice(b"\r\n");
+        self
+    }
+
+    fn build(mut self) -> (String, Vec<u8>) {
+        self.parts
+            .extend_from_slice(format!("--{}--\r\n", self.boundary).as_bytes());
+        (format!("multipart/form-data; boundary={}", self.boundary), self.parts)
+    }
+}
+
+fn team_upload_request(team_id: &str, token: &str, csrf: &str) -> axum::http::Request<axum::body::Body> {
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "shared.png", "image/png", TEST_PNG)
+        .build();
+    let content_length = body.len();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(&format!("/api/teams/{team_id}/uploads"))
+        .header("content-type", content_type)
+        .header("content-length", content_length)
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-csrf-token", csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
 
 fn team_agent(name: &str, role: &str) -> serde_json::Value {
     json!({
@@ -1115,6 +1173,201 @@ async fn shared_team_invitee_can_read_team_lead_and_start_runtime_without_owner_
             "unstable error code at {uri}"
         );
     }
+}
+
+#[tokio::test]
+async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitrary_paths() {
+    let (mut app, services, received_files) = build_app_with_captured_mock_agent_files().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (invitee_token, invitee_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss2").await;
+    ensure_default_team_assistant(&mut app, &services, &owner_token, &owner_csrf).await;
+
+    let mut create_body = two_agent_body();
+    create_body["sharing_mode"] = json!("shared");
+    let create_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            create_body,
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let team = body_json(create_response).await["data"].clone();
+    let team_id = team["id"].as_str().unwrap();
+
+    let eligible = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/teams/eligible-collaborators?team_id={team_id}"),
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(eligible.status(), StatusCode::OK);
+    let account_ref = body_json(eligible).await["data"][0]["account_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let added = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/members"),
+            json!({ "account_ref": account_ref }),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::CREATED);
+
+    let upload_response = app
+        .clone()
+        .oneshot(team_upload_request(team_id, &invitee_token, &invitee_csrf))
+        .await
+        .unwrap();
+    assert_eq!(
+        upload_response.status(),
+        StatusCode::OK,
+        "active Shared Team member upload should stage the image"
+    );
+    let upload_body = body_json(upload_response).await;
+    let upload_id = upload_body["data"]["upload_id"]
+        .as_str()
+        .expect("Team upload returns an opaque upload_id");
+    assert!(!upload_id.is_empty());
+    assert!(!upload_id.starts_with('/'), "upload reference must not expose a host path");
+
+    let attached = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/messages"),
+            json!({
+                "content": "Please inspect this image",
+                "files": [{ "kind": "team_upload", "upload_id": upload_id }]
+            }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(attached.status(), StatusCode::OK, "Team image attachment should be accepted");
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let bytes = { received_files.lock().unwrap().first().cloned() };
+            if let Some(bytes) = bytes {
+                return bytes;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Team runtime should receive the uploaded image");
+    assert_eq!(received, TEST_PNG, "runtime must read the exact staged PNG bytes");
+
+    for arbitrary_ref in [
+        json!({ "kind": "upload", "path": "/tmp/forged-upload.png" }),
+        json!({ "kind": "local", "path": "/etc/passwd" }),
+    ] {
+        let denied = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                &format!("/api/teams/{team_id}/messages"),
+                json!({ "content": "forged path", "files": [arbitrary_ref] }),
+                &invitee_token,
+                &invitee_csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(denied).await["code"], "BAD_REQUEST");
+    }
+
+    let mut other_team_body = two_agent_body();
+    other_team_body["sharing_mode"] = json!("shared");
+    let other_team_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            other_team_body,
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_team_response.status(), StatusCode::CREATED);
+    let other_team_id = body_json(other_team_response).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cross_team_attachment = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{other_team_id}/messages"),
+            json!({
+                "content": "cross-Team upload reference",
+                "files": [{ "kind": "team_upload", "upload_id": upload_id }]
+            }),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_team_attachment.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(cross_team_attachment).await["code"], "NOT_FOUND");
+
+    let members = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}/members"), &owner_token))
+        .await
+        .unwrap();
+    assert_eq!(members.status(), StatusCode::OK);
+    let membership_ref = body_json(members).await["data"][0]["membership_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let revoked = app
+        .clone()
+        .oneshot(delete_with_token(
+            &format!("/api/teams/{team_id}/members/{membership_ref}"),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let post_revoke_upload = app
+        .clone()
+        .oneshot(team_upload_request(team_id, &invitee_token, &invitee_csrf))
+        .await
+        .unwrap();
+    assert_eq!(post_revoke_upload.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(post_revoke_upload).await["code"], "NOT_FOUND");
+    let post_revoke_attach = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/messages"),
+            json!({
+                "content": "attach after revocation",
+                "files": [{ "kind": "team_upload", "upload_id": upload_id }]
+            }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(post_revoke_attach.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(post_revoke_attach).await["code"], "NOT_FOUND");
 }
 
 #[tokio::test]
