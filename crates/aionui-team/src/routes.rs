@@ -699,14 +699,16 @@ async fn upload_team_file(
     Path(id): Path<String>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<TeamUploadResponse>>, ApiError> {
-    // Authorize Team and verify workspace BEFORE accepting/buffering the upload body
+    // Authorize Team and verify workspace BEFORE accepting/buffering the upload body.
+    // The service re-authorizes under the Team membership lock before persisting,
+    // since membership or the persisted workspace may change while streaming.
     let access = state.service.authorize_team(&user.id, &id).await?;
-    let canonical_workspace = state.service.verify_and_resolve_team_workspace(&access).await?;
+    state.service.verify_and_resolve_team_workspace(&access).await?;
 
     let upload_data = extract_team_upload_multipart(multipart).await?;
     let resp = state
         .service
-        .store_team_upload(&access, &canonical_workspace, upload_data)
+        .upload_team_file(&user.id, &id, upload_data)
         .await?;
     Ok(Json(ApiResponse::ok(resp)))
 }

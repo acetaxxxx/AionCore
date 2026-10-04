@@ -3,6 +3,7 @@ mod response_builder;
 pub(crate) mod spawn_support;
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -3385,11 +3386,21 @@ impl TeamSessionService {
         slot_id: &str,
         request: InterruptTeamAgentRequest,
     ) -> Result<TeamInterruptAgentResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, Some(user_id)).await?;
+        let access = self.authorize_team(user_id, team_id).await?;
+        if access.role != TeamAccessRole::Owner {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        self.ensure_session_inner(team_id, Some(&access.execution_owner_id)).await?;
         let (message, files) = self
-            .resolve_message_attachments(user_id, is_local_admin, &request.message, request.files)
+            .resolve_team_message_attachments(&access, is_local_admin, &request.message, request.files)
             .await?;
+        let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
+        let current_access = self.authorize_team(user_id, team_id).await?;
+        if current_access.role != TeamAccessRole::Owner
+            || current_access.execution_owner_id != access.execution_owner_id
+        {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
         self.published_session(team_id)?
             .interrupt_agent_from_user(slot_id, &message, files, request.reason, request.queued_policy)
             .await
@@ -3421,6 +3432,7 @@ impl TeamSessionService {
             .observe_agent_messages(slot_id, expected_batch_id, message_ids)
             .await
     }
+}
 
 #[derive(Debug, Clone)]
 pub struct TeamUploadStreamData {
@@ -3475,7 +3487,7 @@ fn sanitize_content_type(raw_ct: Option<&str>) -> String {
 }
 
 impl TeamSessionService {
-    pub async fn store_team_upload(
+    async fn store_team_upload(
         &self,
         access: &TeamAuthorizationContext,
         canonical_workspace: &Path,
@@ -3535,12 +3547,34 @@ impl TeamSessionService {
         let meta_bytes = serde_json::to_vec_pretty(&metadata)
             .map_err(|e| TeamError::InvalidRequest(format!("failed to serialize upload metadata: {e}")))?;
 
-        std::fs::write(&target_path, &upload_data.file_bytes)
-            .map_err(|e| TeamError::InvalidRequest(format!("failed to write uploaded file: {e}")))?;
-        if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
+        let mut target_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target_path)
+            .map_err(|e| TeamError::InvalidRequest(format!("failed to create uploaded file: {e}")))?;
+        if let Err(e) = target_file.write_all(&upload_data.file_bytes) {
             let _ = std::fs::remove_file(&target_path);
+            return Err(TeamError::InvalidRequest(format!("failed to write uploaded file: {e}")));
+        }
+        drop(target_file);
+
+        let mut meta_file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&meta_path)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = std::fs::remove_file(&target_path);
+                return Err(TeamError::InvalidRequest(format!("failed to create upload metadata: {e}")));
+            }
+        };
+        if let Err(e) = meta_file.write_all(&meta_bytes) {
+            let _ = std::fs::remove_file(&target_path);
+            let _ = std::fs::remove_file(&meta_path);
             return Err(TeamError::InvalidRequest(format!("failed to write upload metadata: {e}")));
         }
+        drop(meta_file);
 
         let meta_meta = std::fs::symlink_metadata(&meta_path)
             .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
@@ -3582,6 +3616,9 @@ impl TeamSessionService {
         team_id: &str,
         upload_data: TeamUploadStreamData,
     ) -> Result<TeamUploadResponse, TeamError> {
+        // Serialize storage with membership revocation, then re-read authorization
+        // and the persisted workspace after the request body has been received.
+        let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let access = self.authorize_team(user_id, team_id).await?;
         let canonical_workspace = self.verify_and_resolve_team_workspace(&access).await?;
         self.store_team_upload(&access, &canonical_workspace, upload_data).await
