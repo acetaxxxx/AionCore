@@ -183,7 +183,7 @@ pub(crate) async fn compose_injected_prefix_for(
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
     let mut context = options.context;
-    workspace_preview::configure_from_env(&mut context).await?;
+    workspace_preview::configure_from_env(&mut context, deps.mcp_server_repo.as_deref()).await?;
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {
