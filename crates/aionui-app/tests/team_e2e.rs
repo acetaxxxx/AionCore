@@ -1533,6 +1533,77 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
 }
 
 #[tokio::test]
+async fn shared_team_upload_rate_limit_allows_multi_image_burst_then_returns_stable_429() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (invitee_token, invitee_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss2").await;
+    ensure_default_team_assistant(&mut app, &services, &owner_token, &owner_csrf).await;
+
+    let mut create_body = two_agent_body();
+    create_body["sharing_mode"] = json!("shared");
+    let create_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            create_body,
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let team_id = body_json(create_response).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let eligible = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/teams/eligible-collaborators?team_id={team_id}"),
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(eligible.status(), StatusCode::OK);
+    let account_ref = body_json(eligible).await["data"][0]["account_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let added = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/members"),
+            json!({ "account_ref": account_ref }),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::CREATED);
+
+    // A twenty-image selection burst fits in the initial bucket.
+    for _ in 0..20 {
+        let response = app
+            .clone()
+            .oneshot(team_upload_request(&team_id, &invitee_token, &invitee_csrf))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let limited = app
+        .clone()
+        .oneshot(team_upload_request(&team_id, &invitee_token, &invitee_csrf))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body_json(limited).await["code"], "TEAM_UPLOAD_RATE_LIMITED");
+}
+
+#[tokio::test]
 async fn shared_team_file_endpoints_allow_active_members_and_reject_other_workspace_access() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

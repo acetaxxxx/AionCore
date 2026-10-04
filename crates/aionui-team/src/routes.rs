@@ -96,6 +96,12 @@ impl From<TeamError> for ApiError {
                 "This Team has reached its shared upload storage limit",
                 None,
             ),
+            TeamError::TeamUploadRateLimited => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_UPLOAD_RATE_LIMITED",
+                "Team upload rate limit exceeded; retry shortly",
+                None,
+            ),
             TeamError::TeamUploadFileTooLarge => ApiError::coded(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "TEAM_UPLOAD_FILE_TOO_LARGE",
@@ -749,6 +755,7 @@ async fn upload_team_file(
     // since membership or the persisted workspace may change while streaming.
     let access = state.service.authorize_team(&user.id, &id).await?;
     state.service.verify_and_resolve_team_workspace(&access).await?;
+    state.service.check_team_upload_rate_limit(&id)?;
 
     let upload_data = extract_team_upload_multipart(multipart).await?;
     let resp = state.service.upload_team_file(&user.id, &id, upload_data).await?;

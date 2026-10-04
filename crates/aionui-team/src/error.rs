@@ -41,6 +41,9 @@ pub enum TeamError {
     #[error("Team upload quota exceeded")]
     TeamUploadQuotaExceeded,
 
+    #[error("Team upload rate limit exceeded")]
+    TeamUploadRateLimited,
+
     #[error("Team upload file exceeds its size limit")]
     TeamUploadFileTooLarge,
 

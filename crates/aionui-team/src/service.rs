@@ -70,6 +70,10 @@ use crate::workspace::validate_create_workspace_path;
 pub(crate) const TEAM_UPLOAD_MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const TEAM_UPLOAD_MAX_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 const TEAM_UPLOAD_MAX_FILE_COUNT: usize = 100;
+const TEAM_UPLOAD_RATE_BURST: f64 = 20.0;
+const TEAM_UPLOAD_RATE_REFILL_PER_SECOND: f64 = 1.0;
+const TEAM_UPLOAD_RATE_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+const TEAM_UPLOAD_RATE_MAX_TEAMS: usize = 4096;
 
 /// Default number of activity items returned when the client omits `limit`.
 pub const DEFAULT_ACTIVITY_LIMIT: i64 = 500;
@@ -84,6 +88,46 @@ const ELIGIBLE_LIST_RATE_LIMIT: Duration = Duration::from_secs(1);
 const ELIGIBLE_OWNER_RECORD_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 const ELIGIBLE_OWNER_RECORD_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER: usize = MAX_ELIGIBLE_TEAM_USERS;
+
+#[derive(Default)]
+struct TeamUploadRateLimit {
+    buckets: Mutex<HashMap<String, TeamUploadRateBucket>>,
+}
+
+struct TeamUploadRateBucket {
+    tokens: f64,
+    updated_at: Instant,
+    last_seen_at: Instant,
+}
+
+impl TeamUploadRateLimit {
+    fn check(&self, team_id: &str) -> Result<(), TeamError> {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        buckets.retain(|_, bucket| now.saturating_duration_since(bucket.last_seen_at) < TEAM_UPLOAD_RATE_STATE_TTL);
+
+        if !buckets.contains_key(team_id) && buckets.len() >= TEAM_UPLOAD_RATE_MAX_TEAMS {
+            return Err(TeamError::TeamUploadRateLimited);
+        }
+
+        let bucket = buckets.entry(team_id.to_owned()).or_insert(TeamUploadRateBucket {
+            tokens: TEAM_UPLOAD_RATE_BURST,
+            updated_at: now,
+            last_seen_at: now,
+        });
+        let elapsed = now.saturating_duration_since(bucket.updated_at).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * TEAM_UPLOAD_RATE_REFILL_PER_SECOND).min(TEAM_UPLOAD_RATE_BURST);
+        bucket.updated_at = now;
+        bucket.last_seen_at = now;
+
+        if bucket.tokens < 1.0 {
+            return Err(TeamError::TeamUploadRateLimited);
+        }
+
+        bucket.tokens -= 1.0;
+        Ok(())
+    }
+}
 /// Which item kinds the unified activity feed returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -412,6 +456,9 @@ pub struct TeamSessionService {
     /// Short-lived, single-use account references scoped to the listing owner
     /// and Team. Raw Core user IDs never cross the API boundary.
     eligible_account_refs: EligibleAccountRefStore,
+    /// Bounded, expiring Team-scoped upload buckets. Checked before multipart
+    /// parsing so authenticated bursts cannot force unbounded body buffering.
+    team_upload_rate_limit: TeamUploadRateLimit,
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -550,6 +597,7 @@ impl TeamSessionService {
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
             eligible_account_refs: EligibleAccountRefStore::default(),
+            team_upload_rate_limit: TeamUploadRateLimit::default(),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
@@ -3521,6 +3569,12 @@ fn sanitize_content_type(raw_ct: Option<&str>) -> String {
 }
 
 impl TeamSessionService {
+    /// Consume one request from this Team's upload burst budget. Call only
+    /// after Team/workspace authorization and before reading multipart bytes.
+    pub fn check_team_upload_rate_limit(&self, team_id: &str) -> Result<(), TeamError> {
+        self.team_upload_rate_limit.check(team_id)
+    }
+
     async fn store_team_upload(
         &self,
         access: &TeamAuthorizationContext,
