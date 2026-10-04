@@ -1616,6 +1616,51 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         .unwrap();
     assert_eq!(post_revoke_attach.status(), StatusCode::NOT_FOUND);
     assert_eq!(body_json(post_revoke_attach).await["code"], "NOT_FOUND");
+
+    assert!(
+        uploads_dir.is_dir(),
+        "staged Team upload storage should exist before deletion"
+    );
+    let (body_started_tx, mut body_started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let pending_upload = app
+        .clone()
+        .oneshot(team_upload_request_with_paused_body(
+            team_id,
+            &owner_token,
+            &owner_csrf,
+            release_rx,
+            body_started_tx,
+        ));
+    let pending_upload = tokio::spawn(pending_upload);
+    tokio::time::timeout(std::time::Duration::from_secs(10), body_started_rx.recv())
+        .await
+        .expect("pending upload should begin reading its body")
+        .expect("pending upload notification should remain connected");
+
+    let deleted = app
+        .clone()
+        .oneshot(delete_with_token(
+            &format!("/api/teams/{team_id}"),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert!(
+        !uploads_dir.exists(),
+        "Team deletion must remove durable staged upload storage"
+    );
+
+    release_tx.send(()).unwrap();
+    let pending_upload = pending_upload.await.unwrap().unwrap();
+    assert_eq!(pending_upload.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(pending_upload).await["code"], "NOT_FOUND");
+    assert!(
+        !uploads_dir.exists(),
+        "a body-buffered upload queued before deletion must not recreate storage afterward"
+    );
 }
 
 #[tokio::test]

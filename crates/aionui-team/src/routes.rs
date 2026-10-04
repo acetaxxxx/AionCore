@@ -114,6 +114,12 @@ impl From<TeamError> for ApiError {
                 "Team upload exceeds the 30 MiB per-file limit",
                 None,
             ),
+            TeamError::TeamUploadStorageCleanupFailed => ApiError::coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "TEAM_UPLOAD_STORAGE_CLEANUP_FAILED",
+                "Team upload storage could not be removed; Team deletion was not completed",
+                None,
+            ),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),

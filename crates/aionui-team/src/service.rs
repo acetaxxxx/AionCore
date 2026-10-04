@@ -1586,10 +1586,19 @@ impl TeamSessionService {
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        // Upload requests reauthorize and persist under this same lock. Holding
+        // it across cleanup prevents a buffered request from recreating the
+        // Team's upload directory after deletion.
+        let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let team = self.load_owned_team(user_id, team_id).await?;
 
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamDeleted)
             .await;
+
+        // Remove staged bytes before deleting the Team row. If filesystem
+        // cleanup fails, leave the Team available and report the failure rather
+        // than orphaning storage outside the active-Team quota.
+        self.remove_team_upload_storage(team_id)?;
 
         for agent in &team.agents {
             let _ = self
@@ -1609,8 +1618,8 @@ impl TeamSessionService {
         // the live aggregate), so it never blocks deletion.
         self.remove_team_order_row(user_id, team_id).await;
 
-        self.add_agent_locks.remove(team_id);
-
+        // Keep the lock entry: a queued caller may still hold an Arc to this
+        // mutex, and removing it could let a later request create a second lock.
         info!(team_id = %team_id, "Team removed");
         self.broadcast_team_removed(user_id, team_id);
         Ok(())
@@ -3547,6 +3556,36 @@ fn open_upload_child_directory(parent: &std::fs::File, name: &str, team_id: &str
 }
 
 impl TeamUploadDirectory {
+    fn remove_team(storage_root: &Path, team_id: &str) -> Result<(), TeamError> {
+        if !team_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+
+        let root_metadata = match std::fs::symlink_metadata(storage_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        };
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+
+        let team_path = storage_root.join(team_id);
+        let team_metadata = match std::fs::symlink_metadata(&team_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        };
+        if team_metadata.file_type().is_symlink() || !team_metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+
+        std::fs::remove_dir_all(team_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)
+    }
+
     #[cfg(unix)]
     fn open(storage_root: &Path, team_id: &str) -> Result<Self, TeamError> {
         if !team_id
@@ -3754,6 +3793,18 @@ impl TeamSessionService {
             .ok()
             .and_then(|root| root.clone())
             .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))
+    }
+
+    fn remove_team_upload_storage(&self, team_id: &str) -> Result<(), TeamError> {
+        let storage_root = self
+            .team_upload_storage_root
+            .read()
+            .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?
+            .clone();
+        if let Some(storage_root) = storage_root {
+            TeamUploadDirectory::remove_team(&storage_root, team_id)?;
+        }
+        Ok(())
     }
 
     async fn store_team_upload(

@@ -50,6 +50,9 @@ pub enum TeamError {
     #[error("Team upload file exceeds its size limit")]
     TeamUploadFileTooLarge,
 
+    #[error("Failed to remove Team upload storage")]
+    TeamUploadStorageCleanupFailed,
+
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 
