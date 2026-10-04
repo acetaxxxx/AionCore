@@ -3549,8 +3549,6 @@ fn open_upload_child_directory(parent: &std::fs::File, name: &str, team_id: &str
 impl TeamUploadDirectory {
     #[cfg(unix)]
     fn open(storage_root: &Path, team_id: &str) -> Result<Self, TeamError> {
-        use rustix::fs::{Mode, OFlags, openat};
-
         if !team_id
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
