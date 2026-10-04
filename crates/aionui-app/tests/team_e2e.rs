@@ -1433,9 +1433,11 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
     );
 
     // The quota is recomputed from durable workspace files, not process memory.
-    let uploads_dir = std::path::Path::new(team["workspace"].as_str().unwrap())
-        .join(".aionui")
-        .join("uploads");
+    let uploads_dir = services.data_dir.join("team-uploads").join(team_id);
+    assert!(
+        !uploads_dir.starts_with(team["workspace"].as_str().unwrap()),
+        "Team upload storage must not be controlled by workspace writers"
+    );
     let quota_marker = uploads_dir.join("quota-fixture.bin");
     let quota_file = std::fs::OpenOptions::new()
         .write(true)

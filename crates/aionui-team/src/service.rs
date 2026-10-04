@@ -463,6 +463,9 @@ pub struct TeamSessionService {
     /// One TeamSessionService is constructed for the Core app process; router
     /// clones share this process-wide bound on buffered upload bodies.
     team_upload_in_flight: Arc<tokio::sync::Semaphore>,
+    /// Upload bytes live outside the mutable Team workspace so workspace
+    /// writers cannot rename or replace the directory during staging.
+    team_upload_storage_root: Arc<RwLock<Option<PathBuf>>>,
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -603,6 +606,7 @@ impl TeamSessionService {
             eligible_account_refs: EligibleAccountRefStore::default(),
             team_upload_rate_limit: TeamUploadRateLimit::default(),
             team_upload_in_flight: Arc::new(tokio::sync::Semaphore::new(TEAM_UPLOAD_MAX_IN_FLIGHT)),
+            team_upload_storage_root: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
@@ -742,6 +746,13 @@ impl TeamSessionService {
     pub fn with_user_order_store(&self, user_order: Arc<dyn IUserOrderStore>) {
         if let Ok(mut guard) = self.user_order.write() {
             *guard = Some(user_order);
+        }
+    }
+
+    /// Configure Core-owned durable storage for opaque Team uploads.
+    pub fn with_team_upload_storage_root(&self, root: PathBuf) {
+        if let Ok(mut guard) = self.team_upload_storage_root.write() {
+            *guard = Some(root);
         }
     }
 
@@ -3509,7 +3520,6 @@ struct TeamUploadMetadata {
 }
 
 struct TeamUploadDirectory {
-    #[cfg(not(target_os = "linux"))]
     path: PathBuf,
     #[cfg(unix)]
     handle: std::fs::File,
@@ -3538,38 +3548,34 @@ fn open_upload_child_directory(parent: &std::fs::File, name: &str, team_id: &str
 
 impl TeamUploadDirectory {
     #[cfg(unix)]
-    fn open(workspace: &Path, team_id: &str) -> Result<Self, TeamError> {
+    fn open(storage_root: &Path, team_id: &str) -> Result<Self, TeamError> {
         use rustix::fs::{Mode, OFlags, openat};
 
-        let workspace_parent = workspace
-            .parent()
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
-        let workspace_name = workspace
-            .file_name()
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
-        let parent_handle =
-            std::fs::File::open(workspace_parent).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-        let workspace_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let workspace_handle = openat(&parent_handle, workspace_name, workspace_flags, Mode::empty())
-            .map(std::fs::File::from)
+        if !team_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        std::fs::create_dir_all(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let root_metadata = std::fs::symlink_metadata(storage_root)
             .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-        let aionui_handle = open_upload_child_directory(&workspace_handle, ".aionui", team_id)?;
-        let handle = open_upload_child_directory(&aionui_handle, "uploads", team_id)?;
-        #[cfg(not(target_os = "linux"))]
-        let path = workspace.join(".aionui").join("uploads");
-        #[cfg(not(target_os = "linux"))]
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let root_handle = std::fs::File::open(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let handle = open_upload_child_directory(&root_handle, team_id, team_id)?;
+        let canonical_root = storage_root
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let path = canonical_root.join(team_id);
         let canonical_path = path
             .canonicalize()
             .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-        #[cfg(not(target_os = "linux"))]
-        if !canonical_path.starts_with(workspace) {
+        if !canonical_path.starts_with(&canonical_root) {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        Ok(Self {
-            #[cfg(not(target_os = "linux"))]
-            path: canonical_path,
-            handle,
-        })
+        Ok(Self { path: canonical_path, handle })
     }
 
     #[cfg(target_os = "linux")]
@@ -3585,31 +3591,34 @@ impl TeamUploadDirectory {
     }
 
     #[cfg(not(unix))]
-    fn open(workspace: &Path, team_id: &str) -> Result<Self, TeamError> {
-        let aionui_dir = workspace.join(".aionui");
-        if aionui_dir.exists() {
-            let metadata =
-                std::fs::symlink_metadata(&aionui_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(TeamError::TeamNotFound(team_id.to_owned()));
-            }
-        } else {
-            std::fs::create_dir(&aionui_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+    fn open(storage_root: &Path, team_id: &str) -> Result<Self, TeamError> {
+        if !team_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        let uploads_dir = aionui_dir.join("uploads");
-        if uploads_dir.exists() {
-            let metadata =
-                std::fs::symlink_metadata(&uploads_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(TeamError::TeamNotFound(team_id.to_owned()));
-            }
-        } else {
-            std::fs::create_dir(&uploads_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        std::fs::create_dir_all(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let root_metadata = std::fs::symlink_metadata(storage_root)
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
-        let path = uploads_dir
+        let team_dir = storage_root.join(team_id);
+        if !team_dir.exists() {
+            std::fs::create_dir(&team_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        }
+        let metadata = std::fs::symlink_metadata(&team_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let canonical_root = storage_root
             .canonicalize()
             .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-        if !path.starts_with(workspace) {
+        let path = team_dir
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if !path.starts_with(&canonical_root) {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }
         Ok(Self { path })
@@ -3723,20 +3732,28 @@ impl TeamSessionService {
             .map_err(|_| TeamError::TeamUploadConcurrencyLimited)
     }
 
+    fn team_upload_storage_root(&self, team_id: &str) -> Result<PathBuf, TeamError> {
+        self.team_upload_storage_root
+            .read()
+            .ok()
+            .and_then(|root| root.clone())
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))
+    }
+
     async fn store_team_upload(
         &self,
         access: &TeamAuthorizationContext,
-        canonical_workspace: &Path,
+        storage_root: &Path,
         upload_data: TeamUploadStreamData,
     ) -> Result<TeamUploadResponse, TeamError> {
         if upload_data.file_bytes.len() > TEAM_UPLOAD_MAX_FILE_BYTES {
             return Err(TeamError::TeamUploadFileTooLarge);
         }
 
-        // Open each managed directory without following symlinks. On Unix the
-        // returned descriptor anchors file creation even if a Team runtime
-        // concurrently renames/replaces `.aionui/uploads` in its workspace.
-        let upload_directory = TeamUploadDirectory::open(canonical_workspace, &access.team.id)?;
+        // Upload bytes live under Core-owned data storage, away from the
+        // mutable Team workspace. On Unix the descriptor also prevents
+        // symlink replacement from redirecting file creation.
+        let upload_directory = TeamUploadDirectory::open(storage_root, &access.team.id)?;
 
         let upload_id = generate_id();
         let extension =
@@ -3787,8 +3804,9 @@ impl TeamSessionService {
         // and the persisted workspace after the request body has been received.
         let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let access = self.authorize_team(user_id, team_id).await?;
-        let canonical_workspace = self.verify_and_resolve_team_workspace(&access).await?;
-        self.store_team_upload(&access, &canonical_workspace, upload_data).await
+        self.verify_and_resolve_team_workspace(&access).await?;
+        let storage_root = self.team_upload_storage_root(team_id)?;
+        self.store_team_upload(&access, &storage_root, upload_data).await
     }
 
     pub(crate) async fn verify_and_resolve_team_workspace(
@@ -3843,19 +3861,10 @@ impl TeamSessionService {
             return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
-        let canonical_workspace = self.verify_and_resolve_team_workspace(access).await?;
-        let uploads_dir = canonical_workspace.join(".aionui").join("uploads");
-        let uploads_meta =
-            std::fs::symlink_metadata(&uploads_dir).map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if uploads_meta.file_type().is_symlink() || !uploads_meta.is_dir() {
-            return Err(TeamError::TeamNotFound(access.team.id.clone()));
-        }
-        let canonical_uploads_dir = uploads_dir
-            .canonicalize()
-            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if !canonical_uploads_dir.starts_with(&canonical_workspace) {
-            return Err(TeamError::TeamNotFound(access.team.id.clone()));
-        }
+        self.verify_and_resolve_team_workspace(access).await?;
+        let storage_root = self.team_upload_storage_root(&access.team.id)?;
+        let upload_directory = TeamUploadDirectory::open(&storage_root, &access.team.id)?;
+        let canonical_uploads_dir = &upload_directory.path;
 
         let meta_path = canonical_uploads_dir.join(format!("{upload_id}.meta.json"));
         let meta_metadata =
@@ -3866,7 +3875,7 @@ impl TeamSessionService {
         let canonical_meta = meta_path
             .canonicalize()
             .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if !canonical_meta.starts_with(&canonical_uploads_dir) || !canonical_meta.starts_with(&canonical_workspace) {
+        if !canonical_meta.starts_with(canonical_uploads_dir) {
             return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
@@ -3895,7 +3904,7 @@ impl TeamSessionService {
         let canonical_file = file_path
             .canonicalize()
             .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if !canonical_file.starts_with(&canonical_uploads_dir) || !canonical_file.starts_with(&canonical_workspace) {
+        if !canonical_file.starts_with(canonical_uploads_dir) {
             return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
