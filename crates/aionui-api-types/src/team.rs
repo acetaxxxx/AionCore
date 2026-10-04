@@ -155,6 +155,12 @@ pub struct TeamMcpAllowlistResponse {
     pub mcp_server_ids: Vec<String>,
 }
 
+/// Response returned after successfully uploading a file for a team.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamUploadResponse {
+    pub upload_id: String,
+}
+
 /// Request body for `PATCH /api/teams/:id/name`.
 #[derive(Debug, Deserialize)]
 pub struct RenameTeamRequest {

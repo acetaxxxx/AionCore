@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, Query, State};
+use axum::extract::{Extension, Json, Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 
@@ -18,14 +18,14 @@ use aionui_api_types::{
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse,
     TeamMcpAllowlistResponse, TeamMemberListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
-    TeamTaskResponse,
+    TeamTaskResponse, TeamUploadResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::{ActivityCursor, DbError, PageDirection};
 
 use crate::error::{TeamError, classify_public_error};
-use crate::service::{ActivityKind, DEFAULT_ACTIVITY_LIMIT, TeamSessionService};
+use crate::service::{ActivityKind, DEFAULT_ACTIVITY_LIMIT, TeamSessionService, TeamUploadStreamData};
 
 #[derive(Clone)]
 pub struct TeamRouterState {
@@ -239,6 +239,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             axum::routing::patch(update_agent_model),
         )
         .route("/api/teams/{id}/messages", post(send_message))
+        .route("/api/teams/{id}/uploads", post(upload_team_file))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
         .route("/api/teams/{id}/agents/{slot_id}/interrupt", post(interrupt_agent))
         .route("/api/teams/{id}/agents/{slot_id}/attach", post(attach_agent))
@@ -647,6 +648,66 @@ async fn reset_agent_context(
         .clear_agent_context(&user.id, &params.id, &params.slot_id)
         .await?;
     Ok(Json(ApiResponse::ok(outcome)))
+}
+
+const MAX_TEAM_UPLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MiB hard bounded cap
+
+async fn extract_team_upload_multipart(mut multipart: Multipart) -> Result<TeamUploadStreamData, ApiError> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name: Option<String> = None;
+    let mut content_type: Option<String> = None;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("multipart error: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_owned();
+        if name == "file" {
+            file_name = field.file_name().map(str::to_owned);
+            content_type = field.content_type().map(str::to_owned);
+
+            let mut bytes = Vec::new();
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|e| ApiError::BadRequest(format!("failed to stream upload field: {e}")))?
+            {
+                if bytes.len() + chunk.len() > MAX_TEAM_UPLOAD_SIZE {
+                    return Err(ApiError::BadRequest(format!(
+                        "file exceeds maximum upload limit of {MAX_TEAM_UPLOAD_SIZE} bytes"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            file_bytes = Some(bytes);
+        }
+    }
+
+    let file_bytes = file_bytes.ok_or_else(|| ApiError::BadRequest("missing 'file' field".to_owned()))?;
+
+    Ok(TeamUploadStreamData {
+        file_bytes,
+        file_name,
+        content_type,
+    })
+}
+
+async fn upload_team_file(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    multipart: Multipart,
+) -> Result<Json<ApiResponse<TeamUploadResponse>>, ApiError> {
+    // Authorize Team and verify workspace BEFORE accepting/buffering the upload body.
+    // The service re-authorizes under the Team membership lock before persisting,
+    // since membership or the persisted workspace may change while streaming.
+    let access = state.service.authorize_team(&user.id, &id).await?;
+    state.service.verify_and_resolve_team_workspace(&access).await?;
+
+    let upload_data = extract_team_upload_multipart(multipart).await?;
+    let resp = state.service.upload_team_file(&user.id, &id, upload_data).await?;
+    Ok(Json(ApiResponse::ok(resp)))
 }
 
 async fn send_message(

@@ -143,6 +143,7 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
             Ok(AgentInstance::Mock(std::sync::Arc::new(NoopMockAgent {
                 conversation_id: opts.conversation_id().to_owned(),
                 workspace: opts.context.workspace.path.clone(),
+                received_files: None,
             })))
         })
     });
@@ -156,9 +157,47 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
     (router, services)
 }
 
+/// Build a mock-agent app that records (path, bytes) read from message attachment paths.
+/// The Team upload E2E uses this to prove the staged image reaches runtime.
+pub async fn build_app_with_captured_mock_agent_files() -> (
+    axum::Router,
+    AppServices,
+    std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let received_files = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory_received_files = std::sync::Arc::clone(&received_files);
+    let factory: std::sync::Arc<
+        dyn Fn(
+                aionui_ai_agent::types::BuildTaskOptions,
+            )
+                -> futures_util::future::BoxFuture<'static, Result<AgentInstance, aionui_ai_agent::AgentError>>
+            + Send
+            + Sync,
+    > = std::sync::Arc::new(move |opts| {
+        let received_files = std::sync::Arc::clone(&factory_received_files);
+        Box::pin(async move {
+            Ok(AgentInstance::Mock(std::sync::Arc::new(NoopMockAgent {
+                conversation_id: opts.conversation_id().to_owned(),
+                workspace: opts.context.workspace.path.clone(),
+                received_files: Some(received_files),
+            })))
+        })
+    });
+    let wtm: std::sync::Arc<dyn aionui_ai_agent::IWorkerTaskManager> =
+        std::sync::Arc::new(WorkerTaskManagerImpl::new(factory));
+    let services = AppServices::from_config(db, &AppConfig::default())
+        .await
+        .unwrap()
+        .with_worker_task_manager(wtm);
+    let router = create_router(&services).await.expect("build router");
+    (router, services, received_files)
+}
+
 struct NoopMockAgent {
     conversation_id: String,
     workspace: String,
+    received_files: Option<std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>>,
 }
 
 #[async_trait::async_trait]
@@ -184,8 +223,19 @@ impl IAgentTask for NoopMockAgent {
     }
     async fn send_message(
         &self,
-        _data: aionui_ai_agent::types::SendMessageData,
+        data: aionui_ai_agent::types::SendMessageData,
     ) -> Result<(), aionui_ai_agent::AgentSendError> {
+        if let Some(received_files) = &self.received_files {
+            let contents = data
+                .files
+                .iter()
+                .map(|path| {
+                    let bytes = std::fs::read(path).expect("runtime attachment path must be readable");
+                    (path.clone(), bytes)
+                })
+                .collect::<Vec<_>>();
+            received_files.lock().unwrap().extend(contents);
+        }
         Ok(())
     }
     async fn cancel(&self) -> Result<(), aionui_ai_agent::AgentError> {
