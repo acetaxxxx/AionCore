@@ -37,27 +37,18 @@ pub(super) async fn configure_from_env(context: &mut AgentSessionContext) -> Res
     let mut env: HashMap<String, String> = launch
         .env
         .into_iter()
-        .map(|(k, v)| {
-            (
-                k.to_string_lossy().into_owned(),
-                v.to_string_lossy().into_owned(),
-            )
-        })
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
         .collect();
     env.insert("GATEWAY_MCP_TOKEN".into(), token);
     env.insert(
         "GATEWAY_MCP_URL".into(),
-        std::env::var("GATEWAY_MCP_URL")
-            .unwrap_or_else(|_| "http://workspace-gateway:3000/mcp".into()),
+        std::env::var("GATEWAY_MCP_URL").unwrap_or_else(|_| "http://workspace-gateway:3000/mcp".into()),
     );
     env.insert(
         "AIONUI_CONVERSATION_ID".into(),
         context.conversation.conversation_id.clone(),
     );
-    env.insert(
-        "AIONUI_USER_ID".into(),
-        context.conversation.user_id.clone(),
-    );
+    env.insert("AIONUI_USER_ID".into(), context.conversation.user_id.clone());
     if let Some(team) = context.team.as_ref() {
         env.insert("AIONUI_PREVIEW_TEAM_ID".into(), team.team_id.clone());
     }
@@ -76,10 +67,7 @@ pub(super) async fn configure_from_env(context: &mut AgentSessionContext) -> Res
 }
 
 fn append_instructions(prompt: &mut Option<String>) {
-    if prompt
-        .as_ref()
-        .is_some_and(|text| text.contains("[Workspace Preview]"))
-    {
+    if prompt.as_ref().is_some_and(|text| text.contains("[Workspace Preview]")) {
         return;
     }
     *prompt = Some(match prompt.take() {
@@ -91,26 +79,17 @@ fn append_instructions(prompt: &mut Option<String>) {
 fn install(context: &mut AgentSessionContext, server: SessionMcpServer) {
     match &mut context.kind {
         AgentSessionKind::Acp(build) => {
-            build
-                .config
-                .session_mcp_servers
-                .retain(|item| item.name != NAME);
+            build.config.session_mcp_servers.retain(|item| item.name != NAME);
             build.config.session_mcp_servers.push(server);
             append_instructions(&mut build.config.preset_context);
         }
         AgentSessionKind::Antigravity(build) => {
-            build
-                .config
-                .session_mcp_servers
-                .retain(|item| item.name != NAME);
+            build.config.session_mcp_servers.retain(|item| item.name != NAME);
             build.config.session_mcp_servers.push(server);
             append_instructions(&mut build.config.preset_context);
         }
         AgentSessionKind::Aionrs(build) => {
-            build
-                .config
-                .session_mcp_servers
-                .retain(|item| item.name != NAME);
+            build.config.session_mcp_servers.retain(|item| item.name != NAME);
             build.config.session_mcp_servers.push(server);
             append_instructions(&mut build.config.preset_rules);
         }
@@ -121,8 +100,8 @@ fn install(context: &mut AgentSessionContext, server: SessionMcpServer) {
 mod tests {
     use super::*;
     use crate::session_context::{
-        AcpSessionBuildContext, AionrsSessionBuildContext, AntigravitySessionBuildContext,
-        ConversationContext, WorkspaceContext,
+        AcpSessionBuildContext, AionrsSessionBuildContext, AntigravitySessionBuildContext, ConversationContext,
+        WorkspaceContext,
     };
     use aionui_common::{AgentType, ProviderWithModel};
 
@@ -188,15 +167,11 @@ mod tests {
             install(&mut context, server.clone());
             install(&mut context, server.clone());
             let (servers, prompt) = match &context.kind {
-                AgentSessionKind::Acp(build) => {
-                    (&build.config.session_mcp_servers, &build.config.preset_context)
-                }
+                AgentSessionKind::Acp(build) => (&build.config.session_mcp_servers, &build.config.preset_context),
                 AgentSessionKind::Antigravity(build) => {
                     (&build.config.session_mcp_servers, &build.config.preset_context)
                 }
-                AgentSessionKind::Aionrs(build) => {
-                    (&build.config.session_mcp_servers, &build.config.preset_rules)
-                }
+                AgentSessionKind::Aionrs(build) => (&build.config.session_mcp_servers, &build.config.preset_rules),
             };
             assert_eq!(servers, &vec![server.clone()]);
             assert!(prompt.as_ref().unwrap().contains("preview_create"));
