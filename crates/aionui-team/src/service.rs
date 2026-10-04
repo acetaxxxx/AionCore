@@ -3646,8 +3646,23 @@ impl TeamUploadDirectory {
             .open(self.path.join(name))
             .map_err(|_| TeamError::InvalidRequest("failed to create uploaded file".into()))?;
 
-        file.write_all(bytes)
-            .map_err(|_| TeamError::InvalidRequest("failed to write uploaded file".into()))
+        if file.write_all(bytes).is_err() {
+            drop(file);
+            self.remove_file(name);
+            return Err(TeamError::InvalidRequest("failed to write uploaded file".into()));
+        }
+        Ok(())
+    }
+
+    fn remove_file(&self, name: &str) {
+        #[cfg(unix)]
+        {
+            let _ = rustix::fs::unlinkat(&self.handle, name, rustix::fs::AtFlags::empty());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(self.path.join(name));
+        }
     }
 }
 
@@ -3784,12 +3799,11 @@ impl TeamSessionService {
             return Err(TeamError::TeamUploadQuotaExceeded);
         }
 
-        // A failed write may leave a partial file, which remains inside the
-        // bound Team directory and counts against its durable quota. Avoid
-        // unlinking by pathname: a concurrent workspace writer could replace
-        // that name after exclusive creation.
         upload_directory.create_new(&file_name_on_disk, &upload_data.file_bytes)?;
-        upload_directory.create_new(&meta_name_on_disk, &meta_bytes)?;
+        if let Err(error) = upload_directory.create_new(&meta_name_on_disk, &meta_bytes) {
+            upload_directory.remove_file(&file_name_on_disk);
+            return Err(error);
+        }
 
         Ok(TeamUploadResponse { upload_id })
     }
