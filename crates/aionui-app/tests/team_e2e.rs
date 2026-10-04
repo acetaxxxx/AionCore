@@ -1285,7 +1285,7 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         "resolved path must be canonical without traversal"
     );
 
-    let lead_slot_id = team["agents"][0]["slot_id"].as_str().unwrap();
+    let lead_slot_id = team["assistants"][0]["slot_id"].as_str().unwrap();
     let denied_direct = app
         .clone()
         .oneshot(json_with_token(
