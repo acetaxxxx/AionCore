@@ -1258,11 +1258,11 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         .unwrap();
     assert_eq!(attached.status(), StatusCode::OK, "Team image attachment should be accepted");
 
-    let received = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let (received_path, received) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let bytes = { received_files.lock().unwrap().first().cloned() };
-            if let Some(bytes) = bytes {
-                return bytes;
+            let captured = { received_files.lock().unwrap().first().cloned() };
+            if let Some(captured) = captured {
+                return captured;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -1270,6 +1270,73 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
     .await
     .expect("Team runtime should receive the uploaded image");
     assert_eq!(received, TEST_PNG, "runtime must read the exact staged PNG bytes");
+    assert!(
+        received_path.ends_with(".png"),
+        "resolved path must be an image-recognizable path ending in .png, got: {received_path}"
+    );
+    assert!(
+        !received_path.contains(".."),
+        "resolved path must be canonical without traversal"
+    );
+
+    let lead_slot_id = team["agents"][0]["slot_id"].as_str().unwrap();
+    let denied_direct = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/agents/{lead_slot_id}/messages"),
+            json!({
+                "content": "forged direct path",
+                "files": [{ "kind": "upload", "path": "/tmp/forged-direct.png" }]
+            }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied_direct.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(denied_direct).await["code"], "BAD_REQUEST");
+
+    let attached_direct = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/agents/{lead_slot_id}/messages"),
+            json!({
+                "content": "Direct lead inspect",
+                "files": [{ "kind": "team_upload", "upload_id": upload_id }]
+            }),
+            &invitee_token,
+            &invitee_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(attached_direct.status(), StatusCode::OK);
+
+    let (outsider_token, outsider_csrf) = setup_and_login(&mut app, &services, "bob", "StrongP@ss3").await;
+    let outsider_upload = app
+        .clone()
+        .oneshot(team_upload_request(team_id, &outsider_token, &outsider_csrf))
+        .await
+        .unwrap();
+    assert_eq!(outsider_upload.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(outsider_upload).await["code"], "NOT_FOUND");
+    let outsider_attach = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/messages"),
+            json!({
+                "content": "outsider attach",
+                "files": [{ "kind": "team_upload", "upload_id": upload_id }]
+            }),
+            &outsider_token,
+            &outsider_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(outsider_attach.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(outsider_attach).await["code"], "NOT_FOUND");
 
     for arbitrary_ref in [
         json!({ "kind": "upload", "path": "/tmp/forged-upload.png" }),

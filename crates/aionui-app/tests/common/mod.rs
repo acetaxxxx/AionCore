@@ -157,12 +157,12 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
     (router, services)
 }
 
-/// Build a mock-agent app that records bytes read from message attachment paths.
+/// Build a mock-agent app that records (path, bytes) read from message attachment paths.
 /// The Team upload E2E uses this to prove the staged image reaches runtime.
 pub async fn build_app_with_captured_mock_agent_files() -> (
     axum::Router,
     AppServices,
-    std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
 ) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let received_files = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -197,7 +197,7 @@ pub async fn build_app_with_captured_mock_agent_files() -> (
 struct NoopMockAgent {
     conversation_id: String,
     workspace: String,
-    received_files: Option<std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>>,
+    received_files: Option<std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>>,
 }
 
 #[async_trait::async_trait]
@@ -229,7 +229,10 @@ impl IAgentTask for NoopMockAgent {
             let contents = data
                 .files
                 .iter()
-                .map(|path| std::fs::read(path).expect("runtime attachment path must be readable"))
+                .map(|path| {
+                    let bytes = std::fs::read(path).expect("runtime attachment path must be readable");
+                    (path.clone(), bytes)
+                })
                 .collect::<Vec<_>>();
             received_files.lock().unwrap().extend(contents);
         }

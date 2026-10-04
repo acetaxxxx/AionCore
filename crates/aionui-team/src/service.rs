@@ -3422,29 +3422,79 @@ impl TeamSessionService {
             .await
     }
 
-    pub async fn upload_team_file(
-        &self,
-        user_id: &str,
-        team_id: &str,
-        file_bytes: Vec<u8>,
-    ) -> Result<TeamUploadResponse, TeamError> {
-        let access = self.authorize_team(user_id, team_id).await?;
-        let canonical_workspace = self.verify_and_resolve_team_workspace(&access).await?;
+#[derive(Debug, Clone)]
+pub struct TeamUploadStreamData {
+    pub file_bytes: Vec<u8>,
+    pub file_name: Option<String>,
+    pub content_type: Option<String>,
+}
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TeamUploadMetadata {
+    pub upload_id: String,
+    pub original_file_name: Option<String>,
+    pub extension: Option<String>,
+    pub content_type: String,
+    pub size_bytes: usize,
+    pub created_at: TimestampMs,
+}
+
+fn extract_sanitized_extension(file_name: Option<&str>, content_type: Option<&str>) -> Option<String> {
+    if let Some(name) = file_name {
+        if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
+            let ext = ext.trim().to_ascii_lowercase();
+            if !ext.is_empty() && ext.len() <= 10 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Some(ext);
+            }
+        }
+    }
+    match content_type.map(|c| c.trim().to_ascii_lowercase()).as_deref() {
+        Some("image/png") => Some("png".into()),
+        Some("image/jpeg") | Some("image/jpg") => Some("jpg".into()),
+        Some("image/gif") => Some("gif".into()),
+        Some("image/webp") => Some("webp".into()),
+        Some("image/svg+xml") => Some("svg".into()),
+        Some("image/bmp") => Some("bmp".into()),
+        Some("application/pdf") => Some("pdf".into()),
+        Some("text/plain") => Some("txt".into()),
+        _ => None,
+    }
+}
+
+fn sanitize_content_type(raw_ct: Option<&str>) -> String {
+    raw_ct
+        .map(|ct| ct.trim().to_ascii_lowercase())
+        .filter(|ct| {
+            !ct.is_empty()
+                && ct.len() <= 128
+                && ct
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '+' || c == '.')
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+impl TeamSessionService {
+    pub async fn store_team_upload(
+        &self,
+        access: &TeamAuthorizationContext,
+        canonical_workspace: &Path,
+        upload_data: TeamUploadStreamData,
+    ) -> Result<TeamUploadResponse, TeamError> {
         let aionui_dir = canonical_workspace.join(".aionui");
         if aionui_dir.exists() {
             let meta = std::fs::symlink_metadata(&aionui_dir)
-                .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+                .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
             if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(TeamError::TeamNotFound(team_id.to_owned()));
+                return Err(TeamError::TeamNotFound(access.team.id.clone()));
             }
         }
         let uploads_dir = aionui_dir.join("uploads");
         if uploads_dir.exists() {
             let meta = std::fs::symlink_metadata(&uploads_dir)
-                .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+                .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
             if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(TeamError::TeamNotFound(team_id.to_owned()));
+                return Err(TeamError::TeamNotFound(access.team.id.clone()));
             }
         } else {
             std::fs::create_dir_all(&uploads_dir)
@@ -3453,37 +3503,91 @@ impl TeamSessionService {
 
         let canonical_uploads_dir = uploads_dir
             .canonicalize()
-            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-        if !canonical_uploads_dir.starts_with(&canonical_workspace) {
-            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        if !canonical_uploads_dir.starts_with(canonical_workspace) {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
         let upload_id = generate_id();
-        let target_path = canonical_uploads_dir.join(&upload_id);
-        std::fs::write(&target_path, file_bytes)
-            .map_err(|e| TeamError::InvalidRequest(format!("failed to write uploaded file: {e}")))?;
+        let extension = extract_sanitized_extension(
+            upload_data.file_name.as_deref(),
+            upload_data.content_type.as_deref(),
+        );
+        let content_type = sanitize_content_type(upload_data.content_type.as_deref());
 
-        let meta = std::fs::symlink_metadata(&target_path)
-            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
+        let file_name_on_disk = match &extension {
+            Some(ext) => format!("{upload_id}.{ext}"),
+            None => upload_id.clone(),
+        };
+        let meta_name_on_disk = format!("{upload_id}.meta.json");
+
+        let target_path = canonical_uploads_dir.join(&file_name_on_disk);
+        let meta_path = canonical_uploads_dir.join(&meta_name_on_disk);
+
+        let metadata = TeamUploadMetadata {
+            upload_id: upload_id.clone(),
+            original_file_name: upload_data.file_name,
+            extension,
+            content_type,
+            size_bytes: upload_data.file_bytes.len(),
+            created_at: now_ms(),
+        };
+        let meta_bytes = serde_json::to_vec_pretty(&metadata)
+            .map_err(|e| TeamError::InvalidRequest(format!("failed to serialize upload metadata: {e}")))?;
+
+        std::fs::write(&target_path, &upload_data.file_bytes)
+            .map_err(|e| TeamError::InvalidRequest(format!("failed to write uploaded file: {e}")))?;
+        if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
             let _ = std::fs::remove_file(&target_path);
-            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+            return Err(TeamError::InvalidRequest(format!("failed to write upload metadata: {e}")));
+        }
+
+        let meta_meta = std::fs::symlink_metadata(&meta_path)
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        let file_meta = std::fs::symlink_metadata(&target_path)
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        if meta_meta.file_type().is_symlink()
+            || !meta_meta.is_file()
+            || file_meta.file_type().is_symlink()
+            || !file_meta.is_file()
+        {
+            let _ = std::fs::remove_file(&target_path);
+            let _ = std::fs::remove_file(&meta_path);
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
         let canonical_target = target_path
             .canonicalize()
-            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        let canonical_meta = meta_path
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+
         if !canonical_target.starts_with(&canonical_uploads_dir)
-            || !canonical_target.starts_with(&canonical_workspace)
+            || !canonical_target.starts_with(canonical_workspace)
+            || !canonical_meta.starts_with(&canonical_uploads_dir)
+            || !canonical_meta.starts_with(canonical_workspace)
         {
             let _ = std::fs::remove_file(&target_path);
-            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+            let _ = std::fs::remove_file(&meta_path);
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
         Ok(TeamUploadResponse { upload_id })
     }
 
-    async fn verify_and_resolve_team_workspace(
+    pub async fn upload_team_file(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        upload_data: TeamUploadStreamData,
+    ) -> Result<TeamUploadResponse, TeamError> {
+        let access = self.authorize_team(user_id, team_id).await?;
+        let canonical_workspace = self.verify_and_resolve_team_workspace(&access).await?;
+        self.store_team_upload(&access, &canonical_workspace, upload_data).await
+    }
+
+    pub(crate) async fn verify_and_resolve_team_workspace(
         &self,
         access: &TeamAuthorizationContext,
     ) -> Result<PathBuf, TeamError> {
@@ -3549,7 +3653,42 @@ impl TeamSessionService {
             return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
-        let file_path = canonical_uploads_dir.join(upload_id);
+        let meta_path = canonical_uploads_dir.join(format!("{upload_id}.meta.json"));
+        let meta_metadata = std::fs::symlink_metadata(&meta_path)
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        if meta_metadata.file_type().is_symlink() || !meta_metadata.is_file() {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+        let canonical_meta = meta_path
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        if !canonical_meta.starts_with(&canonical_uploads_dir)
+            || !canonical_meta.starts_with(&canonical_workspace)
+        {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+
+        let meta_content = std::fs::read_to_string(&canonical_meta)
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+        let upload_meta: TeamUploadMetadata = serde_json::from_str(&meta_content)
+            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
+
+        if upload_meta.upload_id != upload_id {
+            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        }
+
+        let file_name_on_disk = match &upload_meta.extension {
+            Some(ext)
+                if !ext.is_empty()
+                    && ext.len() <= 10
+                    && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+            {
+                format!("{upload_id}.{ext}")
+            }
+            _ => upload_id.to_string(),
+        };
+
+        let file_path = canonical_uploads_dir.join(&file_name_on_disk);
         let file_meta = std::fs::symlink_metadata(&file_path)
             .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
         if file_meta.file_type().is_symlink() || !file_meta.is_file() {

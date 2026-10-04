@@ -25,7 +25,7 @@ use aionui_common::ApiError;
 use aionui_db::{ActivityCursor, DbError, PageDirection};
 
 use crate::error::{TeamError, classify_public_error};
-use crate::service::{ActivityKind, DEFAULT_ACTIVITY_LIMIT, TeamSessionService};
+use crate::service::{ActivityKind, DEFAULT_ACTIVITY_LIMIT, TeamSessionService, TeamUploadStreamData};
 
 #[derive(Clone)]
 pub struct TeamRouterState {
@@ -650,27 +650,47 @@ async fn reset_agent_context(
     Ok(Json(ApiResponse::ok(outcome)))
 }
 
-async fn extract_team_upload_multipart(mut multipart: Multipart) -> Result<Vec<u8>, ApiError> {
-    let mut file_data: Option<Vec<u8>> = None;
+const MAX_TEAM_UPLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MiB hard bounded cap
 
-    while let Some(field) = multipart
+async fn extract_team_upload_multipart(mut multipart: Multipart) -> Result<TeamUploadStreamData, ApiError> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name: Option<String> = None;
+    let mut content_type: Option<String> = None;
+
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|e| ApiError::BadRequest(format!("multipart error: {e}")))?
     {
         let name = field.name().unwrap_or("").to_owned();
         if name == "file" {
-            file_data = Some(
-                field
-                    .bytes()
-                    .await
-                    .map_err(|e| ApiError::BadRequest(format!("failed to read file: {e}")))?
-                    .to_vec(),
-            );
+            file_name = field.file_name().map(str::to_owned);
+            content_type = field.content_type().map(str::to_owned);
+
+            let mut bytes = Vec::new();
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|e| ApiError::BadRequest(format!("failed to stream upload field: {e}")))?
+            {
+                if bytes.len() + chunk.len() > MAX_TEAM_UPLOAD_SIZE {
+                    return Err(ApiError::BadRequest(format!(
+                        "file exceeds maximum upload limit of {MAX_TEAM_UPLOAD_SIZE} bytes"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            file_bytes = Some(bytes);
         }
     }
 
-    file_data.ok_or_else(|| ApiError::BadRequest("missing 'file' field".to_owned()))
+    let file_bytes = file_bytes.ok_or_else(|| ApiError::BadRequest("missing 'file' field".to_owned()))?;
+
+    Ok(TeamUploadStreamData {
+        file_bytes,
+        file_name,
+        content_type,
+    })
 }
 
 async fn upload_team_file(
@@ -679,8 +699,15 @@ async fn upload_team_file(
     Path(id): Path<String>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<TeamUploadResponse>>, ApiError> {
-    let file_bytes = extract_team_upload_multipart(multipart).await?;
-    let resp = state.service.upload_team_file(&user.id, &id, file_bytes).await?;
+    // Authorize Team and verify workspace BEFORE accepting/buffering the upload body
+    let access = state.service.authorize_team(&user.id, &id).await?;
+    let canonical_workspace = state.service.verify_and_resolve_team_workspace(&access).await?;
+
+    let upload_data = extract_team_upload_multipart(multipart).await?;
+    let resp = state
+        .service
+        .store_team_upload(&access, &canonical_workspace, upload_data)
+        .await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 
