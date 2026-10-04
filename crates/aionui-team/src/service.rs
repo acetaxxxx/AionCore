@@ -3516,11 +3516,7 @@ struct TeamUploadDirectory {
 }
 
 #[cfg(unix)]
-fn open_upload_child_directory(
-    parent: &std::fs::File,
-    name: &str,
-    team_id: &str,
-) -> Result<std::fs::File, TeamError> {
+fn open_upload_child_directory(parent: &std::fs::File, name: &str, team_id: &str) -> Result<std::fs::File, TeamError> {
     use rustix::fs::{Mode, OFlags, openat};
 
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -3551,8 +3547,8 @@ impl TeamUploadDirectory {
         let workspace_name = workspace
             .file_name()
             .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
-        let parent_handle = std::fs::File::open(workspace_parent)
-            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let parent_handle =
+            std::fs::File::open(workspace_parent).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
         let workspace_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let workspace_handle = openat(&parent_handle, workspace_name, workspace_flags, Mode::empty())
             .map(std::fs::File::from)
@@ -3592,8 +3588,8 @@ impl TeamUploadDirectory {
     fn open(workspace: &Path, team_id: &str) -> Result<Self, TeamError> {
         let aionui_dir = workspace.join(".aionui");
         if aionui_dir.exists() {
-            let metadata = std::fs::symlink_metadata(&aionui_dir)
-                .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+            let metadata =
+                std::fs::symlink_metadata(&aionui_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(TeamError::TeamNotFound(team_id.to_owned()));
             }
@@ -3602,8 +3598,8 @@ impl TeamUploadDirectory {
         }
         let uploads_dir = aionui_dir.join("uploads");
         if uploads_dir.exists() {
-            let metadata = std::fs::symlink_metadata(&uploads_dir)
-                .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+            let metadata =
+                std::fs::symlink_metadata(&uploads_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(TeamError::TeamNotFound(team_id.to_owned()));
             }
@@ -3654,8 +3650,8 @@ fn team_upload_usage(uploads_dir: &Path, team_id: &str) -> Result<(u64, usize), 
 
     for entry in entries {
         let entry = entry.map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
-        let metadata = std::fs::symlink_metadata(entry.path())
-            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let metadata =
+            std::fs::symlink_metadata(entry.path()).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(TeamError::TeamNotFound(team_id.to_owned()));
         }

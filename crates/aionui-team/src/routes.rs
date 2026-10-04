@@ -243,7 +243,9 @@ pub fn team_routes(state: TeamRouterState) -> Router {
     // preempt the upload handler's stable TEAM_UPLOAD_FILE_TOO_LARGE response.
     let team_upload_routes = Router::new()
         .route("/api/teams/{id}/uploads", post(upload_team_file))
-        .layer(DefaultBodyLimit::max(TEAM_UPLOAD_MAX_FILE_BYTES + MAX_TEAM_UPLOAD_MULTIPART_OVERHEAD));
+        .layer(DefaultBodyLimit::max(
+            TEAM_UPLOAD_MAX_FILE_BYTES + MAX_TEAM_UPLOAD_MULTIPART_OVERHEAD,
+        ));
 
     Router::new()
         .merge(team_upload_routes)
@@ -690,36 +692,28 @@ async fn extract_team_upload_multipart(mut multipart: Multipart) -> Result<TeamU
     let mut file_name: Option<String> = None;
     let mut content_type: Option<String> = None;
 
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|_| {
-            ApiError::coded(
-                StatusCode::BAD_REQUEST,
-                "TEAM_UPLOAD_MULTIPART_INVALID",
-                "Invalid Team upload multipart body",
-                None,
-            )
-        })?
-    {
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| {
+        ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "TEAM_UPLOAD_MULTIPART_INVALID",
+            "Invalid Team upload multipart body",
+            None,
+        )
+    })? {
         let name = field.name().unwrap_or("").to_owned();
         if name == "file" {
             file_name = field.file_name().map(str::to_owned);
             content_type = field.content_type().map(str::to_owned);
 
             let mut bytes = Vec::new();
-            while let Some(chunk) = field
-                .chunk()
-                .await
-                .map_err(|_| {
-                    ApiError::coded(
-                        StatusCode::BAD_REQUEST,
-                        "TEAM_UPLOAD_MULTIPART_INVALID",
-                        "Invalid Team upload multipart body",
-                        None,
-                    )
-                })?
-            {
+            while let Some(chunk) = field.chunk().await.map_err(|_| {
+                ApiError::coded(
+                    StatusCode::BAD_REQUEST,
+                    "TEAM_UPLOAD_MULTIPART_INVALID",
+                    "Invalid Team upload multipart body",
+                    None,
+                )
+            })? {
                 if bytes.len() + chunk.len() > TEAM_UPLOAD_MAX_FILE_BYTES {
                     return Err(ApiError::coded(
                         StatusCode::PAYLOAD_TOO_LARGE,

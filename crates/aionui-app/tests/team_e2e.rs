@@ -81,11 +81,7 @@ fn team_upload_request_with_bytes(
     team_upload_request_with_body(team_id, token, csrf, content_type, body)
 }
 
-fn team_upload_request_without_file(
-    team_id: &str,
-    token: &str,
-    csrf: &str,
-) -> axum::http::Request<axum::body::Body> {
+fn team_upload_request_without_file(team_id: &str, token: &str, csrf: &str) -> axum::http::Request<axum::body::Body> {
     let (content_type, body) = UploadMultipart::new().add_text("note", "no file supplied").build();
     team_upload_request_with_body(team_id, token, csrf, content_type, body)
 }
@@ -1309,11 +1305,7 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
 
     let missing_file = app
         .clone()
-        .oneshot(team_upload_request_without_file(
-            team_id,
-            &invitee_token,
-            &invitee_csrf,
-        ))
+        .oneshot(team_upload_request_without_file(team_id, &invitee_token, &invitee_csrf))
         .await
         .unwrap();
     assert_eq!(missing_file.status(), StatusCode::BAD_REQUEST);
@@ -1382,14 +1374,21 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         .await
         .unwrap();
     assert_eq!(overloaded_upload.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(body_json(overloaded_upload).await["code"], "TEAM_UPLOAD_CONCURRENCY_LIMITED");
+    assert_eq!(
+        body_json(overloaded_upload).await["code"],
+        "TEAM_UPLOAD_CONCURRENCY_LIMITED"
+    );
 
     for release in body_releases {
         release.send(()).unwrap();
     }
     for upload in concurrent_uploads {
         let response = upload.await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "admitted upload should finish after body release");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "admitted upload should finish after body release"
+        );
     }
 
     let attached = app
