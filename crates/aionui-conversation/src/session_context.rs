@@ -1123,6 +1123,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn team_imported_preview_selection_reaches_all_factory_contexts_as_ids() {
+        let repos = setup().await;
+        for (agent_type, backend) in [("acp", "claude"), ("antigravity", "agy"), ("aionrs", "aionrs")] {
+            let row = row(
+                agent_type,
+                serde_json::json!({
+                    "teamId": "shared-team",
+                    "backend": backend,
+                    "mcp_server_ids": ["owner-imported-preview-row"],
+                    "session_mcp_servers": [],
+                }),
+                None,
+            );
+
+            let context = repos.builder().build_options(&row, None).await.unwrap().context;
+            assert_eq!(context.team.as_ref().unwrap().team_id, "shared-team");
+            let (belongs_to_team, team, ids, servers) = match &context.kind {
+                AgentSessionKind::Acp(build) => (
+                    build.belongs_to_team,
+                    &build.team,
+                    &build.config.mcp_server_ids,
+                    &build.config.session_mcp_servers,
+                ),
+                AgentSessionKind::Antigravity(build) => (
+                    build.belongs_to_team,
+                    &build.team,
+                    &build.config.mcp_server_ids,
+                    &build.config.session_mcp_servers,
+                ),
+                AgentSessionKind::Aionrs(build) => (
+                    build.belongs_to_team,
+                    &build.team,
+                    &build.config.mcp_server_ids,
+                    &build.config.session_mcp_servers,
+                ),
+            };
+            assert!(belongs_to_team);
+            assert_eq!(team.as_ref().unwrap().team_id, "shared-team");
+            assert_eq!(*ids, Some(vec!["owner-imported-preview-row".into()]));
+            assert!(
+                servers.is_empty(),
+                "imported rows are resolved by the factory repository"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn acp_team_extra_is_exposed_as_typed_context() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
