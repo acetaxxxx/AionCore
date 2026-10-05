@@ -3,6 +3,7 @@ mod response_builder;
 pub(crate) mod spawn_support;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -67,6 +68,20 @@ use crate::work_coordinator::{
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
+pub(crate) const TEAM_UPLOAD_MAX_FILE_BYTES: usize = aionui_common::constants::UPLOAD_MAX_SIZE;
+const TEAM_UPLOAD_MAX_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
+const TEAM_UPLOAD_MAX_FILE_COUNT: usize = 100;
+const TEAM_UPLOAD_MAX_IN_FLIGHT: usize = 4;
+const TEAM_UPLOAD_MAX_TOMBSTONES: usize = 8;
+const TEAM_UPLOAD_MAX_TOMBSTONE_STORAGE_BYTES: u64 = TEAM_UPLOAD_MAX_STORAGE_BYTES * TEAM_UPLOAD_MAX_TOMBSTONES as u64;
+// Coordinates tombstone quota accounting within one Core process. Deployments
+// must keep a single Core writer for a data_dir; this is not cross-process.
+static TEAM_UPLOAD_TOMBSTONE_STAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const TEAM_UPLOAD_RATE_BURST: f64 = 20.0;
+const TEAM_UPLOAD_RATE_REFILL_PER_SECOND: f64 = 1.0;
+const TEAM_UPLOAD_RATE_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+const TEAM_UPLOAD_RATE_MAX_TEAMS: usize = 4096;
+
 /// Default number of activity items returned when the client omits `limit`.
 pub const DEFAULT_ACTIVITY_LIMIT: i64 = 500;
 /// Hard upper bound for the activity `limit` query parameter.
@@ -80,6 +95,46 @@ const ELIGIBLE_LIST_RATE_LIMIT: Duration = Duration::from_secs(1);
 const ELIGIBLE_OWNER_RECORD_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 const ELIGIBLE_OWNER_RECORD_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_OUTSTANDING_ELIGIBLE_ACCOUNT_REFS_PER_OWNER: usize = MAX_ELIGIBLE_TEAM_USERS;
+
+#[derive(Default)]
+struct TeamUploadRateLimit {
+    buckets: Mutex<HashMap<String, TeamUploadRateBucket>>,
+}
+
+struct TeamUploadRateBucket {
+    tokens: f64,
+    updated_at: Instant,
+    last_seen_at: Instant,
+}
+
+impl TeamUploadRateLimit {
+    fn check(&self, team_id: &str) -> Result<(), TeamError> {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        buckets.retain(|_, bucket| now.saturating_duration_since(bucket.last_seen_at) < TEAM_UPLOAD_RATE_STATE_TTL);
+
+        if !buckets.contains_key(team_id) && buckets.len() >= TEAM_UPLOAD_RATE_MAX_TEAMS {
+            return Err(TeamError::TeamUploadRateLimited);
+        }
+
+        let bucket = buckets.entry(team_id.to_owned()).or_insert(TeamUploadRateBucket {
+            tokens: TEAM_UPLOAD_RATE_BURST,
+            updated_at: now,
+            last_seen_at: now,
+        });
+        let elapsed = now.saturating_duration_since(bucket.updated_at).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * TEAM_UPLOAD_RATE_REFILL_PER_SECOND).min(TEAM_UPLOAD_RATE_BURST);
+        bucket.updated_at = now;
+        bucket.last_seen_at = now;
+
+        if bucket.tokens < 1.0 {
+            return Err(TeamError::TeamUploadRateLimited);
+        }
+
+        bucket.tokens -= 1.0;
+        Ok(())
+    }
+}
 /// Which item kinds the unified activity feed returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -401,13 +456,22 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing membership mutations with session startup so
     /// callers cannot read-modify-write the `agents` JSON or rebuild a runtime
     /// session from a stale roster snapshot.
-    add_agent_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    add_agent_locks: Arc<DashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Short-lived, single-use account references scoped to the listing owner
     /// and Team. Raw Core user IDs never cross the API boundary.
     eligible_account_refs: EligibleAccountRefStore,
+    /// Bounded, expiring Team-scoped upload buckets. Checked before multipart
+    /// parsing so authenticated bursts cannot force unbounded body buffering.
+    team_upload_rate_limit: TeamUploadRateLimit,
+    /// One TeamSessionService is constructed for the Core app process; router
+    /// clones share this process-wide bound on buffered upload bodies.
+    team_upload_in_flight: Arc<tokio::sync::Semaphore>,
+    /// Upload bytes live outside the mutable Team workspace so workspace
+    /// writers cannot rename or replace the directory during staging.
+    team_upload_storage_root: Arc<RwLock<Option<PathBuf>>>,
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -425,10 +489,43 @@ pub struct TeamSessionService {
 
 impl TeamSessionService {
     fn team_membership_lock(&self, team_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        // DashMap retain and entry operations take the same shard locks, so a
+        // live caller cannot race this removal with upgrading its Weak entry.
+        // Weak entries with no strong references have no holders or waiters.
+        self.add_agent_locks.retain(|_, lock| lock.strong_count() > 0);
+
+        match self.add_agent_locks.entry(team_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if let Some(lock) = entry.get().upgrade() {
+                    lock
+                } else {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    entry.insert(Arc::downgrade(&lock));
+                    lock
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                entry.insert(Arc::downgrade(&lock));
+                lock
+            }
+        }
+    }
+
+    fn prune_team_membership_lock(&self, team_id: &str, lock: &Arc<tokio::sync::Mutex<()>>) {
+        {
+            let entry = self.add_agent_locks.entry(team_id.to_owned());
+            if let dashmap::mapref::entry::Entry::Occupied(entry) = entry
+                && entry.get().ptr_eq(&Arc::downgrade(lock))
+                && Arc::strong_count(lock) == 1
+            {
+                entry.remove();
+            }
+        }
+
+        // Weak entries do not retain mutexes, but pruning expired keys here
+        // keeps the registry from growing with deleted Team IDs.
+        self.add_agent_locks.retain(|_, lock| lock.strong_count() > 0);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -546,6 +643,9 @@ impl TeamSessionService {
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
             eligible_account_refs: EligibleAccountRefStore::default(),
+            team_upload_rate_limit: TeamUploadRateLimit::default(),
+            team_upload_in_flight: Arc::new(tokio::sync::Semaphore::new(TEAM_UPLOAD_MAX_IN_FLIGHT)),
+            team_upload_storage_root: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
@@ -685,6 +785,13 @@ impl TeamSessionService {
     pub fn with_user_order_store(&self, user_order: Arc<dyn IUserOrderStore>) {
         if let Ok(mut guard) = self.user_order.write() {
             *guard = Some(user_order);
+        }
+    }
+
+    /// Configure Core-owned durable storage for opaque Team uploads.
+    pub fn with_team_upload_storage_root(&self, root: PathBuf) {
+        if let Ok(mut guard) = self.team_upload_storage_root.write() {
+            *guard = Some(root);
         }
     }
 
@@ -1085,6 +1192,50 @@ impl TeamSessionService {
         }
     }
 
+    /// Reconcile Team upload deletion tombstones before the app serves requests.
+    /// Failed rows are logged and retried on the next startup; the tombstone
+    /// count and aggregate bytes are capped before any new Team deletion stages.
+    pub async fn reconcile_team_upload_tombstones(&self) -> Result<(), TeamError> {
+        let storage_root = self
+            .team_upload_storage_root
+            .read()
+            .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?
+            .clone();
+        let Some(storage_root) = storage_root else {
+            return Ok(());
+        };
+        let (team_ids, truncated) = TeamUploadDirectory::list_tombstones(&storage_root)?;
+        let mut failed = truncated;
+        if truncated {
+            warn!(
+                max_tombstones = TEAM_UPLOAD_MAX_TOMBSTONES,
+                "Team upload tombstone scan was capped; remaining entries will be retried next startup"
+            );
+        }
+
+        for team_id in team_ids {
+            let team_exists = match self.repo.get_team_for_restore(&team_id).await {
+                Ok(team) => team.is_some(),
+                Err(error) => {
+                    failed = true;
+                    warn!(team_id = %team_id, error = %error, "failed to look up Team upload tombstone during startup");
+                    continue;
+                }
+            };
+
+            if let Err(error) = TeamUploadDirectory::reconcile_tombstone(&storage_root, &team_id, team_exists) {
+                failed = true;
+                warn!(team_id = %team_id, error = %error, "failed to reconcile Team upload tombstone; retrying on next startup");
+            }
+        }
+
+        if failed {
+            Err(TeamError::TeamUploadStorageCleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
+
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
         if req.agents.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
@@ -1375,6 +1526,7 @@ impl TeamSessionService {
     ) -> Result<(), TeamError> {
         self.load_owned_team_row(owner_user_id, team_id).await?;
         let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
+        self.load_owned_team_row(owner_user_id, team_id).await?;
         let member_user_id = self
             .repo
             .list_team_members(team_id)
@@ -1442,11 +1594,7 @@ impl TeamSessionService {
             normalized.push(id.to_owned());
         }
 
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let guard = lock.lock().await;
         self.load_owned_team_row(owner_user_id, team_id).await?;
         if self.repo.get_team_sharing_mode(team_id).await? != TeamSharingMode::Shared {
@@ -1483,11 +1631,7 @@ impl TeamSessionService {
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let _guard = lock.lock().await;
         let access = self.authorize_team(user_id, team_id).await?;
         // Project-bind side branch: lazily backfill binding only when a single
@@ -1518,6 +1662,11 @@ impl TeamSessionService {
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        // Upload requests reauthorize and persist under this same lock. Holding
+        // it across cleanup prevents a buffered request from recreating the
+        // Team's upload directory after deletion.
+        let membership_lock = self.team_membership_lock(team_id);
+        let membership_guard = Arc::clone(&membership_lock).lock_owned().await;
         let team = self.load_owned_team(user_id, team_id).await?;
 
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamDeleted)
@@ -1530,9 +1679,24 @@ impl TeamSessionService {
                 .await;
         }
 
-        self.repo.delete_mailbox_by_team(user_id, team_id).await?;
-        self.repo.delete_tasks_by_team(user_id, team_id).await?;
-        self.repo.delete_team(user_id, team_id).await?;
+        let storage_root = self
+            .team_upload_storage_root
+            .read()
+            .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?
+            .clone();
+        let (_, storage_cleanup_error) = with_staged_team_upload_deletion(storage_root.as_deref(), team_id, || async {
+            self.repo
+                .delete_mailbox_by_team(user_id, team_id)
+                .await
+                .map_err(TeamError::from)?;
+            self.repo
+                .delete_tasks_by_team(user_id, team_id)
+                .await
+                .map_err(TeamError::from)?;
+            self.repo.delete_team(user_id, team_id).await.map_err(TeamError::from)?;
+            Ok(())
+        })
+        .await?;
 
         // Cascade the team's sidebar ordering row (design §4.3, path 2). Members'
         // conversation rows are dropped by the conversation delete hook via the
@@ -1541,10 +1705,15 @@ impl TeamSessionService {
         // the live aggregate), so it never blocks deletion.
         self.remove_team_order_row(user_id, team_id).await;
 
-        self.add_agent_locks.remove(team_id);
+        drop(membership_guard);
+        self.prune_team_membership_lock(team_id, &membership_lock);
 
         info!(team_id = %team_id, "Team removed");
         self.broadcast_team_removed(user_id, team_id);
+        if let Some(error) = storage_cleanup_error {
+            warn!(team_id = %team_id, error = %error, "Team was deleted but upload tombstone cleanup is pending");
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1603,11 +1772,7 @@ impl TeamSessionService {
         team_id: &str,
         req: AddAgentRequest,
     ) -> Result<TeamAgentResponse, TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let _guard = lock.lock().await;
 
         let row = self.load_owned_team_row(user_id, team_id).await?;
@@ -1659,11 +1824,7 @@ impl TeamSessionService {
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let (removed, session, removal_lease) = {
             let _guard = lock.lock().await;
             let team = self.load_owned_team(user_id, team_id).await?;
@@ -1819,11 +1980,7 @@ impl TeamSessionService {
     }
 
     pub async fn rename_agent(&self, user_id: &str, team_id: &str, slot_id: &str, name: &str) -> Result<(), TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let _guard = lock.lock().await;
 
         let mut team = self.load_owned_team(user_id, team_id).await?;
@@ -1902,11 +2059,7 @@ impl TeamSessionService {
         model: &str,
         trigger: ModelPersistTrigger,
     ) -> Result<(), TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.team_membership_lock(team_id);
         let _guard = lock.lock().await;
         let mut team = self.load_owned_team(user_id, team_id).await?;
         let target = team
@@ -3445,11 +3598,487 @@ pub struct TeamUploadStreamData {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct TeamUploadMetadata {
     pub upload_id: String,
-    pub original_file_name: Option<String>,
     pub extension: Option<String>,
     pub content_type: String,
     pub size_bytes: usize,
     pub created_at: TimestampMs,
+}
+
+struct TeamUploadDirectory {
+    path: PathBuf,
+    #[cfg(unix)]
+    handle: std::fs::File,
+}
+
+struct TeamUploadTombstone {
+    original_path: PathBuf,
+    tombstone_path: PathBuf,
+    restore_on_drop: bool,
+}
+
+impl TeamUploadTombstone {
+    fn restore(mut self) -> Result<(), TeamError> {
+        restore_team_upload_directory(&self.tombstone_path, &self.original_path)?;
+        self.restore_on_drop = false;
+        Ok(())
+    }
+
+    fn purge_with(mut self, purge: fn(&Path) -> Result<(), TeamError>) -> Result<(), TeamError> {
+        // Once the Team row has been deleted, restoring the directory would
+        // recreate storage for a nonexistent Team. Leave a hidden tombstone if
+        // cleanup fails so it can be diagnosed without making it addressable.
+        self.restore_on_drop = false;
+        purge(&self.tombstone_path)
+    }
+}
+
+fn restore_team_upload_directory(tombstone_path: &Path, original_path: &Path) -> Result<(), TeamError> {
+    let tombstone_metadata =
+        std::fs::symlink_metadata(tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+    if tombstone_metadata.file_type().is_symlink() || !tombstone_metadata.is_dir() {
+        return Err(TeamError::TeamUploadStorageCleanupFailed);
+    }
+
+    match std::fs::symlink_metadata(original_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::rename(tombstone_path, original_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            if let Some(parent) = tombstone_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+            Ok(())
+        }
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
+            // A previous restoration may have moved some files before failing.
+            // Complete it idempotently, refusing symlinks and collisions.
+            for entry in std::fs::read_dir(tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)? {
+                let entry = entry.map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+                let metadata =
+                    std::fs::symlink_metadata(entry.path()).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(TeamError::TeamUploadStorageCleanupFailed);
+                }
+                let destination = original_path.join(entry.file_name());
+                if std::fs::symlink_metadata(&destination).is_ok() {
+                    return Err(TeamError::TeamUploadStorageCleanupFailed);
+                }
+                std::fs::rename(entry.path(), destination).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            }
+            std::fs::remove_dir(tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            if let Some(parent) = tombstone_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+            Ok(())
+        }
+        _ => Err(TeamError::TeamUploadStorageCleanupFailed),
+    }
+}
+
+fn purge_team_upload_tombstone(tombstone_path: &Path) -> Result<(), TeamError> {
+    let metadata = std::fs::symlink_metadata(tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(TeamError::TeamUploadStorageCleanupFailed);
+    }
+    std::fs::remove_dir_all(tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)
+}
+
+impl Drop for TeamUploadTombstone {
+    fn drop(&mut self) {
+        if self.restore_on_drop {
+            let _ = restore_team_upload_directory(&self.tombstone_path, &self.original_path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_upload_child_directory(parent: &std::fs::File, name: &str, team_id: &str) -> Result<std::fs::File, TeamError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match openat(parent, name, flags, Mode::empty()) {
+        Ok(directory) => Ok(std::fs::File::from(directory)),
+        Err(error) if error == rustix::io::Errno::NOENT => {
+            match rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
+                Ok(()) => {}
+                Err(error) if error == rustix::io::Errno::EXIST => {}
+                Err(_) => return Err(TeamError::TeamNotFound(team_id.to_owned())),
+            }
+            openat(parent, name, flags, Mode::empty())
+                .map(std::fs::File::from)
+                .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))
+        }
+        Err(_) => Err(TeamError::TeamNotFound(team_id.to_owned())),
+    }
+}
+
+impl TeamUploadDirectory {
+    fn validate_team_id(team_id: &str) -> Result<(), TeamError> {
+        if !team_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+        Ok(())
+    }
+
+    fn stage_team_removal(storage_root: &Path, team_id: &str) -> Result<Option<TeamUploadTombstone>, TeamError> {
+        let _stage_guard = TEAM_UPLOAD_TOMBSTONE_STAGE_LOCK
+            .lock()
+            .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+        Self::validate_team_id(team_id)?;
+
+        let root_metadata = match std::fs::symlink_metadata(storage_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        };
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+
+        let team_path = storage_root.join(team_id);
+        let team_metadata = match std::fs::symlink_metadata(&team_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        };
+        if team_metadata.file_type().is_symlink() || !team_metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+
+        let team_usage = team_upload_usage(&team_path, team_id)
+            .map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?
+            .0;
+        let deletion_root = storage_root.join(".deleting");
+        match std::fs::symlink_metadata(&deletion_root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(TeamError::TeamUploadStorageCleanupFailed);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&deletion_root).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            }
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        }
+        let (tombstone_count, tombstone_bytes) = Self::tombstone_storage_usage(&deletion_root)?;
+        if tombstone_count >= TEAM_UPLOAD_MAX_TOMBSTONES
+            || tombstone_bytes.saturating_add(team_usage) > TEAM_UPLOAD_MAX_TOMBSTONE_STORAGE_BYTES
+        {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+        let tombstone_path = deletion_root.join(team_id);
+        if std::fs::symlink_metadata(&tombstone_path).is_ok() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+        std::fs::rename(&team_path, &tombstone_path).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+        Ok(Some(TeamUploadTombstone {
+            original_path: team_path,
+            tombstone_path,
+            restore_on_drop: true,
+        }))
+    }
+
+    fn list_tombstones(storage_root: &Path) -> Result<(Vec<String>, bool), TeamError> {
+        let deletion_root = storage_root.join(".deleting");
+        let metadata = match std::fs::symlink_metadata(&deletion_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+
+        let mut team_ids = Vec::new();
+        for entry in std::fs::read_dir(&deletion_root).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)? {
+            if team_ids.len() > TEAM_UPLOAD_MAX_TOMBSTONES {
+                break;
+            }
+            let entry = entry.map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            let team_id = entry.file_name().to_string_lossy().into_owned();
+            Self::validate_team_id(&team_id)?;
+            let metadata =
+                std::fs::symlink_metadata(entry.path()).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(TeamError::TeamUploadStorageCleanupFailed);
+            }
+            team_ids.push(team_id);
+        }
+        team_ids.sort();
+        let truncated = team_ids.len() > TEAM_UPLOAD_MAX_TOMBSTONES;
+        team_ids.truncate(TEAM_UPLOAD_MAX_TOMBSTONES);
+        Ok((team_ids, truncated))
+    }
+
+    fn tombstone_storage_usage(deletion_root: &Path) -> Result<(usize, u64), TeamError> {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for team_id in Self::list_tombstones_from_root(deletion_root)? {
+            let path = deletion_root.join(&team_id);
+            let (team_bytes, _) =
+                team_upload_usage(&path, &team_id).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(team_bytes);
+        }
+        Ok((count, bytes))
+    }
+
+    fn list_tombstones_from_root(deletion_root: &Path) -> Result<Vec<String>, TeamError> {
+        let mut team_ids = Vec::new();
+        for entry in std::fs::read_dir(deletion_root).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)? {
+            if team_ids.len() >= TEAM_UPLOAD_MAX_TOMBSTONES {
+                return Err(TeamError::TeamUploadStorageCleanupFailed);
+            }
+            let entry = entry.map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            let team_id = entry.file_name().to_string_lossy().into_owned();
+            Self::validate_team_id(&team_id)?;
+            let metadata =
+                std::fs::symlink_metadata(entry.path()).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(TeamError::TeamUploadStorageCleanupFailed);
+            }
+            team_ids.push(team_id);
+        }
+        Ok(team_ids)
+    }
+
+    fn reconcile_tombstone(storage_root: &Path, team_id: &str, team_exists: bool) -> Result<(), TeamError> {
+        Self::reconcile_tombstone_with(
+            storage_root,
+            team_id,
+            team_exists,
+            restore_team_upload_directory,
+            purge_team_upload_tombstone,
+        )
+    }
+
+    fn reconcile_tombstone_with<R, P>(
+        storage_root: &Path,
+        team_id: &str,
+        team_exists: bool,
+        restore: R,
+        purge: P,
+    ) -> Result<(), TeamError>
+    where
+        R: FnOnce(&Path, &Path) -> Result<(), TeamError>,
+        P: FnOnce(&Path) -> Result<(), TeamError>,
+    {
+        Self::validate_team_id(team_id)?;
+        let deletion_root = storage_root.join(".deleting");
+        let deletion_metadata =
+            std::fs::symlink_metadata(&deletion_root).map_err(|_| TeamError::TeamUploadStorageCleanupFailed)?;
+        if deletion_metadata.file_type().is_symlink() || !deletion_metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+        let tombstone_path = deletion_root.join(team_id);
+        let metadata = match std::fs::symlink_metadata(&tombstone_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(TeamError::TeamUploadStorageCleanupFailed),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(TeamError::TeamUploadStorageCleanupFailed);
+        }
+
+        if team_exists {
+            restore(&tombstone_path, &storage_root.join(team_id))?;
+        } else {
+            purge(&tombstone_path)?;
+        }
+        let _ = std::fs::remove_dir(deletion_root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn open(storage_root: &Path, team_id: &str) -> Result<Self, TeamError> {
+        if !team_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        std::fs::create_dir_all(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let root_metadata =
+            std::fs::symlink_metadata(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let root_handle = std::fs::File::open(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let handle = open_upload_child_directory(&root_handle, team_id, team_id)?;
+        let canonical_root = storage_root
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let path = canonical_root.join(team_id);
+        let canonical_path = path
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        Ok(Self {
+            path: canonical_path,
+            handle,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn quota_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+
+        PathBuf::from(format!("/proc/self/fd/{}", self.handle.as_raw_fd()))
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn quota_path(&self) -> PathBuf {
+        self.path.clone()
+    }
+
+    #[cfg(not(unix))]
+    fn open(storage_root: &Path, team_id: &str) -> Result<Self, TeamError> {
+        if !team_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        std::fs::create_dir_all(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let root_metadata =
+            std::fs::symlink_metadata(storage_root).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let team_dir = storage_root.join(team_id);
+        if !team_dir.exists() {
+            std::fs::create_dir(&team_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        }
+        let metadata = std::fs::symlink_metadata(&team_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let canonical_root = storage_root
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let path = team_dir
+            .canonicalize()
+            .map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if !path.starts_with(&canonical_root) {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        Ok(Self { path })
+    }
+
+    #[cfg(not(unix))]
+    fn quota_path(&self) -> PathBuf {
+        self.path.clone()
+    }
+
+    fn create_new(&self, name: &str, bytes: &[u8]) -> Result<(), TeamError> {
+        #[cfg(unix)]
+        let mut file = {
+            use rustix::fs::{Mode, OFlags, openat};
+
+            let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let file = openat(&self.handle, name, flags, Mode::from_raw_mode(0o600))
+                .map_err(|_| TeamError::InvalidRequest("failed to create uploaded file".into()))?;
+            std::fs::File::from(file)
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.path.join(name))
+            .map_err(|_| TeamError::InvalidRequest("failed to create uploaded file".into()))?;
+
+        if file.write_all(bytes).is_err() {
+            drop(file);
+            self.remove_file(name);
+            return Err(TeamError::InvalidRequest("failed to write uploaded file".into()));
+        }
+        Ok(())
+    }
+
+    fn remove_file(&self, name: &str) {
+        #[cfg(unix)]
+        {
+            let _ = rustix::fs::unlinkat(&self.handle, name, rustix::fs::AtFlags::empty());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(self.path.join(name));
+        }
+    }
+}
+
+async fn with_staged_team_upload_deletion<T, F, Fut>(
+    storage_root: Option<&Path>,
+    team_id: &str,
+    delete_team_rows: F,
+) -> Result<(T, Option<TeamError>), TeamError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, TeamError>>,
+{
+    with_staged_team_upload_deletion_using_purge(storage_root, team_id, delete_team_rows, purge_team_upload_tombstone)
+        .await
+}
+
+async fn with_staged_team_upload_deletion_using_purge<T, F, Fut>(
+    storage_root: Option<&Path>,
+    team_id: &str,
+    delete_team_rows: F,
+    purge: fn(&Path) -> Result<(), TeamError>,
+) -> Result<(T, Option<TeamError>), TeamError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, TeamError>>,
+{
+    let tombstone = storage_root
+        .map(|root| TeamUploadDirectory::stage_team_removal(root, team_id))
+        .transpose()?
+        .flatten();
+
+    match delete_team_rows().await {
+        Ok(result) => {
+            let cleanup_error = tombstone.and_then(|tombstone| tombstone.purge_with(purge).err());
+            Ok((result, cleanup_error))
+        }
+        Err(delete_error) => {
+            if let Some(tombstone) = tombstone {
+                tombstone.restore()?;
+            }
+            Err(delete_error)
+        }
+    }
+}
+
+fn team_upload_usage(uploads_dir: &Path, team_id: &str) -> Result<(u64, usize), TeamError> {
+    let entries = std::fs::read_dir(uploads_dir).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+    let mut total_bytes = 0u64;
+    let mut file_count = 0usize;
+    let mut entry_count = 0usize;
+
+    for entry in entries {
+        let entry = entry.map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let metadata =
+            std::fs::symlink_metadata(entry.path()).map_err(|_| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+
+        entry_count = entry_count.saturating_add(1);
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if !entry.file_name().to_string_lossy().ends_with(".meta.json") {
+            file_count = file_count.saturating_add(1);
+        }
+        if total_bytes > TEAM_UPLOAD_MAX_STORAGE_BYTES
+            || file_count > TEAM_UPLOAD_MAX_FILE_COUNT
+            || entry_count > TEAM_UPLOAD_MAX_FILE_COUNT * 2
+        {
+            return Err(TeamError::TeamUploadQuotaExceeded);
+        }
+    }
+
+    Ok((total_bytes, file_count))
 }
 
 fn extract_sanitized_extension(file_name: Option<&str>, content_type: Option<&str>) -> Option<String> {
@@ -3488,38 +4117,43 @@ fn sanitize_content_type(raw_ct: Option<&str>) -> String {
 }
 
 impl TeamSessionService {
+    /// Consume one request from this Team's upload burst budget. Call only
+    /// after Team/workspace authorization and before reading multipart bytes.
+    pub fn check_team_upload_rate_limit(&self, team_id: &str) -> Result<(), TeamError> {
+        self.team_upload_rate_limit.check(team_id)
+    }
+
+    /// Reserve one bounded upload buffer slot. The owned permit is held by the
+    /// route handler through multipart parsing and durable storage, and releases
+    /// automatically on success, error, or cancellation.
+    pub fn try_acquire_team_upload_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, TeamError> {
+        Arc::clone(&self.team_upload_in_flight)
+            .try_acquire_owned()
+            .map_err(|_| TeamError::TeamUploadConcurrencyLimited)
+    }
+
+    fn team_upload_storage_root(&self, team_id: &str) -> Result<PathBuf, TeamError> {
+        self.team_upload_storage_root
+            .read()
+            .ok()
+            .and_then(|root| root.clone())
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))
+    }
+
     async fn store_team_upload(
         &self,
         access: &TeamAuthorizationContext,
-        canonical_workspace: &Path,
+        storage_root: &Path,
         upload_data: TeamUploadStreamData,
     ) -> Result<TeamUploadResponse, TeamError> {
-        let aionui_dir = canonical_workspace.join(".aionui");
-        if aionui_dir.exists() {
-            let meta =
-                std::fs::symlink_metadata(&aionui_dir).map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(TeamError::TeamNotFound(access.team.id.clone()));
-            }
-        }
-        let uploads_dir = aionui_dir.join("uploads");
-        if uploads_dir.exists() {
-            let meta =
-                std::fs::symlink_metadata(&uploads_dir).map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(TeamError::TeamNotFound(access.team.id.clone()));
-            }
-        } else {
-            std::fs::create_dir_all(&uploads_dir)
-                .map_err(|e| TeamError::InvalidRequest(format!("failed to create uploads dir: {e}")))?;
+        if upload_data.file_bytes.len() > TEAM_UPLOAD_MAX_FILE_BYTES {
+            return Err(TeamError::TeamUploadFileTooLarge);
         }
 
-        let canonical_uploads_dir = uploads_dir
-            .canonicalize()
-            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if !canonical_uploads_dir.starts_with(canonical_workspace) {
-            return Err(TeamError::TeamNotFound(access.team.id.clone()));
-        }
+        // Upload bytes live under Core-owned data storage, away from the
+        // mutable Team workspace. On Unix the descriptor also prevents
+        // symlink replacement from redirecting file creation.
+        let upload_directory = TeamUploadDirectory::open(storage_root, &access.team.id)?;
 
         let upload_id = generate_id();
         let extension =
@@ -3532,12 +4166,8 @@ impl TeamSessionService {
         };
         let meta_name_on_disk = format!("{upload_id}.meta.json");
 
-        let target_path = canonical_uploads_dir.join(&file_name_on_disk);
-        let meta_path = canonical_uploads_dir.join(&meta_name_on_disk);
-
         let metadata = TeamUploadMetadata {
             upload_id: upload_id.clone(),
-            original_file_name: upload_data.file_name,
             extension,
             content_type,
             size_bytes: upload_data.file_bytes.len(),
@@ -3546,68 +4176,18 @@ impl TeamSessionService {
         let meta_bytes = serde_json::to_vec_pretty(&metadata)
             .map_err(|e| TeamError::InvalidRequest(format!("failed to serialize upload metadata: {e}")))?;
 
-        let mut target_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target_path)
-            .map_err(|e| TeamError::InvalidRequest(format!("failed to create uploaded file: {e}")))?;
-        if let Err(e) = target_file.write_all(&upload_data.file_bytes) {
-            let _ = std::fs::remove_file(&target_path);
-            return Err(TeamError::InvalidRequest(format!("failed to write uploaded file: {e}")));
-        }
-        drop(target_file);
-
-        let mut meta_file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&meta_path)
+        let (used_bytes, used_files) = team_upload_usage(&upload_directory.quota_path(), &access.team.id)?;
+        let incoming_bytes = (upload_data.file_bytes.len() as u64).saturating_add(meta_bytes.len() as u64);
+        if used_files >= TEAM_UPLOAD_MAX_FILE_COUNT
+            || used_bytes.saturating_add(incoming_bytes) > TEAM_UPLOAD_MAX_STORAGE_BYTES
         {
-            Ok(file) => file,
-            Err(e) => {
-                let _ = std::fs::remove_file(&target_path);
-                return Err(TeamError::InvalidRequest(format!(
-                    "failed to create upload metadata: {e}"
-                )));
-            }
-        };
-        if let Err(e) = meta_file.write_all(&meta_bytes) {
-            let _ = std::fs::remove_file(&target_path);
-            let _ = std::fs::remove_file(&meta_path);
-            return Err(TeamError::InvalidRequest(format!(
-                "failed to write upload metadata: {e}"
-            )));
-        }
-        drop(meta_file);
-
-        let meta_meta =
-            std::fs::symlink_metadata(&meta_path).map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        let file_meta =
-            std::fs::symlink_metadata(&target_path).map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if meta_meta.file_type().is_symlink()
-            || !meta_meta.is_file()
-            || file_meta.file_type().is_symlink()
-            || !file_meta.is_file()
-        {
-            let _ = std::fs::remove_file(&target_path);
-            let _ = std::fs::remove_file(&meta_path);
-            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+            return Err(TeamError::TeamUploadQuotaExceeded);
         }
 
-        let canonical_target = target_path
-            .canonicalize()
-            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        let canonical_meta = meta_path
-            .canonicalize()
-            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-
-        if !canonical_target.starts_with(&canonical_uploads_dir)
-            || !canonical_target.starts_with(canonical_workspace)
-            || !canonical_meta.starts_with(&canonical_uploads_dir)
-            || !canonical_meta.starts_with(canonical_workspace)
-        {
-            let _ = std::fs::remove_file(&target_path);
-            let _ = std::fs::remove_file(&meta_path);
-            return Err(TeamError::TeamNotFound(access.team.id.clone()));
+        upload_directory.create_new(&file_name_on_disk, &upload_data.file_bytes)?;
+        if let Err(error) = upload_directory.create_new(&meta_name_on_disk, &meta_bytes) {
+            upload_directory.remove_file(&file_name_on_disk);
+            return Err(error);
         }
 
         Ok(TeamUploadResponse { upload_id })
@@ -3623,8 +4203,9 @@ impl TeamSessionService {
         // and the persisted workspace after the request body has been received.
         let _membership_guard = self.team_membership_lock(team_id).lock_owned().await;
         let access = self.authorize_team(user_id, team_id).await?;
-        let canonical_workspace = self.verify_and_resolve_team_workspace(&access).await?;
-        self.store_team_upload(&access, &canonical_workspace, upload_data).await
+        self.verify_and_resolve_team_workspace(&access).await?;
+        let storage_root = self.team_upload_storage_root(team_id)?;
+        self.store_team_upload(&access, &storage_root, upload_data).await
     }
 
     pub(crate) async fn verify_and_resolve_team_workspace(
@@ -3679,19 +4260,10 @@ impl TeamSessionService {
             return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
-        let canonical_workspace = self.verify_and_resolve_team_workspace(access).await?;
-        let uploads_dir = canonical_workspace.join(".aionui").join("uploads");
-        let uploads_meta =
-            std::fs::symlink_metadata(&uploads_dir).map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if uploads_meta.file_type().is_symlink() || !uploads_meta.is_dir() {
-            return Err(TeamError::TeamNotFound(access.team.id.clone()));
-        }
-        let canonical_uploads_dir = uploads_dir
-            .canonicalize()
-            .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if !canonical_uploads_dir.starts_with(&canonical_workspace) {
-            return Err(TeamError::TeamNotFound(access.team.id.clone()));
-        }
+        self.verify_and_resolve_team_workspace(access).await?;
+        let storage_root = self.team_upload_storage_root(&access.team.id)?;
+        let upload_directory = TeamUploadDirectory::open(&storage_root, &access.team.id)?;
+        let canonical_uploads_dir = &upload_directory.path;
 
         let meta_path = canonical_uploads_dir.join(format!("{upload_id}.meta.json"));
         let meta_metadata =
@@ -3702,7 +4274,7 @@ impl TeamSessionService {
         let canonical_meta = meta_path
             .canonicalize()
             .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if !canonical_meta.starts_with(&canonical_uploads_dir) || !canonical_meta.starts_with(&canonical_workspace) {
+        if !canonical_meta.starts_with(canonical_uploads_dir) {
             return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
@@ -3731,7 +4303,7 @@ impl TeamSessionService {
         let canonical_file = file_path
             .canonicalize()
             .map_err(|_| TeamError::TeamNotFound(access.team.id.clone()))?;
-        if !canonical_file.starts_with(&canonical_uploads_dir) || !canonical_file.starts_with(&canonical_workspace) {
+        if !canonical_file.starts_with(canonical_uploads_dir) {
             return Err(TeamError::TeamNotFound(access.team.id.clone()));
         }
 
@@ -6370,6 +6942,198 @@ mod tests {
         drop(revoke_guard);
         read_acquired_rx.await.unwrap();
         reader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn team_membership_lock_pruning_preserves_live_waiters_and_drops_idle_entries() {
+        let (service, _repo, _task_manager, _conversation_repo) =
+            setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let lock = service.team_membership_lock("team-prune");
+        let guard = Arc::clone(&lock).lock_owned().await;
+        let waiter_lock = service.team_membership_lock("team-prune");
+        let (waiter_started_tx, waiter_started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            waiter_started_tx.send(()).unwrap();
+            let _guard = waiter_lock.lock_owned().await;
+        });
+        waiter_started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+
+        // A queued caller still owns an Arc, so pruning must leave the shared
+        // mutex discoverable until every holder has finished.
+        service.prune_team_membership_lock("team-prune", &lock);
+        let current_lock = service.team_membership_lock("team-prune");
+        assert!(Arc::ptr_eq(&lock, &current_lock));
+        assert!(service.add_agent_locks.contains_key("team-prune"));
+
+        drop(guard);
+        waiter.await.unwrap();
+        drop(current_lock);
+        service.prune_team_membership_lock("team-prune", &lock);
+        assert!(!service.add_agent_locks.contains_key("team-prune"));
+
+        // A later request may create a fresh mutex only after the old mutex
+        // has no guard or queued caller.
+        let replacement = service.team_membership_lock("team-prune");
+        assert!(!Arc::ptr_eq(&lock, &replacement));
+    }
+
+    #[test]
+    fn team_membership_lock_prunes_weak_entries_during_team_id_churn() {
+        let (service, _repo, _task_manager, _conversation_repo) =
+            setup_with_factory_metadata_team_repo_and_conversation_repo();
+
+        for index in 0..1_000 {
+            let lock = service.team_membership_lock(&format!("missing-team-{index}"));
+            drop(lock);
+            assert!(
+                service.add_agent_locks.len() <= 1,
+                "expired Team lock entries should be pruned during lookup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_team_row_deletion_restores_staged_uploads() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_root = temp_dir.path().join("team-uploads");
+        let team_directory = storage_root.join("team-rollback");
+        std::fs::create_dir_all(&team_directory).unwrap();
+        std::fs::write(team_directory.join("image.png"), b"team image bytes").unwrap();
+
+        let result = super::with_staged_team_upload_deletion(Some(&storage_root), "team-rollback", || async {
+            Err::<(), _>(super::TeamError::InvalidRequest(
+                "injected Team row delete failure".into(),
+            ))
+        })
+        .await;
+
+        assert!(matches!(result, Err(super::TeamError::InvalidRequest(_))));
+        assert_eq!(
+            std::fs::read(team_directory.join("image.png")).unwrap(),
+            b"team image bytes"
+        );
+        assert_eq!(
+            std::fs::read_dir(&storage_root).unwrap().filter_map(Result::ok).count(),
+            1,
+            "rollback should leave the restored Team directory and no tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_team_row_deletion_restores_staged_uploads() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_root = temp_dir.path().join("team-uploads");
+        let team_directory = storage_root.join("team-cancel");
+        std::fs::create_dir_all(&team_directory).unwrap();
+        std::fs::write(team_directory.join("image.png"), b"team image bytes").unwrap();
+        let storage_root_for_task = storage_root.clone();
+        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            super::with_staged_team_upload_deletion(Some(&storage_root_for_task), "team-cancel", || async {
+                let _ = staged_tx.send(());
+                std::future::pending::<Result<(), super::TeamError>>().await
+            })
+            .await
+        });
+        staged_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(
+            std::fs::read(team_directory.join("image.png")).unwrap(),
+            b"team image bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_post_delete_purge_returns_after_row_operation_and_reconciles() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_root = temp_dir.path().join("team-uploads");
+        let team_directory = storage_root.join("team-purge-retry");
+        std::fs::create_dir_all(&team_directory).unwrap();
+        std::fs::write(team_directory.join("image.png"), b"team image bytes").unwrap();
+
+        let (deleted, cleanup_error) = super::with_staged_team_upload_deletion_using_purge(
+            Some(&storage_root),
+            "team-purge-retry",
+            || async { Ok::<_, super::TeamError>("rows deleted") },
+            |_| Err(super::TeamError::TeamUploadStorageCleanupFailed),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(deleted, "rows deleted");
+        assert!(matches!(
+            cleanup_error,
+            Some(super::TeamError::TeamUploadStorageCleanupFailed)
+        ));
+        let tombstone = storage_root.join(".deleting/team-purge-retry");
+        assert!(tombstone.join("image.png").exists());
+        super::TeamUploadDirectory::reconcile_tombstone(&storage_root, "team-purge-retry", false).unwrap();
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn failed_restore_and_reconciliation_are_retryable() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_root = temp_dir.path().join("team-uploads");
+        let deletion_root = storage_root.join(".deleting");
+        let tombstone = deletion_root.join("team-restore-retry");
+        std::fs::create_dir_all(&tombstone).unwrap();
+        std::fs::write(tombstone.join("image.png"), b"team image bytes").unwrap();
+
+        let failed_restore = super::TeamUploadDirectory::reconcile_tombstone_with(
+            &storage_root,
+            "team-restore-retry",
+            true,
+            |_, _| Err(super::TeamError::TeamUploadStorageCleanupFailed),
+            |_| Ok(()),
+        );
+        assert!(matches!(
+            failed_restore,
+            Err(super::TeamError::TeamUploadStorageCleanupFailed)
+        ));
+        assert!(tombstone.join("image.png").exists());
+        super::TeamUploadDirectory::reconcile_tombstone(&storage_root, "team-restore-retry", true).unwrap();
+        assert_eq!(
+            std::fs::read(storage_root.join("team-restore-retry/image.png")).unwrap(),
+            b"team image bytes"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let invalid_tombstone = deletion_root.join("team-invalid");
+            std::fs::create_dir_all(&deletion_root).unwrap();
+            symlink(temp_dir.path(), &invalid_tombstone).unwrap();
+            assert!(matches!(
+                super::TeamUploadDirectory::reconcile_tombstone(&storage_root, "team-invalid", false),
+                Err(super::TeamError::TeamUploadStorageCleanupFailed)
+            ));
+            assert!(
+                std::fs::symlink_metadata(invalid_tombstone)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn startup_tombstone_scan_is_capped_and_reports_remaining_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_root = temp_dir.path().join("team-uploads");
+        let deletion_root = storage_root.join(".deleting");
+        std::fs::create_dir_all(&deletion_root).unwrap();
+        for index in 0..(super::TEAM_UPLOAD_MAX_TOMBSTONES + 2) {
+            std::fs::create_dir(deletion_root.join(format!("team-tombstone-{index}"))).unwrap();
+        }
+
+        let (team_ids, truncated) = super::TeamUploadDirectory::list_tombstones(&storage_root).unwrap();
+        assert_eq!(team_ids.len(), super::TEAM_UPLOAD_MAX_TOMBSTONES);
+        assert!(truncated);
     }
 
     #[test]

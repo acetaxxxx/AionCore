@@ -49,6 +49,15 @@ impl UploadMultipart {
         self
     }
 
+    fn add_text(mut self, name: &str, value: &str) -> Self {
+        self.parts
+            .extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
+        self.parts.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes(),
+        );
+        self
+    }
+
     fn build(mut self) -> (String, Vec<u8>) {
         self.parts
             .extend_from_slice(format!("--{}--\r\n", self.boundary).as_bytes());
@@ -57,9 +66,72 @@ impl UploadMultipart {
 }
 
 fn team_upload_request(team_id: &str, token: &str, csrf: &str) -> axum::http::Request<axum::body::Body> {
+    team_upload_request_with_bytes(team_id, token, csrf, TEST_PNG)
+}
+
+fn team_upload_request_with_bytes(
+    team_id: &str,
+    token: &str,
+    csrf: &str,
+    bytes: &[u8],
+) -> axum::http::Request<axum::body::Body> {
     let (content_type, body) = UploadMultipart::new()
-        .add_file("file", "shared.png", "image/png", TEST_PNG)
+        .add_file("file", "shared.png", "image/png", bytes)
         .build();
+    team_upload_request_with_body(team_id, token, csrf, content_type, body)
+}
+
+fn team_upload_request_without_file(team_id: &str, token: &str, csrf: &str) -> axum::http::Request<axum::body::Body> {
+    let (content_type, body) = UploadMultipart::new().add_text("note", "no file supplied").build();
+    team_upload_request_with_body(team_id, token, csrf, content_type, body)
+}
+
+fn team_upload_request_with_paused_body(
+    team_id: &str,
+    token: &str,
+    csrf: &str,
+    release_body: tokio::sync::oneshot::Receiver<()>,
+    body_started: tokio::sync::mpsc::UnboundedSender<()>,
+) -> axum::http::Request<axum::body::Body> {
+    use futures_util::StreamExt;
+
+    let boundary = "----PausedSharedTeamUpload";
+    let mut prefix = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"shared.png\"\r\nContent-Type: image/png\r\n\r\n"
+    )
+    .into_bytes();
+    prefix.extend_from_slice(TEST_PNG);
+    let suffix = format!("\r\n--{boundary}--\r\n").into_bytes();
+    let content_length = prefix.len() + suffix.len();
+    let prefix_stream = futures_util::stream::once(async move {
+        let _ = body_started.send(());
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(prefix))
+    });
+    let suffix_stream = futures_util::stream::once(async move {
+        let _ = release_body.await;
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(suffix))
+    });
+    let body = axum::body::Body::from_stream(prefix_stream.chain(suffix_stream));
+
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(&format!("/api/teams/{team_id}/uploads"))
+        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .header("content-length", content_length)
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-csrf-token", csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(body)
+        .unwrap()
+}
+
+fn team_upload_request_with_body(
+    team_id: &str,
+    token: &str,
+    csrf: &str,
+    content_type: String,
+    body: Vec<u8>,
+) -> axum::http::Request<axum::body::Body> {
     let content_length = body.len();
     axum::http::Request::builder()
         .method("POST")
@@ -1224,6 +1296,35 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         .unwrap();
     assert_eq!(added.status(), StatusCode::CREATED);
 
+    let owner_upload = app
+        .clone()
+        .oneshot(team_upload_request(team_id, &owner_token, &owner_csrf))
+        .await
+        .unwrap();
+    assert_eq!(owner_upload.status(), StatusCode::OK, "Team owner can stage an image");
+
+    let missing_file = app
+        .clone()
+        .oneshot(team_upload_request_without_file(team_id, &invitee_token, &invitee_csrf))
+        .await
+        .unwrap();
+    assert_eq!(missing_file.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(missing_file).await["code"], "TEAM_UPLOAD_FILE_REQUIRED");
+
+    let oversized_bytes = vec![0u8; 30 * 1024 * 1024 + 1];
+    let oversized = app
+        .clone()
+        .oneshot(team_upload_request_with_bytes(
+            team_id,
+            &invitee_token,
+            &invitee_csrf,
+            &oversized_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(oversized).await["code"], "TEAM_UPLOAD_FILE_TOO_LARGE");
+
     let upload_response = app
         .clone()
         .oneshot(team_upload_request(team_id, &invitee_token, &invitee_csrf))
@@ -1243,6 +1344,52 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         !upload_id.starts_with('/'),
         "upload reference must not expose a host path"
     );
+
+    let (body_started_tx, mut body_started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut body_releases = Vec::new();
+    let mut concurrent_uploads = Vec::new();
+    for _ in 0..4 {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let request = team_upload_request_with_paused_body(
+            team_id,
+            &invitee_token,
+            &invitee_csrf,
+            release_rx,
+            body_started_tx.clone(),
+        );
+        let app = app.clone();
+        concurrent_uploads.push(tokio::spawn(async move { app.oneshot(request).await.unwrap() }));
+        body_releases.push(release_tx);
+    }
+    for _ in 0..4 {
+        tokio::time::timeout(std::time::Duration::from_secs(10), body_started_rx.recv())
+            .await
+            .expect("each admitted upload should begin reading its body")
+            .expect("body-start notification should remain connected");
+    }
+
+    let overloaded_upload = app
+        .clone()
+        .oneshot(team_upload_request(team_id, &invitee_token, &invitee_csrf))
+        .await
+        .unwrap();
+    assert_eq!(overloaded_upload.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        body_json(overloaded_upload).await["code"],
+        "TEAM_UPLOAD_CONCURRENCY_LIMITED"
+    );
+
+    for release in body_releases {
+        release.send(()).unwrap();
+    }
+    for upload in concurrent_uploads {
+        let response = upload.await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "admitted upload should finish after body release"
+        );
+    }
 
     let attached = app
         .clone()
@@ -1284,6 +1431,34 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         !received_path.contains(".."),
         "resolved path must be canonical without traversal"
     );
+
+    // The quota is recomputed from durable workspace files, not process memory.
+    let uploads_dir = services.data_dir.join("team-uploads").join(team_id);
+    assert!(
+        !uploads_dir.starts_with(team["workspace"].as_str().unwrap()),
+        "Team upload storage must not be controlled by workspace writers"
+    );
+    let quota_marker = uploads_dir.join("quota-fixture.bin");
+    let quota_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&quota_marker)
+        .unwrap();
+    quota_file.set_len(100 * 1024 * 1024).unwrap();
+    drop(quota_file);
+    let over_quota = app
+        .clone()
+        .oneshot(team_upload_request_with_bytes(
+            team_id,
+            &invitee_token,
+            &invitee_csrf,
+            b"x",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(over_quota.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(over_quota).await["code"], "TEAM_UPLOAD_QUOTA_EXCEEDED");
+    std::fs::remove_file(quota_marker).unwrap();
 
     let lead_slot_id = team["assistants"][0]["slot_id"].as_str().unwrap();
     let denied_direct = app
@@ -1441,6 +1616,120 @@ async fn shared_team_member_can_upload_and_attach_image_without_accepting_arbitr
         .unwrap();
     assert_eq!(post_revoke_attach.status(), StatusCode::NOT_FOUND);
     assert_eq!(body_json(post_revoke_attach).await["code"], "NOT_FOUND");
+
+    assert!(
+        uploads_dir.is_dir(),
+        "staged Team upload storage should exist before deletion"
+    );
+    let (body_started_tx, mut body_started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let pending_upload = app.clone().oneshot(team_upload_request_with_paused_body(
+        team_id,
+        &owner_token,
+        &owner_csrf,
+        release_rx,
+        body_started_tx,
+    ));
+    let pending_upload = tokio::spawn(pending_upload);
+    tokio::time::timeout(std::time::Duration::from_secs(10), body_started_rx.recv())
+        .await
+        .expect("pending upload should begin reading its body")
+        .expect("pending upload notification should remain connected");
+
+    let deleted = app
+        .clone()
+        .oneshot(delete_with_token(
+            &format!("/api/teams/{team_id}"),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert!(
+        !uploads_dir.exists(),
+        "Team deletion must remove durable staged upload storage"
+    );
+
+    release_tx.send(()).unwrap();
+    let pending_upload = pending_upload.await.unwrap().unwrap();
+    assert_eq!(pending_upload.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(pending_upload).await["code"], "NOT_FOUND");
+    assert!(
+        !uploads_dir.exists(),
+        "a body-buffered upload queued before deletion must not recreate storage afterward"
+    );
+}
+
+#[tokio::test]
+async fn shared_team_upload_rate_limit_allows_multi_image_burst_then_returns_stable_429() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (invitee_token, invitee_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss2").await;
+    ensure_default_team_assistant(&mut app, &services, &owner_token, &owner_csrf).await;
+
+    let mut create_body = two_agent_body();
+    create_body["sharing_mode"] = json!("shared");
+    let create_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            create_body,
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let team_id = body_json(create_response).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let eligible = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/teams/eligible-collaborators?team_id={team_id}"),
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(eligible.status(), StatusCode::OK);
+    let account_ref = body_json(eligible).await["data"][0]["account_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let added = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/members"),
+            json!({ "account_ref": account_ref }),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::CREATED);
+
+    // A twenty-image selection burst fits in the initial bucket.
+    for _ in 0..20 {
+        let response = app
+            .clone()
+            .oneshot(team_upload_request(&team_id, &invitee_token, &invitee_csrf))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let limited = app
+        .clone()
+        .oneshot(team_upload_request(&team_id, &invitee_token, &invitee_csrf))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body_json(limited).await["code"], "TEAM_UPLOAD_RATE_LIMITED");
 }
 
 #[tokio::test]

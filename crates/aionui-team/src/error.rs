@@ -38,6 +38,21 @@ pub enum TeamError {
     #[error("A newer collaborator list is available; refresh the picker and try again")]
     EligibleCollaboratorListingSuperseded,
 
+    #[error("Team upload quota exceeded")]
+    TeamUploadQuotaExceeded,
+
+    #[error("Team upload rate limit exceeded")]
+    TeamUploadRateLimited,
+
+    #[error("Too many Team uploads are in progress")]
+    TeamUploadConcurrencyLimited,
+
+    #[error("Team upload file exceeds its size limit")]
+    TeamUploadFileTooLarge,
+
+    #[error("Failed to remove Team upload storage")]
+    TeamUploadStorageCleanupFailed,
+
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 

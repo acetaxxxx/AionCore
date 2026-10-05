@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 
@@ -25,7 +25,9 @@ use aionui_common::ApiError;
 use aionui_db::{ActivityCursor, DbError, PageDirection};
 
 use crate::error::{TeamError, classify_public_error};
-use crate::service::{ActivityKind, DEFAULT_ACTIVITY_LIMIT, TeamSessionService, TeamUploadStreamData};
+use crate::service::{
+    ActivityKind, DEFAULT_ACTIVITY_LIMIT, TEAM_UPLOAD_MAX_FILE_BYTES, TeamSessionService, TeamUploadStreamData,
+};
 
 #[derive(Clone)]
 pub struct TeamRouterState {
@@ -86,6 +88,36 @@ impl From<TeamError> for ApiError {
                 StatusCode::CONFLICT,
                 "TEAM_COLLABORATOR_LISTING_SUPERSEDED",
                 "A newer collaborator list is available; refresh the picker and try again",
+                None,
+            ),
+            TeamError::TeamUploadQuotaExceeded => ApiError::coded(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "TEAM_UPLOAD_QUOTA_EXCEEDED",
+                "This Team has reached its shared upload storage limit",
+                None,
+            ),
+            TeamError::TeamUploadRateLimited => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_UPLOAD_RATE_LIMITED",
+                "Team upload rate limit exceeded; retry shortly",
+                None,
+            ),
+            TeamError::TeamUploadConcurrencyLimited => ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TEAM_UPLOAD_CONCURRENCY_LIMITED",
+                "Too many Team uploads are in progress; retry shortly",
+                None,
+            ),
+            TeamError::TeamUploadFileTooLarge => ApiError::coded(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "TEAM_UPLOAD_FILE_TOO_LARGE",
+                "Team upload exceeds the 30 MiB per-file limit",
+                None,
+            ),
+            TeamError::TeamUploadStorageCleanupFailed => ApiError::coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "TEAM_UPLOAD_STORAGE_CLEANUP_FAILED",
+                "Team upload storage could not be removed; Team deletion was not completed",
                 None,
             ),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
@@ -209,8 +241,20 @@ impl From<TeamError> for ApiError {
     }
 }
 
+const MAX_TEAM_UPLOAD_MULTIPART_OVERHEAD: usize = 64 * 1024;
+
 pub fn team_routes(state: TeamRouterState) -> Router {
+    // Multipart overhead sits outside the per-file limit. Scope the larger
+    // extractor bound to this route so the global request limit does not
+    // preempt the upload handler's stable TEAM_UPLOAD_FILE_TOO_LARGE response.
+    let team_upload_routes = Router::new()
+        .route("/api/teams/{id}/uploads", post(upload_team_file))
+        .layer(DefaultBodyLimit::max(
+            TEAM_UPLOAD_MAX_FILE_BYTES + MAX_TEAM_UPLOAD_MULTIPART_OVERHEAD,
+        ));
+
     Router::new()
+        .merge(team_upload_routes)
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/eligible-collaborators", get(list_eligible_collaborators))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
@@ -239,7 +283,6 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             axum::routing::patch(update_agent_model),
         )
         .route("/api/teams/{id}/messages", post(send_message))
-        .route("/api/teams/{id}/uploads", post(upload_team_file))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
         .route("/api/teams/{id}/agents/{slot_id}/interrupt", post(interrupt_agent))
         .route("/api/teams/{id}/agents/{slot_id}/attach", post(attach_agent))
@@ -650,33 +693,40 @@ async fn reset_agent_context(
     Ok(Json(ApiResponse::ok(outcome)))
 }
 
-const MAX_TEAM_UPLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MiB hard bounded cap
-
 async fn extract_team_upload_multipart(mut multipart: Multipart) -> Result<TeamUploadStreamData, ApiError> {
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
     let mut content_type: Option<String> = None;
 
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("multipart error: {e}")))?
-    {
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| {
+        ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "TEAM_UPLOAD_MULTIPART_INVALID",
+            "Invalid Team upload multipart body",
+            None,
+        )
+    })? {
         let name = field.name().unwrap_or("").to_owned();
         if name == "file" {
             file_name = field.file_name().map(str::to_owned);
             content_type = field.content_type().map(str::to_owned);
 
             let mut bytes = Vec::new();
-            while let Some(chunk) = field
-                .chunk()
-                .await
-                .map_err(|e| ApiError::BadRequest(format!("failed to stream upload field: {e}")))?
-            {
-                if bytes.len() + chunk.len() > MAX_TEAM_UPLOAD_SIZE {
-                    return Err(ApiError::BadRequest(format!(
-                        "file exceeds maximum upload limit of {MAX_TEAM_UPLOAD_SIZE} bytes"
-                    )));
+            while let Some(chunk) = field.chunk().await.map_err(|_| {
+                ApiError::coded(
+                    StatusCode::BAD_REQUEST,
+                    "TEAM_UPLOAD_MULTIPART_INVALID",
+                    "Invalid Team upload multipart body",
+                    None,
+                )
+            })? {
+                if bytes.len() + chunk.len() > TEAM_UPLOAD_MAX_FILE_BYTES {
+                    return Err(ApiError::coded(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "TEAM_UPLOAD_FILE_TOO_LARGE",
+                        "Team upload exceeds the 30 MiB per-file limit",
+                        None,
+                    ));
                 }
                 bytes.extend_from_slice(&chunk);
             }
@@ -684,7 +734,14 @@ async fn extract_team_upload_multipart(mut multipart: Multipart) -> Result<TeamU
         }
     }
 
-    let file_bytes = file_bytes.ok_or_else(|| ApiError::BadRequest("missing 'file' field".to_owned()))?;
+    let file_bytes = file_bytes.ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "TEAM_UPLOAD_FILE_REQUIRED",
+            "Multipart field 'file' is required",
+            None,
+        )
+    })?;
 
     Ok(TeamUploadStreamData {
         file_bytes,
@@ -704,6 +761,8 @@ async fn upload_team_file(
     // since membership or the persisted workspace may change while streaming.
     let access = state.service.authorize_team(&user.id, &id).await?;
     state.service.verify_and_resolve_team_workspace(&access).await?;
+    state.service.check_team_upload_rate_limit(&id)?;
+    let _in_flight_permit = state.service.try_acquire_team_upload_slot()?;
 
     let upload_data = extract_team_upload_multipart(multipart).await?;
     let resp = state.service.upload_team_file(&user.id, &id, upload_data).await?;

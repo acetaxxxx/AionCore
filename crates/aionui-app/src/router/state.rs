@@ -375,6 +375,13 @@ pub async fn build_module_states(
         .recover_stale_runtime_state_on_startup()
         .await;
 
+    if let Err(error) = states.team.service.reconcile_team_upload_tombstones().await {
+        tracing::warn!(
+            error = %error,
+            "Team upload tombstone reconciliation was incomplete; remaining entries will be retried next startup"
+        );
+    }
+
     Ok((states, channel_components))
 }
 
@@ -1319,6 +1326,7 @@ pub fn build_team_state(
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
     spawn_assistant_mcp_binding_watcher(services.event_bus.subscribe(), Arc::clone(&service));
+    service.with_team_upload_storage_root(services.data_dir.join("team-uploads"));
     service.with_project_service(Arc::new(services.project_service.clone()));
     // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
     service.with_user_order_store(services.user_order_store.clone());

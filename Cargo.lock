@@ -1066,6 +1066,7 @@ dependencies = [
  "futures-util",
  "regex",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "sqlx",
